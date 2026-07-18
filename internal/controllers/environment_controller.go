@@ -522,20 +522,23 @@ func (r *EnvironmentReconciler) ensurePod(ctx context.Context, env *platformv1al
 	return &pod, nil
 }
 
-func (r *EnvironmentReconciler) currentSandboxdPod(ctx context.Context, env *platformv1alpha1.Environment, pod *corev1.Pod) bool {
+func (r *EnvironmentReconciler) currentSandboxdPod(ctx context.Context, env *platformv1alpha1.Environment, pod *corev1.Pod) (bool, error) {
 	if !metav1.IsControlledBy(pod, env) || pod.Annotations[sandboxdRevisionAnnotation] != sandboxdSecurityRevision ||
 		pod.Annotations[sandboxdauth.IdentityAnnotation] == "" || pod.Annotations[sandboxdauth.TrustAnnotation] == "" ||
 		pod.Annotations[sandboxdauth.TokenAnnotation] == "" {
-		return false
+		return false, nil
 	}
 	var secret corev1.Secret
 	if err := r.Get(ctx, types.NamespacedName{Namespace: env.Namespace, Name: envCredentialName(env)}, &secret); err != nil {
-		return false
+		if errors.IsNotFound(err) {
+			return false, nil
+		}
+		return false, fmt.Errorf("get sandboxd credentials: %w", err)
 	}
 	return metav1.IsControlledBy(&secret, env) &&
 		secret.Annotations[sandboxdauth.IdentityAnnotation] == pod.Annotations[sandboxdauth.IdentityAnnotation] &&
 		len(secret.Data[sandboxdauth.TLSCertKey]) > 0 && len(secret.Data[sandboxdauth.TLSKeyKey]) > 0 &&
-		len(secret.Data[sandboxdauth.CapabilitiesKey]) > 0
+		len(secret.Data[sandboxdauth.CapabilitiesKey]) > 0, nil
 }
 
 func (r *EnvironmentReconciler) rotateSandboxdCredentials(ctx context.Context, env *platformv1alpha1.Environment) (string, []byte, string, error) {

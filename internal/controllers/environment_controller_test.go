@@ -5,6 +5,7 @@ import (
 	"crypto/x509"
 	"encoding/json"
 	"encoding/pem"
+	stderrors "errors"
 	"testing"
 	"time"
 
@@ -246,6 +247,57 @@ func TestEnsurePodReplacesLegacyOrWrongOwnerPod(t *testing.T) {
 	if err := reconciler.Get(context.Background(), client.ObjectKeyFromObject(legacyPod), &deleted); err == nil {
 		t.Fatal("legacy pod was not deleted for secure recreation")
 	}
+}
+
+func TestEnsurePodRetainsCurrentPodWhenSecretReadFails(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	if err := platformv1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	env := &platformv1alpha1.Environment{ObjectMeta: metav1.ObjectMeta{
+		Name: "test", Namespace: "default", UID: "environment-uid",
+	}}
+	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
+		Name: envPodName(env), Namespace: env.Namespace,
+		Annotations: map[string]string{
+			sandboxdRevisionAnnotation:      sandboxdSecurityRevision,
+			sandboxdauth.IdentityAnnotation: "current.sandboxd.swe.dev",
+			sandboxdauth.TrustAnnotation:    "public trust bundle",
+			sandboxdauth.TokenAnnotation:    "terminal token",
+		},
+	}}
+	if err := controllerutil.SetControllerReference(env, pod, scheme); err != nil {
+		t.Fatal(err)
+	}
+	baseClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(pod).Build()
+	readErr := stderrors.New("transient Secret API failure")
+	reconciler := &EnvironmentReconciler{
+		Client: secretReadErrorClient{Client: baseClient, err: readErr}, Scheme: scheme,
+	}
+
+	got, err := reconciler.ensurePod(context.Background(), env, &platformv1alpha1.EnvironmentTemplate{})
+	if got != nil || !stderrors.Is(err, readErr) {
+		t.Fatalf("ensurePod() = (%#v, %v), want transient Secret error", got, err)
+	}
+	var retained corev1.Pod
+	if err := baseClient.Get(context.Background(), client.ObjectKeyFromObject(pod), &retained); err != nil {
+		t.Fatalf("current pod was deleted after transient Secret read failure: %v", err)
+	}
+}
+
+type secretReadErrorClient struct {
+	client.Client
+	err error
+}
+
+func (c secretReadErrorClient) Get(ctx context.Context, key client.ObjectKey, object client.Object, options ...client.GetOption) error {
+	if _, ok := object.(*corev1.Secret); ok {
+		return c.err
+	}
+	return c.Client.Get(ctx, key, object, options...)
 }
 
 func TestStaleDependentsAreRemovedButForeignCollisionsArePreserved(t *testing.T) {
