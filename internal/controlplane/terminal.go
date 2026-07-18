@@ -7,6 +7,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -24,7 +25,6 @@ import (
 )
 
 const (
-	defaultNamespace = "default"
 	sandboxdPort     = "50051"
 	wakeTimeout      = 2 * time.Minute
 	wakePollInterval = 250 * time.Millisecond
@@ -181,21 +181,29 @@ type terminalControl struct {
 var terminalUpgrader = websocket.Upgrader{
 	ReadBufferSize:  32 * 1024,
 	WriteBufferSize: 32 * 1024,
+	CheckOrigin:     func(*http.Request) bool { return true }, // checked before backend dial
 }
 
-func (s *Server) handleTerminal(w http.ResponseWriter, r *http.Request) {
-	environment, ok := terminalEnvironment(r.URL.Path)
-	if !ok {
-		http.NotFound(w, r)
+func (s *Server) handleTerminal(w http.ResponseWriter, r *http.Request, namespace, environment string) {
+	if s.access == nil {
+		writeAccessError(w, errUnauthenticated)
+		return
+	}
+	if err := s.access.Authorize(r, ResourceAccess{Namespace: namespace, Verb: "get", Resource: "environments", Subresource: "terminal", Name: environment}, true); err != nil {
+		writeAccessError(w, err)
+		return
+	}
+	if !websocket.IsWebSocketUpgrade(r) {
+		http.Error(w, "websocket upgrade is required", http.StatusBadRequest)
+		return
+	}
+	if !s.checkWebSocketOrigin(r) {
+		http.Error(w, "websocket origin is not allowed", http.StatusForbidden)
 		return
 	}
 	if s.terminalDialer == nil {
 		http.Error(w, "terminal gateway is unavailable", http.StatusServiceUnavailable)
 		return
-	}
-	namespace := r.URL.Query().Get("namespace")
-	if namespace == "" {
-		namespace = defaultNamespace
 	}
 
 	terminal, closer, err := s.terminalDialer.DialTerminal(r.Context(), namespace, environment)
@@ -217,13 +225,36 @@ func (s *Server) handleTerminal(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func terminalEnvironment(path string) (string, bool) {
-	remainder := strings.TrimPrefix(path, terminalPathPrefix)
-	if remainder == path || !strings.HasSuffix(remainder, "/terminal") {
-		return "", false
+func (s *Server) checkWebSocketOrigin(r *http.Request) bool {
+	origin := r.Header.Get("Origin")
+	if origin == "" {
+		_, _, err := requestToken(r, false)
+		return err == nil
 	}
-	environment := strings.TrimSuffix(remainder, "/terminal")
-	return environment, environment != "" && !strings.Contains(environment, "/")
+	parsed, err := url.Parse(origin)
+	if err != nil || parsed.Host == "" || (parsed.Scheme != "http" && parsed.Scheme != "https") {
+		return false
+	}
+	host := r.Host
+	scheme := "http"
+	if r.TLS != nil {
+		scheme = "https"
+	}
+	if s.trustProxy {
+		forwardedHost := r.Header.Get("X-Forwarded-Host")
+		forwardedProto := r.Header.Get("X-Forwarded-Proto")
+		if forwardedHost != "" || forwardedProto != "" {
+			if forwardedHost == "" || forwardedProto == "" || strings.Contains(forwardedHost, ",") || strings.Contains(forwardedProto, ",") {
+				return false
+			}
+			host = strings.TrimSpace(forwardedHost)
+			scheme = strings.ToLower(strings.TrimSpace(forwardedProto))
+			if scheme != "http" && scheme != "https" {
+				return false
+			}
+		}
+	}
+	return parsed.Scheme == scheme && strings.EqualFold(parsed.Host, host)
 }
 
 func bridgeWebTerminal(ctx context.Context, connection *websocket.Conn, client sandboxdv1.TerminalServiceClient) error {

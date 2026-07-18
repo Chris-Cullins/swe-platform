@@ -5,10 +5,12 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/client-go/kubernetes"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/config"
 
@@ -30,14 +32,35 @@ func main() {
 		log.Error("register API types", "error", err)
 		os.Exit(1)
 	}
-	kubeClient, err := client.New(config.GetConfigOrDie(), client.Options{Scheme: scheme})
+	restConfig := config.GetConfigOrDie()
+	kubeClient, err := client.New(restConfig, client.Options{Scheme: scheme})
 	if err != nil {
 		log.Error("create Kubernetes client", "error", err)
 		os.Exit(1)
 	}
+	clientset, err := kubernetes.NewForConfig(restConfig)
+	if err != nil {
+		log.Error("create Kubernetes authentication client", "error", err)
+		os.Exit(1)
+	}
+	bootstrapToken := os.Getenv("SWE_BOOTSTRAP_TOKEN")
+	if bootstrapToken != "" && len(bootstrapToken) < 32 {
+		log.Error("SWE_BOOTSTRAP_TOKEN must contain at least 32 characters")
+		os.Exit(1)
+	}
+	access := controlplane.KubernetesAccessController{
+		Client:         clientset,
+		BootstrapToken: bootstrapToken,
+		Audience:       os.Getenv("SWE_TOKEN_AUDIENCE"),
+	}
 	server := &http.Server{
-		Addr:              *address,
-		Handler:           controlplane.NewServer(log, controlplane.KubernetesTerminalDialer{Client: kubeClient}).Handler(),
+		Addr: *address,
+		Handler: controlplane.NewServer(log, controlplane.ServerOptions{
+			Access:         access,
+			Runs:           controlplane.KubernetesRunResolver{Client: kubeClient},
+			TerminalDialer: controlplane.KubernetesTerminalDialer{Client: kubeClient},
+			TrustProxy:     strings.EqualFold(os.Getenv("SWE_TRUST_PROXY_HEADERS"), "true"),
+		}).Handler(),
 		ReadHeaderTimeout: 5 * time.Second,
 		IdleTimeout:       2 * time.Minute,
 	}
