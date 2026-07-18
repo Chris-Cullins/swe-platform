@@ -15,8 +15,10 @@ jobs:
 
       - uses: actions/setup-go@v5
         with:
-          go-version: "1.25"
+          go-version: "1.26"
           cache: true
+
+      - uses: azure/setup-helm@v4
 
       - name: Build root module (operator + CLI)
         run: go build ./...
@@ -42,4 +44,10 @@ jobs:
       - name: Generated code is current
         run: |
           make generate manifests
-          git diff --exit-code -- api config
+          git diff --exit-code -- api config charts/swe-platform/crds
+
+      - name: Validate Helm chart
+        run: |
+          helm lint charts/swe-platform
+          helm lint charts/swe-platform --values charts/swe-platform/values-kind.yaml
+          helm template swe-platform charts/swe-platform --namespace default --values charts/swe-platform/values-kind.yaml >/dev/null

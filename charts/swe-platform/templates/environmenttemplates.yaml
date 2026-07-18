@@ -1,0 +1,12 @@
+{{- range .Values.environmentTemplates }}
+---
+apiVersion: swe.dev/v1alpha1
+kind: EnvironmentTemplate
+metadata:
+  name: {{ required "environmentTemplates[].name is required" .name }}
+  namespace: {{ default $.Release.Namespace .namespace }}
+  labels:
+    {{- include "swe-platform.labels" $ | nindent 4 }}
+spec:
+  {{- toYaml .spec | nindent 2 }}
+{{- end }}

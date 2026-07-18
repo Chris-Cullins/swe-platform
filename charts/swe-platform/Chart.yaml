@@ -1,0 +1,6 @@
+apiVersion: v2
+name: swe-platform
+description: Kubernetes operator and API definitions for swe-platform
+type: application
+version: 0.1.0
+appVersion: "0.1.0"

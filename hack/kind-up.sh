@@ -17,9 +17,11 @@ cat <<EOF
 Cluster '$CLUSTER' is ready.
 
 Next steps:
-  make install-crds   # install the swe.dev CRDs
-  make run            # run the operator locally against the cluster
-  bin/swe run "fix the flaky tests" -t <template-name>
+  make docker-build
+  kind load docker-image ghcr.io/chris-cullins/swe-platform/operator:dev --name $CLUSTER
+  kind load docker-image ghcr.io/chris-cullins/swe-platform/env-base:dev --name $CLUSTER
+  helm upgrade --install swe-platform charts/swe-platform -n default -f charts/swe-platform/values-kind.yaml
+  bin/swe run "fix the flaky tests" -t small
 
 Note: gVisor (runsc) is not installed on kind nodes by default, so the local
 dev flow runs environments without a RuntimeClass. That matches the `kind`

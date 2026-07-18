@@ -1,0 +1,41 @@
+replicaCount: 1
+
+image:
+  repository: ghcr.io/chris-cullins/swe-platform/operator
+  tag: latest
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+serviceAccount:
+  create: true
+  annotations: {}
+  name: ""
+
+leaderElection: true
+metricsBindAddress: ":8080"
+healthProbeBindAddress: ":8081"
+
+podAnnotations: {}
+podSecurityContext:
+  runAsNonRoot: true
+  seccompProfile:
+    type: RuntimeDefault
+securityContext:
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop: ["ALL"]
+  readOnlyRootFilesystem: true
+  runAsNonRoot: true
+
+resources: {}
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+# EnvironmentTemplate resources to create. Each entry may set `namespace` and
+# otherwise uses the release namespace. Empty by default because no stable
+# public environment image is published yet.
+environmentTemplates: []

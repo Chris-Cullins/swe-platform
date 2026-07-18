@@ -49,10 +49,18 @@ vet: ## Run go vet in both modules
 generate: $(CONTROLLER_GEN) ## Generate deepcopy methods
 	$(CONTROLLER_GEN) object paths="./api/..."
 
-.PHONY: manifests
+.PHONY: manifests sync-chart-crds check-chart-crds
 manifests: $(CONTROLLER_GEN) ## Generate CRDs and RBAC into config/
 	$(CONTROLLER_GEN) crd paths="./api/..." output:crd:artifacts:config=config/crd/bases
 	$(CONTROLLER_GEN) rbac:roleName=manager-role paths="./internal/controllers/..." output:rbac:artifacts:config=config/rbac
+	$(MAKE) sync-chart-crds
+
+sync-chart-crds: ## Synchronize generated CRDs into the Helm chart
+	mkdir -p charts/swe-platform/crds
+	cp config/crd/bases/*.yaml charts/swe-platform/crds/
+
+check-chart-crds: ## Verify Helm CRDs match the generated manifests
+	diff -ru config/crd/bases charts/swe-platform/crds
 
 .PHONY: proto
 proto: ## Regenerate sandboxd protobuf code (requires protoc)

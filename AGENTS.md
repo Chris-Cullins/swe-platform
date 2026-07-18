@@ -16,9 +16,9 @@ architectural. If it's missing, ask the maintainer instead of guessing at design
 
 P0 scaffold is in place: CRD types, environment controller, `sandboxd` (exec/fs/ports/
 health implemented; terminal is a stub), CLI (`run`/`logs` work; `attach` is a stub),
-kind script, CI. Remaining P0 gaps are marked `TODO(P0/P1/P2)` in code — most notably:
-setup-hook execution, agent credential injection, and the end-to-end kind acceptance
-(`make kind-up && make install-crds && swe run`).
+kind acceptance, CI, and a Helm chart for the operator and CRDs. Remaining gaps are
+marked `TODO(P0/P1/P2)` in code — most notably setup-hook execution, agent credential
+injection, and agent adapters.
 
 ## Architecture invariants — do not violate these
 
@@ -60,10 +60,11 @@ runs both via `make` targets:
 - **Build all binaries:** `make build` (outputs to `bin/`, gitignored)
 - **Unit tests:** `make test` · **Vet:** `make vet`
 - **Regenerate deepcopy:** `make generate` · **CRDs + RBAC:** `make manifests`
-  (CI fails if `make generate manifests` produces a diff — regenerate before committing)
+  (`manifests` synchronizes chart CRDs; CI fails on a diff). Use `make check-chart-crds`
+  to verify the checked-in Helm CRDs independently.
 - **Regenerate protobuf:** `make proto` (requires `protoc`; plugins install locally)
-- **Dev cluster:** `make kind-up` → `make install-crds` → `make run` (operator runs
-  locally against kind), then `bin/swe run "<prompt>" -t <template>`
+- **Dev cluster:** `make kind-up`, build/load the images, then install
+  `charts/swe-platform` with `values-kind.yaml` as printed by the script.
 - **E2E acceptance:** `./hack/e2e.sh` — full kind + operator + `swe run` pass with the
   env-base image built and loaded locally (no registry credentials needed). Runs in CI
   as the `e2e` workflow on relevant PRs and via `workflow_dispatch`.
