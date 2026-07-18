@@ -11,7 +11,8 @@ with a reviewable diff, branch, or PR.
 > passing kind end-to-end (`./hack/e2e.sh`). A first control-plane service accepts and
 > streams adapter-owned transcript events over SSE, while `swe attach` and the control
 > plane's WebSocket terminal endpoint connect to a shared tmux session through `sandboxd`;
-> pause/resume preserves workspace disks and runs repository resume hooks. Agent adapters
+> pause/resume preserves workspace disks and runs repository resume hooks, and idle
+> environments pause automatically before terminal requests wake them. Agent adapters
 > and portal proxying are not built yet. The Helm chart installs the
 > operator, control plane, and CRDs. Values presets
 > cover kind, k3s, GKE with GKE Sandbox, and EKS.
@@ -93,6 +94,10 @@ its workspace PVC, then set it to `false` to create a fresh pod; `.agents/resume
 after the volume is reattached. Both hooks can use values from the Project Secret, which
 also remains available to the running environment. GitHub App token minting is not
 implemented yet.
+
+Active environments are automatically paused after their template's `idleTimeout`
+(15 minutes by default). Opening the control-plane web terminal records activity and
+wakes a paused environment before connecting.
 
 The control plane exposes a browser terminal at
 `GET /api/v1/environments/{name}/terminal?namespace={namespace}`. The WebSocket client

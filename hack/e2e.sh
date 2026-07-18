@@ -233,7 +233,20 @@ if ! kubectl exec "env-${ENV_NAME}" -- sh -c 'test "$(wc -l < /workspace/setup-r
 	exit 1
 fi
 
-echo "==> verifying web terminal through the control plane"
+echo "==> verifying idle pause and terminal wake through the control plane"
+PRE_IDLE_POD_UID=$(kubectl get pod "env-${ENV_NAME}" -o jsonpath='{.metadata.uid}')
+kubectl patch environmenttemplate small --type=merge -p '{"spec":{"idleTimeout":"5s"}}' >/dev/null
+for _ in $(seq 1 30); do
+	PHASE=$(kubectl get environment "$ENV_NAME" -o jsonpath='{.status.phase}')
+	if [[ "$PHASE" == "Paused" ]] && ! kubectl get pod "env-${ENV_NAME}" >/dev/null 2>&1; then
+		break
+	fi
+	sleep 1
+done
+if [[ "${PHASE:-}" != "Paused" ]] || kubectl get pod "env-${ENV_NAME}" >/dev/null 2>&1; then
+	echo "FAIL: idle environment did not pause and remove its pod"
+	exit 1
+fi
 WEB_TERMINAL_CLIENT=$(mktemp /tmp/swe-web-terminal-XXXXXX.go)
 cat > "$WEB_TERMINAL_CLIENT" <<'EOF'
 package main
@@ -267,6 +280,19 @@ go run "$WEB_TERMINAL_CLIENT" "ws://127.0.0.1:18080/api/v1/environments/${ENV_NA
 if ! grep -q 'web-terminal-e2e-ok' /tmp/swe-platform-web-terminal.out; then
 	echo "FAIL: terminal output was not received through the control-plane websocket"
 	cat /tmp/swe-platform-web-terminal.out
+	exit 1
+fi
+if [[ "$(kubectl get environment "$ENV_NAME" -o jsonpath='{.spec.paused}')" == "true" ]]; then
+	echo "FAIL: terminal request did not wake the idle environment"
+	exit 1
+fi
+if [[ "$(kubectl get environment "$ENV_NAME" -o jsonpath='{.status.phase}')" != "Ready" ]]; then
+	echo "FAIL: woken environment did not become ready"
+	exit 1
+fi
+POST_WAKE_POD_UID=$(kubectl get pod "env-${ENV_NAME}" -o jsonpath='{.metadata.uid}')
+if [[ "$POST_WAKE_POD_UID" == "$PRE_IDLE_POD_UID" ]]; then
+	echo "FAIL: terminal request connected without recreating the paused pod"
 	exit 1
 fi
 

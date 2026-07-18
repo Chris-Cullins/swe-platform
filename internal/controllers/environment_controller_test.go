@@ -3,6 +3,7 @@ package controllers
 import (
 	"context"
 	"testing"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -228,5 +229,62 @@ func TestReconcilePausedWaitsForPodDeletion(t *testing.T) {
 	}
 	if updated.Status.Phase != platformv1alpha1.EnvironmentPhasePaused || updated.Status.PodName != "" {
 		t.Fatalf("Status = %#v, want Paused with no pod name", updated.Status)
+	}
+}
+
+func TestReconcileIdleRequestsPauseAfterTimeout(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := platformv1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	lastActive := metav1.NewTime(time.Now().Add(-time.Minute))
+	env := &platformv1alpha1.Environment{
+		ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default"},
+		Status: platformv1alpha1.EnvironmentStatus{
+			Phase:        platformv1alpha1.EnvironmentPhaseReady,
+			PodName:      "env-test",
+			LastActiveAt: &lastActive,
+		},
+	}
+	reconciler := &EnvironmentReconciler{
+		Client: fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(env).WithObjects(env).Build(),
+		Scheme: scheme,
+	}
+	tmpl := &platformv1alpha1.EnvironmentTemplate{
+		Spec: platformv1alpha1.EnvironmentTemplateSpec{IdleTimeout: &metav1.Duration{Duration: 30 * time.Second}},
+	}
+
+	result, err := reconciler.reconcileIdle(context.Background(), env, tmpl)
+	if err != nil {
+		t.Fatalf("reconcileIdle() error = %v", err)
+	}
+	if !result.Requeue {
+		t.Fatal("reconcileIdle() did not requeue after requesting pause")
+	}
+	var updated platformv1alpha1.Environment
+	if err := reconciler.Get(context.Background(), client.ObjectKeyFromObject(env), &updated); err != nil {
+		t.Fatal(err)
+	}
+	if !updated.Spec.Paused || updated.Status.Phase != platformv1alpha1.EnvironmentPhaseIdle {
+		t.Fatalf("Environment = %#v, want paused with Idle phase", updated)
+	}
+}
+
+func TestReconcileIdleSchedulesRemainingTimeout(t *testing.T) {
+	lastActive := metav1.Now()
+	env := &platformv1alpha1.Environment{
+		Status: platformv1alpha1.EnvironmentStatus{LastActiveAt: &lastActive},
+	}
+	tmpl := &platformv1alpha1.EnvironmentTemplate{
+		Spec: platformv1alpha1.EnvironmentTemplateSpec{IdleTimeout: &metav1.Duration{Duration: time.Minute}},
+	}
+	reconciler := &EnvironmentReconciler{}
+
+	result, err := reconciler.reconcileIdle(context.Background(), env, tmpl)
+	if err != nil {
+		t.Fatalf("reconcileIdle() error = %v", err)
+	}
+	if result.RequeueAfter <= 0 || result.RequeueAfter > time.Minute {
+		t.Fatalf("RequeueAfter = %s, want remaining one-minute timeout", result.RequeueAfter)
 	}
 }

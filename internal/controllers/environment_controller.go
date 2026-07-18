@@ -3,6 +3,7 @@ package controllers
 import (
 	"context"
 	"fmt"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
@@ -13,7 +14,9 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	platformv1alpha1 "github.com/Chris-Cullins/swe-platform/api/v1alpha1"
 )
@@ -26,7 +29,11 @@ var sizePresets = map[string]corev1.ResourceList{
 	"large":  {corev1.ResourceCPU: resource.MustParse("16"), corev1.ResourceMemory: resource.MustParse("32Gi")},
 }
 
-const defaultDiskSize = "40Gi"
+const (
+	defaultDiskSize    = "40Gi"
+	defaultIdleTimeout = 15 * time.Minute
+	templateRefField   = "spec.templateRef"
+)
 
 const projectSetupScript = `set -eu
 if [ ! -d /workspace/.git ]; then
@@ -82,6 +89,8 @@ func (r *EnvironmentReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		return r.reconcilePaused(ctx, &env)
 	}
 	if env.Status.Phase == platformv1alpha1.EnvironmentPhasePaused {
+		now := metav1.Now()
+		env.Status.LastActiveAt = &now
 		return ctrl.Result{Requeue: true}, r.setPhase(ctx, &env, platformv1alpha1.EnvironmentPhaseResuming, "")
 	}
 
@@ -90,7 +99,40 @@ func (r *EnvironmentReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		return ctrl.Result{}, r.fail(ctx, &env, fmt.Errorf("ensure pod: %w", err))
 	}
 
-	return ctrl.Result{}, r.syncStatus(ctx, &env, pod)
+	if err := r.syncStatus(ctx, &env, pod); err != nil {
+		return ctrl.Result{}, err
+	}
+	if pod.Status.Phase != corev1.PodRunning {
+		return ctrl.Result{}, nil
+	}
+	return r.reconcileIdle(ctx, &env, &tmpl)
+}
+
+// reconcileIdle schedules the next activity check or requests a pause once the
+// template's idle timeout has elapsed.
+func (r *EnvironmentReconciler) reconcileIdle(ctx context.Context, env *platformv1alpha1.Environment, tmpl *platformv1alpha1.EnvironmentTemplate) (ctrl.Result, error) {
+	timeout := defaultIdleTimeout
+	if tmpl.Spec.IdleTimeout != nil {
+		timeout = tmpl.Spec.IdleTimeout.Duration
+	}
+	remaining := timeout
+	if env.Status.LastActiveAt != nil {
+		remaining = time.Until(env.Status.LastActiveAt.Add(timeout))
+	}
+	if remaining > 0 {
+		return ctrl.Result{RequeueAfter: remaining}, nil
+	}
+
+	before := env.DeepCopy()
+	env.Spec.Paused = true
+	patch := client.MergeFromWithOptions(before, client.MergeFromWithOptimisticLock{})
+	if err := r.Patch(ctx, env, patch); err != nil {
+		return ctrl.Result{}, fmt.Errorf("request idle pause: %w", err)
+	}
+	if err := r.setPhase(ctx, env, platformv1alpha1.EnvironmentPhaseIdle, env.Status.PodName); err != nil {
+		return ctrl.Result{}, err
+	}
+	return ctrl.Result{Requeue: true}, nil
 }
 
 // reconcilePaused deletes the pod (if any) and keeps the workspace volume.
@@ -252,6 +294,7 @@ func (r *EnvironmentReconciler) ensurePod(ctx context.Context, env *platformv1al
 // syncStatus maps pod state onto the Environment phase.
 func (r *EnvironmentReconciler) syncStatus(ctx context.Context, env *platformv1alpha1.Environment, pod *corev1.Pod) error {
 	phase := platformv1alpha1.EnvironmentPhaseCreating
+	initializeActivity := false
 	switch pod.Status.Phase {
 	case corev1.PodPending:
 		if env.Status.Phase == platformv1alpha1.EnvironmentPhaseResuming {
@@ -261,13 +304,22 @@ func (r *EnvironmentReconciler) syncStatus(ctx context.Context, env *platformv1a
 		}
 	case corev1.PodRunning:
 		phase = platformv1alpha1.EnvironmentPhaseReady
-		// TODO(P2): phase = Running while a Run is attached, Idle after activity stops.
+		initializeActivity = env.Status.LastActiveAt == nil
 	case corev1.PodFailed:
 		phase = platformv1alpha1.EnvironmentPhaseFailed
 	case corev1.PodSucceeded:
 		phase = platformv1alpha1.EnvironmentPhaseTerminated
 	}
-	return r.setPhase(ctx, env, phase, pod.Name)
+	if initializeActivity {
+		now := metav1.Now()
+		env.Status.LastActiveAt = &now
+	}
+	if env.Status.Phase == phase && env.Status.PodName == pod.Name && !initializeActivity {
+		return nil
+	}
+	env.Status.Phase = phase
+	env.Status.PodName = pod.Name
+	return r.Status().Update(ctx, env)
 }
 
 func (r *EnvironmentReconciler) setPhase(ctx context.Context, env *platformv1alpha1.Environment, phase platformv1alpha1.EnvironmentPhase, podName string) error {
@@ -302,9 +354,27 @@ func ptr[T any](v T) *T { return &v }
 
 // SetupWithManager registers the controller with the manager.
 func (r *EnvironmentReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	if err := mgr.GetFieldIndexer().IndexField(context.Background(), &platformv1alpha1.Environment{}, templateRefField, func(object client.Object) []string {
+		environment := object.(*platformv1alpha1.Environment)
+		return []string{environment.Spec.TemplateRef}
+	}); err != nil {
+		return fmt.Errorf("index environments by template: %w", err)
+	}
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&platformv1alpha1.Environment{}).
 		Owns(&corev1.Pod{}).
 		Owns(&corev1.PersistentVolumeClaim{}).
+		Watches(&platformv1alpha1.EnvironmentTemplate{}, handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, object client.Object) []reconcile.Request {
+			var environments platformv1alpha1.EnvironmentList
+			if err := r.List(ctx, &environments, client.InNamespace(object.GetNamespace()), client.MatchingFields{templateRefField: object.GetName()}); err != nil {
+				log.FromContext(ctx).Error(err, "list environments for template", "template", object.GetName())
+				return nil
+			}
+			requests := make([]reconcile.Request, 0, len(environments.Items))
+			for i := range environments.Items {
+				requests = append(requests, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(&environments.Items[i])})
+			}
+			return requests
+		})).
 		Complete(r)
 }
