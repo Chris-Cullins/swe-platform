@@ -8,10 +8,10 @@ streams everything back live, auto-pauses when idle so compute cost drops to ~$0
 with a reviewable diff, branch, or PR.
 
 > **Status: early.** The P0 scaffold is in — CRDs, operator, `sandboxd`, CLI — with a
-> passing kind end-to-end (`./hack/e2e.sh`). Agent adapters and the control plane are
-> not built yet. A Helm chart now installs the existing operator and CRDs; it does not
-> install the not-yet-implemented control plane or gateway. Helm values presets cover
-> kind, k3s, GKE with GKE Sandbox, and EKS.
+> passing kind end-to-end (`./hack/e2e.sh`). A first control-plane service accepts and
+> streams adapter-owned transcript events over SSE; agent adapters and the gateway are
+> not built yet. The Helm chart installs the operator, control plane, and CRDs. Values
+> presets cover kind, k3s, GKE with GKE Sandbox, and EKS.
 
 ## Why
 

@@ -10,6 +10,10 @@
 {{- end }}
 {{- end }}
 
+{{- define "swe-platform.controlPlaneFullname" -}}
+{{- printf "%s-control-plane" (include "swe-platform.fullname" . | trunc 49 | trimSuffix "-") -}}
+{{- end }}
+
 {{- define "swe-platform.labels" -}}
 helm.sh/chart: {{ printf "%s-%s" .Chart.Name .Chart.Version | replace "+" "_" }}
 app.kubernetes.io/name: {{ include "swe-platform.name" . }}

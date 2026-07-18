@@ -5,6 +5,15 @@ image:
   tag: latest
   pullPolicy: IfNotPresent
 
+controlPlane:
+  enabled: true
+  replicaCount: 1
+  image:
+    repository: ghcr.io/chris-cullins/swe-platform/control-plane
+    tag: latest
+    pullPolicy: IfNotPresent
+  resources: {}
+
 imagePullSecrets: []
 nameOverride: ""
 fullnameOverride: ""

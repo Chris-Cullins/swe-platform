@@ -1,0 +1,19 @@
+{{- if .Values.controlPlane.enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "swe-platform.controlPlaneFullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "swe-platform.labels" . | nindent 4 }}
+    app.kubernetes.io/component: control-plane
+spec:
+  selector:
+    app.kubernetes.io/name: {{ include "swe-platform.name" . }}
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/component: control-plane
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+{{- end }}

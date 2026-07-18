@@ -1,7 +1,9 @@
 # swe-platform Helm chart
 
-This chart installs the swe-platform CRDs and operator. The control plane and gateway
-are not implemented yet and are not part of this chart.
+This chart installs the swe-platform CRDs, operator, and the first control-plane API.
+The control plane accepts adapter-owned transcript events and streams them over SSE.
+Its current transcript store is in-memory and single-replica; durable storage, auth,
+and the gateway are not implemented yet.
 
 ## Install
 
@@ -29,6 +31,22 @@ supported by eligible nodes.
 
 For local development, use `values-kind.yaml`; it references locally loaded `:dev`
 images and disables leader election.
+
+## Transcript API
+
+After forwarding the control-plane Service, adapters can append JSON transcript events
+and clients can consume replay plus live events as an SSE stream:
+
+```sh
+kubectl port-forward service/swe-platform-swe-platform-control-plane 8080:80
+curl -N http://127.0.0.1:8080/api/v1/runs/run-123/transcript
+curl -H 'Content-Type: application/json' \
+  -d '{"type":"output","data":{"text":"hello"}}' \
+  http://127.0.0.1:8080/api/v1/runs/run-123/transcript
+```
+
+SSE reconnects honor `Last-Event-ID`. Callers may also request events after a known ID
+with `?after=<id>`.
 
 ## Validate
 

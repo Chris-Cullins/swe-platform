@@ -23,6 +23,8 @@ jobs:
         image:
           - name: operator
             dockerfile: images/operator/Dockerfile
+          - name: control-plane
+            dockerfile: images/control-plane/Dockerfile
           - name: env-base
             dockerfile: images/env-base/Dockerfile
     steps:

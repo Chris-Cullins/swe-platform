@@ -17,11 +17,15 @@ all: build
 ##@ Build
 
 .PHONY: build
-build: build-operator build-cli build-sandboxd ## Build all binaries into bin/
+build: build-operator build-control-plane build-cli build-sandboxd ## Build all binaries into bin/
 
 .PHONY: build-operator
 build-operator: ## Build the operator
 	go build -o $(LOCALBIN)/operator ./cmd/operator
+
+.PHONY: build-control-plane
+build-control-plane: ## Build the control-plane API
+	go build -o $(LOCALBIN)/control-plane ./cmd/control-plane
 
 .PHONY: build-cli
 build-cli: ## Build the swe CLI
@@ -98,11 +102,15 @@ run: ## Run the operator locally against the current cluster
 ##@ Images
 
 .PHONY: docker-build
-docker-build: docker-build-operator docker-build-env-base ## Build all images
+docker-build: docker-build-operator docker-build-control-plane docker-build-env-base ## Build all images
 
 .PHONY: docker-build-operator
 docker-build-operator: ## Build the operator image
 	docker build -t ghcr.io/chris-cullins/swe-platform/operator:dev -f images/operator/Dockerfile .
+
+.PHONY: docker-build-control-plane
+docker-build-control-plane: ## Build the control-plane image
+	docker build -t ghcr.io/chris-cullins/swe-platform/control-plane:dev -f images/control-plane/Dockerfile .
 
 .PHONY: docker-build-env-base
 docker-build-env-base: ## Build the environment base image (includes sandboxd)

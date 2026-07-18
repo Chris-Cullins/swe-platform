@@ -12,8 +12,14 @@ set -euo pipefail
 CLUSTER="${KIND_CLUSTER:-swe-e2e}"
 ENV_IMAGE="ghcr.io/chris-cullins/swe-platform/env-base:dev"
 OPERATOR_IMAGE="ghcr.io/chris-cullins/swe-platform/operator:dev"
+CONTROL_PLANE_IMAGE="ghcr.io/chris-cullins/swe-platform/control-plane:dev"
+PORT_FORWARD_PID=""
 
 cleanup() {
+	if [[ -n "$PORT_FORWARD_PID" ]]; then
+		kill "$PORT_FORWARD_PID" >/dev/null 2>&1 || true
+		wait "$PORT_FORWARD_PID" >/dev/null 2>&1 || true
+	fi
 	if [[ "${KEEP_CLUSTER:-false}" != "true" ]]; then
 		kind delete cluster --name "$CLUSTER" >/dev/null 2>&1 || true
 	fi
@@ -33,7 +39,7 @@ echo "==> building platform images"
 make docker-build >/dev/null
 
 echo "==> loading images into kind"
-kind load docker-image "$ENV_IMAGE" "$OPERATOR_IMAGE" --name "$CLUSTER"
+kind load docker-image "$ENV_IMAGE" "$OPERATOR_IMAGE" "$CONTROL_PLANE_IMAGE" --name "$CLUSTER"
 
 echo "==> installing operator, CRDs, and kind template through Helm"
 helm upgrade --install swe-platform charts/swe-platform \
@@ -45,6 +51,37 @@ bin/swe run "end-to-end smoke test" -t small --timeout 3m
 echo "==> verifying state"
 kubectl get environments
 kubectl get pods -l app.kubernetes.io/managed-by=swe-platform
+
+echo "==> verifying live transcript stream through the control plane"
+kubectl port-forward service/swe-platform-swe-platform-control-plane 18080:80 >/tmp/swe-platform-port-forward.log 2>&1 &
+PORT_FORWARD_PID=$!
+for _ in $(seq 1 30); do
+	if curl --fail --silent http://127.0.0.1:18080/healthz >/dev/null; then
+		break
+	fi
+	sleep 1
+done
+curl --fail --silent --no-buffer --max-time 10 \
+	http://127.0.0.1:18080/api/v1/runs/e2e-run/transcript > /tmp/swe-platform-transcript.out &
+STREAM_PID=$!
+sleep 1
+curl --fail --silent \
+	-H 'Content-Type: application/json' \
+	-d '{"type":"output","data":{"text":"e2e transcript event"}}' \
+	http://127.0.0.1:18080/api/v1/runs/e2e-run/transcript >/dev/null
+for _ in $(seq 1 30); do
+	if grep -q 'e2e transcript event' /tmp/swe-platform-transcript.out; then
+		break
+	fi
+	sleep 1
+done
+kill "$STREAM_PID" >/dev/null 2>&1 || true
+wait "$STREAM_PID" >/dev/null 2>&1 || true
+if ! grep -q 'e2e transcript event' /tmp/swe-platform-transcript.out; then
+	echo "FAIL: transcript event was not received from the SSE stream"
+	cat /tmp/swe-platform-transcript.out
+	exit 1
+fi
 
 ENV_NAME=$(kubectl get environments -o jsonpath='{.items[0].metadata.name}')
 POD_PHASE=$(kubectl get pod "env-${ENV_NAME}" -o jsonpath='{.status.phase}')

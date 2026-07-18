@@ -16,9 +16,10 @@ architectural. If it's missing, ask the maintainer instead of guessing at design
 
 P0 scaffold is in place: CRD types, environment controller, `sandboxd` (exec/fs/ports/
 health implemented; terminal is a stub), CLI (`run`/`logs` work; `attach` is a stub),
-kind acceptance, CI, and a Helm chart for the operator and CRDs. Remaining gaps are
-marked `TODO(P0/P1/P2)` in code — most notably setup-hook execution, agent credential
-injection, and agent adapters.
+kind acceptance, CI, and a Helm chart for the operator, control plane, and CRDs. The
+control plane currently provides in-memory transcript ingestion and SSE streaming.
+Remaining gaps are marked `TODO(P0/P1/P2)` in code — most notably setup-hook execution,
+agent credential injection, and agent adapters.
 
 ## Architecture invariants — do not violate these
 
@@ -57,7 +58,7 @@ injection, and agent adapters.
 Two Go modules — root (operator, CLI, API types) and `sandboxd/`. Everything below
 runs both via `make` targets:
 
-- **Build all binaries:** `make build` (outputs to `bin/`, gitignored)
+- **Build all binaries:** `make build` (outputs operator, control plane, CLI, and sandboxd to `bin/`, gitignored)
 - **Unit tests:** `make test` · **Vet:** `make vet`
 - **Regenerate deepcopy:** `make generate` · **CRDs + RBAC:** `make manifests`
   (`manifests` synchronizes chart CRDs; CI fails on a diff). Use `make check-chart-crds`

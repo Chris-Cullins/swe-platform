@@ -3,6 +3,10 @@ image:
   tag: dev
   pullPolicy: IfNotPresent
 
+controlPlane:
+  image:
+    tag: dev
+
 leaderElection: false
 
 environmentTemplates:
