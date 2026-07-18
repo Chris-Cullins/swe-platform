@@ -106,11 +106,14 @@ immediately replenishes the pool. Claiming for a Project recreates the generic w
 against its existing workspace volume so repository setup completes before the run is
 reported ready.
 
-The control plane exposes a browser terminal at
-`GET /api/v1/environments/{name}/terminal?namespace={namespace}`. The WebSocket client
+The authenticated control plane exposes a browser terminal at
+`GET /api/v1/namespaces/{namespace}/environments/{name}/terminal`. The WebSocket client
 first sends `{"type":"open","cols":80,"rows":24}`, then uses binary frames for terminal
 input and output. Send `{"type":"resize","cols":120,"rows":40}` to resize the shared
-terminal. The namespace defaults to `default`.
+terminal. Kubernetes TokenReview authenticates bearer credentials and SubjectAccessReview
+authorizes the exact namespaced environment; the namespace is never accepted from a query
+parameter. See the [Helm chart documentation](charts/swe-platform/README.md#control-plane-authentication-and-authorization)
+for credentials, browser sessions, RBAC, and self-hosted bootstrap setup.
 
 ## Contributing
 

@@ -58,6 +58,9 @@ agent credential injection, and agent adapters.
 Two Go modules — root (operator, CLI, API types) and `sandboxd/`. Everything below
 runs both via `make` targets:
 
+- **Orb setup:** `.agents/setup` installs the pinned Go and Helm versions into
+  `$HOME/.local` when they are unavailable.
+
 - **Build all binaries:** `make build` (outputs operator, control plane, CLI, and sandboxd to `bin/`, gitignored)
 - **Unit tests:** `make test` · **Vet:** `make vet`
 - **Regenerate deepcopy:** `make generate` · **CRDs + RBAC:** `make manifests`

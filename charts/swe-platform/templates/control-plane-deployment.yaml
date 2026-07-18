@@ -33,6 +33,18 @@ spec:
           image: "{{ .Values.controlPlane.image.repository }}:{{ .Values.controlPlane.image.tag | default .Chart.AppVersion }}"
           imagePullPolicy: {{ .Values.controlPlane.image.pullPolicy }}
           args: ["--listen-address=:8080"]
+          env:
+            - name: SWE_TOKEN_AUDIENCE
+              value: {{ .Values.controlPlane.auth.tokenAudience | quote }}
+            - name: SWE_TRUST_PROXY_HEADERS
+              value: {{ .Values.controlPlane.auth.trustProxyHeaders | quote }}
+            {{- with .Values.controlPlane.auth.bootstrapTokenSecret.name }}
+            - name: SWE_BOOTSTRAP_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ . | quote }}
+                  key: {{ $.Values.controlPlane.auth.bootstrapTokenSecret.key | quote }}
+            {{- end }}
           ports:
             - name: http
               containerPort: 8080

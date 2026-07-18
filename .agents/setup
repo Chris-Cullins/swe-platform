@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+GO_VERSION=1.26.5
+HELM_VERSION=v4.2.3
+
+mkdir -p "$HOME/.local/bin" "$HOME/.local/lib"
+
+if ! command -v go >/dev/null 2>&1 || [[ "$(go version)" != *"go${GO_VERSION}"* ]]; then
+	curl -fsSL "https://go.dev/dl/go${GO_VERSION}.linux-amd64.tar.gz" -o /tmp/go.tar.gz
+	rm -rf "$HOME/.local/lib/go"
+	tar -C "$HOME/.local/lib" -xzf /tmp/go.tar.gz
+	ln -sf "$HOME/.local/lib/go/bin/go" "$HOME/.local/bin/go"
+	ln -sf "$HOME/.local/lib/go/bin/gofmt" "$HOME/.local/bin/gofmt"
+	rm -f /tmp/go.tar.gz
+fi
+
+if ! command -v helm >/dev/null 2>&1 || [[ "$(helm version --short)" != *"${HELM_VERSION}"* ]]; then
+	curl -fsSL "https://get.helm.sh/helm-${HELM_VERSION}-linux-amd64.tar.gz" -o /tmp/helm.tar.gz
+	tar -C /tmp -xzf /tmp/helm.tar.gz
+	install /tmp/linux-amd64/helm "$HOME/.local/bin/helm"
+	rm -rf /tmp/helm.tar.gz /tmp/linux-amd64
+fi

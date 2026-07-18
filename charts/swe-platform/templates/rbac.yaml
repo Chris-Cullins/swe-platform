@@ -57,6 +57,12 @@ metadata:
     {{- include "swe-platform.labels" . | nindent 4 }}
     app.kubernetes.io/component: control-plane
 rules:
+  - apiGroups: ["authentication.k8s.io"]
+    resources: ["tokenreviews"]
+    verbs: ["create"]
+  - apiGroups: ["authorization.k8s.io"]
+    resources: ["subjectaccessreviews"]
+    verbs: ["create"]
   - apiGroups: [""]
     resources: ["pods"]
     verbs: ["get"]
@@ -68,6 +74,9 @@ rules:
     verbs: ["get", "update"]
   - apiGroups: ["swe.dev"]
     resources: ["environmenttemplates"]
+    verbs: ["get"]
+  - apiGroups: ["swe.dev"]
+    resources: ["runs"]
     verbs: ["get"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1

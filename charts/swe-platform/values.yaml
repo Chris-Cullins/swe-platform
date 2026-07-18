@@ -12,6 +12,16 @@ controlPlane:
     repository: ghcr.io/chris-cullins/swe-platform/control-plane
     tag: latest
     pullPolicy: IfNotPresent
+  auth:
+    tokenAudience: swe-platform
+    # Honor X-Forwarded-Host/Proto for WebSocket origin checks only when a trusted
+    # reverse proxy overwrites both headers.
+    trustProxyHeaders: false
+    # Optional all-access bootstrap credential for initial self-hosted setup.
+    # Create this Secret out of band and disable/remove it after configuring RBAC.
+    bootstrapTokenSecret:
+      name: ""
+      key: token
   resources: {}
 
 imagePullSecrets: []

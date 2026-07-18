@@ -54,8 +54,12 @@ echo "==> loading images into kind"
 kind load docker-image "$ENV_IMAGE" "$OPERATOR_IMAGE" "$CONTROL_PLANE_IMAGE" --name "$CLUSTER"
 
 echo "==> installing operator, CRDs, and kind template through Helm"
+E2E_BOOTSTRAP_TOKEN="$(openssl rand -hex 32)"
+kubectl create secret generic swe-platform-bootstrap --from-literal=token="$E2E_BOOTSTRAP_TOKEN"
 helm upgrade --install swe-platform charts/swe-platform \
-	--namespace default --values charts/swe-platform/values-kind.yaml --wait --timeout 2m
+	--namespace default --values charts/swe-platform/values-kind.yaml \
+	--set controlPlane.auth.bootstrapTokenSecret.name=swe-platform-bootstrap \
+	--wait --timeout 2m
 
 echo "==> waiting for warm environment"
 kubectl wait --for=jsonpath='{.status.warmPoolReady}'=1 environmenttemplate/small --timeout=2m
@@ -145,7 +149,8 @@ EOF
 echo "==> creating project environment + run via swe"
 bin/swe run "end-to-end smoke test" --project e2e --timeout 3m
 
-ENV_NAME=$(kubectl get runs -o jsonpath='{.items[0].spec.environmentRef}')
+RUN_NAME=$(kubectl get runs -o jsonpath='{.items[0].metadata.name}')
+ENV_NAME=$(kubectl get run "$RUN_NAME" -o jsonpath='{.spec.environmentRef}')
 if [[ "$ENV_NAME" != "$WARM_ENV_NAME" ]]; then
 	echo "FAIL: swe run created $ENV_NAME instead of claiming warm environment $WARM_ENV_NAME"
 	exit 1
@@ -167,6 +172,47 @@ echo "==> verifying state"
 kubectl get environments
 kubectl get pods -l app.kubernetes.io/managed-by=swe-platform
 
+echo "==> configuring a run-scoped transcript producer"
+cat <<EOF | kubectl apply -f -
+apiVersion: swe.dev/v1alpha1
+kind: Run
+metadata:
+  name: auth-scope-run-b
+spec:
+  environmentRef: ${ENV_NAME}
+  agent: e2e
+  prompt: authorization scope test
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: e2e-transcript-producer
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: e2e-transcript-producer
+rules:
+  - apiGroups: ["swe.dev"]
+    resources: ["runs/transcript"]
+    resourceNames: ["${RUN_NAME}"]
+    verbs: ["update"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: e2e-transcript-producer
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: e2e-transcript-producer
+subjects:
+  - kind: ServiceAccount
+    name: e2e-transcript-producer
+    namespace: default
+EOF
+PRODUCER_TOKEN=$(kubectl create token e2e-transcript-producer --audience=swe-platform)
+
 echo "==> verifying live transcript stream through the control plane"
 kubectl port-forward service/swe-platform-swe-platform-control-plane 18080:80 >/tmp/swe-platform-port-forward.log 2>&1 &
 PORT_FORWARD_PID=$!
@@ -176,14 +222,42 @@ for _ in $(seq 1 30); do
 	fi
 	sleep 1
 done
+ANONYMOUS_STATUS=$(curl --silent --output /dev/null --write-out '%{http_code}' \
+	"http://127.0.0.1:18080/api/v1/namespaces/default/runs/${RUN_NAME}/transcript")
+if [[ "$ANONYMOUS_STATUS" != "401" ]]; then
+	echo "FAIL: anonymous transcript status was ${ANONYMOUS_STATUS}, expected 401"
+	exit 1
+fi
 curl --fail --silent --no-buffer --max-time 10 \
-	http://127.0.0.1:18080/api/v1/runs/e2e-run/transcript > /tmp/swe-platform-transcript.out &
+	-H "Authorization: Bearer ${E2E_BOOTSTRAP_TOKEN}" \
+	"http://127.0.0.1:18080/api/v1/namespaces/default/runs/${RUN_NAME}/transcript" > /tmp/swe-platform-transcript.out &
 STREAM_PID=$!
 sleep 1
-curl --fail --silent \
+APPEND_STATUS=$(curl --silent --output /dev/null --write-out '%{http_code}' \
+	-H "Authorization: Bearer ${PRODUCER_TOKEN}" \
 	-H 'Content-Type: application/json' \
 	-d '{"type":"output","data":{"text":"e2e transcript event"}}' \
-	http://127.0.0.1:18080/api/v1/runs/e2e-run/transcript >/dev/null
+	"http://127.0.0.1:18080/api/v1/namespaces/default/runs/${RUN_NAME}/transcript")
+if [[ "$APPEND_STATUS" != "202" ]]; then
+	echo "FAIL: run-scoped producer append status was ${APPEND_STATUS}, expected 202"
+	exit 1
+fi
+DENIED_STATUS=$(curl --silent --output /dev/null --write-out '%{http_code}' \
+	-H "Authorization: Bearer ${PRODUCER_TOKEN}" \
+	-H 'Content-Type: application/json' \
+	-d '{"type":"output","data":{"text":"forged"}}' \
+	http://127.0.0.1:18080/api/v1/namespaces/default/runs/auth-scope-run-b/transcript)
+if [[ "$DENIED_STATUS" != "403" ]]; then
+	echo "FAIL: cross-run producer append status was ${DENIED_STATUS}, expected 403"
+	exit 1
+fi
+UNKNOWN_STATUS=$(curl --silent --output /dev/null --write-out '%{http_code}' \
+	-H "Authorization: Bearer ${E2E_BOOTSTRAP_TOKEN}" \
+	http://127.0.0.1:18080/api/v1/namespaces/default/runs/unknown-run/transcript)
+if [[ "$UNKNOWN_STATUS" != "404" ]]; then
+	echo "FAIL: unknown Run transcript status was ${UNKNOWN_STATUS}, expected 404"
+	exit 1
+fi
 for _ in $(seq 1 30); do
 	if grep -q 'e2e transcript event' /tmp/swe-platform-transcript.out; then
 		break
@@ -278,6 +352,7 @@ package main
 
 import (
 	"fmt"
+	"net/http"
 	"os"
 	"strings"
 	"time"
@@ -286,7 +361,8 @@ import (
 )
 
 func main() {
-	connection, _, err := websocket.DefaultDialer.Dial(os.Args[1], nil)
+	header := http.Header{"Authorization": []string{"Bearer " + os.Args[2]}}
+	connection, _, err := websocket.DefaultDialer.Dial(os.Args[1], header)
 	if err != nil { panic(err) }
 	defer connection.Close()
 	_ = connection.SetReadDeadline(time.Now().Add(15 * time.Second))
@@ -301,7 +377,9 @@ func main() {
 	fmt.Print(output.String())
 }
 EOF
-go run "$WEB_TERMINAL_CLIENT" "ws://127.0.0.1:18080/api/v1/environments/${ENV_NAME}/terminal" > /tmp/swe-platform-web-terminal.out
+go run "$WEB_TERMINAL_CLIENT" \
+	"ws://127.0.0.1:18080/api/v1/namespaces/default/environments/${ENV_NAME}/terminal" \
+	"$E2E_BOOTSTRAP_TOKEN" > /tmp/swe-platform-web-terminal.out
 if ! grep -q 'web-terminal-e2e-ok' /tmp/swe-platform-web-terminal.out; then
 	echo "FAIL: terminal output was not received through the control-plane websocket"
 	cat /tmp/swe-platform-web-terminal.out
