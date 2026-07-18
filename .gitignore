@@ -1,0 +1,5 @@
+# Design docs — private for now
+docs/
+
+# macOS
+.DS_Store
