@@ -49,5 +49,9 @@ jobs:
       - name: Validate Helm chart
         run: |
           helm lint charts/swe-platform
-          helm lint charts/swe-platform --values charts/swe-platform/values-kind.yaml
-          helm template swe-platform charts/swe-platform --namespace default --values charts/swe-platform/values-kind.yaml >/dev/null
+          for preset in kind k3s gke eks; do
+            values="charts/swe-platform/values-${preset}.yaml"
+            helm lint charts/swe-platform --values "$values"
+            helm template swe-platform charts/swe-platform \
+              --namespace swe-platform-system --values "$values" >/dev/null
+          done

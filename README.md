@@ -10,7 +10,8 @@ with a reviewable diff, branch, or PR.
 > **Status: early.** The P0 scaffold is in — CRDs, operator, `sandboxd`, CLI — with a
 > passing kind end-to-end (`./hack/e2e.sh`). Agent adapters and the control plane are
 > not built yet. A Helm chart now installs the existing operator and CRDs; it does not
-> install the not-yet-implemented control plane or gateway.
+> install the not-yet-implemented control plane or gateway. Helm values presets cover
+> kind, k3s, GKE with GKE Sandbox, and EKS.
 
 ## Why
 
@@ -71,8 +72,8 @@ with a reviewable diff, branch, or PR.
 Development targets a local [kind](https://kind.sigs.k8s.io/) cluster. Run `make kind-up`,
 build and load the operator and env-base images as printed by that command, then install
 `charts/swe-platform` with `values-kind.yaml`. The preset creates the `small` template
-in `default`; default chart values intentionally create no template until a stable
-environment image is published.
+in `default`. Production installation assumptions and k3s/GKE/EKS presets are documented
+in the [chart README](charts/swe-platform/README.md).
 
 ## Contributing
 

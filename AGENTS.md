@@ -65,6 +65,8 @@ runs both via `make` targets:
 - **Regenerate protobuf:** `make proto` (requires `protoc`; plugins install locally)
 - **Dev cluster:** `make kind-up`, build/load the images, then install
   `charts/swe-platform` with `values-kind.yaml` as printed by the script.
+- **Production Helm presets:** `charts/swe-platform/values-{k3s,gke,eks}.yaml`; CI lints
+  and renders every preset. Provider assumptions are documented in the chart README.
 - **E2E acceptance:** `./hack/e2e.sh` — full kind + operator + `swe run` pass with the
   env-base image built and loaded locally (no registry credentials needed). Runs in CI
   as the `e2e` workflow on relevant PRs and via `workflow_dispatch`.

@@ -1,0 +1,33 @@
+# Production baseline for GKE clusters whose environment node pools have
+# GKE Sandbox enabled. The gvisor RuntimeClass must exist before environments run.
+replicaCount: 2
+
+image:
+  tag: latest
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    cpu: 500m
+    memory: 512Mi
+
+affinity:
+  podAntiAffinity:
+    preferredDuringSchedulingIgnoredDuringExecution:
+      - weight: 100
+        podAffinityTerm:
+          topologyKey: kubernetes.io/hostname
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: swe-platform
+
+environmentTemplates:
+  - name: medium
+    spec:
+      image: ghcr.io/chris-cullins/swe-platform/env-base:latest
+      size: medium
+      runtimeClass: gvisor
+      idleTimeout: 15m
+      diskSize: 40Gi
