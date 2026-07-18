@@ -77,6 +77,17 @@ build and load the operator and env-base images as printed by that command, then
 in `default`. Production installation assumptions and k3s/GKE/EKS presets are documented
 in the [chart README](charts/swe-platform/README.md).
 
+Create runs with an explicit template, or reference a `Project` to use its default
+template and inject the environment variables from `spec.secretRef` into the environment:
+
+```sh
+swe run --template small "Fix the flaky test"
+swe run --project org-repo "Fix the flaky test"
+```
+
+Project Secrets are injected at pod creation. GitHub App token minting and automatic
+repository checkout are not implemented yet.
+
 The control plane exposes a browser terminal at
 `GET /api/v1/environments/{name}/terminal?namespace={namespace}`. The WebSocket client
 first sends `{"type":"open","cols":80,"rows":24}`, then uses binary frames for terminal

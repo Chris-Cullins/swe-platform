@@ -38,6 +38,7 @@ type EnvironmentReconciler struct {
 // +kubebuilder:rbac:groups=swe.dev,resources=environments,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=swe.dev,resources=environments/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=swe.dev,resources=environmenttemplates,verbs=get;list;watch
+// +kubebuilder:rbac:groups=swe.dev,resources=projects,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=persistentvolumeclaims,verbs=get;list;watch;create;update;patch;delete
 
@@ -187,7 +188,17 @@ func (r *EnvironmentReconciler) ensurePod(ctx context.Context, env *platformv1al
 	if tmpl.Spec.RuntimeClass != "" {
 		pod.Spec.RuntimeClassName = &tmpl.Spec.RuntimeClass
 	}
-	// TODO(P1): inject git credentials + project env vars via Project.spec.secretRef.
+	if env.Spec.ProjectRef != "" {
+		var project platformv1alpha1.Project
+		if err := r.Get(ctx, types.NamespacedName{Namespace: env.Namespace, Name: env.Spec.ProjectRef}, &project); err != nil {
+			return nil, fmt.Errorf("get project %q: %w", env.Spec.ProjectRef, err)
+		}
+		if project.Spec.SecretRef != nil {
+			pod.Spec.Containers[0].EnvFrom = []corev1.EnvFromSource{{
+				SecretRef: &corev1.SecretEnvSource{LocalObjectReference: *project.Spec.SecretRef},
+			}}
+		}
+	}
 	// TODO(P2): run .agents/setup hook before marking Ready; register warm-pool claims.
 	if err := controllerutil.SetControllerReference(env, &pod, r.Scheme); err != nil {
 		return nil, err

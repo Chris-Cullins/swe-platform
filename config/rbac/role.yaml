@@ -41,6 +41,7 @@ rules:
   - swe.dev
   resources:
   - environmenttemplates
+  - projects
   verbs:
   - get
   - list

@@ -49,8 +49,23 @@ echo "==> installing operator, CRDs, and kind template through Helm"
 helm upgrade --install swe-platform charts/swe-platform \
 	--namespace default --values charts/swe-platform/values-kind.yaml --wait --timeout 2m
 
-echo "==> creating environment + run via swe"
-bin/swe run "end-to-end smoke test" -t small --timeout 3m
+echo "==> creating project configuration"
+kubectl create secret generic e2e-project-config --from-literal=SWE_E2E_PROJECT_CONFIG=project-config-ok
+kubectl apply -f - <<'EOF'
+apiVersion: swe.dev/v1alpha1
+kind: Project
+metadata:
+  name: e2e
+spec:
+  repositories:
+    - https://github.com/Chris-Cullins/swe-platform
+  templateRef: small
+  secretRef:
+    name: e2e-project-config
+EOF
+
+echo "==> creating project environment + run via swe"
+bin/swe run "end-to-end smoke test" --project e2e --timeout 3m
 
 echo "==> verifying state"
 kubectl get environments
@@ -89,9 +104,14 @@ fi
 
 ENV_NAME=$(kubectl get environments -o jsonpath='{.items[0].metadata.name}')
 echo "==> verifying shared terminal through swe attach"
-printf 'printf terminal-e2e-ok; exit\n' | bin/swe attach "$ENV_NAME" > /tmp/swe-platform-terminal.out
+printf 'printf terminal-e2e-ok; printf "\\n%%s\\n" "$SWE_E2E_PROJECT_CONFIG"; exit\n' | bin/swe attach "$ENV_NAME" > /tmp/swe-platform-terminal.out
 if ! grep -q 'terminal-e2e-ok' /tmp/swe-platform-terminal.out; then
 	echo "FAIL: terminal output was not received through swe attach"
+	cat /tmp/swe-platform-terminal.out
+	exit 1
+fi
+if ! grep -q 'project-config-ok' /tmp/swe-platform-terminal.out; then
+	echo "FAIL: project Secret was not injected into the environment"
 	cat /tmp/swe-platform-terminal.out
 	exit 1
 fi

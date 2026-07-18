@@ -16,6 +16,7 @@ import (
 func newRunCommand() *cobra.Command {
 	var (
 		template string
+		project  string
 		agent    string
 		wait     bool
 		timeout  time.Duration
@@ -27,28 +28,41 @@ func newRunCommand() *cobra.Command {
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			namespace, _ := cmd.Flags().GetString("namespace")
-			return runEnvironment(cmd.Context(), namespace, template, agent, args[0], wait, timeout)
+			return runEnvironment(cmd.Context(), namespace, template, project, agent, args[0], wait, timeout)
 		},
 	}
 
-	cmd.Flags().StringVarP(&template, "template", "t", "", "EnvironmentTemplate to use (required)")
+	cmd.Flags().StringVarP(&template, "template", "t", "", "EnvironmentTemplate to use (defaults to the project's template)")
+	cmd.Flags().StringVarP(&project, "project", "p", "", "Project providing the default template and environment configuration")
 	cmd.Flags().StringVar(&agent, "agent", "claude-code", "Agent adapter to run")
 	cmd.Flags().BoolVar(&wait, "wait", true, "Wait for the environment to become Ready")
 	cmd.Flags().DurationVar(&timeout, "timeout", 5*time.Minute, "How long to wait for readiness")
-	_ = cmd.MarkFlagRequired("template")
 	return cmd
 }
 
-func runEnvironment(ctx context.Context, namespace, template, agent, prompt string, wait bool, timeout time.Duration) error {
+func runEnvironment(ctx context.Context, namespace, template, project, agent, prompt string, wait bool, timeout time.Duration) error {
 	clients, err := newKubeClients()
 	if err != nil {
 		return err
+	}
+	if project != "" {
+		var configuredProject platformv1alpha1.Project
+		if err := clients.Get(ctx, types.NamespacedName{Namespace: namespace, Name: project}, &configuredProject); err != nil {
+			return fmt.Errorf("get project %q: %w", project, err)
+		}
+		if template == "" {
+			template = configuredProject.Spec.TemplateRef
+		}
+	}
+	if template == "" {
+		return fmt.Errorf("an environment template is required: set --template or use a project with spec.templateRef")
 	}
 
 	envName := "env-" + randSuffix(6)
 	env := &platformv1alpha1.Environment{
 		ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: envName},
 		Spec: platformv1alpha1.EnvironmentSpec{
+			ProjectRef:  project,
 			TemplateRef: template,
 		},
 	}
