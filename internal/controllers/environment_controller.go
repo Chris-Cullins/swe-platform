@@ -38,6 +38,9 @@ if ! git -c safe.directory=/workspace -C /workspace config --local --get swe.set
 	fi
 	git -c safe.directory=/workspace -C /workspace config --local swe.setup-complete true
 fi
+if [ "${SWE_RESUMING:-false}" = true ] && [ -f /workspace/.agents/resume ]; then
+	/bin/sh /workspace/.agents/resume
+fi
 `
 
 // EnvironmentReconciler reconciles Environment objects into pods + workspace volumes.
@@ -78,6 +81,9 @@ func (r *EnvironmentReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	if env.Spec.Paused {
 		return r.reconcilePaused(ctx, &env)
 	}
+	if env.Status.Phase == platformv1alpha1.EnvironmentPhasePaused {
+		return ctrl.Result{Requeue: true}, r.setPhase(ctx, &env, platformv1alpha1.EnvironmentPhaseResuming, "")
+	}
 
 	pod, err := r.ensurePod(ctx, &env, &tmpl)
 	if err != nil {
@@ -96,6 +102,7 @@ func (r *EnvironmentReconciler) reconcilePaused(ctx context.Context, env *platfo
 		if delErr := r.Delete(ctx, &pod); delErr != nil && !errors.IsNotFound(delErr) {
 			return ctrl.Result{}, fmt.Errorf("delete pod for pause: %w", delErr)
 		}
+		return ctrl.Result{Requeue: true}, nil
 	} else if !errors.IsNotFound(err) {
 		return ctrl.Result{}, err
 	}
@@ -206,6 +213,9 @@ func (r *EnvironmentReconciler) ensurePod(ctx context.Context, env *platformv1al
 			return nil, fmt.Errorf("project %q has no repositories", env.Spec.ProjectRef)
 		}
 		projectEnv := []corev1.EnvVar{{Name: "SWE_REPOSITORY", Value: project.Spec.Repositories[0]}}
+		if env.Status.Phase == platformv1alpha1.EnvironmentPhaseResuming {
+			projectEnv = append(projectEnv, corev1.EnvVar{Name: "SWE_RESUMING", Value: "true"})
+		}
 		pod.Spec.InitContainers = []corev1.Container{{
 			Name:            "project-setup",
 			Image:           tmpl.Spec.Image,
@@ -244,7 +254,9 @@ func (r *EnvironmentReconciler) syncStatus(ctx context.Context, env *platformv1a
 	phase := platformv1alpha1.EnvironmentPhaseCreating
 	switch pod.Status.Phase {
 	case corev1.PodPending:
-		if len(pod.Spec.InitContainers) > 0 {
+		if env.Status.Phase == platformv1alpha1.EnvironmentPhaseResuming {
+			phase = platformv1alpha1.EnvironmentPhaseResuming
+		} else if len(pod.Spec.InitContainers) > 0 {
 			phase = platformv1alpha1.EnvironmentPhaseSetup
 		}
 	case corev1.PodRunning:

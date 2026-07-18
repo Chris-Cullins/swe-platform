@@ -11,7 +11,8 @@ with a reviewable diff, branch, or PR.
 > passing kind end-to-end (`./hack/e2e.sh`). A first control-plane service accepts and
 > streams adapter-owned transcript events over SSE, while `swe attach` and the control
 > plane's WebSocket terminal endpoint connect to a shared tmux session through `sandboxd`;
-> agent adapters and portal proxying are not built yet. The Helm chart installs the
+> pause/resume preserves workspace disks and runs repository resume hooks. Agent adapters
+> and portal proxying are not built yet. The Helm chart installs the
 > operator, control plane, and CRDs. Values presets
 > cover kind, k3s, GKE with GKE Sandbox, and EKS.
 
@@ -87,8 +88,11 @@ swe run --project org-repo "Fix the flaky test"
 
 The first repository configured on a Project is cloned into `/workspace` when its
 environment is created. If the repository contains `.agents/setup`, the hook runs once
-after checkout; it can use values from the Project Secret. Project Secrets remain
-available to the running environment. GitHub App token minting is not implemented yet.
+after checkout. Set `Environment.spec.paused` to `true` to delete the pod while retaining
+its workspace PVC, then set it to `false` to create a fresh pod; `.agents/resume` runs
+after the volume is reattached. Both hooks can use values from the Project Secret, which
+also remains available to the running environment. GitHub App token minting is not
+implemented yet.
 
 The control plane exposes a browser terminal at
 `GET /api/v1/environments/{name}/terminal?namespace={namespace}`. The WebSocket client

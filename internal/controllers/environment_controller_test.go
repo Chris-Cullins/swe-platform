@@ -106,3 +106,127 @@ func TestSyncStatusReportsSetupForProjectInitialization(t *testing.T) {
 		t.Fatalf("Phase = %q, want Setup", updated.Status.Phase)
 	}
 }
+
+func TestEnsurePodMarksProjectInitializationAsResume(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	if err := platformv1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+
+	project := &platformv1alpha1.Project{
+		ObjectMeta: metav1.ObjectMeta{Name: "example", Namespace: "default"},
+		Spec: platformv1alpha1.ProjectSpec{
+			Repositories: []string{"https://github.com/example/repo"},
+		},
+	}
+	reconciler := &EnvironmentReconciler{
+		Client: fake.NewClientBuilder().WithScheme(scheme).WithObjects(project).Build(),
+		Scheme: scheme,
+	}
+	env := &platformv1alpha1.Environment{
+		ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default", UID: "environment-uid"},
+		Spec: platformv1alpha1.EnvironmentSpec{
+			ProjectRef:  project.Name,
+			TemplateRef: "small",
+		},
+		Status: platformv1alpha1.EnvironmentStatus{Phase: platformv1alpha1.EnvironmentPhaseResuming},
+	}
+	tmpl := &platformv1alpha1.EnvironmentTemplate{
+		Spec: platformv1alpha1.EnvironmentTemplateSpec{Image: "example/environment:latest", Size: "small"},
+	}
+
+	pod, err := reconciler.ensurePod(context.Background(), env, tmpl)
+	if err != nil {
+		t.Fatalf("ensurePod() error = %v", err)
+	}
+	setup := pod.Spec.InitContainers[0]
+	if len(setup.Env) != 2 || setup.Env[1].Name != "SWE_RESUMING" || setup.Env[1].Value != "true" {
+		t.Fatalf("init container Env = %#v, want SWE_RESUMING=true", setup.Env)
+	}
+}
+
+func TestSyncStatusPreservesResumingWhilePodStarts(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	if err := platformv1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+
+	env := &platformv1alpha1.Environment{
+		ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default"},
+		Status:     platformv1alpha1.EnvironmentStatus{Phase: platformv1alpha1.EnvironmentPhaseResuming},
+	}
+	reconciler := &EnvironmentReconciler{
+		Client: fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(env).WithObjects(env).Build(),
+		Scheme: scheme,
+	}
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "env-test", Namespace: "default"},
+		Spec:       corev1.PodSpec{InitContainers: []corev1.Container{{Name: "project-setup"}}},
+		Status:     corev1.PodStatus{Phase: corev1.PodPending},
+	}
+
+	if err := reconciler.syncStatus(context.Background(), env, pod); err != nil {
+		t.Fatalf("syncStatus() error = %v", err)
+	}
+	var updated platformv1alpha1.Environment
+	if err := reconciler.Get(context.Background(), client.ObjectKeyFromObject(env), &updated); err != nil {
+		t.Fatal(err)
+	}
+	if updated.Status.Phase != platformv1alpha1.EnvironmentPhaseResuming {
+		t.Fatalf("Phase = %q, want Resuming", updated.Status.Phase)
+	}
+}
+
+func TestReconcilePausedWaitsForPodDeletion(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	if err := platformv1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+
+	env := &platformv1alpha1.Environment{
+		ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default"},
+		Status: platformv1alpha1.EnvironmentStatus{
+			Phase:   platformv1alpha1.EnvironmentPhaseReady,
+			PodName: "env-test",
+		},
+	}
+	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "env-test", Namespace: "default"}}
+	reconciler := &EnvironmentReconciler{
+		Client: fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(env).WithObjects(env, pod).Build(),
+		Scheme: scheme,
+	}
+
+	result, err := reconciler.reconcilePaused(context.Background(), env)
+	if err != nil {
+		t.Fatalf("reconcilePaused() error = %v", err)
+	}
+	if !result.Requeue {
+		t.Fatal("reconcilePaused() did not requeue after deleting the pod")
+	}
+	var updated platformv1alpha1.Environment
+	if err := reconciler.Get(context.Background(), client.ObjectKeyFromObject(env), &updated); err != nil {
+		t.Fatal(err)
+	}
+	if updated.Status.Phase != platformv1alpha1.EnvironmentPhaseReady {
+		t.Fatalf("Phase = %q before pod deletion is observed, want Ready", updated.Status.Phase)
+	}
+
+	if _, err := reconciler.reconcilePaused(context.Background(), &updated); err != nil {
+		t.Fatalf("second reconcilePaused() error = %v", err)
+	}
+	if err := reconciler.Get(context.Background(), client.ObjectKeyFromObject(env), &updated); err != nil {
+		t.Fatal(err)
+	}
+	if updated.Status.Phase != platformv1alpha1.EnvironmentPhasePaused || updated.Status.PodName != "" {
+		t.Fatalf("Status = %#v, want Paused with no pod name", updated.Status)
+	}
+}

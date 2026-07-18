@@ -68,8 +68,11 @@ mkdir -p "$PROJECT_WORKTREE/.agents"
 cat > "$PROJECT_WORKTREE/.agents/setup" <<'EOF'
 printf '%s\n' "$SWE_E2E_PROJECT_CONFIG" >> setup-result
 EOF
-git -C "$PROJECT_WORKTREE" add .agents/setup
-git -C "$PROJECT_WORKTREE" commit -m "Add e2e setup hook" >/dev/null
+cat > "$PROJECT_WORKTREE/.agents/resume" <<'EOF'
+printf '%s\n' "$SWE_E2E_PROJECT_CONFIG" >> resume-result
+EOF
+git -C "$PROJECT_WORKTREE" add .agents/setup .agents/resume
+git -C "$PROJECT_WORKTREE" commit -m "Add e2e lifecycle hooks" >/dev/null
 git -C "$PROJECT_WORKTREE" bundle create "$PROJECT_REPO/repo.bundle" main
 kubectl create configmap e2e-git-repo --from-file="$PROJECT_REPO/repo.bundle"
 kubectl apply -f - <<EOF
@@ -198,6 +201,35 @@ done
 kubectl wait --for=condition=Ready pod/"env-${ENV_NAME}" --timeout=2m
 if ! kubectl exec "env-${ENV_NAME}" -- sh -c 'test "$(wc -l < /workspace/setup-result)" -eq 1'; then
 	echo "FAIL: .agents/setup ran again for an initialized workspace"
+	exit 1
+fi
+
+echo "==> verifying pause retains the workspace and resume runs its hook"
+kubectl patch environment "$ENV_NAME" --type=merge -p '{"spec":{"paused":true}}' >/dev/null
+for _ in $(seq 1 60); do
+	PHASE=$(kubectl get environment "$ENV_NAME" -o jsonpath='{.status.phase}')
+	if [[ "$PHASE" == "Paused" ]] && ! kubectl get pod "env-${ENV_NAME}" >/dev/null 2>&1; then
+		break
+	fi
+	sleep 1
+done
+if [[ "${PHASE:-}" != "Paused" ]] || kubectl get pod "env-${ENV_NAME}" >/dev/null 2>&1; then
+	echo "FAIL: environment did not pause and remove its pod"
+	exit 1
+fi
+if ! kubectl get pvc "env-${ENV_NAME}" >/dev/null 2>&1; then
+	echo "FAIL: pause removed the workspace PVC"
+	exit 1
+fi
+kubectl patch environment "$ENV_NAME" --type=merge -p '{"spec":{"paused":false}}' >/dev/null
+kubectl wait --for=jsonpath='{.status.phase}'=Ready environment/"$ENV_NAME" --timeout=2m
+kubectl wait --for=condition=Ready pod/"env-${ENV_NAME}" --timeout=2m
+if ! kubectl exec "env-${ENV_NAME}" -- sh -c 'test "$(cat /workspace/resume-result)" = project-config-ok'; then
+	echo "FAIL: .agents/resume did not run with the project Secret"
+	exit 1
+fi
+if ! kubectl exec "env-${ENV_NAME}" -- sh -c 'test "$(wc -l < /workspace/setup-result)" -eq 1'; then
+	echo "FAIL: .agents/setup ran again while resuming"
 	exit 1
 fi
 
