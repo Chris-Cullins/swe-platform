@@ -1,0 +1,11 @@
+# Sample EnvironmentTemplate for local development and e2e.
+# Intentionally has no runtimeClass: kind/minikube nodes have no gVisor.
+apiVersion: swe.dev/v1alpha1
+kind: EnvironmentTemplate
+metadata:
+  name: small
+spec:
+  image: ghcr.io/chris-cullins/swe-platform/env-base:dev
+  size: small
+  idleTimeout: 15m
+  diskSize: 5Gi

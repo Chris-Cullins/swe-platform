@@ -1,0 +1,36 @@
+name: e2e
+
+on:
+  pull_request:
+    paths:
+      - "api/**"
+      - "cmd/**"
+      - "internal/**"
+      - "sandboxd/**"
+      - "images/**"
+      - "config/**"
+      - "hack/**"
+      - "go.mod"
+      - "go.sum"
+      - "Makefile"
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  kind:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+          cache: true
+
+      - uses: helm/kind-action@v1
+        with:
+          cluster_name: swe-e2e
+
+      - name: Run e2e acceptance
+        run: ./hack/e2e.sh

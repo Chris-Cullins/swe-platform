@@ -7,8 +7,9 @@ fresh environment (repo clone, toolchain, secrets, setup hooks), runs the agent 
 streams everything back live, auto-pauses when idle so compute cost drops to ~$0, and ends
 with a reviewable diff, branch, or PR.
 
-> **Status: early.** The design is set and the first code is landing now. Watch the repo
-> if this interests you.
+> **Status: early.** The P0 scaffold is in — CRDs, operator, `sandboxd`, CLI — with a
+> passing kind end-to-end (`./hack/e2e.sh`). Agent adapters and the control plane are
+> not built yet. Watch the repo if this interests you.
 
 ## Why
 

@@ -64,6 +64,9 @@ runs both via `make` targets:
 - **Regenerate protobuf:** `make proto` (requires `protoc`; plugins install locally)
 - **Dev cluster:** `make kind-up` → `make install-crds` → `make run` (operator runs
   locally against kind), then `bin/swe run "<prompt>" -t <template>`
+- **E2E acceptance:** `./hack/e2e.sh` — full kind + operator + `swe run` pass with the
+  env-base image built and loaded locally (no registry credentials needed). Runs in CI
+  as the `e2e` workflow on relevant PRs and via `workflow_dispatch`.
 - **Images:** `make docker-build` (operator + env-base)
 
 **If you add or change tooling, structure, or workflows, update this file in the same
