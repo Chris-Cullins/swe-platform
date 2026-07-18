@@ -14,11 +14,15 @@ ENV_IMAGE="ghcr.io/chris-cullins/swe-platform/env-base:dev"
 OPERATOR_IMAGE="ghcr.io/chris-cullins/swe-platform/operator:dev"
 CONTROL_PLANE_IMAGE="ghcr.io/chris-cullins/swe-platform/control-plane:dev"
 PORT_FORWARD_PID=""
+WEB_TERMINAL_CLIENT=""
 
 cleanup() {
 	if [[ -n "$PORT_FORWARD_PID" ]]; then
 		kill "$PORT_FORWARD_PID" >/dev/null 2>&1 || true
 		wait "$PORT_FORWARD_PID" >/dev/null 2>&1 || true
+	fi
+	if [[ -n "$WEB_TERMINAL_CLIENT" ]]; then
+		rm -f "$WEB_TERMINAL_CLIENT"
 	fi
 	if [[ "${KEEP_CLUSTER:-false}" != "true" ]]; then
 		kind delete cluster --name "$CLUSTER" >/dev/null 2>&1 || true
@@ -89,6 +93,43 @@ printf 'printf terminal-e2e-ok; exit\n' | bin/swe attach "$ENV_NAME" > /tmp/swe-
 if ! grep -q 'terminal-e2e-ok' /tmp/swe-platform-terminal.out; then
 	echo "FAIL: terminal output was not received through swe attach"
 	cat /tmp/swe-platform-terminal.out
+	exit 1
+fi
+
+echo "==> verifying web terminal through the control plane"
+WEB_TERMINAL_CLIENT=$(mktemp /tmp/swe-web-terminal-XXXXXX.go)
+cat > "$WEB_TERMINAL_CLIENT" <<'EOF'
+package main
+
+import (
+	"fmt"
+	"os"
+	"strings"
+	"time"
+
+	"github.com/gorilla/websocket"
+)
+
+func main() {
+	connection, _, err := websocket.DefaultDialer.Dial(os.Args[1], nil)
+	if err != nil { panic(err) }
+	defer connection.Close()
+	_ = connection.SetReadDeadline(time.Now().Add(15 * time.Second))
+	if err := connection.WriteJSON(map[string]any{"type": "open", "cols": 80, "rows": 24}); err != nil { panic(err) }
+	if err := connection.WriteMessage(websocket.BinaryMessage, []byte("printf web-terminal-e2e-ok\n")); err != nil { panic(err) }
+	var output strings.Builder
+	for !strings.Contains(output.String(), "web-terminal-e2e-ok") {
+		messageType, data, err := connection.ReadMessage()
+		if err != nil { panic(err) }
+		if messageType == websocket.BinaryMessage { _, _ = output.Write(data) }
+	}
+	fmt.Print(output.String())
+}
+EOF
+go run "$WEB_TERMINAL_CLIENT" "ws://127.0.0.1:18080/api/v1/environments/${ENV_NAME}/terminal" > /tmp/swe-platform-web-terminal.out
+if ! grep -q 'web-terminal-e2e-ok' /tmp/swe-platform-web-terminal.out; then
+	echo "FAIL: terminal output was not received through the control-plane websocket"
+	cat /tmp/swe-platform-web-terminal.out
 	exit 1
 fi
 

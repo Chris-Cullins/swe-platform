@@ -9,9 +9,10 @@ with a reviewable diff, branch, or PR.
 
 > **Status: early.** The P0 scaffold is in — CRDs, operator, `sandboxd`, CLI — with a
 > passing kind end-to-end (`./hack/e2e.sh`). A first control-plane service accepts and
-> streams adapter-owned transcript events over SSE, and `swe attach` connects to a
-> shared tmux terminal through `sandboxd`; agent adapters and the web gateway are not
-> built yet. The Helm chart installs the operator, control plane, and CRDs. Values presets
+> streams adapter-owned transcript events over SSE, while `swe attach` and the control
+> plane's WebSocket terminal endpoint connect to a shared tmux session through `sandboxd`;
+> agent adapters and portal proxying are not built yet. The Helm chart installs the
+> operator, control plane, and CRDs. Values presets
 > cover kind, k3s, GKE with GKE Sandbox, and EKS.
 
 ## Why
@@ -75,6 +76,12 @@ build and load the operator and env-base images as printed by that command, then
 `charts/swe-platform` with `values-kind.yaml`. The preset creates the `small` template
 in `default`. Production installation assumptions and k3s/GKE/EKS presets are documented
 in the [chart README](charts/swe-platform/README.md).
+
+The control plane exposes a browser terminal at
+`GET /api/v1/environments/{name}/terminal?namespace={namespace}`. The WebSocket client
+first sends `{"type":"open","cols":80,"rows":24}`, then uses binary frames for terminal
+input and output. Send `{"type":"resize","cols":120,"rows":40}` to resize the shared
+terminal. The namespace defaults to `default`.
 
 ## Contributing
 

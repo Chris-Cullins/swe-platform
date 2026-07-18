@@ -15,6 +15,7 @@ import (
 )
 
 const transcriptPathPrefix = "/api/v1/runs/"
+const terminalPathPrefix = "/api/v1/environments/"
 
 // TranscriptEvent is one adapter-owned transcript event.
 type TranscriptEvent struct {
@@ -31,16 +32,21 @@ type appendTranscriptRequest struct {
 
 // Server serves the control-plane API and live transcript streams.
 type Server struct {
-	log   *slog.Logger
-	store *transcriptStore
+	log            *slog.Logger
+	store          *transcriptStore
+	terminalDialer TerminalDialer
 }
 
 // NewServer constructs a control-plane API handler.
-func NewServer(log *slog.Logger) *Server {
+func NewServer(log *slog.Logger, terminalDialer ...TerminalDialer) *Server {
 	if log == nil {
 		log = slog.Default()
 	}
-	return &Server{log: log, store: newTranscriptStore()}
+	server := &Server{log: log, store: newTranscriptStore()}
+	if len(terminalDialer) > 0 {
+		server.terminalDialer = terminalDialer[0]
+	}
+	return server
 }
 
 // Handler returns the HTTP handler for the API.
@@ -49,6 +55,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
 	})
+	mux.HandleFunc("GET "+terminalPathPrefix, s.handleTerminal)
 	mux.HandleFunc(transcriptPathPrefix, s.handleTranscript)
 	return mux
 }

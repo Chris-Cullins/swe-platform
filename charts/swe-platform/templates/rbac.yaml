@@ -35,3 +35,45 @@ subjects:
   - kind: ServiceAccount
     name: {{ include "swe-platform.serviceAccountName" . }}
     namespace: {{ .Release.Namespace }}
+{{- if .Values.controlPlane.enabled }}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ include "swe-platform.controlPlaneFullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "swe-platform.labels" . | nindent 4 }}
+    app.kubernetes.io/component: control-plane
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "swe-platform.controlPlaneFullname" . }}
+  labels:
+    {{- include "swe-platform.labels" . | nindent 4 }}
+    app.kubernetes.io/component: control-plane
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get"]
+  - apiGroups: ["swe.dev"]
+    resources: ["environments"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "swe-platform.controlPlaneFullname" . }}
+  labels:
+    {{- include "swe-platform.labels" . | nindent 4 }}
+    app.kubernetes.io/component: control-plane
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ include "swe-platform.controlPlaneFullname" . }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "swe-platform.controlPlaneFullname" . }}
+    namespace: {{ .Release.Namespace }}
+{{- end }}
