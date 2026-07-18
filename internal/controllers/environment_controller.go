@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/go-logr/logr"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -29,6 +28,18 @@ var sizePresets = map[string]corev1.ResourceList{
 
 const defaultDiskSize = "40Gi"
 
+const projectSetupScript = `set -eu
+if [ ! -d /workspace/.git ]; then
+	git clone -- "$SWE_REPOSITORY" /workspace
+fi
+if ! git -c safe.directory=/workspace -C /workspace config --local --get swe.setup-complete >/dev/null 2>&1; then
+	if [ -f /workspace/.agents/setup ]; then
+		/bin/sh /workspace/.agents/setup
+	fi
+	git -c safe.directory=/workspace -C /workspace config --local swe.setup-complete true
+fi
+`
+
 // EnvironmentReconciler reconciles Environment objects into pods + workspace volumes.
 type EnvironmentReconciler struct {
 	client.Client
@@ -45,8 +56,6 @@ type EnvironmentReconciler struct {
 // Reconcile drives an Environment toward its desired state:
 // pod + PVC present when active, pod deleted (PVC retained) when paused.
 func (r *EnvironmentReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
-	logger := log.FromContext(ctx)
-
 	var env platformv1alpha1.Environment
 	if err := r.Get(ctx, req.NamespacedName, &env); err != nil {
 		return ctrl.Result{}, client.IgnoreNotFound(err)
@@ -75,7 +84,7 @@ func (r *EnvironmentReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		return ctrl.Result{}, r.fail(ctx, &env, fmt.Errorf("ensure pod: %w", err))
 	}
 
-	return ctrl.Result{}, r.syncStatus(ctx, &env, pod, logger)
+	return ctrl.Result{}, r.syncStatus(ctx, &env, pod)
 }
 
 // reconcilePaused deletes the pod (if any) and keeps the workspace volume.
@@ -193,13 +202,34 @@ func (r *EnvironmentReconciler) ensurePod(ctx context.Context, env *platformv1al
 		if err := r.Get(ctx, types.NamespacedName{Namespace: env.Namespace, Name: env.Spec.ProjectRef}, &project); err != nil {
 			return nil, fmt.Errorf("get project %q: %w", env.Spec.ProjectRef, err)
 		}
+		if len(project.Spec.Repositories) == 0 {
+			return nil, fmt.Errorf("project %q has no repositories", env.Spec.ProjectRef)
+		}
+		projectEnv := []corev1.EnvVar{{Name: "SWE_REPOSITORY", Value: project.Spec.Repositories[0]}}
+		pod.Spec.InitContainers = []corev1.Container{{
+			Name:            "project-setup",
+			Image:           tmpl.Spec.Image,
+			ImagePullPolicy: corev1.PullIfNotPresent,
+			Command:         []string{"/bin/sh", "-c", projectSetupScript},
+			Env:             projectEnv,
+			Resources: corev1.ResourceRequirements{
+				Requests: resources,
+				Limits:   resources,
+			},
+			SecurityContext: &corev1.SecurityContext{
+				AllowPrivilegeEscalation: ptr(false),
+				Capabilities:             &corev1.Capabilities{Drop: []corev1.Capability{"ALL"}},
+			},
+			VolumeMounts: pod.Spec.Containers[0].VolumeMounts,
+		}}
 		if project.Spec.SecretRef != nil {
-			pod.Spec.Containers[0].EnvFrom = []corev1.EnvFromSource{{
+			projectSecret := []corev1.EnvFromSource{{
 				SecretRef: &corev1.SecretEnvSource{LocalObjectReference: *project.Spec.SecretRef},
 			}}
+			pod.Spec.InitContainers[0].EnvFrom = projectSecret
+			pod.Spec.Containers[0].EnvFrom = projectSecret
 		}
 	}
-	// TODO(P2): run .agents/setup hook before marking Ready; register warm-pool claims.
 	if err := controllerutil.SetControllerReference(env, &pod, r.Scheme); err != nil {
 		return nil, err
 	}
@@ -210,11 +240,13 @@ func (r *EnvironmentReconciler) ensurePod(ctx context.Context, env *platformv1al
 }
 
 // syncStatus maps pod state onto the Environment phase.
-func (r *EnvironmentReconciler) syncStatus(ctx context.Context, env *platformv1alpha1.Environment, pod *corev1.Pod, logger logr.Logger) error {
+func (r *EnvironmentReconciler) syncStatus(ctx context.Context, env *platformv1alpha1.Environment, pod *corev1.Pod) error {
 	phase := platformv1alpha1.EnvironmentPhaseCreating
 	switch pod.Status.Phase {
 	case corev1.PodPending:
-		phase = platformv1alpha1.EnvironmentPhaseCreating
+		if len(pod.Spec.InitContainers) > 0 {
+			phase = platformv1alpha1.EnvironmentPhaseSetup
+		}
 	case corev1.PodRunning:
 		phase = platformv1alpha1.EnvironmentPhaseReady
 		// TODO(P2): phase = Running while a Run is attached, Idle after activity stops.

@@ -15,6 +15,8 @@ OPERATOR_IMAGE="ghcr.io/chris-cullins/swe-platform/operator:dev"
 CONTROL_PLANE_IMAGE="ghcr.io/chris-cullins/swe-platform/control-plane:dev"
 PORT_FORWARD_PID=""
 WEB_TERMINAL_CLIENT=""
+PROJECT_REPO=""
+PROJECT_WORKTREE=""
 
 cleanup() {
 	if [[ -n "$PORT_FORWARD_PID" ]]; then
@@ -23,6 +25,12 @@ cleanup() {
 	fi
 	if [[ -n "$WEB_TERMINAL_CLIENT" ]]; then
 		rm -f "$WEB_TERMINAL_CLIENT"
+	fi
+	if [[ -n "$PROJECT_REPO" ]]; then
+		rm -rf "$PROJECT_REPO"
+	fi
+	if [[ -n "$PROJECT_WORKTREE" ]]; then
+		rm -rf "$PROJECT_WORKTREE"
 	fi
 	if [[ "${KEEP_CLUSTER:-false}" != "true" ]]; then
 		kind delete cluster --name "$CLUSTER" >/dev/null 2>&1 || true
@@ -51,6 +59,65 @@ helm upgrade --install swe-platform charts/swe-platform \
 
 echo "==> creating project configuration"
 kubectl create secret generic e2e-project-config --from-literal=SWE_E2E_PROJECT_CONFIG=project-config-ok
+PROJECT_REPO="$(mktemp -d /tmp/swe-e2e-project-XXXXXX)"
+PROJECT_WORKTREE="$(mktemp -d /tmp/swe-e2e-worktree-XXXXXX)"
+git -C "$PROJECT_WORKTREE" init -b main >/dev/null
+git -C "$PROJECT_WORKTREE" config user.name "swe e2e"
+git -C "$PROJECT_WORKTREE" config user.email "swe-e2e@example.invalid"
+mkdir -p "$PROJECT_WORKTREE/.agents"
+cat > "$PROJECT_WORKTREE/.agents/setup" <<'EOF'
+printf '%s\n' "$SWE_E2E_PROJECT_CONFIG" >> setup-result
+EOF
+git -C "$PROJECT_WORKTREE" add .agents/setup
+git -C "$PROJECT_WORKTREE" commit -m "Add e2e setup hook" >/dev/null
+git -C "$PROJECT_WORKTREE" bundle create "$PROJECT_REPO/repo.bundle" main
+kubectl create configmap e2e-git-repo --from-file="$PROJECT_REPO/repo.bundle"
+kubectl apply -f - <<EOF
+apiVersion: v1
+kind: Pod
+metadata:
+  name: e2e-git-server
+  labels:
+    app: e2e-git-server
+spec:
+  securityContext:
+    fsGroup: 10001
+  initContainers:
+    - name: prepare-repository
+      image: $ENV_IMAGE
+      command: [/bin/sh, -c]
+      args:
+        - git clone --bare /seed/repo.bundle /repos/e2e.git && git -C /repos/e2e.git symbolic-ref HEAD refs/heads/main
+      volumeMounts:
+        - {name: seed, mountPath: /seed}
+        - {name: repositories, mountPath: /repos}
+  containers:
+    - name: git
+      image: $ENV_IMAGE
+      command: [git, daemon, --reuseaddr, --base-path=/repos, --export-all, --verbose]
+      ports:
+        - {name: git, containerPort: 9418}
+      volumeMounts:
+        - {name: repositories, mountPath: /repos}
+  volumes:
+    - name: seed
+      configMap: {name: e2e-git-repo}
+    - name: repositories
+      emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: e2e-git-server
+spec:
+  selector: {app: e2e-git-server}
+  ports:
+    - {name: git, port: 9418, targetPort: git}
+EOF
+kubectl wait --for=condition=Ready pod/e2e-git-server --timeout=1m
+rm -rf "$PROJECT_REPO" "$PROJECT_WORKTREE"
+PROJECT_REPO=""
+PROJECT_WORKTREE=""
 kubectl apply -f - <<'EOF'
 apiVersion: swe.dev/v1alpha1
 kind: Project
@@ -58,7 +125,7 @@ metadata:
   name: e2e
 spec:
   repositories:
-    - https://github.com/Chris-Cullins/swe-platform
+    - git://e2e-git-server/e2e.git
   templateRef: small
   secretRef:
     name: e2e-project-config
@@ -113,6 +180,24 @@ fi
 if ! grep -q 'project-config-ok' /tmp/swe-platform-terminal.out; then
 	echo "FAIL: project Secret was not injected into the environment"
 	cat /tmp/swe-platform-terminal.out
+	exit 1
+fi
+if ! kubectl exec "env-${ENV_NAME}" -- sh -c 'test "$(cat /workspace/setup-result)" = project-config-ok'; then
+	echo "FAIL: project repository checkout or .agents/setup did not complete"
+	exit 1
+fi
+
+echo "==> verifying setup runs only once when the pod is recreated"
+kubectl delete pod "env-${ENV_NAME}" --wait=true >/dev/null
+for _ in $(seq 1 30); do
+	if kubectl get pod "env-${ENV_NAME}" >/dev/null 2>&1; then
+		break
+	fi
+	sleep 1
+done
+kubectl wait --for=condition=Ready pod/"env-${ENV_NAME}" --timeout=2m
+if ! kubectl exec "env-${ENV_NAME}" -- sh -c 'test "$(wc -l < /workspace/setup-result)" -eq 1'; then
+	echo "FAIL: .agents/setup ran again for an initialized workspace"
 	exit 1
 fi
 

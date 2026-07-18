@@ -85,8 +85,10 @@ swe run --template small "Fix the flaky test"
 swe run --project org-repo "Fix the flaky test"
 ```
 
-Project Secrets are injected at pod creation. GitHub App token minting and automatic
-repository checkout are not implemented yet.
+The first repository configured on a Project is cloned into `/workspace` when its
+environment is created. If the repository contains `.agents/setup`, the hook runs once
+after checkout; it can use values from the Project Secret. Project Secrets remain
+available to the running environment. GitHub App token minting is not implemented yet.
 
 The control plane exposes a browser terminal at
 `GET /api/v1/environments/{name}/terminal?namespace={namespace}`. The WebSocket client
