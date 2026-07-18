@@ -1,5 +1,5 @@
 # Build the operator binary.
-FROM golang:1.26 AS build
+FROM --platform=$BUILDPLATFORM golang:1.26 AS build
 WORKDIR /src
 
 COPY go.mod go.sum ./
@@ -8,7 +8,9 @@ RUN go mod download
 COPY api/ api/
 COPY cmd/operator/ cmd/operator/
 COPY internal/ internal/
-RUN CGO_ENABLED=0 go build -o /out/operator ./cmd/operator
+ARG TARGETOS
+ARG TARGETARCH
+RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -o /out/operator ./cmd/operator
 
 # Run it.
 FROM gcr.io/distroless/static:nonroot

@@ -29,7 +29,7 @@ build-cli: ## Build the swe CLI
 
 .PHONY: build-sandboxd
 build-sandboxd: ## Build sandboxd
-	cd sandboxd && go build -o ../$(LOCALBIN)/sandboxd ./cmd/sandboxd
+	go build -C sandboxd -o $(LOCALBIN)/sandboxd ./cmd/sandboxd
 
 ##@ Test & verify
 
@@ -106,8 +106,7 @@ docker-build-operator: ## Build the operator image
 
 .PHONY: docker-build-env-base
 docker-build-env-base: ## Build the environment base image (includes sandboxd)
-	GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -C sandboxd -o ../$(LOCALBIN)/env-base/sandboxd ./cmd/sandboxd
-	docker build -t ghcr.io/chris-cullins/swe-platform/env-base:dev -f images/env-base/Dockerfile $(LOCALBIN)/env-base
+	docker build -t ghcr.io/chris-cullins/swe-platform/env-base:dev -f images/env-base/Dockerfile .
 
 ##@ Misc
 

@@ -69,6 +69,8 @@ runs both via `make` targets:
   env-base image built and loaded locally (no registry credentials needed). Runs in CI
   as the `e2e` workflow on relevant PRs and via `workflow_dispatch`.
 - **Images:** `make docker-build` (operator + env-base)
+- **Publish images:** pushes to `main` and `v*` tags publish multi-architecture operator
+  and env-base images to GHCR via `.github/workflows/publish-images.yaml`.
 
 **If you add or change tooling, structure, or workflows, update this file in the same
 commit.**

@@ -1,5 +1,15 @@
-# Base image for environments. Build context must contain a linux/amd64
-# sandboxd binary (see `make docker-build-env-base`).
+FROM --platform=$BUILDPLATFORM golang:1.26 AS build
+WORKDIR /src
+
+COPY sandboxd/go.mod sandboxd/go.sum ./
+RUN go mod download
+
+COPY sandboxd/ ./
+ARG TARGETOS
+ARG TARGETARCH
+RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -o /out/sandboxd ./cmd/sandboxd
+
+# Base image for environments.
 FROM debian:12-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -10,7 +20,7 @@ RUN useradd --create-home --uid 10001 swe \
 	&& mkdir -p /workspace \
 	&& chown swe:swe /workspace
 
-COPY sandboxd /usr/local/bin/sandboxd
+COPY --from=build /out/sandboxd /usr/local/bin/sandboxd
 
 USER swe
 WORKDIR /workspace
