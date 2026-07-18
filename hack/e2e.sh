@@ -149,7 +149,8 @@ EOF
 echo "==> creating project environment + run via swe"
 bin/swe run "end-to-end smoke test" --project e2e --timeout 3m
 
-ENV_NAME=$(kubectl get runs -o jsonpath='{.items[0].spec.environmentRef}')
+RUN_NAME=$(kubectl get runs -o jsonpath='{.items[0].metadata.name}')
+ENV_NAME=$(kubectl get run "$RUN_NAME" -o jsonpath='{.spec.environmentRef}')
 if [[ "$ENV_NAME" != "$WARM_ENV_NAME" ]]; then
 	echo "FAIL: swe run created $ENV_NAME instead of claiming warm environment $WARM_ENV_NAME"
 	exit 1
@@ -170,8 +171,6 @@ fi
 echo "==> verifying state"
 kubectl get environments
 kubectl get pods -l app.kubernetes.io/managed-by=swe-platform
-RUN_NAME=$(kubectl get runs -o jsonpath='{.items[0].metadata.name}')
-ENV_NAME=$(kubectl get run "$RUN_NAME" -o jsonpath='{.spec.environmentRef}')
 
 echo "==> configuring a run-scoped transcript producer"
 cat <<EOF | kubectl apply -f -
