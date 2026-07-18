@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -33,6 +34,7 @@ func newConn(t *testing.T, workspace string) *grpc.ClientConn {
 	grpcServer := grpc.NewServer()
 	sandboxdv1.RegisterHealthServiceServer(grpcServer, &HealthServer{Version: "test"})
 	sandboxdv1.RegisterExecServiceServer(grpcServer, &ExecServer{Workspace: workspace})
+	sandboxdv1.RegisterProcessServiceServer(grpcServer, NewProcessServer(workspace))
 	sandboxdv1.RegisterFilesystemServiceServer(grpcServer, &FilesystemServer{Workspace: workspace})
 	sandboxdv1.RegisterTerminalServiceServer(grpcServer, &TerminalServer{
 		Workspace:  workspace,
@@ -249,5 +251,155 @@ func TestPortRegistry(t *testing.T) {
 	}
 	if len(list.Ports) != 1 || list.Ports[0].Label != "web" {
 		t.Fatalf("unexpected ports: %+v", list.Ports)
+	}
+}
+
+func processTestSpec(t *testing.T, workspace, mode string) *sandboxdv1.ProcessSpec {
+	t.Helper()
+	return &sandboxdv1.ProcessSpec{
+		Argv: []string{os.Args[0], "-test.run=TestManagedProcessHelper", "--", mode, workspace},
+		Env:  map[string]string{"SANDBOXD_PROCESS_HELPER": "1"},
+	}
+}
+
+func waitFor(t *testing.T, condition func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for !condition() {
+		if time.Now().After(deadline) {
+			t.Fatal("timed out waiting for managed process")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+func TestProcessDuplicateStartAndConflict(t *testing.T) {
+	workspace := t.TempDir()
+	client := sandboxdv1.NewProcessServiceClient(newConn(t, workspace))
+	key := &sandboxdv1.ProcessKey{OwnerId: "task-1", Role: "agent"}
+	spec := processTestSpec(t, workspace, "wait")
+
+	const callers = 8
+	var wg sync.WaitGroup
+	errs := make(chan error, callers)
+	for range callers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, err := client.Start(context.Background(), &sandboxdv1.StartProcessRequest{Key: key, Spec: spec})
+			errs <- err
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatalf("duplicate start: %v", err)
+		}
+	}
+	waitFor(t, func() bool {
+		content, _ := os.ReadFile(filepath.Join(workspace, "starts"))
+		return strings.Count(string(content), "start\n") == 1
+	})
+
+	conflict := processTestSpec(t, workspace, "exit")
+	if _, err := client.Start(context.Background(), &sandboxdv1.StartProcessRequest{Key: key, Spec: conflict}); status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("conflicting start: expected FailedPrecondition, got %v", err)
+	}
+	_, _ = client.Stop(context.Background(), &sandboxdv1.StopProcessRequest{Key: key, Mode: sandboxdv1.StopMode_STOP_MODE_FORCE})
+}
+
+func TestProcessRPCancellationDoesNotKillAndStopIsIdempotent(t *testing.T) {
+	workspace := t.TempDir()
+	client := sandboxdv1.NewProcessServiceClient(newConn(t, workspace))
+	key := &sandboxdv1.ProcessKey{OwnerId: "task-2", Role: "agent"}
+	ctx, cancel := context.WithCancel(context.Background())
+	if _, err := client.Start(ctx, &sandboxdv1.StartProcessRequest{Key: key, Spec: processTestSpec(t, workspace, "wait")}); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	cancel()
+	waitFor(t, func() bool {
+		p, err := client.Get(context.Background(), &sandboxdv1.GetProcessRequest{Key: key})
+		return err == nil && p.State == sandboxdv1.ProcessState_PROCESS_STATE_RUNNING
+	})
+
+	stop := &sandboxdv1.StopProcessRequest{Key: key, Mode: sandboxdv1.StopMode_STOP_MODE_FORCE}
+	if _, err := client.Stop(context.Background(), stop); err != nil {
+		t.Fatalf("first stop: %v", err)
+	}
+	if _, err := client.Stop(context.Background(), stop); err != nil {
+		t.Fatalf("duplicate stop: %v", err)
+	}
+	waitFor(t, func() bool {
+		p, err := client.Get(context.Background(), &sandboxdv1.GetProcessRequest{Key: key})
+		return err == nil && p.State == sandboxdv1.ProcessState_PROCESS_STATE_EXITED
+	})
+	absent, err := client.Stop(context.Background(), &sandboxdv1.StopProcessRequest{Key: &sandboxdv1.ProcessKey{OwnerId: "absent", Role: "agent"}})
+	if err != nil || absent.State != sandboxdv1.ProcessState_PROCESS_STATE_EXITED {
+		t.Fatalf("stop absent process: process=%v error=%v", absent, err)
+	}
+}
+
+func TestProcessGetRetainsTerminalState(t *testing.T) {
+	workspace := t.TempDir()
+	client := sandboxdv1.NewProcessServiceClient(newConn(t, workspace))
+	key := &sandboxdv1.ProcessKey{OwnerId: "task-3", Role: "setup"}
+	if _, err := client.Start(context.Background(), &sandboxdv1.StartProcessRequest{Key: key, Spec: processTestSpec(t, workspace, "exit")}); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	waitFor(t, func() bool {
+		p, err := client.Get(context.Background(), &sandboxdv1.GetProcessRequest{Key: key})
+		return err == nil && p.State == sandboxdv1.ProcessState_PROCESS_STATE_EXITED && p.ExitCode == 0
+	})
+	p, err := client.Get(context.Background(), &sandboxdv1.GetProcessRequest{Key: key})
+	if err != nil || p.State != sandboxdv1.ProcessState_PROCESS_STATE_EXITED {
+		t.Fatalf("retained Get: process=%v error=%v", p, err)
+	}
+}
+
+func TestProcessServerCloseFencesEpoch(t *testing.T) {
+	workspace := t.TempDir()
+	server := NewProcessServer(workspace)
+	key := &sandboxdv1.ProcessKey{OwnerId: "task-close", Role: "service"}
+	if _, err := server.Start(context.Background(), &sandboxdv1.StartProcessRequest{Key: key, Spec: processTestSpec(t, workspace, "wait")}); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	server.Close()
+	server.Close() // idempotent
+	waitFor(t, func() bool {
+		process, err := server.Get(context.Background(), &sandboxdv1.GetProcessRequest{Key: key})
+		return err == nil && process.State == sandboxdv1.ProcessState_PROCESS_STATE_EXITED
+	})
+	if _, err := server.Start(context.Background(), &sandboxdv1.StartProcessRequest{
+		Key:  &sandboxdv1.ProcessKey{OwnerId: "after-close", Role: "agent"},
+		Spec: processTestSpec(t, workspace, "exit"),
+	}); status.Code(err) != codes.Unavailable {
+		t.Fatalf("start after close: want Unavailable, got %v", err)
+	}
+}
+
+func TestManagedProcessHelper(t *testing.T) {
+	if os.Getenv("SANDBOXD_PROCESS_HELPER") != "1" {
+		return
+	}
+	args := os.Args
+	for len(args) > 0 && args[0] != "--" {
+		args = args[1:]
+	}
+	if len(args) != 3 {
+		os.Exit(2)
+	}
+	mode, workspace := args[1], args[2]
+	if mode == "exit" {
+		return
+	}
+	f, err := os.OpenFile(filepath.Join(workspace, "starts"), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		os.Exit(3)
+	}
+	_, _ = f.WriteString("start\n")
+	_ = f.Close()
+	for {
+		time.Sleep(time.Second)
 	}
 }

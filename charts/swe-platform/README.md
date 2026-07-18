@@ -5,6 +5,11 @@ The control plane accepts adapter-owned transcript events and streams them over 
 Its current transcript store is in-memory and single-replica; durable storage, auth,
 and the gateway are not implemented yet.
 
+The operator reconciles each `Run` as the single task intent and allocates or claims its
+`Environment`; clients must not create the two resources independently. Its RBAC permits
+Run status/finalizer updates and Environment allocation/claim updates. Process execution
+remains behind the environment's portable sandboxd contract rather than Kubernetes exec.
+
 ## Install
 
 Choose the values preset for the target cluster and install into a dedicated namespace:

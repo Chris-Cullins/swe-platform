@@ -41,6 +41,71 @@ message ExecExit {
   string error = 2;
 }
 
+// ProcessService manages background processes for the lifetime of one
+// sandboxd daemon epoch. Processes are addressed by their logical owner and
+// role, never by an operating-system process identifier.
+service ProcessService {
+  // Start is detached from the RPC context. Repeating the same key and spec
+  // returns the existing process; the same key with a different spec fails.
+  rpc Start(StartProcessRequest) returns (Process);
+  // Get returns running and retained terminal state in this sandboxd epoch.
+  rpc Get(GetProcessRequest) returns (Process);
+  // Stop is idempotent, including when the key is absent or already terminal.
+  rpc Stop(StopProcessRequest) returns (Process);
+}
+
+message ProcessKey {
+  string owner_id = 1;
+  string role = 2;
+}
+
+message ProcessSpec {
+  repeated string argv = 1;
+  // cwd defaults to the environment workspace.
+  string cwd = 2;
+  map<string, string> env = 3;
+}
+
+message StartProcessRequest {
+  ProcessKey key = 1;
+  ProcessSpec spec = 2;
+}
+
+message GetProcessRequest {
+  ProcessKey key = 1;
+}
+
+enum StopMode {
+  STOP_MODE_UNSPECIFIED = 0;
+  STOP_MODE_GRACEFUL = 1;
+  STOP_MODE_FORCE = 2;
+}
+
+message StopProcessRequest {
+  ProcessKey key = 1;
+  StopMode mode = 2;
+  // Time allowed after a graceful request before force is used. Zero uses the
+  // server default. Ignored for STOP_MODE_FORCE.
+  uint32 grace_period_ms = 3;
+}
+
+enum ProcessState {
+  PROCESS_STATE_UNSPECIFIED = 0;
+  PROCESS_STATE_RUNNING = 1;
+  PROCESS_STATE_STOPPING = 2;
+  PROCESS_STATE_EXITED = 3;
+  PROCESS_STATE_FAILED = 4;
+}
+
+message Process {
+  ProcessKey key = 1;
+  ProcessSpec spec = 2;
+  ProcessState state = 3;
+  // exit_code is meaningful in terminal states. A start/wait failure uses -1.
+  int32 exit_code = 4;
+  string error = 5;
+}
+
 // FilesystemService provides file access inside the environment.
 service FilesystemService {
   rpc Read(ReadRequest) returns (ReadResponse);

@@ -64,6 +64,11 @@ type EnvironmentStatus struct {
 	// +optional
 	Phase EnvironmentPhase `json:"phase,omitempty"`
 
+	// ClaimedBy is the Run currently using a reusable Environment. Controller-
+	// owned Environments do not use claims. Name and UID fence stale Runs.
+	// +optional
+	ClaimedBy *RunReference `json:"claimedBy,omitempty"`
+
 	// +optional
 	Endpoints EnvironmentEndpoints `json:"endpoints,omitempty"`
 

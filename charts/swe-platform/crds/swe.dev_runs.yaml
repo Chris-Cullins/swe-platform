@@ -47,15 +47,24 @@ spec:
           metadata:
             type: object
           spec:
-            description: RunSpec defines one agent task executing in an environment.
+            description: |-
+              RunSpec defines one agent task executing in an environment.
+              A Run either claims environmentRef or asks the controller to allocate an
+              Environment from templateRef/projectRef.
             properties:
               agent:
                 description: Agent names the agent adapter to use (e.g. claude-code,
                   aider).
                 type: string
+              cancel:
+                description: Cancel requests idempotent cancellation. It cannot be
+                  unset.
+                type: boolean
               environmentRef:
-                description: EnvironmentRef is the name of the Environment to run
-                  in.
+                description: |-
+                  EnvironmentRef claims an existing Environment. Claimed Environments are
+                  released, not deleted, when the Run terminates.
+                minLength: 1
                 type: string
               notify:
                 description: |-
@@ -69,14 +78,39 @@ spec:
                 description: ParentRef links this run to the run that spawned it,
                   if any.
                 type: string
+              projectRef:
+                description: |-
+                  ProjectRef configures a controller-allocated Environment and supplies its
+                  default template when templateRef is empty.
+                minLength: 1
+                type: string
               prompt:
                 description: Prompt is the task handed to the agent.
                 type: string
+              templateRef:
+                description: TemplateRef selects the template for a controller-allocated
+                  Environment.
+                minLength: 1
+                type: string
             required:
             - agent
-            - environmentRef
             - prompt
             type: object
+            x-kubernetes-validations:
+            - message: set environmentRef or templateRef/projectRef, not both
+              rule: 'has(self.environmentRef) ? (!has(self.templateRef) && !has(self.projectRef))
+                : (has(self.templateRef) || has(self.projectRef))'
+            - message: agent, prompt, and environment selection are immutable
+              rule: self.agent == oldSelf.agent && self.prompt == oldSelf.prompt &&
+                ((!has(self.environmentRef) && !has(oldSelf.environmentRef)) || (has(self.environmentRef)
+                && has(oldSelf.environmentRef) && self.environmentRef == oldSelf.environmentRef))
+                && ((!has(self.projectRef) && !has(oldSelf.projectRef)) || (has(self.projectRef)
+                && has(oldSelf.projectRef) && self.projectRef == oldSelf.projectRef))
+                && ((!has(self.templateRef) && !has(oldSelf.templateRef)) || (has(self.templateRef)
+                && has(oldSelf.templateRef) && self.templateRef == oldSelf.templateRef))
+            - message: cancel cannot be unset
+              rule: '!has(oldSelf.cancel) || !oldSelf.cancel || (has(self.cancel)
+                && self.cancel)'
           status:
             description: RunStatus defines the observed state of Run.
             properties:
@@ -143,13 +177,45 @@ spec:
                 x-kubernetes-list-map-keys:
                 - type
                 x-kubernetes-list-type: map
+              environmentRef:
+                description: EnvironmentRef is the exact owned or claimed Environment
+                  incarnation.
+                properties:
+                  name:
+                    type: string
+                  ownership:
+                    description: EnvironmentOwnership determines terminal and deletion
+                      cleanup.
+                    enum:
+                    - Owned
+                    - Claimed
+                    type: string
+                  uid:
+                    description: |-
+                      UID is a type that holds unique ID values, including UUIDs.  Because we
+                      don't ONLY use UUIDs, this is an alias to string.  Being a type captures
+                      intent and helps make sure that UIDs and names do not get conflated.
+                    type: string
+                required:
+                - name
+                - ownership
+                - uid
+                type: object
+              observedGeneration:
+                description: ObservedGeneration is the Run generation reflected by
+                  this status.
+                format: int64
+                type: integer
               state:
                 description: RunState describes where a Run is in its lifecycle.
                 enum:
-                - Queued
+                - Allocating
+                - EnvironmentReady
+                - AdapterAccepted
                 - Running
                 - NeedsInput
-                - Done
+                - Paused
+                - Succeeded
                 - Failed
                 - Cancelled
                 type: string

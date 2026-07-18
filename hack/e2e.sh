@@ -134,8 +134,32 @@ spec:
     name: e2e-project-config
 EOF
 
-echo "==> creating project environment + run via swe"
-bin/swe run "end-to-end smoke test" --project e2e --timeout 3m
+echo "==> creating project environment + run intent via swe"
+bin/swe run "end-to-end smoke test" --project e2e --wait=false
+RUN_NAME=$(kubectl get runs -o jsonpath='{.items[0].metadata.name}')
+kubectl wait --for=jsonpath='{.status.state}'=Failed run/"$RUN_NAME" --timeout=3m
+RUN_ENV_NAME=$(kubectl get run "$RUN_NAME" -o jsonpath='{.status.environmentRef.name}')
+kubectl wait --for=jsonpath='{.status.phase}'=Paused environment/"$RUN_ENV_NAME" --timeout=3m
+if [[ $(kubectl get environments -o name | wc -l) -ne 1 ]]; then
+	echo "FAIL: Run allocation created duplicate environments"
+	exit 1
+fi
+
+# No production agent adapter exists yet, so the unknown adapter fails and its
+# owned Environment is correctly paused. Use a standalone Environment for the
+# remaining environment/sandboxd acceptance checks.
+kubectl delete run "$RUN_NAME" --wait=true >/dev/null
+kubectl wait --for=delete environment/"$RUN_ENV_NAME" --timeout=2m
+cat <<'EOF' | kubectl apply -f -
+apiVersion: swe.dev/v1alpha1
+kind: Environment
+metadata:
+  name: e2e-environment
+spec:
+  projectRef: e2e
+  templateRef: small
+EOF
+kubectl wait --for=jsonpath='{.status.phase}'=Ready environment/e2e-environment --timeout=3m
 
 echo "==> verifying state"
 kubectl get environments
@@ -172,7 +196,7 @@ if ! grep -q 'e2e transcript event' /tmp/swe-platform-transcript.out; then
 	exit 1
 fi
 
-ENV_NAME=$(kubectl get environments -o jsonpath='{.items[0].metadata.name}')
+ENV_NAME=e2e-environment
 echo "==> verifying shared terminal through swe attach"
 printf 'printf terminal-e2e-ok; printf "\\n%%s\\n" "$SWE_E2E_PROJECT_CONFIG"; exit\n' | bin/swe attach "$ENV_NAME" > /tmp/swe-platform-terminal.out
 if ! grep -q 'terminal-e2e-ok' /tmp/swe-platform-terminal.out; then

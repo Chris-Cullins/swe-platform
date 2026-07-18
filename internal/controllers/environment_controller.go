@@ -3,6 +3,7 @@ package controllers
 import (
 	"context"
 	"fmt"
+	"net"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
@@ -10,6 +11,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/intstr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
@@ -82,7 +84,7 @@ func (r *EnvironmentReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		return r.reconcilePaused(ctx, &env)
 	}
 	if env.Status.Phase == platformv1alpha1.EnvironmentPhasePaused {
-		return ctrl.Result{Requeue: true}, r.setPhase(ctx, &env, platformv1alpha1.EnvironmentPhaseResuming, "")
+		return ctrl.Result{Requeue: true}, r.setPhase(ctx, &env, platformv1alpha1.EnvironmentPhaseResuming, "", "")
 	}
 
 	pod, err := r.ensurePod(ctx, &env, &tmpl)
@@ -107,7 +109,7 @@ func (r *EnvironmentReconciler) reconcilePaused(ctx context.Context, env *platfo
 		return ctrl.Result{}, err
 	}
 
-	return ctrl.Result{}, r.setPhase(ctx, env, platformv1alpha1.EnvironmentPhasePaused, "")
+	return ctrl.Result{}, r.setPhase(ctx, env, platformv1alpha1.EnvironmentPhasePaused, "", "")
 }
 
 func (r *EnvironmentReconciler) ensureWorkspacePVC(ctx context.Context, env *platformv1alpha1.Environment, tmpl *platformv1alpha1.EnvironmentTemplate) error {
@@ -178,6 +180,13 @@ func (r *EnvironmentReconciler) ensurePod(ctx context.Context, env *platformv1al
 				Image:           tmpl.Spec.Image,
 				ImagePullPolicy: corev1.PullIfNotPresent,
 				Command:         []string{"sandboxd", "serve"},
+				Ports: []corev1.ContainerPort{{
+					Name:          "sandboxd",
+					ContainerPort: 50051,
+				}},
+				ReadinessProbe: &corev1.Probe{
+					ProbeHandler: corev1.ProbeHandler{TCPSocket: &corev1.TCPSocketAction{Port: intstr.FromString("sandboxd")}},
+				},
 				Resources: corev1.ResourceRequirements{
 					Requests: resources,
 					Limits:   resources,
@@ -252,6 +261,7 @@ func (r *EnvironmentReconciler) ensurePod(ctx context.Context, env *platformv1al
 // syncStatus maps pod state onto the Environment phase.
 func (r *EnvironmentReconciler) syncStatus(ctx context.Context, env *platformv1alpha1.Environment, pod *corev1.Pod) error {
 	phase := platformv1alpha1.EnvironmentPhaseCreating
+	sandboxdEndpoint := ""
 	switch pod.Status.Phase {
 	case corev1.PodPending:
 		if env.Status.Phase == platformv1alpha1.EnvironmentPhaseResuming {
@@ -260,22 +270,35 @@ func (r *EnvironmentReconciler) syncStatus(ctx context.Context, env *platformv1a
 			phase = platformv1alpha1.EnvironmentPhaseSetup
 		}
 	case corev1.PodRunning:
-		phase = platformv1alpha1.EnvironmentPhaseReady
+		if podReady(pod) && pod.Status.PodIP != "" {
+			phase = platformv1alpha1.EnvironmentPhaseReady
+			sandboxdEndpoint = net.JoinHostPort(pod.Status.PodIP, "50051")
+		}
 		// TODO(P2): phase = Running while a Run is attached, Idle after activity stops.
 	case corev1.PodFailed:
 		phase = platformv1alpha1.EnvironmentPhaseFailed
 	case corev1.PodSucceeded:
 		phase = platformv1alpha1.EnvironmentPhaseTerminated
 	}
-	return r.setPhase(ctx, env, phase, pod.Name)
+	return r.setPhase(ctx, env, phase, pod.Name, sandboxdEndpoint)
 }
 
-func (r *EnvironmentReconciler) setPhase(ctx context.Context, env *platformv1alpha1.Environment, phase platformv1alpha1.EnvironmentPhase, podName string) error {
-	if env.Status.Phase == phase && env.Status.PodName == podName {
+func podReady(pod *corev1.Pod) bool {
+	for _, condition := range pod.Status.Conditions {
+		if condition.Type == corev1.PodReady {
+			return condition.Status == corev1.ConditionTrue
+		}
+	}
+	return false
+}
+
+func (r *EnvironmentReconciler) setPhase(ctx context.Context, env *platformv1alpha1.Environment, phase platformv1alpha1.EnvironmentPhase, podName, sandboxdEndpoint string) error {
+	if env.Status.Phase == phase && env.Status.PodName == podName && env.Status.Endpoints.Sandboxd == sandboxdEndpoint {
 		return nil
 	}
 	env.Status.Phase = phase
 	env.Status.PodName = podName
+	env.Status.Endpoints.Sandboxd = sandboxdEndpoint
 	return r.Status().Update(ctx, env)
 }
 

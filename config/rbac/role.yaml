@@ -33,6 +33,7 @@ rules:
   - swe.dev
   resources:
   - environments/status
+  - runs/status
   verbs:
   - get
   - patch
@@ -45,4 +46,15 @@ rules:
   verbs:
   - get
   - list
+  - watch
+- apiGroups:
+  - swe.dev
+  resources:
+  - runs
+  verbs:
+  - delete
+  - get
+  - list
+  - patch
+  - update
   - watch
