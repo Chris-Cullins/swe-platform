@@ -14,14 +14,11 @@ architectural. If it's missing, ask the maintainer instead of guessing at design
 
 ## Current state
 
-Pre-scaffold. The immediate milestone is **P0** (see `docs/TODO.md` if available):
-
-1. Go module + kubebuilder scaffold, Makefile, CI
-2. `sandboxd` — gRPC daemon: exec / filesystem / terminal / ports / health
-3. CRDs v1alpha1: `Environment`, `EnvironmentTemplate`, `Run`, `Project`
-4. Operator: environment controller (pod + PVC + NetworkPolicy, setup hook, status)
-5. CLI `swe`: `run` / `attach` / `logs`
-6. kind quickstart: `kind create cluster && helm install && swe run` in <5 min
+P0 scaffold is in place: CRD types, environment controller, `sandboxd` (exec/fs/ports/
+health implemented; terminal is a stub), CLI (`run`/`logs` work; `attach` is a stub),
+kind script, CI. Remaining P0 gaps are marked `TODO(P0/P1/P2)` in code — most notably:
+setup-hook execution, agent credential injection, and the end-to-end kind acceptance
+(`make kind-up && make install-crds && swe run`).
 
 ## Architecture invariants — do not violate these
 
@@ -46,7 +43,10 @@ Pre-scaffold. The immediate milestone is **P0** (see `docs/TODO.md` if available
 
 - **Language:** Go for control plane, operator, `sandboxd`, and CLI.
 - **Layout:** kubebuilder conventions — `api/v1alpha1/` for types,
-  `internal/controllers/`, `cmd/`. Keep `sandboxd` a separate module/binary.
+  `internal/controllers/`, `cmd/{operator,swe}`. `sandboxd/` is a **separate Go
+  module** with its own `go.mod`: keep its dependencies minimal (gRPC + protobuf
+  only) so it stays portable and the environment base image stays small.
+  Generated protobuf code lives in `sandboxd/gen/` and is committed.
 - **APIs:** CRDs are `v1alpha1`; breaking changes are acceptable pre-1.0, but migrate
   the CRD sketch in `docs/ARCHITECTURE.md` when you change fields.
 - **CLI-first:** every user-facing feature needs a CLI path before any UI work.
@@ -54,9 +54,17 @@ Pre-scaffold. The immediate milestone is **P0** (see `docs/TODO.md` if available
 
 ## Build & test
 
-_Not yet scaffolded._ When P0 lands this section must contain: how to build all
-binaries, run unit tests, spin up the kind dev cluster, and regenerate CRDs/deepcopy
-(`make generate`, `make manifests` or equivalent).
+Two Go modules — root (operator, CLI, API types) and `sandboxd/`. Everything below
+runs both via `make` targets:
+
+- **Build all binaries:** `make build` (outputs to `bin/`, gitignored)
+- **Unit tests:** `make test` · **Vet:** `make vet`
+- **Regenerate deepcopy:** `make generate` · **CRDs + RBAC:** `make manifests`
+  (CI fails if `make generate manifests` produces a diff — regenerate before committing)
+- **Regenerate protobuf:** `make proto` (requires `protoc`; plugins install locally)
+- **Dev cluster:** `make kind-up` → `make install-crds` → `make run` (operator runs
+  locally against kind), then `bin/swe run "<prompt>" -t <template>`
+- **Images:** `make docker-build` (operator + env-base)
 
 **If you add or change tooling, structure, or workflows, update this file in the same
 commit.**

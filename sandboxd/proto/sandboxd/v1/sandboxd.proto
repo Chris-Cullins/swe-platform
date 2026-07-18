@@ -1,0 +1,143 @@
+syntax = "proto3";
+
+package sandboxd.v1;
+
+option go_package = "github.com/Chris-Cullins/swe-platform/sandboxd/gen/proto/sandboxd/v1;sandboxdv1";
+
+// ExecService runs commands inside the environment and streams output.
+service ExecService {
+  // Exec starts a command on the first message, then streams stdin.
+  // The server streams stdout/stderr chunks and a single terminal exit message.
+  rpc Exec(stream ExecRequest) returns (stream ExecResponse);
+}
+
+message ExecRequest {
+  oneof kind {
+    ExecStart start = 1;
+    bytes stdin = 2;
+  }
+}
+
+message ExecStart {
+  // argv is the command and its arguments; argv[0] is the program.
+  // No shell is implied — shell behavior requires argv = {"sh", "-c", ...}.
+  repeated string argv = 1;
+  // cwd defaults to the environment workspace.
+  string cwd = 2;
+  map<string, string> env = 3;
+}
+
+message ExecResponse {
+  oneof kind {
+    bytes stdout = 1;
+    bytes stderr = 2;
+    ExecExit exit = 3;
+  }
+}
+
+message ExecExit {
+  int32 code = 1;
+  // error is set when the command could not be started or waited on.
+  string error = 2;
+}
+
+// FilesystemService provides file access inside the environment.
+service FilesystemService {
+  rpc Read(ReadRequest) returns (ReadResponse);
+  rpc Write(WriteRequest) returns (WriteResponse);
+  rpc List(ListRequest) returns (ListResponse);
+}
+
+message ReadRequest {
+  string path = 1;
+}
+
+message ReadResponse {
+  bytes content = 1;
+}
+
+message WriteRequest {
+  string path = 1;
+  bytes content = 2;
+  // mode is the file permission bits (e.g. 0o644); 0 means default.
+  uint32 mode = 3;
+}
+
+message WriteResponse {}
+
+message ListRequest {
+  string path = 1;
+}
+
+message ListResponse {
+  repeated Entry entries = 1;
+}
+
+message Entry {
+  string name = 1;
+  bool is_dir = 2;
+  int64 size = 3;
+}
+
+// TerminalService multiplexes the environment's shared terminal session.
+// The agent and the human attach to the same session (tmux on Linux,
+// ConPTY on Windows).
+service TerminalService {
+  rpc Terminal(stream TerminalMessage) returns (stream TerminalMessage);
+}
+
+message TerminalMessage {
+  oneof kind {
+    TerminalOpen open = 1;
+    bytes data = 2;
+    TerminalResize resize = 3;
+  }
+}
+
+message TerminalOpen {
+  uint32 cols = 1;
+  uint32 rows = 2;
+}
+
+message TerminalResize {
+  uint32 cols = 1;
+  uint32 rows = 2;
+}
+
+// PortService tracks ports in use inside the environment so the gateway
+// can expose them as portals.
+service PortService {
+  rpc Register(RegisterPortRequest) returns (Port);
+  rpc List(ListPortsRequest) returns (ListPortsResponse);
+}
+
+message RegisterPortRequest {
+  // port of 0 asks sandboxd to pick a free one.
+  uint32 port = 1;
+  string label = 2;
+}
+
+message Port {
+  uint32 port = 1;
+  string label = 2;
+  // url is filled in once the gateway has exposed the port; empty until then.
+  string url = 3;
+}
+
+message ListPortsRequest {}
+
+message ListPortsResponse {
+  repeated Port ports = 1;
+}
+
+// HealthService reports daemon liveness and version.
+service HealthService {
+  rpc Check(HealthCheckRequest) returns (HealthCheckResponse);
+}
+
+message HealthCheckRequest {}
+
+message HealthCheckResponse {
+  bool ok = 1;
+  string version = 2;
+}

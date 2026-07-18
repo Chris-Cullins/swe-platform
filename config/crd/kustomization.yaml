@@ -1,0 +1,7 @@
+# CRDs can be installed with `kubectl apply -f config/crd/bases`
+# or via kustomize with this file.
+resources:
+  - bases/swe.dev_environments.yaml
+  - bases/swe.dev_environmenttemplates.yaml
+  - bases/swe.dev_projects.yaml
+  - bases/swe.dev_runs.yaml
