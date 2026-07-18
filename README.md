@@ -12,7 +12,8 @@ with a reviewable diff, branch, or PR.
 > streams adapter-owned transcript events over SSE, while `swe attach` and the control
 > plane's WebSocket terminal endpoint connect to a shared tmux session through `sandboxd`;
 > pause/resume preserves workspace disks and runs repository resume hooks, and idle
-> environments pause automatically before terminal requests wake them. Agent adapters
+> environments pause automatically before terminal requests wake them. Template warm
+> pools keep unclaimed environments ready for `swe run` to claim. Agent adapters
 > and portal proxying are not built yet. The Helm chart installs the
 > operator, control plane, and CRDs. Values presets
 > cover kind, k3s, GKE with GKE Sandbox, and EKS.
@@ -98,6 +99,12 @@ implemented yet.
 Active environments are automatically paused after their template's `idleTimeout`
 (15 minutes by default). Opening the control-plane web terminal records activity and
 wakes a paused environment before connecting.
+
+Set `EnvironmentTemplate.spec.warmPool.min` to keep that many unclaimed environments
+ready. `swe run` claims a ready environment before creating a cold one, and the operator
+immediately replenishes the pool. Claiming for a Project recreates the generic warm pod
+against its existing workspace volume so repository setup completes before the run is
+reported ready.
 
 The control plane exposes a browser terminal at
 `GET /api/v1/environments/{name}/terminal?namespace={namespace}`. The WebSocket client

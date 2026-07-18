@@ -288,3 +288,37 @@ func TestReconcileIdleSchedulesRemainingTimeout(t *testing.T) {
 		t.Fatalf("RequeueAfter = %s, want remaining one-minute timeout", result.RequeueAfter)
 	}
 }
+
+func TestConsumeClaimRefreshesActivity(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := platformv1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	oldActivity := metav1.NewTime(time.Now().Add(-time.Hour))
+	env := &platformv1alpha1.Environment{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        "test",
+			Namespace:   "default",
+			Annotations: map[string]string{claimedAnnotation: "claim-id"},
+		},
+		Status: platformv1alpha1.EnvironmentStatus{LastActiveAt: &oldActivity},
+	}
+	reconciler := &EnvironmentReconciler{
+		Client: fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(env).WithObjects(env).Build(),
+		Scheme: scheme,
+	}
+
+	if err := reconciler.consumeClaim(context.Background(), env); err != nil {
+		t.Fatalf("consumeClaim() error = %v", err)
+	}
+	var updated platformv1alpha1.Environment
+	if err := reconciler.Get(context.Background(), client.ObjectKeyFromObject(env), &updated); err != nil {
+		t.Fatal(err)
+	}
+	if updated.Annotations[claimedAnnotation] != "" {
+		t.Fatalf("claim annotation was not consumed: %#v", updated.Annotations)
+	}
+	if updated.Status.LastActiveAt == nil || time.Since(updated.Status.LastActiveAt.Time) > time.Minute {
+		t.Fatalf("LastActiveAt = %v, want recently refreshed", updated.Status.LastActiveAt)
+	}
+}

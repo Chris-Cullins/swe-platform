@@ -7,10 +7,19 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	platformv1alpha1 "github.com/Chris-Cullins/swe-platform/api/v1alpha1"
+)
+
+const (
+	warmPoolLabel     = "swe.dev/warm-pool"
+	projectAnnotation = "swe.dev/project"
+	claimedAnnotation = "swe.dev/claimed"
 )
 
 func newRunCommand() *cobra.Command {
@@ -58,18 +67,28 @@ func runEnvironment(ctx context.Context, namespace, template, project, agent, pr
 		return fmt.Errorf("an environment template is required: set --template or use a project with spec.templateRef")
 	}
 
-	envName := "env-" + randSuffix(6)
-	env := &platformv1alpha1.Environment{
-		ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: envName},
-		Spec: platformv1alpha1.EnvironmentSpec{
-			ProjectRef:  project,
-			TemplateRef: template,
-		},
+	env, claimed, err := claimWarmEnvironment(ctx, clients, namespace, template, project)
+	if err != nil {
+		return err
 	}
-	if err := clients.Create(ctx, env); err != nil {
-		return fmt.Errorf("create environment: %w", err)
+	if !claimed {
+		env = &platformv1alpha1.Environment{
+			ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: "env-" + randSuffix(6)},
+			Spec: platformv1alpha1.EnvironmentSpec{
+				ProjectRef:  project,
+				TemplateRef: template,
+			},
+		}
+		if err := clients.Create(ctx, env); err != nil {
+			return fmt.Errorf("create environment: %w", err)
+		}
 	}
-	fmt.Printf("environment %s created (template %s)\n", envName, template)
+	envName := env.Name
+	if claimed {
+		fmt.Printf("environment %s claimed from warm pool (template %s)\n", envName, template)
+	} else {
+		fmt.Printf("environment %s created (template %s)\n", envName, template)
+	}
 
 	run := &platformv1alpha1.Run{
 		ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: "run-" + randSuffix(6)},
@@ -90,6 +109,39 @@ func runEnvironment(ctx context.Context, namespace, template, project, agent, pr
 	return waitForReady(ctx, clients, namespace, envName, timeout)
 }
 
+func claimWarmEnvironment(ctx context.Context, clients *kubeClients, namespace, template, project string) (*platformv1alpha1.Environment, bool, error) {
+	var environments platformv1alpha1.EnvironmentList
+	if err := clients.List(ctx, &environments,
+		client.InNamespace(namespace),
+		client.MatchingLabels{warmPoolLabel: template},
+	); err != nil {
+		return nil, false, fmt.Errorf("list warm environments: %w", err)
+	}
+	for i := range environments.Items {
+		env := &environments.Items[i]
+		if env.Status.Phase != platformv1alpha1.EnvironmentPhaseReady {
+			continue
+		}
+		before := env.DeepCopy()
+		delete(env.Labels, warmPoolLabel)
+		env.OwnerReferences = nil
+		if env.Annotations == nil {
+			env.Annotations = make(map[string]string)
+		}
+		env.Annotations[claimedAnnotation] = time.Now().UTC().Format(time.RFC3339Nano)
+		env.Spec.ProjectRef = project
+		patch := client.MergeFromWithOptions(before, client.MergeFromWithOptimisticLock{})
+		if err := clients.Patch(ctx, env, patch); err != nil {
+			if errors.IsConflict(err) || errors.IsNotFound(err) {
+				continue
+			}
+			return nil, false, fmt.Errorf("claim warm environment %q: %w", env.Name, err)
+		}
+		return env, true, nil
+	}
+	return nil, false, nil
+}
+
 // waitForReady polls the Environment until it reports Ready or the timeout expires.
 // TODO(P1): replace polling with a watch once the control plane exists.
 func waitForReady(ctx context.Context, clients *kubeClients, namespace, name string, timeout time.Duration) error {
@@ -108,8 +160,17 @@ func waitForReady(ctx context.Context, clients *kubeClients, namespace, name str
 		}
 		switch env.Status.Phase {
 		case platformv1alpha1.EnvironmentPhaseReady, platformv1alpha1.EnvironmentPhaseRunning:
-			fmt.Printf("environment %s is ready — attach with: swe attach %s\n", name, name)
-			return nil
+			var pod corev1.Pod
+			if err := clients.Get(ctx, types.NamespacedName{Namespace: namespace, Name: "env-" + name}, &pod); err != nil {
+				if !errors.IsNotFound(err) {
+					return fmt.Errorf("get environment pod: %w", err)
+				}
+				break
+			}
+			if pod.Status.Phase == corev1.PodRunning && pod.Annotations[projectAnnotation] == env.Spec.ProjectRef {
+				fmt.Printf("environment %s is ready — attach with: swe attach %s\n", name, name)
+				return nil
+			}
 		case platformv1alpha1.EnvironmentPhaseFailed:
 			return fmt.Errorf("environment failed")
 		}

@@ -2,6 +2,7 @@ package controllers
 
 import (
 	"context"
+	stderrors "errors"
 	"fmt"
 	"time"
 
@@ -33,7 +34,12 @@ const (
 	defaultDiskSize    = "40Gi"
 	defaultIdleTimeout = 15 * time.Minute
 	templateRefField   = "spec.templateRef"
+	warmPoolLabel      = "swe.dev/warm-pool"
+	projectAnnotation  = "swe.dev/project"
+	claimedAnnotation  = "swe.dev/claimed"
 )
+
+var errPodReplacing = stderrors.New("environment pod is being replaced")
 
 const projectSetupScript = `set -eu
 if [ ! -d /workspace/.git ]; then
@@ -75,6 +81,11 @@ func (r *EnvironmentReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		// Owned pods/PVCs are garbage-collected via owner references.
 		return ctrl.Result{}, nil
 	}
+	if env.Annotations[claimedAnnotation] != "" {
+		if err := r.consumeClaim(ctx, &env); err != nil {
+			return ctrl.Result{}, err
+		}
+	}
 
 	var tmpl platformv1alpha1.EnvironmentTemplate
 	if err := r.Get(ctx, types.NamespacedName{Namespace: env.Namespace, Name: env.Spec.TemplateRef}, &tmpl); err != nil {
@@ -95,6 +106,9 @@ func (r *EnvironmentReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	}
 
 	pod, err := r.ensurePod(ctx, &env, &tmpl)
+	if stderrors.Is(err, errPodReplacing) {
+		return ctrl.Result{Requeue: true}, nil
+	}
 	if err != nil {
 		return ctrl.Result{}, r.fail(ctx, &env, fmt.Errorf("ensure pod: %w", err))
 	}
@@ -108,9 +122,26 @@ func (r *EnvironmentReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	return r.reconcileIdle(ctx, &env, &tmpl)
 }
 
+func (r *EnvironmentReconciler) consumeClaim(ctx context.Context, env *platformv1alpha1.Environment) error {
+	now := metav1.Now()
+	env.Status.LastActiveAt = &now
+	if err := r.Status().Update(ctx, env); err != nil {
+		return fmt.Errorf("record warm environment claim activity: %w", err)
+	}
+	before := env.DeepCopy()
+	delete(env.Annotations, claimedAnnotation)
+	if err := r.Patch(ctx, env, client.MergeFrom(before)); err != nil {
+		return fmt.Errorf("consume warm environment claim: %w", err)
+	}
+	return nil
+}
+
 // reconcileIdle schedules the next activity check or requests a pause once the
 // template's idle timeout has elapsed.
 func (r *EnvironmentReconciler) reconcileIdle(ctx context.Context, env *platformv1alpha1.Environment, tmpl *platformv1alpha1.EnvironmentTemplate) (ctrl.Result, error) {
+	if env.Labels[warmPoolLabel] != "" {
+		return ctrl.Result{}, nil
+	}
 	timeout := defaultIdleTimeout
 	if tmpl.Spec.IdleTimeout != nil {
 		timeout = tmpl.Spec.IdleTimeout.Duration
@@ -193,6 +224,15 @@ func (r *EnvironmentReconciler) ensurePod(ctx context.Context, env *platformv1al
 	var pod corev1.Pod
 	err := r.Get(ctx, types.NamespacedName{Namespace: env.Namespace, Name: podName}, &pod)
 	if err == nil {
+		if pod.Annotations[projectAnnotation] != env.Spec.ProjectRef {
+			if err := r.setPhase(ctx, env, platformv1alpha1.EnvironmentPhaseSetup, ""); err != nil {
+				return nil, err
+			}
+			if err := r.Delete(ctx, &pod); err != nil {
+				return nil, fmt.Errorf("replace pod for project change: %w", err)
+			}
+			return nil, errPodReplacing
+		}
 		return &pod, nil
 	}
 	if !errors.IsNotFound(err) {
@@ -209,6 +249,9 @@ func (r *EnvironmentReconciler) ensurePod(ctx context.Context, env *platformv1al
 			Namespace: env.Namespace,
 			Name:      podName,
 			Labels:    envLabels(env),
+			Annotations: map[string]string{
+				projectAnnotation: env.Spec.ProjectRef,
+			},
 		},
 		Spec: corev1.PodSpec{
 			RestartPolicy: corev1.RestartPolicyAlways,

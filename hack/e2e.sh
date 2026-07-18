@@ -57,6 +57,14 @@ echo "==> installing operator, CRDs, and kind template through Helm"
 helm upgrade --install swe-platform charts/swe-platform \
 	--namespace default --values charts/swe-platform/values-kind.yaml --wait --timeout 2m
 
+echo "==> waiting for warm environment"
+kubectl wait --for=jsonpath='{.status.warmPoolReady}'=1 environmenttemplate/small --timeout=2m
+WARM_ENV_NAME=$(kubectl get environments -l swe.dev/warm-pool=small -o jsonpath='{.items[0].metadata.name}')
+if [[ -z "$WARM_ENV_NAME" ]]; then
+	echo "FAIL: warm pool did not create an environment"
+	exit 1
+fi
+
 echo "==> creating project configuration"
 kubectl create secret generic e2e-project-config --from-literal=SWE_E2E_PROJECT_CONFIG=project-config-ok
 PROJECT_REPO="$(mktemp -d /tmp/swe-e2e-project-XXXXXX)"
@@ -137,6 +145,24 @@ EOF
 echo "==> creating project environment + run via swe"
 bin/swe run "end-to-end smoke test" --project e2e --timeout 3m
 
+ENV_NAME=$(kubectl get runs -o jsonpath='{.items[0].spec.environmentRef}')
+if [[ "$ENV_NAME" != "$WARM_ENV_NAME" ]]; then
+	echo "FAIL: swe run created $ENV_NAME instead of claiming warm environment $WARM_ENV_NAME"
+	exit 1
+fi
+for _ in $(seq 1 60); do
+	REPLACEMENT_NAME=$(kubectl get environments -l swe.dev/warm-pool=small -o jsonpath='{range .items[*]}{.metadata.name}{end}' 2>/dev/null || true)
+	REPLACEMENT_PHASE=$(kubectl get environments -l swe.dev/warm-pool=small -o jsonpath='{range .items[*]}{.status.phase}{end}' 2>/dev/null || true)
+	if [[ -n "$REPLACEMENT_NAME" && "$REPLACEMENT_NAME" != "$ENV_NAME" && "$REPLACEMENT_PHASE" == "Ready" ]]; then
+		break
+	fi
+	sleep 1
+done
+if [[ -z "${REPLACEMENT_NAME:-}" || "$REPLACEMENT_NAME" == "$ENV_NAME" || "${REPLACEMENT_PHASE:-}" != "Ready" ]]; then
+	echo "FAIL: warm pool was not replenished after claim"
+	exit 1
+fi
+
 echo "==> verifying state"
 kubectl get environments
 kubectl get pods -l app.kubernetes.io/managed-by=swe-platform
@@ -172,7 +198,6 @@ if ! grep -q 'e2e transcript event' /tmp/swe-platform-transcript.out; then
 	exit 1
 fi
 
-ENV_NAME=$(kubectl get environments -o jsonpath='{.items[0].metadata.name}')
 echo "==> verifying shared terminal through swe attach"
 printf 'printf terminal-e2e-ok; printf "\\n%%s\\n" "$SWE_E2E_PROJECT_CONFIG"; exit\n' | bin/swe attach "$ENV_NAME" > /tmp/swe-platform-terminal.out
 if ! grep -q 'terminal-e2e-ok' /tmp/swe-platform-terminal.out; then

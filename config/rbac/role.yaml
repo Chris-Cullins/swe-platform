@@ -33,6 +33,7 @@ rules:
   - swe.dev
   resources:
   - environments/status
+  - environmenttemplates/status
   verbs:
   - get
   - patch
