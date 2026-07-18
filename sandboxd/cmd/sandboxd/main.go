@@ -39,7 +39,7 @@ func main() {
 	sandboxdv1.RegisterHealthServiceServer(grpcServer, &server.HealthServer{Version: Version})
 	sandboxdv1.RegisterExecServiceServer(grpcServer, &server.ExecServer{Workspace: *workspace})
 	sandboxdv1.RegisterFilesystemServiceServer(grpcServer, &server.FilesystemServer{Workspace: *workspace})
-	sandboxdv1.RegisterTerminalServiceServer(grpcServer, &server.TerminalServer{})
+	sandboxdv1.RegisterTerminalServiceServer(grpcServer, &server.TerminalServer{Workspace: *workspace})
 	sandboxdv1.RegisterPortServiceServer(grpcServer, server.NewPortServer())
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)

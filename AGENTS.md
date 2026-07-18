@@ -15,9 +15,9 @@ architectural. If it's missing, ask the maintainer instead of guessing at design
 ## Current state
 
 P0 scaffold is in place: CRD types, environment controller, `sandboxd` (exec/fs/ports/
-health implemented; terminal is a stub), CLI (`run`/`logs` work; `attach` is a stub),
-kind acceptance, CI, and a Helm chart for the operator, control plane, and CRDs. The
-control plane currently provides in-memory transcript ingestion and SSE streaming.
+health and a shared tmux terminal), CLI (`run`/`logs`/`attach`), kind acceptance, CI,
+and a Helm chart for the operator, control plane, and CRDs. The control plane currently
+provides in-memory transcript ingestion and SSE streaming.
 Remaining gaps are marked `TODO(P0/P1/P2)` in code — most notably setup-hook execution,
 agent credential injection, and agent adapters.
 

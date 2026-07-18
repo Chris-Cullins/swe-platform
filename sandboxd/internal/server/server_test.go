@@ -5,13 +5,17 @@ import (
 	"io"
 	"net"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/status"
 	"google.golang.org/grpc/test/bufconn"
 
 	sandboxdv1 "github.com/Chris-Cullins/swe-platform/sandboxd/gen/proto/sandboxd/v1"
@@ -21,11 +25,20 @@ import (
 // and returns a client connection to it.
 func newConn(t *testing.T, workspace string) *grpc.ClientConn {
 	t.Helper()
+	socketName := "swe-test-" + filepath.Base(workspace)
+	t.Cleanup(func() {
+		_ = exec.Command("tmux", "-L", socketName, "kill-server").Run()
+	})
 	lis := bufconn.Listen(1024 * 1024)
 	grpcServer := grpc.NewServer()
 	sandboxdv1.RegisterHealthServiceServer(grpcServer, &HealthServer{Version: "test"})
 	sandboxdv1.RegisterExecServiceServer(grpcServer, &ExecServer{Workspace: workspace})
 	sandboxdv1.RegisterFilesystemServiceServer(grpcServer, &FilesystemServer{Workspace: workspace})
+	sandboxdv1.RegisterTerminalServiceServer(grpcServer, &TerminalServer{
+		Workspace:  workspace,
+		SocketName: socketName,
+		Shell:      []string{"sh"},
+	})
 	sandboxdv1.RegisterPortServiceServer(grpcServer, NewPortServer())
 	go func() { _ = grpcServer.Serve(lis) }()
 	t.Cleanup(grpcServer.Stop)
@@ -133,6 +146,87 @@ func TestFilesystemRoundTrip(t *testing.T) {
 	// The file must have landed inside the workspace.
 	if _, err := os.Stat(filepath.Join(workspace, "notes", "hello.txt")); err != nil {
 		t.Fatalf("file not in workspace: %v", err)
+	}
+}
+
+func TestTerminalStreamsSharedTmuxSession(t *testing.T) {
+	if _, err := exec.LookPath("tmux"); err != nil {
+		t.Skip("tmux is not installed")
+	}
+
+	conn := newConn(t, t.TempDir())
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	stream, err := sandboxdv1.NewTerminalServiceClient(conn).Terminal(ctx)
+	if err != nil {
+		t.Fatalf("terminal: %v", err)
+	}
+	if err := stream.Send(&sandboxdv1.TerminalMessage{Kind: &sandboxdv1.TerminalMessage_Open{
+		Open: &sandboxdv1.TerminalOpen{Cols: 80, Rows: 24},
+	}}); err != nil {
+		t.Fatalf("send open: %v", err)
+	}
+	if err := stream.Send(&sandboxdv1.TerminalMessage{Kind: &sandboxdv1.TerminalMessage_Data{
+		Data: []byte("printf terminal-ok; exit\n"),
+	}}); err != nil {
+		t.Fatalf("send input: %v", err)
+	}
+	var output []byte
+	for {
+		message, err := stream.Recv()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatalf("recv: %v", err)
+		}
+		output = append(output, message.GetData()...)
+	}
+	if !strings.Contains(string(output), "terminal-ok") {
+		t.Fatalf("terminal output did not contain marker: %q", output)
+	}
+}
+
+func TestTerminalCloseSendDetaches(t *testing.T) {
+	if _, err := exec.LookPath("tmux"); err != nil {
+		t.Skip("tmux is not installed")
+	}
+
+	conn := newConn(t, t.TempDir())
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	stream, err := sandboxdv1.NewTerminalServiceClient(conn).Terminal(ctx)
+	if err != nil {
+		t.Fatalf("terminal: %v", err)
+	}
+	if err := stream.Send(&sandboxdv1.TerminalMessage{Kind: &sandboxdv1.TerminalMessage_Open{
+		Open: &sandboxdv1.TerminalOpen{Cols: 80, Rows: 24},
+	}}); err != nil {
+		t.Fatalf("send open: %v", err)
+	}
+	if err := stream.CloseSend(); err != nil {
+		t.Fatalf("close input: %v", err)
+	}
+	for {
+		if _, err := stream.Recv(); err == io.EOF {
+			break
+		} else if err != nil {
+			t.Fatalf("recv: %v", err)
+		}
+	}
+}
+
+func TestTerminalRequiresOpenFirst(t *testing.T) {
+	conn := newConn(t, t.TempDir())
+	stream, err := sandboxdv1.NewTerminalServiceClient(conn).Terminal(context.Background())
+	if err != nil {
+		t.Fatalf("terminal: %v", err)
+	}
+	if err := stream.Send(&sandboxdv1.TerminalMessage{Kind: &sandboxdv1.TerminalMessage_Data{Data: []byte("no")}}); err != nil {
+		t.Fatalf("send: %v", err)
+	}
+	if _, err := stream.Recv(); status.Code(err) != codes.InvalidArgument {
+		t.Fatalf("expected InvalidArgument, got %v", err)
 	}
 }
 

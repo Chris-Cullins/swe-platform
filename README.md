@@ -9,9 +9,10 @@ with a reviewable diff, branch, or PR.
 
 > **Status: early.** The P0 scaffold is in — CRDs, operator, `sandboxd`, CLI — with a
 > passing kind end-to-end (`./hack/e2e.sh`). A first control-plane service accepts and
-> streams adapter-owned transcript events over SSE; agent adapters and the gateway are
-> not built yet. The Helm chart installs the operator, control plane, and CRDs. Values
-> presets cover kind, k3s, GKE with GKE Sandbox, and EKS.
+> streams adapter-owned transcript events over SSE, and `swe attach` connects to a
+> shared tmux terminal through `sandboxd`; agent adapters and the web gateway are not
+> built yet. The Helm chart installs the operator, control plane, and CRDs. Values presets
+> cover kind, k3s, GKE with GKE Sandbox, and EKS.
 
 ## Why
 

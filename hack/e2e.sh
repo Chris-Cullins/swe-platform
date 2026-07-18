@@ -84,6 +84,14 @@ if ! grep -q 'e2e transcript event' /tmp/swe-platform-transcript.out; then
 fi
 
 ENV_NAME=$(kubectl get environments -o jsonpath='{.items[0].metadata.name}')
+echo "==> verifying shared terminal through swe attach"
+printf 'printf terminal-e2e-ok; exit\n' | bin/swe attach "$ENV_NAME" > /tmp/swe-platform-terminal.out
+if ! grep -q 'terminal-e2e-ok' /tmp/swe-platform-terminal.out; then
+	echo "FAIL: terminal output was not received through swe attach"
+	cat /tmp/swe-platform-terminal.out
+	exit 1
+fi
+
 POD_PHASE=$(kubectl get pod "env-${ENV_NAME}" -o jsonpath='{.status.phase}')
 if [[ "$POD_PHASE" != "Running" ]]; then
 	echo "FAIL: pod env-${ENV_NAME} is ${POD_PHASE}, expected Running"

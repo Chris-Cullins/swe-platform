@@ -3,6 +3,7 @@ FROM --platform=$BUILDPLATFORM golang:1.26 AS build
 WORKDIR /src
 
 COPY go.mod go.sum ./
+COPY sandboxd/go.mod sandboxd/go.sum sandboxd/
 RUN go mod download
 
 COPY api/ api/

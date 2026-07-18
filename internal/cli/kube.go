@@ -6,6 +6,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
@@ -16,7 +17,8 @@ import (
 // a controller-runtime client for swe.dev objects and a clientset for pod logs.
 type kubeClients struct {
 	client.Client
-	Clientset *kubernetes.Clientset
+	Clientset  *kubernetes.Clientset
+	RESTConfig *rest.Config
 }
 
 // newKubeClients builds clients from the user's kubeconfig (honoring current context).
@@ -43,5 +45,5 @@ func newKubeClients() (*kubeClients, error) {
 	if err != nil {
 		return nil, fmt.Errorf("build clientset: %w", err)
 	}
-	return &kubeClients{Client: c, Clientset: cs}, nil
+	return &kubeClients{Client: c, Clientset: cs, RESTConfig: cfg}, nil
 }
