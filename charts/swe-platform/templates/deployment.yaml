@@ -36,6 +36,14 @@ spec:
             - --metrics-bind-address={{ .Values.metricsBindAddress }}
             - --health-probe-bind-address={{ .Values.healthProbeBindAddress }}
             - --leader-elect={{ .Values.leaderElection }}
+            - --control-plane-namespace=$(POD_NAMESPACE)
+            - --control-plane-name={{ include "swe-platform.name" . }}
+            - --control-plane-instance={{ .Release.Name }}
+          env:
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
           ports:
             - name: metrics
               containerPort: 8080

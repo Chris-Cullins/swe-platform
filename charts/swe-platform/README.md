@@ -29,6 +29,13 @@ The RuntimeClass applies to environment pods, not the operator. A preset that na
 RuntimeClass will leave environments Pending unless that RuntimeClass is installed and
 supported by eligible nodes.
 
+The operator creates a default ingress NetworkPolicy for each environment. It permits the
+environment's sandboxd port only from this release's control-plane-labeled pods in the release
+namespace. The cluster CNI must enforce
+Kubernetes NetworkPolicy for this defense in depth; TLS identity and capability authorization
+remain mandatory regardless. See [the security model](../../SECURITY.md) for credential
+lifecycle and backend requirements.
+
 For local development, use `values-kind.yaml`; it references locally loaded `:dev`
 images and disables leader election.
 

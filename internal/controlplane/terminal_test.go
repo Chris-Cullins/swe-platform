@@ -15,6 +15,7 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/test/bufconn"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -205,6 +206,37 @@ func setWebSocketUpgrade(request *http.Request) {
 	request.Header.Set("Connection", "upgrade")
 	request.Header.Set("Upgrade", "websocket")
 }
+
+func TestKubernetesTerminalDialerRejectsPodOwnedByAnotherEnvironmentIncarnation(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	if err := platformv1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	environment := &platformv1alpha1.Environment{
+		ObjectMeta: metav1.ObjectMeta{Name: "env-1", Namespace: "project-1", UID: "current-environment"},
+		Status:     platformv1alpha1.EnvironmentStatus{PodName: "env-env-1"},
+	}
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "env-env-1", Namespace: "project-1",
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: platformv1alpha1.GroupVersion.String(), Kind: "Environment", Name: "env-1", UID: "old-environment", Controller: ptrTo(true),
+			}},
+		},
+		Status: corev1.PodStatus{PodIP: "192.0.2.10"},
+	}
+	dialer := KubernetesTerminalDialer{Client: fake.NewClientBuilder().WithScheme(scheme).WithObjects(environment, pod).Build()}
+
+	_, _, err := dialer.DialTerminal(context.Background(), "project-1", "env-1")
+	if err == nil || !strings.Contains(err.Error(), "not owned by the current environment") {
+		t.Fatalf("DialTerminal() error = %v, want stale pod rejection", err)
+	}
+}
+
+func ptrTo[T any](value T) *T { return &value }
 
 type terminalTestDialer struct {
 	mu          sync.Mutex

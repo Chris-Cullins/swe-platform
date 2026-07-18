@@ -9,6 +9,7 @@ RUN go mod download
 COPY api/ api/
 COPY cmd/operator/ cmd/operator/
 COPY internal/ internal/
+COPY sandboxd/auth/ sandboxd/auth/
 ARG TARGETOS
 ARG TARGETARCH
 RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -o /out/operator ./cmd/operator

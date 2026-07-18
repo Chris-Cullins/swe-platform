@@ -30,9 +30,15 @@ func main() {
 	var metricsAddr string
 	var probeAddr string
 	var leaderElect bool
+	var controlPlaneNamespace string
+	var controlPlaneName string
+	var controlPlaneInstance string
 	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8080", "The address the metrics endpoint binds to.")
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "The address the probe endpoint binds to.")
 	flag.BoolVar(&leaderElect, "leader-elect", false, "Enable leader election for the operator.")
+	flag.StringVar(&controlPlaneNamespace, "control-plane-namespace", "default", "Namespace containing the control-plane pods allowed to reach sandboxd.")
+	flag.StringVar(&controlPlaneName, "control-plane-name", "swe-platform", "app.kubernetes.io/name label of the control plane.")
+	flag.StringVar(&controlPlaneInstance, "control-plane-instance", "swe-platform", "app.kubernetes.io/instance label of the control plane.")
 	opts := zap.Options{Development: true}
 	opts.BindFlags(flag.CommandLine)
 	flag.Parse()
@@ -52,8 +58,11 @@ func main() {
 	}
 
 	if err := (&controllers.EnvironmentReconciler{
-		Client: mgr.GetClient(),
-		Scheme: mgr.GetScheme(),
+		Client:                mgr.GetClient(),
+		Scheme:                mgr.GetScheme(),
+		ControlPlaneNamespace: controlPlaneNamespace,
+		ControlPlaneName:      controlPlaneName,
+		ControlPlaneInstance:  controlPlaneInstance,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "Environment")
 		os.Exit(1)
