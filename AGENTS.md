@@ -91,7 +91,10 @@ runs both via `make` targets:
 - **Unit tests:** `make test` · **Vet:** `make vet`
 - **Operations console:** from `ui/`, install with `npm ci`; use `npm run lint`,
   `npm run typecheck`, `npm test -- --run`, and `npm run build`. Start the standalone
-  Vite development server with `npm run dev`.
+  Vite development server with `npm run dev`. Production uses `make ui-build`
+  followed by `make build-control-plane-production`; the tagged build embeds `ui/dist`,
+  while ordinary Go builds intentionally work without generated assets. The control-plane
+  image performs both stages in one multi-stage build.
 - **Windows portability:** CI runs focused sandboxd process, Exec, and filesystem tests
   on `windows-latest`; keep OS-specific tests behind build tags.
 - **Regenerate deepcopy:** `make generate` · **CRDs + RBAC:** `make manifests`
@@ -114,7 +117,8 @@ runs both via `make` targets:
 - **E2E acceptance:** `./hack/e2e.sh` — full kind + operator + `swe run` pass with the
   env-base image built and loaded locally (no registry credentials needed). It also verifies
   control-plane TokenReview/SAR scoping, opaque browser session exchange/logout and CSRF,
-  typed Run list/get/create/retry/cancel, Environment get, transcript SSE, and terminal attach.
+  the embedded console entry point/SPA fallback/static assets, typed Run
+  list/get/create/retry/cancel, Environment get, transcript SSE, and terminal attach.
   Runs in CI as the `e2e` workflow on relevant PRs and via `workflow_dispatch`.
 - **Images:** `make docker-build` (operator + env-base). The env-base image builds
   its pinned tmux with `images/env-base/tmux-control-output-drain.patch`; keep the

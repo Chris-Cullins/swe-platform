@@ -5,6 +5,8 @@
 CONTROLLER_GEN_VERSION ?= v0.21.0
 PROTOC_GEN_GO_VERSION ?= latest
 PROTOC_GEN_GO_GRPC_VERSION ?= latest
+NODE_VERSION ?= 24.18.0
+NPM_VERSION ?= 11.16.0
 
 LOCALBIN := $(abspath bin)
 CONTROLLER_GEN := $(LOCALBIN)/controller-gen
@@ -27,6 +29,10 @@ build-operator: ## Build the operator
 .PHONY: build-control-plane
 build-control-plane: ## Build the control-plane API
 	go build -o $(LOCALBIN)/control-plane ./cmd/control-plane
+
+.PHONY: build-control-plane-production
+build-control-plane-production: check-ui-assets ## Build the control plane with the embedded operations console
+	go build -tags console -o $(LOCALBIN)/control-plane ./cmd/control-plane
 
 .PHONY: build-cli
 build-cli: ## Build the swe CLI
@@ -54,6 +60,22 @@ test: ## Run unit tests in both modules
 vet: ## Run go vet in both modules
 	go vet ./...
 	cd sandboxd && go vet ./...
+
+.PHONY: check-ui-toolchain ui-install ui-build check-ui-assets
+check-ui-toolchain: ## Verify the pinned operations-console Node and npm versions
+	@test "$$(node --version)" = "v$(NODE_VERSION)" || { echo "Node v$(NODE_VERSION) is required" >&2; exit 1; }
+	@test "$$(npm --version)" = "$(NPM_VERSION)" || { echo "npm $(NPM_VERSION) is required" >&2; exit 1; }
+
+ui-install: check-ui-toolchain ## Install the pinned operations-console dependencies
+	cd ui && npm ci
+
+ui-build: ui-install ## Build fresh Vite assets for the production control plane
+	cd ui && npm run build
+
+check-ui-assets: ## Fail if generated Vite assets are absent or older than their inputs
+	@test -f ui/dist/index.html || { echo "ui/dist is missing; run 'make ui-build' before the tagged production build" >&2; exit 1; }
+	@stale="$$(find ui -type f ! -path 'ui/dist/*' ! -path 'ui/node_modules/*' ! -name '*.go' ! -name '*.tsbuildinfo' -newer ui/dist/index.html -print -quit)"; \
+		test -z "$$stale" || { echo "ui/dist is stale because $$stale is newer; run 'make ui-build'" >&2; exit 1; }
 
 ##@ Code generation
 

@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"log/slog"
 	"net/http"
 	"strings"
@@ -41,6 +42,7 @@ type Server struct {
 	resources             ResourceService
 	runs                  RunResolver
 	terminalDialer        TerminalDialer
+	consoleAssets         fs.FS
 	trustProxy            bool
 	allowInsecureSessions bool
 	heartbeat             time.Duration
@@ -74,6 +76,7 @@ type ServerOptions struct {
 	Runs                  RunResolver
 	TranscriptStore       TranscriptStore
 	TerminalDialer        TerminalDialer
+	ConsoleAssets         fs.FS
 	TrustProxy            bool
 	AllowInsecureSessions bool
 	// StreamLifecycle is canceled when long-lived SSE and terminal handlers
@@ -105,6 +108,7 @@ func NewServer(log *slog.Logger, options ServerOptions) *Server {
 		resources:             options.Resources,
 		runs:                  options.Runs,
 		terminalDialer:        options.TerminalDialer,
+		consoleAssets:         options.ConsoleAssets,
 		trustProxy:            options.TrustProxy,
 		allowInsecureSessions: options.AllowInsecureSessions,
 		heartbeat:             heartbeat,
@@ -132,7 +136,17 @@ func (s *Server) Handler() http.Handler {
 	})
 	mux.HandleFunc("/api/v1/session", s.handleSession)
 	mux.HandleFunc(namespacedPathPrefix, s.handleNamespacedAPI)
-	return mux
+	if s.consoleAssets == nil {
+		return mux
+	}
+	console := newConsoleHandler(s.consoleAssets)
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if isReservedServerPath(r.URL.Path) {
+			mux.ServeHTTP(w, r)
+			return
+		}
+		console.ServeHTTP(w, r)
+	})
 }
 
 func (s *Server) handleNamespacedAPI(w http.ResponseWriter, r *http.Request) {

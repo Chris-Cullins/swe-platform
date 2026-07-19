@@ -301,6 +301,36 @@ for _ in $(seq 1 30); do
 	sleep 1
 done
 
+echo "==> verifying embedded operations console through the control-plane Service"
+ROOT_STATUS=$(curl --silent --dump-header /tmp/swe-platform-console-root.headers \
+	--output /tmp/swe-platform-console-root.html --write-out '%{http_code}' \
+	http://127.0.0.1:18080/)
+SPA_STATUS=$(curl --silent --dump-header /tmp/swe-platform-console-spa.headers \
+	--output /tmp/swe-platform-console-spa.html --write-out '%{http_code}' \
+	"http://127.0.0.1:18080/namespaces/default/runs/${RUN_NAME}/overview")
+ASSET_PATH=$(grep -oE 'src="/assets/[^"]+"' /tmp/swe-platform-console-root.html | head -1 | cut -d'"' -f2 || true)
+if [[ "$ROOT_STATUS" != "200" || "$SPA_STATUS" != "200" || -z "$ASSET_PATH" ]] || \
+	! cmp -s /tmp/swe-platform-console-root.html /tmp/swe-platform-console-spa.html || \
+	! tr -d '\r' < /tmp/swe-platform-console-root.headers | grep -Eiq '^Cache-Control: no-store$' || \
+	! grep -Eiq '^Content-Security-Policy: ' /tmp/swe-platform-console-root.headers; then
+	echo "FAIL: control-plane image did not serve the secured SPA entry point and client-route fallback"
+	exit 1
+fi
+ASSET_STATUS=$(curl --silent --dump-header /tmp/swe-platform-console-asset.headers \
+	--output /tmp/swe-platform-console-asset --write-out '%{http_code}' \
+	"http://127.0.0.1:18080${ASSET_PATH}")
+if [[ "$ASSET_STATUS" != "200" || ! -s /tmp/swe-platform-console-asset ]] || \
+	! tr -d '\r' < /tmp/swe-platform-console-asset.headers | grep -Eiq '^Cache-Control: public, max-age=31536000, immutable$'; then
+	echo "FAIL: control-plane image did not serve the immutable Vite asset ${ASSET_PATH}"
+	exit 1
+fi
+UNKNOWN_API_STATUS=$(curl --silent --output /tmp/swe-platform-console-unknown-api \
+	--write-out '%{http_code}' http://127.0.0.1:18080/api/not-a-console-route)
+if [[ "$UNKNOWN_API_STATUS" != "404" ]] || grep -q 'SWE Operations' /tmp/swe-platform-console-unknown-api; then
+	echo "FAIL: unknown API route was swallowed by the SPA fallback"
+	exit 1
+fi
+
 echo "==> verifying browser session and typed resource APIs"
 COOKIE_JAR=/tmp/swe-platform-console-cookies
 rm -f "$COOKIE_JAR"

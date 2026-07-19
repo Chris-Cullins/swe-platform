@@ -1,3 +1,13 @@
+FROM --platform=$BUILDPLATFORM node:24.18.0-bookworm-slim AS console-build
+WORKDIR /src/ui
+
+RUN test "$(node --version)" = "v24.18.0" && test "$(npm --version)" = "11.16.0"
+COPY ui/package.json ui/package-lock.json ./
+RUN npm ci
+COPY ui/index.html ui/tsconfig.json ui/tsconfig.app.json ui/tsconfig.node.json ui/vite.config.ts ./
+COPY ui/src/ src/
+RUN npm run build
+
 FROM --platform=$BUILDPLATFORM golang:1.26 AS build
 WORKDIR /src
 
@@ -9,11 +19,13 @@ COPY api/ api/
 COPY cmd/control-plane/ cmd/control-plane/
 COPY internal/controlplane/ internal/controlplane/
 COPY internal/sandboxclient/ internal/sandboxclient/
+COPY ui/*.go ui/
+COPY --from=console-build /src/ui/dist ui/dist/
 COPY sandboxd/auth/ sandboxd/auth/
 COPY sandboxd/gen/ sandboxd/gen/
 ARG TARGETOS
 ARG TARGETARCH
-RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -o /out/control-plane ./cmd/control-plane
+RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -tags console -o /out/control-plane ./cmd/control-plane
 
 FROM gcr.io/distroless/static:nonroot
 COPY --from=build /out/control-plane /control-plane
