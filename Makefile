@@ -6,7 +6,7 @@ CONTROLLER_GEN_VERSION ?= v0.21.0
 PROTOC_GEN_GO_VERSION ?= latest
 PROTOC_GEN_GO_GRPC_VERSION ?= latest
 
-LOCALBIN := $(shell pwd)/bin
+LOCALBIN := $(abspath bin)
 CONTROLLER_GEN := $(LOCALBIN)/controller-gen
 
 KIND_CLUSTER ?= swe-dev
@@ -18,6 +18,7 @@ all: build
 
 .PHONY: build
 build: build-operator build-control-plane build-cli build-sandboxd ## Build all binaries into bin/
+	$(MAKE) check-build-output
 
 .PHONY: build-operator
 build-operator: ## Build the operator
@@ -36,6 +37,13 @@ build-sandboxd: ## Build sandboxd
 	go build -C sandboxd -o $(LOCALBIN)/sandboxd ./cmd/sandboxd
 
 ##@ Test & verify
+
+.PHONY: check-build-output
+check-build-output: ## Verify all built binaries land in bin/
+	@test -x "$(LOCALBIN)/operator"
+	@test -x "$(LOCALBIN)/control-plane"
+	@test -x "$(LOCALBIN)/swe"
+	@test -x "$(LOCALBIN)/sandboxd"
 
 .PHONY: test
 test: ## Run unit tests in both modules
