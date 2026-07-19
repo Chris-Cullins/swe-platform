@@ -43,6 +43,9 @@ func TestTranscriptReplayAndLiveStream(t *testing.T) {
 	if got := response.Header.Get("Content-Type"); got != "text/event-stream" {
 		t.Fatalf("Content-Type = %q, want text/event-stream", got)
 	}
+	if got := response.Header.Get("X-Accel-Buffering"); got != "no" {
+		t.Fatalf("X-Accel-Buffering = %q, want no", got)
+	}
 
 	lines := make(chan string, 8)
 	go func() {
@@ -57,6 +60,84 @@ func TestTranscriptReplayAndLiveStream(t *testing.T) {
 	assertEventText(t, nextLine(t, lines), "first")
 	postEvent(t, server.URL, `{"source":"adapter","idempotencyKey":"second","type":"output","data":{"text":"second"}}`)
 	assertEventText(t, nextLine(t, lines), "second")
+}
+
+func TestTranscriptStreamSendsHeartbeat(t *testing.T) {
+	api := NewServer(nil, ServerOptions{
+		Access:                      &fakeAccess{},
+		Runs:                        &fakeRunResolver{},
+		TranscriptStore:             NewMemoryTranscriptStore(MemoryTranscriptStoreOptions{}),
+		TranscriptHeartbeatInterval: time.Millisecond,
+	})
+	server := httptest.NewServer(api.Handler())
+	defer server.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, server.URL+transcriptURL, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+
+	scanner := bufio.NewScanner(response.Body)
+	if !scanner.Scan() {
+		t.Fatalf("stream ended before heartbeat: %v", scanner.Err())
+	}
+	if got := scanner.Text(); got != ": ping" {
+		t.Fatalf("heartbeat = %q, want %q", got, ": ping")
+	}
+}
+
+func TestTranscriptStreamLifecycleUnsubscribes(t *testing.T) {
+	streamLifecycle, cancelStreams := context.WithCancel(context.Background())
+	store := NewMemoryTranscriptStore(MemoryTranscriptStoreOptions{}).(*memoryTranscriptStore)
+	api := NewServer(nil, ServerOptions{
+		Access:          &fakeAccess{},
+		Runs:            &fakeRunResolver{},
+		TranscriptStore: store,
+		StreamLifecycle: streamLifecycle,
+	})
+	server := httptest.NewServer(api.Handler())
+	defer server.Close()
+
+	response, err := http.Get(server.URL + transcriptURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	run := RunIdentity{Namespace: "project-1", UID: "run-1-uid"}
+	store.mu.Lock()
+	subscribers := len(store.subscribers[run])
+	store.mu.Unlock()
+	if subscribers != 1 {
+		t.Fatalf("subscribers before shutdown = %d, want 1", subscribers)
+	}
+
+	cancelStreams()
+	done := make(chan error, 1)
+	go func() {
+		_, err := io.Copy(io.Discard, response.Body)
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("read canceled SSE stream: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("SSE stream did not exit after lifecycle cancellation")
+	}
+	store.mu.Lock()
+	_, subscribed := store.subscribers[run]
+	store.mu.Unlock()
+	if subscribed {
+		t.Fatal("SSE subscription remained after lifecycle cancellation")
+	}
 }
 
 func TestTranscriptSharedStoreFansOutAcrossServers(t *testing.T) {

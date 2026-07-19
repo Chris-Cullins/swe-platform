@@ -1,11 +1,18 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"flag"
+	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
+	"os/signal"
 	"strings"
+	"sync"
+	"syscall"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -17,6 +24,8 @@ import (
 	platformv1alpha1 "github.com/Chris-Cullins/swe-platform/api/v1alpha1"
 	"github.com/Chris-Cullins/swe-platform/internal/controlplane"
 )
+
+const shutdownTimeout = 10 * time.Second
 
 func main() {
 	address := flag.String("listen-address", ":8080", "Address for the control-plane HTTP API")
@@ -54,6 +63,8 @@ func main() {
 		Audience:       os.Getenv("SWE_TOKEN_AUDIENCE"),
 	}
 	transcripts := controlplane.NewMemoryTranscriptStore(controlplane.DefaultMemoryTranscriptStoreOptions())
+	streamLifecycle, cancelStreams := context.WithCancel(context.Background())
+	defer cancelStreams()
 	server := &http.Server{
 		Addr: *address,
 		Handler: controlplane.NewServer(log, controlplane.ServerOptions{
@@ -62,13 +73,92 @@ func main() {
 			TranscriptStore: transcripts,
 			TerminalDialer:  controlplane.KubernetesTerminalDialer{Client: kubeClient},
 			TrustProxy:      strings.EqualFold(os.Getenv("SWE_TRUST_PROXY_HEADERS"), "true"),
+			StreamLifecycle: streamLifecycle,
 		}).Handler(),
 		ReadHeaderTimeout: 5 * time.Second,
 		IdleTimeout:       2 * time.Minute,
 	}
+	listener, err := net.Listen("tcp", *address)
+	if err != nil {
+		log.Error("listen for control-plane API", "address", *address, "error", err)
+		os.Exit(1)
+	}
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
 	log.Info("starting control-plane API", "address", *address)
-	if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+	if err := runHTTPServer(ctx, log, server, listener, shutdownTimeout, cancelStreams); err != nil {
 		log.Error("control-plane API stopped", "error", err)
 		os.Exit(1)
+	}
+}
+
+func runHTTPServer(ctx context.Context, log *slog.Logger, server *http.Server, listener net.Listener, drainTimeout time.Duration, cancelStreams context.CancelFunc) error {
+	tracker := &handlerTracker{}
+	tracker.track(server)
+
+	serveErrors := make(chan error, 1)
+	go func() {
+		serveErrors <- server.Serve(listener)
+	}()
+
+	select {
+	case err := <-serveErrors:
+		if errors.Is(err, http.ErrServerClosed) {
+			return nil
+		}
+		return err
+	case <-ctx.Done():
+		log.Info("shutting down control-plane API", "drainTimeout", drainTimeout)
+	}
+
+	shutdownContext, cancelShutdown := context.WithTimeout(context.Background(), drainTimeout)
+	defer cancelShutdown()
+	cancelStreams()
+	shutdownErr := server.Shutdown(shutdownContext)
+	if shutdownErr != nil {
+		_ = server.Close()
+	}
+	serveErr := <-serveErrors
+	drainErr := tracker.wait(shutdownContext)
+	if shutdownErr != nil {
+		return fmt.Errorf("drain control-plane API: %w", shutdownErr)
+	}
+	if drainErr != nil {
+		_ = server.Close()
+		return fmt.Errorf("drain control-plane API handlers: %w", drainErr)
+	}
+	if serveErr != nil && !errors.Is(serveErr, http.ErrServerClosed) {
+		return serveErr
+	}
+	return nil
+}
+
+type handlerTracker struct {
+	active sync.WaitGroup
+}
+
+func (t *handlerTracker) track(server *http.Server) {
+	handler := server.Handler
+	if handler == nil {
+		handler = http.DefaultServeMux
+	}
+	server.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.active.Add(1)
+		defer t.active.Done()
+		handler.ServeHTTP(w, r)
+	})
+}
+
+func (t *handlerTracker) wait(ctx context.Context) error {
+	done := make(chan struct{})
+	go func() {
+		t.active.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
 	}
 }

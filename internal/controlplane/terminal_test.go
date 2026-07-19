@@ -1,6 +1,7 @@
 package controlplane
 
 import (
+	"bufio"
 	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
@@ -93,6 +94,93 @@ func TestWebTerminalBridgesSandboxd(t *testing.T) {
 	if string(backend.input) != "echo hello\n" {
 		t.Fatalf("sandboxd input = %q, want echo hello", backend.input)
 	}
+}
+
+func TestWebTerminalClosesWhileWaitingForOpenWhenContextCanceled(t *testing.T) {
+	listener := bufconn.Listen(1024 * 1024)
+	grpcServer := grpc.NewServer()
+	sandboxdv1.RegisterTerminalServiceServer(grpcServer, &terminalTestServer{})
+	go func() { _ = grpcServer.Serve(listener) }()
+	t.Cleanup(grpcServer.Stop)
+	backendConnection, err := grpc.NewClient("passthrough:///bufconn", grpc.WithContextDialer(func(context.Context, string) (net.Conn, error) {
+		return listener.Dial()
+	}), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = backendConnection.Close() })
+
+	closed := make(chan struct{})
+	dialer := &terminalTestDialer{client: sandboxdv1.NewTerminalServiceClient(backendConnection), closer: closeFunc(func() error {
+		close(closed)
+		return nil
+	})}
+	streamLifecycle, cancelStreams := context.WithCancel(context.Background())
+	server := httptest.NewServer(NewServer(nil, ServerOptions{Access: &fakeAccess{}, TerminalDialer: dialer, StreamLifecycle: streamLifecycle}).Handler())
+	t.Cleanup(server.Close)
+
+	websocketURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/api/v1/namespaces/project-1/environments/env-1/terminal"
+	connection, _, err := websocket.DefaultDialer.Dial(websocketURL, http.Header{"Authorization": []string{"Bearer reader"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = connection.Close() })
+	select {
+	case <-closed:
+		t.Fatal("terminal backend closed before request cancellation")
+	default:
+	}
+
+	cancelStreams()
+	select {
+	case <-closed:
+	case <-time.After(time.Second):
+		t.Fatal("terminal backend was not closed after request cancellation")
+	}
+}
+
+func TestTerminalHandshakeTimeoutBoundsPostHijackWrite(t *testing.T) {
+	if terminalUpgrader.HandshakeTimeout != terminalHandshakeTimeout || terminalHandshakeTimeout >= shutdownTimeoutForTest {
+		t.Fatalf("terminal handshake timeout = %v, want positive and below shutdown budget", terminalUpgrader.HandshakeTimeout)
+	}
+	upgrader := terminalUpgrader
+	upgrader.HandshakeTimeout = 10 * time.Millisecond
+	serverConnection, stalledPeer := net.Pipe()
+	defer serverConnection.Close()
+	defer stalledPeer.Close()
+	w := &hijackResponseWriter{header: make(http.Header), connection: serverConnection}
+	request := httptest.NewRequest(http.MethodGet, "/terminal", nil)
+	setWebSocketUpgrade(request)
+	request.Header.Set("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ==")
+	request.Header.Set("Sec-WebSocket-Version", "13")
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := upgrader.Upgrade(w, request, nil)
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("stalled post-hijack handshake unexpectedly succeeded")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("stalled post-hijack handshake ignored its timeout")
+	}
+}
+
+const shutdownTimeoutForTest = 10 * time.Second
+
+type hijackResponseWriter struct {
+	header     http.Header
+	connection net.Conn
+}
+
+func (w *hijackResponseWriter) Header() http.Header             { return w.header }
+func (*hijackResponseWriter) Write(payload []byte) (int, error) { return len(payload), nil }
+func (*hijackResponseWriter) WriteHeader(int)                   {}
+func (w *hijackResponseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	return w.connection, bufio.NewReadWriter(bufio.NewReader(w.connection), bufio.NewWriter(w.connection)), nil
 }
 
 func TestWebTerminalRequiresDialer(t *testing.T) {
@@ -383,6 +471,7 @@ func ptrTo[T any](value T) *T { return &value }
 type terminalTestDialer struct {
 	mu          sync.Mutex
 	client      sandboxdv1.TerminalServiceClient
+	closer      io.Closer
 	namespace   string
 	environment string
 	calls       int
@@ -394,7 +483,11 @@ func (d *terminalTestDialer) DialTerminal(_ context.Context, namespace, environm
 	d.namespace = namespace
 	d.environment = environment
 	d.mu.Unlock()
-	return d.client, io.NopCloser(strings.NewReader("")), nil
+	closer := d.closer
+	if closer == nil {
+		closer = io.NopCloser(strings.NewReader(""))
+	}
+	return d.client, closer, nil
 }
 
 type terminalTestServer struct {
