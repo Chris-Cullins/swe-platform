@@ -9,7 +9,8 @@ with a reviewable diff, branch, or PR.
 
 > **Status: early.** The P0 scaffold is in — CRDs, operator, `sandboxd`, CLI — with a
 > passing kind end-to-end (`./hack/e2e.sh`). A first control-plane service accepts and
-> streams adapter-owned transcript events over SSE, while `swe attach` and the control
+> streams adapter-owned transcript events through a bounded, tenant-aware transcript-store
+> contract over SSE, while `swe attach` and the control
 > plane's WebSocket terminal endpoint connect to a shared tmux session through `sandboxd`;
 > pause/resume preserves workspace disks and runs repository resume hooks, and idle
 > environments pause automatically before terminal requests wake them. Template warm

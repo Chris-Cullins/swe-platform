@@ -2,7 +2,8 @@
 
 This chart installs the swe-platform CRDs, operator, and the first control-plane API.
 The control plane accepts adapter-owned transcript events and streams them over SSE.
-Its current transcript store is in-memory and single-replica; durable storage and portal
+Its bounded transcript store is currently process-local, so the chart requires one control-plane
+replica and uses a non-overlapping `Recreate` deployment. A durable shared store and portal
 proxying are not implemented yet.
 
 The operator reconciles each `Run` as the single task intent and allocates or claims its
@@ -60,7 +61,8 @@ exact namespace, resource name, and subresource on every request:
 This permits producer credentials to be restricted to one Run using an RBAC Role with
 `resourceNames`. The namespace is part of the URL only as a resource selector; it becomes
 authoritative only after RBAC authorizes that exact namespaced identity. Unknown Runs are
-rejected before transcript state is allocated. Transcript event `data` remains opaque,
+rejected before transcript state is allocated; an already-open stream is not continuously
+reauthorized or closed when its Run is deleted. Transcript event `data` remains opaque,
 adapter-owned JSON.
 
 Service clients send `Authorization: Bearer <token>`. Browser transcript readers and
@@ -137,12 +139,44 @@ TOKEN="$(kubectl create token my-reader -n project-a --audience=swe-platform)"
 curl -N -H "Authorization: Bearer ${TOKEN}" \
   http://127.0.0.1:8080/api/v1/namespaces/project-a/runs/run-123/transcript
 curl -H "Authorization: Bearer ${TOKEN}" -H 'Content-Type: application/json' \
-  -d '{"type":"output","data":{"text":"hello"}}' \
+  -d '{"source":"adapter","sourceSequence":1,"idempotencyKey":"event-1","type":"output","data":{"text":"hello"}}' \
   http://127.0.0.1:8080/api/v1/namespaces/project-a/runs/run-123/transcript
 ```
 
-SSE reconnects honor `Last-Event-ID`. Callers may also request events after a known ID
-with `?after=<id>`.
+The platform envelope owns transport metadata only:
+
+- A transcript belongs to the immutable `(namespace, Run UID)` identity, so names reused
+  across namespaces or after Run recreation never collide.
+- `source` is a bounded, producer-selected idempotency partition, not authenticated
+  provenance. `sourceSequence` is optional producer metadata and does not determine order.
+- `(Run identity, source, idempotencyKey)` identifies one append while that event remains
+  retained. An exact retry returns the original event with `200 OK` and
+  `Idempotent-Replayed: true`; reuse with different `type`, `sourceSequence`, or raw `data`
+  bytes returns `409 Conflict`. The first committed append returns `201 Created`. The original
+  `{type,data}` envelope remains temporarily accepted with `202 Accepted` for compatibility,
+  but is explicitly non-idempotent; reliable producers must send `source` and `idempotencyKey`.
+- `sequence` is a stable, contiguous total order per Run. `id` is an opaque, versioned,
+  store-issued cursor; clients must not parse or synthesize it. `Last-Event-ID` takes
+  precedence over `?after=<cursor>` on reconnect.
+- Cursors malformed, unverifiable after a memory-store restart, forged, for another Run,
+  or ahead of its high-water mark return `400 invalid_cursor`. Authenticated cursors whose
+  events are no longer retained return
+  `410 cursor_expired` with an `application/problem+json` recovery boundary. A new stream
+  without a cursor receives an ID-less `transcript-gap` control event before retained
+  history when earlier events have expired.
+- The memory store bounds Run count, per-Run and aggregate retained events/bytes,
+  idempotency entries, replay size, subscriber count, and subscriber buffers. Capacity
+  failures are explicit; a slow subscriber is disconnected rather than blocking producers.
+
+`TranscriptStore` is the durability boundary. Every durable implementation must make append
+linearizable per Run (idempotency check, sequence allocation, persistence, and publication are
+one operation) and make subscription an atomic replay/live cut. All replicas must use that
+same store and fan-out mechanism, so replay and live delivery require no sticky sessions.
+Store generations and cursors must survive restart and rolling deployment. The current memory
+implementation deliberately changes generation and signing key on restart, making old cursors
+explicitly `400 invalid_cursor` instead of silently skipping events; it does not provide durable replay.
+Idempotency is correspondingly retained-window idempotency: after an event is evicted, its key
+may be reused and creates a new event.
 
 ## Validate
 

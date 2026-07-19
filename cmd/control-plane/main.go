@@ -53,13 +53,15 @@ func main() {
 		BootstrapToken: bootstrapToken,
 		Audience:       os.Getenv("SWE_TOKEN_AUDIENCE"),
 	}
+	transcripts := controlplane.NewMemoryTranscriptStore(controlplane.DefaultMemoryTranscriptStoreOptions())
 	server := &http.Server{
 		Addr: *address,
 		Handler: controlplane.NewServer(log, controlplane.ServerOptions{
-			Access:         access,
-			Runs:           controlplane.KubernetesRunResolver{Client: kubeClient},
-			TerminalDialer: controlplane.KubernetesTerminalDialer{Client: kubeClient},
-			TrustProxy:     strings.EqualFold(os.Getenv("SWE_TRUST_PROXY_HEADERS"), "true"),
+			Access:          access,
+			Runs:            controlplane.KubernetesRunResolver{Client: kubeClient},
+			TranscriptStore: transcripts,
+			TerminalDialer:  controlplane.KubernetesTerminalDialer{Client: kubeClient},
+			TrustProxy:      strings.EqualFold(os.Getenv("SWE_TRUST_PROXY_HEADERS"), "true"),
 		}).Handler(),
 		ReadHeaderTimeout: 5 * time.Second,
 		IdleTimeout:       2 * time.Minute,

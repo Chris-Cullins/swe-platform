@@ -1,4 +1,7 @@
 {{- if .Values.controlPlane.enabled }}
+{{- if ne (int .Values.controlPlane.replicaCount) 1 }}
+{{- fail "controlPlane.replicaCount must be 1 while the process-local transcript store is enabled" }}
+{{- end }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -9,6 +12,8 @@ metadata:
     app.kubernetes.io/component: control-plane
 spec:
   replicas: {{ .Values.controlPlane.replicaCount }}
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       app.kubernetes.io/name: {{ include "swe-platform.name" . }}
