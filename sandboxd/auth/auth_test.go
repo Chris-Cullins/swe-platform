@@ -156,7 +156,7 @@ func TestTLSAndCapabilityInterceptorsEndToEnd(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := exec.Send(&sandboxdv1.ExecRequest{}); err != nil {
+	if err := exec.Send(&sandboxdv1.ExecRequest{}); err != nil && err != io.EOF {
 		t.Fatal(err)
 	}
 	if _, err := exec.Recv(); status.Code(err) != codes.PermissionDenied {
