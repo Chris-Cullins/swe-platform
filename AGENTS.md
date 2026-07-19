@@ -18,8 +18,10 @@ P0 scaffold is in place: CRD types, environment controller, `sandboxd` (exec/fs/
 health and a shared tmux terminal), CLI (`run`/`logs`/`attach`), kind acceptance, CI,
 and a Helm chart for the operator, control plane, and CRDs. The control plane currently
 provides in-memory transcript ingestion and SSE streaming.
-Remaining gaps are marked `TODO(P0/P1/P2)` in code — most notably agent
-adapters, GitHub App–scoped git tokens, and egress/portal networking.
+Remaining gaps are marked `TODO(P0/P1/P2)` in code — most notably secure agent credential
+injection, additional agent adapters, GitHub App–scoped git tokens, and egress/portal
+networking. The first `claude-code` adapter is registered and uses sandboxd managed
+processes; tests use a fake process service and require no credentials.
 
 ## Architecture invariants — do not violate these
 
@@ -110,7 +112,8 @@ runs both via `make` targets:
 - **Images:** `make docker-build` (operator + env-base). The env-base image builds
   its pinned tmux with `images/env-base/tmux-control-output-drain.patch`; keep the
   source checksum and patch synchronized when upgrading tmux. Its `terminal-test`
-  target runs the patched-runtime terminal regression during `hack/e2e.sh`.
+  target runs the patched-runtime terminal regression during `hack/e2e.sh`. The image
+  also includes a version-pinned Claude Code CLI for the default adapter.
 - **Publish images:** pushes to `main` and `v*` tags publish multi-architecture operator
   and env-base images to GHCR via `.github/workflows/publish-images.yaml`.
 

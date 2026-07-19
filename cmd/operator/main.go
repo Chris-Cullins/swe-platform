@@ -2,7 +2,9 @@ package main
 
 import (
 	"flag"
+	"net/http"
 	"os"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -15,7 +17,9 @@ import (
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
 	platformv1alpha1 "github.com/Chris-Cullins/swe-platform/api/v1alpha1"
+	"github.com/Chris-Cullins/swe-platform/internal/adapters/claudecode"
 	"github.com/Chris-Cullins/swe-platform/internal/controllers"
+	"github.com/Chris-Cullins/swe-platform/internal/transcriptclient"
 )
 
 var (
@@ -35,12 +39,16 @@ func main() {
 	var controlPlaneNamespace string
 	var controlPlaneName string
 	var controlPlaneInstance string
+	var transcriptURL string
+	var transcriptTokenFile string
 	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8080", "The address the metrics endpoint binds to.")
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "The address the probe endpoint binds to.")
 	flag.BoolVar(&leaderElect, "leader-elect", false, "Enable leader election for the operator.")
 	flag.StringVar(&controlPlaneNamespace, "control-plane-namespace", "default", "Namespace containing the control-plane pods allowed to reach sandboxd.")
 	flag.StringVar(&controlPlaneName, "control-plane-name", "swe-platform", "app.kubernetes.io/name label of the control plane.")
 	flag.StringVar(&controlPlaneInstance, "control-plane-instance", "swe-platform", "app.kubernetes.io/instance label of the control plane.")
+	flag.StringVar(&transcriptURL, "transcript-url", "", "Control-plane base URL for adapter transcript events (disabled when empty).")
+	flag.StringVar(&transcriptTokenFile, "transcript-token-file", "", "Projected service-account token used to append adapter transcript events.")
 	opts := zap.Options{Development: true}
 	opts.BindFlags(flag.CommandLine)
 	flag.Parse()
@@ -74,10 +82,22 @@ func main() {
 		setupLog.Error(err, "unable to create controller", "controller", "Environment")
 		os.Exit(1)
 	}
+	var eventSink controllers.AdapterEventSink
+	if transcriptURL != "" {
+		if transcriptTokenFile == "" {
+			setupLog.Error(nil, "transcript-token-file is required when transcript-url is set")
+			os.Exit(1)
+		}
+		eventSink = transcriptclient.Client{
+			BaseURL: transcriptURL, TokenFile: transcriptTokenFile,
+			HTTP: &http.Client{Timeout: 15 * time.Second},
+		}
+	}
 	if err := (&controllers.RunReconciler{
-		Client:   mgr.GetClient(),
-		Scheme:   mgr.GetScheme(),
-		Adapters: map[string]controllers.AdapterLifecycle{},
+		Client:    mgr.GetClient(),
+		Scheme:    mgr.GetScheme(),
+		Adapters:  registeredAdapters(),
+		EventSink: eventSink,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "Run")
 		os.Exit(1)
@@ -104,4 +124,8 @@ func main() {
 		setupLog.Error(err, "problem running manager")
 		os.Exit(1)
 	}
+}
+
+func registeredAdapters() map[string]controllers.AdapterLifecycle {
+	return map[string]controllers.AdapterLifecycle{"claude-code": &claudecode.Adapter{}}
 }

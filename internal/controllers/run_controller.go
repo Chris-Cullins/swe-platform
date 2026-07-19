@@ -2,6 +2,7 @@ package controllers
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"reflect"
@@ -33,6 +34,10 @@ const adapterPollInterval = 2 * time.Second
 var errAllocatedEnvironmentGone = errors.New("allocated environment is gone or no longer claimed by this run")
 var errExplicitEnvironmentClaimed = errors.New("explicit environment is already claimed")
 
+// ErrAdapterCancellationPending means cancellation was accepted but the
+// adapter-owned execution tree has not reached a terminal state yet.
+var ErrAdapterCancellationPending = errors.New("adapter cancellation is pending")
+
 const (
 	runConditionEnvironmentReady           = "EnvironmentReady"
 	runConditionAdapterAcceptanceAttempted = "AdapterAcceptanceAttempted"
@@ -57,18 +62,34 @@ type AdapterTask struct {
 	Prompt string
 }
 
+// AdapterEvent is an adapter-owned transcript event carried by the platform's
+// generic transcript transport. Data is opaque to the controller.
+type AdapterEvent struct {
+	Source         string
+	IdempotencyKey string
+	Type           string
+	Data           json.RawMessage
+}
+
+// AdapterEventSink forwards opaque adapter events for one namespaced Run.
+type AdapterEventSink interface {
+	Append(context.Context, string, string, AdapterEvent) error
+}
+
 // AdapterSandbox is the backend-neutral handle exposed to adapters. Adapters
 // use sandboxd and never inspect pods, containers, VMs, PIDs, or OS signals.
 type AdapterSandbox struct {
 	EnvironmentName string
 	EnvironmentUID  types.UID
 	DialProcess     func(context.Context) (sandboxdv1.ProcessServiceClient, func() error, error)
+	EmitEvent       func(context.Context, AdapterEvent) error
 }
 
 // AdapterLifecycle translates one agent's execution model into normalized Run
 // lifecycle events. Every operation must be idempotent. EnsureAccepted may be
 // repeated after an uncertain response or environment resume; Cancel succeeds
-// when work is already absent or terminal.
+// when work is already absent or terminal and returns
+// ErrAdapterCancellationPending while its execution tree is still stopping.
 type AdapterLifecycle interface {
 	EnsureAccepted(context.Context, AdapterTask, AdapterSandbox) error
 	Observe(context.Context, AdapterTask, AdapterSandbox) (AdapterObservation, string, error)
@@ -80,12 +101,14 @@ type AdapterLifecycle interface {
 // and declared-service processes inside the Environment.
 type RunReconciler struct {
 	client.Client
-	Scheme   *runtime.Scheme
-	Adapters map[string]AdapterLifecycle
+	Scheme    *runtime.Scheme
+	Adapters  map[string]AdapterLifecycle
+	EventSink AdapterEventSink
 }
 
 // +kubebuilder:rbac:groups=swe.dev,resources=runs,verbs=get;list;watch;update;patch
 // +kubebuilder:rbac:groups=swe.dev,resources=runs/status,verbs=get;update;patch
+// +kubebuilder:rbac:groups=swe.dev,resources=runs/transcript,verbs=update
 // +kubebuilder:rbac:groups=swe.dev,resources=environments,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=swe.dev,resources=environments/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=swe.dev,resources=projects,verbs=get;list;watch
@@ -177,6 +200,9 @@ func (r *RunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.R
 				return r.requestEnvironmentFence(ctx, env)
 			}
 			if err := adapter.Cancel(ctx, adapterTask(&run), r.adapterSandbox(&run, env)); err != nil {
+				if errors.Is(err, ErrAdapterCancellationPending) {
+					return ctrl.Result{RequeueAfter: adapterPollInterval}, nil
+				}
 				return ctrl.Result{}, err
 			}
 		}
@@ -574,6 +600,9 @@ func (r *RunReconciler) cleanupTerminal(ctx context.Context, run *platformv1alph
 			return r.requestEnvironmentFence(ctx, env)
 		}
 		if err := adapter.Cancel(ctx, adapterTask(run), r.adapterSandbox(run, env)); err != nil {
+			if errors.Is(err, ErrAdapterCancellationPending) {
+				return ctrl.Result{RequeueAfter: adapterPollInterval}, nil
+			}
 			return ctrl.Result{}, err
 		}
 	}
@@ -628,6 +657,9 @@ func (r *RunReconciler) finalize(ctx context.Context, run *platformv1alpha1.Run)
 					return r.requestEnvironmentFence(ctx, env)
 				}
 				if err := adapter.Cancel(ctx, adapterTask(run), r.adapterSandbox(run, env)); err != nil {
+					if errors.Is(err, ErrAdapterCancellationPending) {
+						return ctrl.Result{RequeueAfter: adapterPollInterval}, nil
+					}
 					return ctrl.Result{}, err
 				}
 			}
@@ -698,7 +730,7 @@ func adapterTask(run *platformv1alpha1.Run) AdapterTask {
 }
 
 func (r *RunReconciler) adapterSandbox(run *platformv1alpha1.Run, env *platformv1alpha1.Environment) AdapterSandbox {
-	return AdapterSandbox{EnvironmentName: env.Name, EnvironmentUID: env.UID,
+	sandbox := AdapterSandbox{EnvironmentName: env.Name, EnvironmentUID: env.UID,
 		DialProcess: func(ctx context.Context) (sandboxdv1.ProcessServiceClient, func() error, error) {
 			current, err := r.getAllocatedEnvironment(ctx, run)
 			if err != nil {
@@ -706,6 +738,12 @@ func (r *RunReconciler) adapterSandbox(run *platformv1alpha1.Run, env *platformv
 			}
 			return (sandboxclient.Connector{Reader: r.Client}).DialProcess(ctx, current.Namespace, current.Name, current.UID)
 		}}
+	if r.EventSink != nil {
+		sandbox.EmitEvent = func(ctx context.Context, event AdapterEvent) error {
+			return r.EventSink.Append(ctx, run.Namespace, run.Name, event)
+		}
+	}
+	return sandbox
 }
 
 // SetupWithManager registers Run watches. Owned Environments enqueue through

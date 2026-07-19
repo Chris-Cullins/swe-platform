@@ -85,6 +85,12 @@ the proxy must overwrite (not append or pass through) both. Non-browser WebSocke
 without `Origin` are allowed only with an explicit bearer credential. Tokens are never
 accepted in query parameters.
 
+When the control plane is enabled, the chart projects a rotating `swe-platform`-audience
+service-account token into the operator and grants that identity `update` on
+`runs/transcript`. The operator uses it only to forward opaque adapter events to the
+control-plane Service. This platform transport credential is separate from agent provider
+credentials, which are never added by the chart or adapter.
+
 For initial self-hosted setup, an optional static bootstrap token provides all control-plane
 API permissions. Create it out of band and reference it during installation:
 
