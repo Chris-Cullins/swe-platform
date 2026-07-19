@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"slices"
 	"sync"
 	"time"
 	"unsafe"
@@ -53,14 +54,17 @@ func (d *processDomain) start() error {
 		return err
 	}
 	files := []*os.File{d.cmd.Stdin.(*os.File), d.cmd.Stdout.(*os.File), d.cmd.Stderr.(*os.File)}
-	handles := make([]windows.Handle, len(files))
-	for i, f := range files {
-		handles[i] = windows.Handle(f.Fd())
-		if err = windows.SetHandleInformation(handles[i], windows.HANDLE_FLAG_INHERIT, windows.HANDLE_FLAG_INHERIT); err != nil {
+	handles := make([]windows.Handle, 0, len(files))
+	for _, f := range files {
+		handle := windows.Handle(f.Fd())
+		if err = windows.SetHandleInformation(handle, windows.HANDLE_FLAG_INHERIT, windows.HANDLE_FLAG_INHERIT); err != nil {
 			windows.CloseHandle(job)
 			return err
 		}
-		defer windows.SetHandleInformation(handles[i], windows.HANDLE_FLAG_INHERIT, 0)
+		defer windows.SetHandleInformation(handle, windows.HANDLE_FLAG_INHERIT, 0)
+		if !slices.Contains(handles, handle) {
+			handles = append(handles, handle)
+		}
 	}
 	if err = attrs.Update(windows.PROC_THREAD_ATTRIBUTE_HANDLE_LIST, unsafe.Pointer(&handles[0]), uintptr(len(handles))*unsafe.Sizeof(handles[0])); err != nil {
 		windows.CloseHandle(job)
@@ -110,7 +114,9 @@ func (d *processDomain) start() error {
 	si := windows.StartupInfoEx{ProcThreadAttributeList: attrs.List()}
 	si.StartupInfo.Cb = uint32(unsafe.Sizeof(si))
 	si.StartupInfo.Flags = windows.STARTF_USESTDHANDLES
-	si.StartupInfo.StdInput, si.StartupInfo.StdOutput, si.StartupInfo.StdErr = handles[0], handles[1], handles[2]
+	si.StartupInfo.StdInput = windows.Handle(files[0].Fd())
+	si.StartupInfo.StdOutput = windows.Handle(files[1].Fd())
+	si.StartupInfo.StdErr = windows.Handle(files[2].Fd())
 	var pi windows.ProcessInformation
 	err = windows.CreateProcess(app, line, nil, nil, true, windows.EXTENDED_STARTUPINFO_PRESENT|windows.CREATE_UNICODE_ENVIRONMENT, &env[0], cwd, &si.StartupInfo, &pi)
 	if err != nil {
