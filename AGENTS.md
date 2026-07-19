@@ -18,8 +18,8 @@ P0 scaffold is in place: CRD types, environment controller, `sandboxd` (exec/fs/
 health and a shared tmux terminal), CLI (`run`/`logs`/`attach`), kind acceptance, CI,
 and a Helm chart for the operator, control plane, and CRDs. The control plane currently
 provides in-memory transcript ingestion and SSE streaming.
-Remaining gaps are marked `TODO(P0/P1/P2)` in code — most notably setup-hook execution,
-agent credential injection, and agent adapters.
+Remaining gaps are marked `TODO(P0/P1/P2)` in code — most notably agent
+adapters, GitHub App–scoped git tokens, and egress/portal networking.
 
 ## Architecture invariants — do not violate these
 
@@ -52,6 +52,28 @@ agent credential injection, and agent adapters.
   the CRD sketch in `docs/ARCHITECTURE.md` when you change fields.
 - **CLI-first:** every user-facing feature needs a CLI path before any UI work.
 - **Minimal changes:** match existing style; don't refactor beyond the task.
+
+## Sync checklist
+
+Several files must move in lockstep, and CI only enforces some of the pairings.
+When a change touches one side of a row, update the other side **in the same
+commit**:
+
+- **CRD field changes** → `make generate manifests` (deepcopy + CRDs + RBAC; CI
+  diffs `charts/swe-platform/crds`) and migrate the CRD sketch in
+  `docs/ARCHITECTURE.md`.
+- **Chart values/template changes** → review every `values-*.yaml` preset —
+  `kind` uses locally loaded `:dev`, `argocd` tracks `:latest` for the Argo
+  mirror, `k3s`/`gke`/`eks` stay immutable on the chart `appVersion` — plus the
+  preset table in the chart README.
+- **New values preset** → add it to the lint loop in `ci.yaml`; add it to the
+  production immutability check only if it pins `appVersion`.
+- **New image** → `Makefile` `docker-build-*` target, the `publish-images.yaml`
+  matrix, and `hack/argocd/imageupdater.yaml` if the mirror should roll it on
+  new `:latest` digests.
+- **New user-facing feature** → CLI path first, then extend `hack/e2e.sh`
+  acceptance coverage.
+- **Tooling, structure, or workflow changes** → update this file.
 
 ## Build & test
 
