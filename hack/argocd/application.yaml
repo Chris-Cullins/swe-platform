@@ -1,0 +1,31 @@
+# Argo CD Application tracking this repository's main branch. Applied by
+# hack/argocd-up.sh into the swe-argo kind cluster.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: swe-platform
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/Chris-Cullins/swe-platform.git
+    targetRevision: main
+    path: charts/swe-platform
+    helm:
+      valueFiles:
+        - values-argocd.yaml
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: swe-platform-system
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+    retry:
+      limit: 10
+      backoff:
+        duration: 10s
+        factor: 2
+        maxDuration: 5m

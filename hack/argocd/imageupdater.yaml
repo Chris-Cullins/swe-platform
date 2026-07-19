@@ -1,0 +1,29 @@
+# Rolls the swe-platform operator and control plane whenever GHCR publishes a
+# new :latest digest from main. The digest strategy pins the tag parameter to
+# latest@sha256:<digest> on the Application, which Argo CD then syncs.
+# env-base is covered separately: environment pods always re-pull :latest.
+apiVersion: argocd-image-updater.argoproj.io/v1alpha1
+kind: ImageUpdater
+metadata:
+  name: swe-platform
+  namespace: argocd
+spec:
+  applicationRefs:
+    - namePattern: swe-platform
+      images:
+        - alias: operator
+          imageName: ghcr.io/chris-cullins/swe-platform/operator:latest
+          commonUpdateSettings:
+            updateStrategy: digest
+          manifestTargets:
+            helm:
+              name: image.repository
+              tag: image.tag
+        - alias: controlplane
+          imageName: ghcr.io/chris-cullins/swe-platform/control-plane:latest
+          commonUpdateSettings:
+            updateStrategy: digest
+          manifestTargets:
+            helm:
+              name: controlPlane.image.repository
+              tag: controlPlane.image.tag

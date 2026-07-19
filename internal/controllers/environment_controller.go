@@ -575,6 +575,23 @@ func (r *EnvironmentReconciler) ensureWorkspacePVC(ctx context.Context, env *pla
 	return true, nil
 }
 
+// envImagePullPolicy applies the Kubernetes default pull-policy convention to
+// environment images: mutable :latest (or untagged, which implies :latest)
+// references must re-pull so a long-lived cluster does not pin a stale image;
+// immutable tags, including the locally kind-loaded :dev, and digest
+// references use the node cache.
+func envImagePullPolicy(image string) corev1.PullPolicy {
+	if strings.Contains(image, "@") {
+		return corev1.PullIfNotPresent
+	}
+	if i := strings.LastIndex(image, ":"); i >= 0 && !strings.Contains(image[i:], "/") {
+		if image[i+1:] != "latest" {
+			return corev1.PullIfNotPresent
+		}
+	}
+	return corev1.PullAlways
+}
+
 // ensurePod returns the backing pod, creating it if necessary.
 func (r *EnvironmentReconciler) ensurePod(ctx context.Context, env *platformv1alpha1.Environment, tmpl *platformv1alpha1.EnvironmentTemplate) (*corev1.Pod, error) {
 	podName := envPodName(env)
@@ -683,10 +700,10 @@ func (r *EnvironmentReconciler) ensurePod(ctx context.Context, env *platformv1al
 			SecurityContext: &corev1.PodSecurityContext{
 				SeccompProfile: &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault},
 			},
-			Containers: []corev1.Container{{
-				Name:            "environment",
-				Image:           tmpl.Spec.Image,
-				ImagePullPolicy: corev1.PullIfNotPresent,
+		Containers: []corev1.Container{{
+			Name:            "environment",
+			Image:           tmpl.Spec.Image,
+			ImagePullPolicy: envImagePullPolicy(tmpl.Spec.Image),
 				Command:         []string{"sandboxd", "serve"},
 				Args: []string{
 					"-tls-cert=" + sandboxdCredentialMount + "/" + sandboxdauth.TLSCertKey,
@@ -773,7 +790,7 @@ func (r *EnvironmentReconciler) ensurePod(ctx context.Context, env *platformv1al
 		pod.Spec.InitContainers = []corev1.Container{{
 			Name:                     "project-setup",
 			Image:                    tmpl.Spec.Image,
-			ImagePullPolicy:          corev1.PullIfNotPresent,
+			ImagePullPolicy:          envImagePullPolicy(tmpl.Spec.Image),
 			Command:                  []string{"/bin/sh", "-c", projectSetupScript},
 			Env:                      projectEnv,
 			TerminationMessagePolicy: corev1.TerminationMessageFallbackToLogsOnError,
