@@ -160,10 +160,10 @@ func TestTmuxSessionEncodesBinaryInputAndResize(t *testing.T) {
 	if len(lines) != 3 {
 		t.Fatalf("control-mode commands = %d, want 3", len(lines))
 	}
-	if got := string(lines[0]); got != sendKeysCommand(input[:512]) {
+	if got := string(lines[0]); got != sendKeysCommand(input[:tmuxSendKeysChunkBytes]) {
 		t.Fatalf("first input command was not binary-safe")
 	}
-	if got := string(lines[1]); got != sendKeysCommand(input[512:]) {
+	if got := string(lines[1]); got != sendKeysCommand(input[tmuxSendKeysChunkBytes:]) {
 		t.Fatalf("second input command = %q", got)
 	}
 	if got := string(lines[2]); got != "refresh-client -C 120,40" {
@@ -205,6 +205,10 @@ func TestTmuxOutputDecodesBinaryData(t *testing.T) {
 	want := []byte{'A', 0x00, '\\', 0xff, 'Z'}
 	if !bytes.Equal(got, want) {
 		t.Fatalf("decoded output = %v, want %v", got, want)
+	}
+	got, ok = tmuxOutput("%output %0 trailing\\")
+	if !ok || string(got) != "trailing\\" {
+		t.Fatalf("decoded trailing backslash = (%q, %t), want preserved backslash", got, ok)
 	}
 	if _, ok := tmuxOutput("%begin 1 2 3"); ok {
 		t.Fatal("decoded a non-output control record")

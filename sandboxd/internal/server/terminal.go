@@ -21,6 +21,7 @@ import (
 const defaultTmuxSocket = "swe-platform"
 const tmuxEnableOutputDrainCommand = "pipe-pane -t swe: 'cat >/dev/null'"
 const tmuxOutputDrainReady = "swe-output-drain-ready:"
+const tmuxSendKeysChunkBytes = 512
 
 var errTerminalUnavailable = errors.New("terminal backend unavailable")
 
@@ -312,7 +313,7 @@ func (s *tmuxTerminalSession) Read() ([]byte, error) {
 
 func (s *tmuxTerminalSession) Write(data []byte) error {
 	for len(data) > 0 {
-		n := min(len(data), 512)
+		n := min(len(data), tmuxSendKeysChunkBytes)
 		if err := s.writeCommand(sendKeysCommand(data[:n])); err != nil {
 			return err
 		}
@@ -392,6 +393,8 @@ func tmuxOutput(line string) ([]byte, bool) {
 		if i+1 < len(escaped) {
 			i++
 			data = append(data, escaped[i])
+		} else {
+			data = append(data, '\\')
 		}
 	}
 	return data, true

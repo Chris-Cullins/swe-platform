@@ -17,6 +17,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -39,10 +40,11 @@ import (
 )
 
 func TestWebTerminalBridgesSandboxd(t *testing.T) {
-	backend := &terminalTestServer{}
+	backend := &terminalTestServer{requireHealth: true}
 	listener := bufconn.Listen(1024 * 1024)
 	grpcServer := grpc.NewServer()
 	sandboxdv1.RegisterTerminalServiceServer(grpcServer, backend)
+	sandboxdv1.RegisterHealthServiceServer(grpcServer, backend)
 	go func() { _ = grpcServer.Serve(listener) }()
 	t.Cleanup(grpcServer.Stop)
 
@@ -53,7 +55,10 @@ func TestWebTerminalBridgesSandboxd(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = connection.Close() })
-	dialer := &terminalTestDialer{client: sandboxdv1.NewTerminalServiceClient(connection)}
+	dialer := &terminalTestDialer{
+		client: sandboxdv1.NewTerminalServiceClient(connection),
+		health: sandboxdv1.NewHealthServiceClient(connection),
+	}
 	server := httptest.NewServer(NewServer(nil, ServerOptions{Access: &fakeAccess{}, TerminalDialer: dialer}).Handler())
 	t.Cleanup(server.Close)
 
@@ -94,6 +99,53 @@ func TestWebTerminalBridgesSandboxd(t *testing.T) {
 	}
 	if string(backend.input) != "echo hello\n" {
 		t.Fatalf("sandboxd input = %q, want echo hello", backend.input)
+	}
+}
+
+func TestBridgeWebTerminalTreatsCausalNormalClientCloseAsClean(t *testing.T) {
+	listener := bufconn.Listen(1024 * 1024)
+	grpcServer := grpc.NewServer()
+	sandboxdv1.RegisterTerminalServiceServer(grpcServer, &terminalCancelServer{})
+	go func() { _ = grpcServer.Serve(listener) }()
+	t.Cleanup(grpcServer.Stop)
+	backendConnection, err := grpc.NewClient("passthrough:///bufconn", grpc.WithContextDialer(func(context.Context, string) (net.Conn, error) {
+		return listener.Dial()
+	}), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = backendConnection.Close() })
+
+	bridgeResult := make(chan error, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		connection, err := terminalUpgrader.Upgrade(w, r, nil)
+		if err != nil {
+			bridgeResult <- err
+			return
+		}
+		defer connection.Close()
+		bridgeResult <- bridgeWebTerminal(r.Context(), connection, sandboxdv1.NewTerminalServiceClient(backendConnection))
+	}))
+	t.Cleanup(server.Close)
+
+	connection, _, err := websocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(server.URL, "http"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = connection.Close() })
+	if err := connection.WriteJSON(terminalControl{Type: "open", Cols: 80, Rows: 24}); err != nil {
+		t.Fatal(err)
+	}
+	if err := connection.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""), time.Now().Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-bridgeResult:
+		if err != nil {
+			t.Fatalf("bridge error after normal client close = %v, want nil", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("bridge did not stop after normal client close")
 	}
 }
 
@@ -191,6 +243,50 @@ func TestWebTerminalRequiresDialer(t *testing.T) {
 	NewServer(nil, ServerOptions{Access: &fakeAccess{}}).Handler().ServeHTTP(response, request)
 	if response.Code != 503 {
 		t.Fatalf("status = %d, want 503", response.Code)
+	}
+}
+
+func TestWebTerminalChecksSandboxdHealthBeforeUpgrade(t *testing.T) {
+	checked := make(chan struct{})
+	closed := make(chan struct{})
+	dialer := &terminalTestDialer{
+		health: terminalTestHealthClient{check: func(ctx context.Context) (*sandboxdv1.HealthCheckResponse, error) {
+			defer close(checked)
+			deadline, ok := ctx.Deadline()
+			remaining := time.Until(deadline)
+			if !ok || remaining <= 0 || remaining > terminalHealthTimeout {
+				return nil, errors.New("health check has no bounded deadline")
+			}
+			return nil, errors.New("sandboxd unavailable")
+		}},
+		closer: closeFunc(func() error {
+			close(closed)
+			return nil
+		}),
+	}
+	server := httptest.NewServer(NewServer(nil, ServerOptions{Access: &fakeAccess{}, TerminalDialer: dialer}).Handler())
+	t.Cleanup(server.Close)
+
+	websocketURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/api/v1/namespaces/project-1/environments/env-1/terminal"
+	connection, response, err := websocket.DefaultDialer.Dial(websocketURL, http.Header{"Authorization": []string{"Bearer reader"}})
+	if connection != nil {
+		_ = connection.Close()
+	}
+	if err == nil {
+		t.Fatal("terminal upgraded despite failed sandboxd health check")
+	}
+	if response == nil || response.StatusCode != http.StatusBadGateway {
+		t.Fatalf("pre-upgrade response = %#v, want HTTP 502", response)
+	}
+	select {
+	case <-checked:
+	default:
+		t.Fatal("sandboxd health was not checked")
+	}
+	select {
+	case <-closed:
+	default:
+		t.Fatal("sandboxd connection was not closed after failed health check")
 	}
 }
 
@@ -346,7 +442,7 @@ func TestKubernetesTerminalDialerUsesRecreatedPodCredentialsAfterWake(t *testing
 	baseClient := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(environment).WithObjects(environment, template, newPod).Build()
 	dialer := KubernetesTerminalDialer{Client: wakeReadyClient{Client: baseClient, podName: newPod.Name}}
 
-	_, closer, err := dialer.DialTerminal(context.Background(), environment.Namespace, environment.Name)
+	_, _, closer, err := dialer.DialTerminal(context.Background(), environment.Namespace, environment.Name)
 	if err != nil {
 		t.Fatalf("DialTerminal() error = %v; wake did not use the recreated pod credential bundle", err)
 	}
@@ -391,7 +487,7 @@ func TestTerminalHeartbeatProtectsSlowWakeBeforeConnection(t *testing.T) {
 	wakeClient := &heartbeatWakeReadyClient{activityCountingClient: activityClient, podName: pod.Name, minimumActivityWrites: 3}
 	dialer := KubernetesTerminalDialer{Client: wakeClient}
 
-	_, closer, err := dialer.DialTerminal(context.Background(), environment.Namespace, environment.Name)
+	_, _, closer, err := dialer.DialTerminal(context.Background(), environment.Namespace, environment.Name)
 	if err != nil {
 		t.Fatalf("DialTerminal() error = %v", err)
 	}
@@ -442,7 +538,7 @@ func TestTerminalHeartbeatCancelsWhenWakeOrDialFails(t *testing.T) {
 			}
 			dialer := KubernetesTerminalDialer{Client: kubeClient}
 
-			if _, _, err := dialer.DialTerminal(context.Background(), environment.Namespace, environment.Name); err == nil {
+			if _, _, _, err := dialer.DialTerminal(context.Background(), environment.Namespace, environment.Name); err == nil {
 				t.Fatalf("DialTerminal() succeeded during %s failure", test.name)
 			}
 			writesAfterFailure := waitForActivityWritesToQuiesce(t, activityClient, 60*time.Millisecond)
@@ -719,7 +815,7 @@ func TestKubernetesTerminalDialerRejectsPodOwnedByAnotherEnvironmentIncarnation(
 	template := &platformv1alpha1.EnvironmentTemplate{ObjectMeta: metav1.ObjectMeta{Name: "default", Namespace: "project-1"}}
 	dialer := KubernetesTerminalDialer{Client: fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(environment).WithObjects(environment, pod, template).Build()}
 
-	_, _, err := dialer.DialTerminal(context.Background(), "project-1", "env-1")
+	_, _, _, err := dialer.DialTerminal(context.Background(), "project-1", "env-1")
 	if err == nil || !strings.Contains(err.Error(), "not owned by the current environment") {
 		t.Fatalf("DialTerminal() error = %v, want stale pod rejection", err)
 	}
@@ -730,33 +826,49 @@ func ptrTo[T any](value T) *T { return &value }
 type terminalTestDialer struct {
 	mu          sync.Mutex
 	client      sandboxdv1.TerminalServiceClient
+	health      sandboxdv1.HealthServiceClient
 	closer      io.Closer
 	namespace   string
 	environment string
 	calls       int
 }
 
-func (d *terminalTestDialer) DialTerminal(_ context.Context, namespace, environment string) (sandboxdv1.TerminalServiceClient, io.Closer, error) {
+func (d *terminalTestDialer) DialTerminal(_ context.Context, namespace, environment string) (sandboxdv1.TerminalServiceClient, sandboxdv1.HealthServiceClient, io.Closer, error) {
 	d.mu.Lock()
 	d.calls++
 	d.namespace = namespace
 	d.environment = environment
 	d.mu.Unlock()
+	health := d.health
+	if health == nil {
+		health = terminalTestHealthClient{}
+	}
 	closer := d.closer
 	if closer == nil {
 		closer = io.NopCloser(strings.NewReader(""))
 	}
-	return d.client, closer, nil
+	return d.client, health, closer, nil
 }
 
 type terminalTestServer struct {
 	sandboxdv1.UnimplementedTerminalServiceServer
-	open   *sandboxdv1.TerminalOpen
-	resize *sandboxdv1.TerminalResize
-	input  []byte
+	sandboxdv1.UnimplementedHealthServiceServer
+	requireHealth bool
+	healthChecked atomic.Bool
+	open          *sandboxdv1.TerminalOpen
+	resize        *sandboxdv1.TerminalResize
+	input         []byte
+}
+
+func (s *terminalTestServer) Check(context.Context, *sandboxdv1.HealthCheckRequest) (*sandboxdv1.HealthCheckResponse, error) {
+	s.healthChecked.Store(true)
+	return &sandboxdv1.HealthCheckResponse{Ok: true}, nil
 }
 
 func (s *terminalTestServer) Terminal(stream sandboxdv1.TerminalService_TerminalServer) error {
+	if s.requireHealth && !s.healthChecked.Load() {
+		return errors.New("terminal opened before health check")
+	}
 	message, err := stream.Recv()
 	if err != nil {
 		return err
@@ -773,4 +885,31 @@ func (s *terminalTestServer) Terminal(stream sandboxdv1.TerminalService_Terminal
 	}
 	s.input = append([]byte(nil), message.GetData()...)
 	return stream.Send(&sandboxdv1.TerminalMessage{Kind: &sandboxdv1.TerminalMessage_Data{Data: []byte("terminal output")}})
+}
+
+type terminalCancelServer struct {
+	sandboxdv1.UnimplementedTerminalServiceServer
+}
+
+func (*terminalCancelServer) Terminal(stream sandboxdv1.TerminalService_TerminalServer) error {
+	message, err := stream.Recv()
+	if err != nil {
+		return err
+	}
+	if message.GetOpen() == nil {
+		return errors.New("missing terminal open")
+	}
+	<-stream.Context().Done()
+	return stream.Context().Err()
+}
+
+type terminalTestHealthClient struct {
+	check func(context.Context) (*sandboxdv1.HealthCheckResponse, error)
+}
+
+func (c terminalTestHealthClient) Check(ctx context.Context, _ *sandboxdv1.HealthCheckRequest, _ ...grpc.CallOption) (*sandboxdv1.HealthCheckResponse, error) {
+	if c.check != nil {
+		return c.check(ctx)
+	}
+	return &sandboxdv1.HealthCheckResponse{Ok: true}, nil
 }

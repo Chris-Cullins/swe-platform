@@ -26,7 +26,8 @@ func newLogsCommand() *cobra.Command {
 }
 
 // streamLogs follows the logs of the environment pod.
-// TODO(P1): stream the agent transcript via the control plane instead of raw pod logs.
+// TODO(#57): define a compatible Run-selecting transcript mode before replacing
+// this kubeconfig-authenticated Environment log stream.
 func streamLogs(cmd *cobra.Command, namespace, envName string) error {
 	clients, err := newKubeClients()
 	if err != nil {

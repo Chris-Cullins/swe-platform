@@ -540,6 +540,14 @@ func TestChildNamesAreBoundedAndScopedToEnvironmentUID(t *testing.T) {
 	if envPodName(first) == envPodName(second) || envPVCName(first) == envPVCName(second) {
 		t.Fatal("same-name Environment recreations share child names")
 	}
+	firstLabel := envLabels(first)["swe.dev/environment"]
+	secondLabel := envLabels(second)["swe.dev/environment"]
+	if problems := validation.IsValidLabelValue(firstLabel); len(problems) != 0 {
+		t.Fatalf("long Environment label %q is invalid: %v", firstLabel, problems)
+	}
+	if firstLabel == secondLabel {
+		t.Fatal("same-name Environment recreations share selector labels")
+	}
 
 	legacy := &platformv1alpha1.Environment{ObjectMeta: metav1.ObjectMeta{Name: strings.Repeat("a", 63), UID: "legacy-uid"}}
 	wantPodName := "env-" + legacy.Name
@@ -554,6 +562,9 @@ func TestChildNamesAreBoundedAndScopedToEnvironmentUID(t *testing.T) {
 		if problems := validation.IsDNS1123Subdomain(name); len(problems) != 0 {
 			t.Errorf("legacy child name %q is invalid: %v", name, problems)
 		}
+	}
+	if got := envLabels(legacy)["swe.dev/environment"]; got != legacy.Name {
+		t.Fatalf("63-character Environment label = %q, want preserved name", got)
 	}
 }
 
