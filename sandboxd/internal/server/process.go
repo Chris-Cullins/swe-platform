@@ -399,7 +399,7 @@ func (s *ProcessServer) shutdownManaged(key processKey, p *managedProcess) {
 	leaderWaited := p.leaderWaited
 	s.mu.Unlock()
 	if leaderWaited {
-		s.finalizeWait(key, p)
+		go s.finalizeWait(key, p)
 	}
 }
 
