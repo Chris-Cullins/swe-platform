@@ -8,6 +8,27 @@ on:
 permissions: {}
 
 jobs:
+  operations-console:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24.18.0"
+          cache: npm
+          cache-dependency-path: ui/package-lock.json
+      - name: Verify bundled npm
+        run: test "$(npm --version)" = "11.16.0"
+      - name: Install and check operations console
+        working-directory: ui
+        run: |
+          npm ci
+          npm run lint
+          npm run typecheck
+          npm test -- --run
+          npm run build
+          npm audit
+
   sandboxd-windows:
     runs-on: windows-latest
     steps:
