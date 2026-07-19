@@ -21,6 +21,7 @@ func TestConsoleServesEntryPointFallbackAndAssets(t *testing.T) {
 		wantType    string
 	}{
 		{name: "entry point", requestPath: "/", wantBody: testConsoleIndex, wantCache: "no-store", wantType: "text/html; charset=utf-8"},
+		{name: "direct entry point", requestPath: "/index.html", wantBody: testConsoleIndex, wantCache: "no-store", wantType: "text/html; charset=utf-8"},
 		{name: "client route fallback", requestPath: "/namespaces/default/runs/run-1/overview", wantBody: testConsoleIndex, wantCache: "no-store", wantType: "text/html; charset=utf-8"},
 		{name: "hashed Vite asset", requestPath: "/assets/index-AbCdEf12.js", wantBody: "console.log('ok')", wantCache: "public, max-age=31536000, immutable", wantType: "text/javascript; charset=utf-8"},
 		{name: "other asset", requestPath: "/favicon.svg", wantBody: "<svg></svg>", wantCache: "no-cache", wantType: "image/svg+xml"},
@@ -74,31 +75,44 @@ func TestConsoleFallbackDoesNotSwallowServerRoutesOrMethods(t *testing.T) {
 	}
 }
 
-func TestConsoleRejectsMissingAndTraversalAssetPaths(t *testing.T) {
+func TestConsoleRejectsMissingAssetPaths(t *testing.T) {
 	handler := NewServer(nil, ServerOptions{ConsoleAssets: testConsoleAssets()}).Handler()
-	for _, requestPath := range []string{
-		"/assets",
-		"/assets/missing.js",
-		"/assets/%2e%2e/index.html",
-		"/assets/..%5cindex.html",
-	} {
+	for _, method := range []string{http.MethodGet, http.MethodHead} {
+		for _, requestPath := range []string{"/assets/missing.js", "/manifest.webmanifest"} {
+			response := requestConsole(handler, method, requestPath)
+			if response.Code != http.StatusNotFound {
+				t.Fatalf("%s %s status = %d, want %d", method, requestPath, response.Code, http.StatusNotFound)
+			}
+			if response.Header().Get("Cache-Control") != "no-store" {
+				t.Fatalf("%s %s Cache-Control = %q, want no-store", method, requestPath, response.Header().Get("Cache-Control"))
+			}
+			if strings.Contains(response.Body.String(), testConsoleIndex) {
+				t.Fatalf("%s %s exposed the SPA entry point", method, requestPath)
+			}
+		}
+	}
+}
+
+func TestConsoleRejectsDirectoriesAndTraversal(t *testing.T) {
+	handler := NewServer(nil, ServerOptions{ConsoleAssets: testConsoleAssets()}).Handler()
+	for _, requestPath := range []string{"/assets", "/assets/%2e%2e/index.html", "/assets/..%5cindex.html"} {
 		response := requestConsole(handler, http.MethodGet, requestPath)
 		if response.Code != http.StatusNotFound {
 			t.Fatalf("%s status = %d, want %d", requestPath, response.Code, http.StatusNotFound)
-		}
-		if strings.Contains(response.Body.String(), testConsoleIndex) {
-			t.Fatalf("%s exposed the SPA entry point", requestPath)
 		}
 	}
 }
 
 func TestConsoleSupportsHeadWithoutBody(t *testing.T) {
-	response := requestConsole(NewServer(nil, ServerOptions{ConsoleAssets: testConsoleAssets()}).Handler(), http.MethodHead, "/")
-	if response.Code != http.StatusOK || response.Body.Len() != 0 {
-		t.Fatalf("HEAD status/body = %d/%q, want 200 with an empty body", response.Code, response.Body.String())
-	}
-	if response.Header().Get("Cache-Control") != "no-store" {
-		t.Fatalf("Cache-Control = %q, want no-store", response.Header().Get("Cache-Control"))
+	handler := NewServer(nil, ServerOptions{ConsoleAssets: testConsoleAssets()}).Handler()
+	for _, requestPath := range []string{"/", "/index.html", "/namespaces/default/runs/run-1/overview"} {
+		response := requestConsole(handler, http.MethodHead, requestPath)
+		if response.Code != http.StatusOK || response.Body.Len() != 0 {
+			t.Fatalf("HEAD %s status/body = %d/%q, want 200 with an empty body", requestPath, response.Code, response.Body.String())
+		}
+		if response.Header().Get("Cache-Control") != "no-store" {
+			t.Fatalf("HEAD %s Cache-Control = %q, want no-store", requestPath, response.Header().Get("Cache-Control"))
+		}
 	}
 }
 
@@ -131,10 +145,13 @@ func assertConsoleSecurityHeaders(t *testing.T, header http.Header) {
 		}
 	}
 	csp := header.Get("Content-Security-Policy")
-	for _, directive := range []string{"default-src 'none'", "script-src 'self'", "style-src 'self' 'unsafe-inline'", "connect-src 'self' ws: wss:", "frame-ancestors 'none'"} {
+	for _, directive := range []string{"default-src 'none'", "script-src 'self'", "style-src 'self' 'unsafe-inline'", "connect-src 'self'", "frame-ancestors 'none'"} {
 		if !strings.Contains(csp, directive) {
 			t.Errorf("Content-Security-Policy %q does not contain %q", csp, directive)
 		}
+	}
+	if strings.Contains(csp, " ws:") || strings.Contains(csp, " wss:") {
+		t.Errorf("Content-Security-Policy permits WebSockets to arbitrary hosts: %q", csp)
 	}
 	if strings.Contains(csp, "script-src 'self' 'unsafe-inline'") || strings.Contains(csp, "'unsafe-eval'") {
 		t.Errorf("Content-Security-Policy is weaker than the Vite output requires: %q", csp)

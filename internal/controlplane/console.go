@@ -14,10 +14,8 @@ import (
 
 // xterm's DOM renderer creates generated style elements for dimensions, ANSI
 // colors, and cursor state, so styles need unsafe-inline. Scripts remain
-// self-only. The ws/wss sources keep same-origin terminals working in browsers
-// that do not treat a scheme-changing WebSocket URL as 'self'; the terminal
-// handler still enforces its existing same-origin policy before upgrading.
-const consoleCSP = "default-src 'none'; base-uri 'none'; connect-src 'self' ws: wss:; font-src 'self' data:; form-action 'self'; frame-ancestors 'none'; img-src 'self' data:; manifest-src 'self'; object-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; worker-src 'none'"
+// self-only.
+const consoleCSP = "default-src 'none'; base-uri 'none'; connect-src 'self'; font-src 'self' data:; form-action 'self'; frame-ancestors 'none'; img-src 'self' data:; manifest-src 'self'; object-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; worker-src 'none'"
 
 var viteHashedAsset = regexp.MustCompile(`^assets/(?:.*/)?[^/]+-[A-Za-z0-9_-]{8,}\.[^/]+$`)
 
@@ -50,7 +48,7 @@ func (h *consoleHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	name := strings.TrimPrefix(r.URL.Path, "/")
-	if name == "" {
+	if name == "" || name == "index.html" {
 		h.serve(w, r, "index.html", h.index, "no-store")
 		return
 	}
@@ -84,7 +82,7 @@ func (h *consoleHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "operations console is unavailable", http.StatusInternalServerError)
 		return
 	}
-	if strings.HasPrefix(name, "assets/") {
+	if strings.HasPrefix(name, "assets/") || path.Ext(name) != "" {
 		w.Header().Set("Cache-Control", "no-store")
 		http.NotFound(w, r)
 		return
