@@ -14,8 +14,9 @@ with a reviewable diff, branch, or PR.
 > plane's WebSocket terminal endpoint connect to a shared tmux session through `sandboxd`;
 > pause/resume preserves workspace disks and runs repository resume hooks, and idle
 > environments pause automatically before terminal requests wake them. Template warm
-> pools keep unclaimed environments ready for `swe run` to claim. Agent adapters
-> and portal proxying are not built yet. The Helm chart installs the
+> pools keep unclaimed environments ready for `swe run` to claim. The first agent adapter
+> runs Claude Code through sandboxd's managed-process API. Portal proxying is not built yet.
+> The Helm chart installs the
 > operator, control plane, and CRDs. Values presets
 > cover kind, k3s, GKE with GKE Sandbox, and EKS.
 
@@ -160,6 +161,36 @@ swe run --name fix-flaky-42 --project org-repo "Fix the flaky test"
 swe run --environment warm-env-1 "Fix the flaky test"
 swe cancel fix-flaky-42
 ```
+
+### Claude Code adapter
+
+`claude-code` is the default `swe run` adapter. It starts one non-interactive `claude`
+process keyed by the immutable Run UID, observes and cancels that process through sandboxd,
+and restarts the same task identity in a fresh sandboxd epoch after an Environment resume.
+The coordinated `env-base` image includes a pinned Claude Code CLI. Custom Environment
+images must provide a compatible `claude` executable on `PATH`.
+
+The adapter runs Claude Code in print mode with stream JSON output and unattended
+permissions inside the isolated Environment. Bounded stdout/stderr chunks are forwarded as
+opaque `claude-code.process-output` transcript events when the control plane is enabled.
+Those events retain sandboxd's absolute stream offsets and observable gap metadata; consumers
+use offsets rather than transcript append order to reconstruct output after a controller retry.
+The process output and sandboxd records are epoch-local; the workspace PVC and already
+ingested transcript events survive pause. A resumed run therefore restarts the prompt against
+the preserved workspace rather than checkpointing the old Claude process or session.
+
+Claude Code authentication must already be available inside the Environment through one of
+Claude Code's supported non-interactive authentication mechanisms. The adapter does not read,
+mount, mint, log, or add credentials, and the image contains none. Adapter-scoped credential
+delivery and GitHub App token minting remain blocked on issue #9; until that exists, operators
+must provision authentication at the Environment layer and accept that it is not yet scoped
+to one adapter process. Never put a credential in a Run prompt.
+
+Current limitations: Claude print mode has no live input continuation channel, so an exit-zero
+successful result remains `Succeeded` even when its history contains permission denials.
+Non-success results, non-zero exits, missing executables, malformed/missing final result
+events, and permanent transcript rejection map to `Failed`. Transcript storage is currently
+process-local to one control-plane replica.
 
 `--name` is the create idempotency key: retry an uncertain request with the same name and
 immutable task arguments. The CLI returns the existing Run only when its intent matches;

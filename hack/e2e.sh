@@ -76,20 +76,30 @@ fi
 WARM_POD_UID=$(kubectl get pod "env-${WARM_ENV_NAME}" -o jsonpath='{.metadata.uid}')
 
 echo "==> creating project configuration"
-kubectl create secret generic e2e-project-config --from-literal=SWE_E2E_PROJECT_CONFIG=project-config-ok
+kubectl create secret generic e2e-project-config \
+	--from-literal=SWE_E2E_PROJECT_CONFIG=project-config-ok \
+	--from-literal=PATH=/workspace/bin:/usr/local/bin:/usr/bin:/bin
 PROJECT_REPO="$(mktemp -d /tmp/swe-e2e-project-XXXXXX)"
 PROJECT_WORKTREE="$(mktemp -d /tmp/swe-e2e-worktree-XXXXXX)"
 git -C "$PROJECT_WORKTREE" init -b main >/dev/null
 git -C "$PROJECT_WORKTREE" config user.name "swe e2e"
 git -C "$PROJECT_WORKTREE" config user.email "swe-e2e@example.invalid"
 mkdir -p "$PROJECT_WORKTREE/.agents"
+mkdir -p "$PROJECT_WORKTREE/bin"
 cat > "$PROJECT_WORKTREE/.agents/setup" <<'EOF'
 printf '%s\n' "$SWE_E2E_PROJECT_CONFIG" >> setup-result
 EOF
 cat > "$PROJECT_WORKTREE/.agents/resume" <<'EOF'
 printf '%s\n' "$SWE_E2E_PROJECT_CONFIG" >> resume-result
 EOF
-git -C "$PROJECT_WORKTREE" add .agents/setup .agents/resume
+cat > "$PROJECT_WORKTREE/bin/claude" <<'EOF'
+#!/bin/sh
+printf '%s\n' '{"type":"system","subtype":"init","session_id":"fake-e2e"}'
+sleep 5
+printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"result":"fake Claude Code completed"}'
+EOF
+chmod +x "$PROJECT_WORKTREE/bin/claude"
+git -C "$PROJECT_WORKTREE" add .agents/setup .agents/resume bin/claude
 git -C "$PROJECT_WORKTREE" commit -m "Add e2e lifecycle hooks" >/dev/null
 git -C "$PROJECT_WORKTREE" bundle create "$PROJECT_REPO/repo.bundle" main
 kubectl create configmap e2e-git-repo --from-file="$PROJECT_REPO/repo.bundle"
@@ -155,7 +165,8 @@ EOF
 echo "==> creating project environment + run intent via swe"
 bin/swe run "end-to-end smoke test" --project e2e --wait=false
 RUN_NAME=$(kubectl get runs -o jsonpath='{.items[0].metadata.name}')
-kubectl wait --for=jsonpath='{.status.state}'=Failed run/"$RUN_NAME" --timeout=3m
+kubectl wait --for=jsonpath='{.status.state}'=Running run/"$RUN_NAME" --timeout=3m
+kubectl wait --for=jsonpath='{.status.state}'=Succeeded run/"$RUN_NAME" --timeout=3m
 RUN_ENV_NAME=$(kubectl get run "$RUN_NAME" -o jsonpath='{.status.environmentRef.name}')
 RUN_ENV_OWNERSHIP=$(kubectl get run "$RUN_NAME" -o jsonpath='{.status.environmentRef.ownership}')
 if [[ "$RUN_ENV_NAME" != "$WARM_ENV_NAME" || "$RUN_ENV_OWNERSHIP" != "Claimed" ]]; then

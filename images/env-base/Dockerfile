@@ -31,6 +31,10 @@ RUN patch -p1 <tmux-control-output-drain.patch \
 	&& make -j"$(nproc)" \
 	&& test "$(./tmux -V)" = "tmux 3.3a-swe-drain"
 
+FROM node:24-bookworm-slim AS claude-code
+ARG CLAUDE_CODE_VERSION=2.1.215
+RUN npm install -g "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}"
+
 # Base image for environments.
 FROM debian:12-slim AS environment
 
@@ -44,6 +48,9 @@ RUN useradd --create-home --uid 10001 swe \
 
 COPY --from=build /out/sandboxd /usr/local/bin/sandboxd
 COPY --from=tmux-build /src/tmux /usr/bin/tmux
+COPY --from=claude-code /usr/local/lib/node_modules/@anthropic-ai /usr/local/lib/node_modules/@anthropic-ai
+COPY --from=claude-code /usr/local/bin/claude /usr/local/bin/claude
+RUN claude --version
 
 USER swe
 WORKDIR /workspace

@@ -26,6 +26,7 @@ type scriptedAdapter struct {
 	observations        []AdapterObservation
 	accepted, cancelled int
 	onCancel            func()
+	cancelErr           error
 }
 
 type failAcceptedStatusClient struct {
@@ -90,7 +91,7 @@ func (a *scriptedAdapter) Cancel(context.Context, AdapterTask, AdapterSandbox) e
 	if a.onCancel != nil {
 		a.onCancel()
 	}
-	return nil
+	return a.cancelErr
 }
 func (a *scriptedAdapter) Observe(context.Context, AdapterTask, AdapterSandbox) (AdapterObservation, string, error) {
 	o := a.observations[0]
@@ -821,6 +822,39 @@ func TestAcceptedUnreachableClaimIsFencedBeforeCancellationCleanup(t *testing.T)
 	}
 	if fencing.Status.ClaimedBy != nil || adapter.cancelled != 0 {
 		t.Fatalf("post-fence claim = %#v, cancellations = %d", fencing.Status.ClaimedBy, adapter.cancelled)
+	}
+}
+
+func TestCancellationPendingRetainsRunAndClaim(t *testing.T) {
+	run := &platformv1alpha1.Run{ObjectMeta: metav1.ObjectMeta{Name: "r", Namespace: "ns", UID: "run-uid", Finalizers: []string{runFinalizer}}, Spec: platformv1alpha1.RunSpec{Agent: "test", Cancel: true}, Status: platformv1alpha1.RunStatus{
+		State:          platformv1alpha1.RunStateAdapterAccepted,
+		EnvironmentRef: &platformv1alpha1.RunEnvironmentReference{Name: "shared", UID: "env-uid", Ownership: platformv1alpha1.EnvironmentOwnershipClaimed},
+		Conditions:     []metav1.Condition{{Type: runConditionAdapterAccepted, Status: metav1.ConditionTrue}},
+	}}
+	env := &platformv1alpha1.Environment{ObjectMeta: metav1.ObjectMeta{Name: "shared", Namespace: "ns", UID: "env-uid"}, Status: platformv1alpha1.EnvironmentStatus{
+		Phase: platformv1alpha1.EnvironmentPhaseReady, PodName: "env-shared", Endpoints: platformv1alpha1.EnvironmentEndpoints{Sandboxd: "10.0.0.1:50051"},
+		ClaimedBy: &platformv1alpha1.RunReference{Name: run.Name, UID: run.UID},
+	}}
+	adapter := &scriptedAdapter{cancelErr: ErrAdapterCancellationPending}
+	r := reconciler(t, adapter, run, env)
+	result, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(run)})
+	if err != nil || result.RequeueAfter != adapterPollInterval {
+		t.Fatalf("pending cancellation = (%#v, %v)", result, err)
+	}
+	var retainedRun platformv1alpha1.Run
+	var retainedEnv platformv1alpha1.Environment
+	if err := r.Get(context.Background(), client.ObjectKeyFromObject(run), &retainedRun); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Get(context.Background(), client.ObjectKeyFromObject(env), &retainedEnv); err != nil {
+		t.Fatal(err)
+	}
+	if retainedRun.Status.State != platformv1alpha1.RunStateAdapterAccepted || retainedEnv.Status.ClaimedBy == nil {
+		t.Fatalf("pending cancellation released state/claim: %s/%#v", retainedRun.Status.State, retainedEnv.Status.ClaimedBy)
+	}
+	adapter.cancelErr = nil
+	if got := reconcileRun(t, r, run.Name); got.Status.State != platformv1alpha1.RunStateCancelled {
+		t.Fatalf("completed cancellation state = %s", got.Status.State)
 	}
 }
 

@@ -79,3 +79,9 @@ rules:
   - patch
   - update
   - watch
+- apiGroups:
+  - swe.dev
+  resources:
+  - runs/transcript
+  verbs:
+  - update
