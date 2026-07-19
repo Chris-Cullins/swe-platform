@@ -175,11 +175,6 @@ if [[ -n "${CLAIM_UID:-}" ]]; then
 	exit 1
 fi
 kubectl wait --for=jsonpath='{.status.phase}'=Ready environment/"$RUN_ENV_NAME" --timeout=3m
-kubectl delete run "$RUN_NAME" --wait=true >/dev/null
-if ! kubectl get environment "$RUN_ENV_NAME" >/dev/null 2>&1; then
-	echo "FAIL: deleting Run removed its claimed Environment"
-	exit 1
-fi
 ENV_NAME=$RUN_ENV_NAME
 for _ in $(seq 1 60); do
 	REPLACEMENT_NAME=$(kubectl get environments -l swe.dev/warm-pool=small -o jsonpath='{range .items[*]}{.metadata.name}{end}' 2>/dev/null || true)
@@ -295,6 +290,12 @@ wait "$STREAM_PID" >/dev/null 2>&1 || true
 if ! grep -q 'e2e transcript event' /tmp/swe-platform-transcript.out; then
 	echo "FAIL: transcript event was not received from the SSE stream"
 	cat /tmp/swe-platform-transcript.out
+	exit 1
+fi
+
+kubectl delete run "$RUN_NAME" --wait=true >/dev/null
+if ! kubectl get environment "$RUN_ENV_NAME" >/dev/null 2>&1; then
+	echo "FAIL: deleting Run removed its claimed Environment"
 	exit 1
 fi
 
