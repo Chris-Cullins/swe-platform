@@ -30,8 +30,9 @@ const adapterPollInterval = 2 * time.Second
 var errAllocatedEnvironmentGone = errors.New("allocated environment is gone or no longer claimed by this run")
 
 const (
-	runConditionEnvironmentReady = "EnvironmentReady"
-	runConditionAdapterAccepted  = "AdapterAccepted"
+	runConditionEnvironmentReady           = "EnvironmentReady"
+	runConditionAdapterAcceptanceAttempted = "AdapterAcceptanceAttempted"
+	runConditionAdapterAccepted            = "AdapterAccepted"
 )
 
 // AdapterObservation is the adapter-neutral state observed for accepted work.
@@ -80,7 +81,7 @@ type RunReconciler struct {
 	Adapters map[string]AdapterLifecycle
 }
 
-// +kubebuilder:rbac:groups=swe.dev,resources=runs,verbs=get;list;watch;update;patch;delete
+// +kubebuilder:rbac:groups=swe.dev,resources=runs,verbs=get;list;watch;update;patch
 // +kubebuilder:rbac:groups=swe.dev,resources=runs/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=swe.dev,resources=environments,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=swe.dev,resources=environments/status,verbs=get;update;patch
@@ -159,13 +160,10 @@ func (r *RunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.R
 		return ctrl.Result{}, err
 	}
 	if run.Spec.Cancel {
-		if runAccepted(&run) && !environmentFenced(env) {
-			if !environmentReachable(env) {
-				return ctrl.Result{RequeueAfter: adapterPollInterval}, nil
-			}
+		if runMayHaveAccepted(&run) && !environmentFenced(env) {
 			adapter := r.Adapters[run.Spec.Agent]
-			if adapter == nil {
-				return ctrl.Result{}, fmt.Errorf("adapter %q is not registered; accepted work cannot be cancelled safely", run.Spec.Agent)
+			if !environmentReachable(env) || adapter == nil {
+				return r.requestEnvironmentFence(ctx, env)
 			}
 			if err := adapter.Cancel(ctx, adapterTask(&run), r.adapterSandbox(&run, env)); err != nil {
 				return ctrl.Result{}, err
@@ -196,6 +194,9 @@ func (r *RunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.R
 		return ctrl.Result{}, r.setRunState(ctx, &run, platformv1alpha1.RunStateFailed, "AdapterUnavailable", fmt.Sprintf("adapter %q is not registered", run.Spec.Agent))
 	}
 	if run.Status.State == platformv1alpha1.RunStateEnvironmentReady {
+		if !acceptanceAttempted(&run) {
+			return ctrl.Result{Requeue: true}, r.markAcceptanceAttempted(ctx, &run)
+		}
 		if err := adapter.EnsureAccepted(ctx, adapterTask(&run), r.adapterSandbox(&run, env)); err != nil {
 			return ctrl.Result{}, err
 		}
@@ -475,12 +476,44 @@ func unpromotedWarmClaim(env *platformv1alpha1.Environment, run *platformv1alpha
 }
 
 func environmentFenced(env *platformv1alpha1.Environment) bool {
-	return env.Status.Phase == platformv1alpha1.EnvironmentPhasePaused && env.Status.PodName == "" && env.Status.Endpoints.Sandboxd == ""
+	return env.Spec.Paused && env.Status.Phase == platformv1alpha1.EnvironmentPhasePaused && env.Status.PodName == "" && env.Status.Endpoints.Sandboxd == ""
 }
 
 func runAccepted(run *platformv1alpha1.Run) bool {
 	condition := apiMeta.FindStatusCondition(run.Status.Conditions, runConditionAdapterAccepted)
 	return condition != nil && condition.Status == metav1.ConditionTrue
+}
+
+func acceptanceAttempted(run *platformv1alpha1.Run) bool {
+	condition := apiMeta.FindStatusCondition(run.Status.Conditions, runConditionAdapterAcceptanceAttempted)
+	return condition != nil && condition.Status == metav1.ConditionTrue
+}
+
+func runMayHaveAccepted(run *platformv1alpha1.Run) bool {
+	return acceptanceAttempted(run) || runAccepted(run)
+}
+
+func (r *RunReconciler) markAcceptanceAttempted(ctx context.Context, run *platformv1alpha1.Run) error {
+	before := run.Status.DeepCopy()
+	apiMeta.SetStatusCondition(&run.Status.Conditions, metav1.Condition{
+		Type: runConditionAdapterAcceptanceAttempted, Status: metav1.ConditionTrue,
+		Reason: "AcceptancePending", Message: "adapter acceptance may be attempted idempotently",
+		ObservedGeneration: run.Generation,
+	})
+	if reflect.DeepEqual(*before, run.Status) {
+		return nil
+	}
+	return r.Status().Update(ctx, run)
+}
+
+func (r *RunReconciler) requestEnvironmentFence(ctx context.Context, env *platformv1alpha1.Environment) (ctrl.Result, error) {
+	if !env.Spec.Paused {
+		env.Spec.Paused = true
+		if err := r.Update(ctx, env); err != nil {
+			return ctrl.Result{}, err
+		}
+	}
+	return ctrl.Result{RequeueAfter: adapterPollInterval}, nil
 }
 
 func (r *RunReconciler) cleanupTerminal(ctx context.Context, run *platformv1alpha1.Run) (ctrl.Result, error) {
@@ -494,13 +527,10 @@ func (r *RunReconciler) cleanupTerminal(ctx context.Context, run *platformv1alph
 	if err != nil {
 		return ctrl.Result{}, err
 	}
-	if runAccepted(run) && !environmentFenced(env) {
-		if !environmentReachable(env) {
-			return ctrl.Result{RequeueAfter: adapterPollInterval}, nil
-		}
+	if runMayHaveAccepted(run) && !environmentFenced(env) {
 		adapter := r.Adapters[run.Spec.Agent]
-		if adapter == nil {
-			return ctrl.Result{}, fmt.Errorf("adapter %q is not registered; accepted work cannot be cleaned up safely", run.Spec.Agent)
+		if !environmentReachable(env) || adapter == nil {
+			return r.requestEnvironmentFence(ctx, env)
 		}
 		if err := adapter.Cancel(ctx, adapterTask(run), r.adapterSandbox(run, env)); err != nil {
 			return ctrl.Result{}, err
@@ -545,13 +575,10 @@ func (r *RunReconciler) finalize(ctx context.Context, run *platformv1alpha1.Run)
 			return ctrl.Result{}, err
 		}
 		if err == nil {
-			if runAccepted(run) && !environmentFenced(env) {
-				if !environmentReachable(env) {
-					return ctrl.Result{RequeueAfter: adapterPollInterval}, nil
-				}
+			if runMayHaveAccepted(run) && !environmentFenced(env) {
 				adapter := r.Adapters[run.Spec.Agent]
-				if adapter == nil {
-					return ctrl.Result{}, fmt.Errorf("adapter %q is not registered; accepted work cannot be finalized safely", run.Spec.Agent)
+				if !environmentReachable(env) || adapter == nil {
+					return r.requestEnvironmentFence(ctx, env)
 				}
 				if err := adapter.Cancel(ctx, adapterTask(run), r.adapterSandbox(run, env)); err != nil {
 					return ctrl.Result{}, err

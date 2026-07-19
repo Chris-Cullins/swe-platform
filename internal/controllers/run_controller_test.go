@@ -2,6 +2,7 @@ package controllers
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"testing"
 
@@ -21,6 +22,28 @@ type scriptedAdapter struct {
 	observations        []AdapterObservation
 	accepted, cancelled int
 	onCancel            func()
+}
+
+type failAcceptedStatusClient struct {
+	client.Client
+	fail bool
+}
+
+func (c *failAcceptedStatusClient) Status() client.SubResourceWriter {
+	return &failAcceptedStatusWriter{SubResourceWriter: c.Client.Status(), client: c}
+}
+
+type failAcceptedStatusWriter struct {
+	client.SubResourceWriter
+	client *failAcceptedStatusClient
+}
+
+func (w *failAcceptedStatusWriter) Update(ctx context.Context, object client.Object, opts ...client.SubResourceUpdateOption) error {
+	if run, ok := object.(*platformv1alpha1.Run); ok && run.Status.State == platformv1alpha1.RunStateAdapterAccepted && w.client.fail {
+		w.client.fail = false
+		return errors.New("simulated lost acceptance status update")
+	}
+	return w.SubResourceWriter.Update(ctx, object, opts...)
 }
 
 // foregroundAdapter models a CLI agent whose managed process exit is the task
@@ -349,6 +372,9 @@ func TestAdapterShapesPauseResumeAndStatus(t *testing.T) {
 			if got := reconcileRun(t, r, "r"); got.Status.State != platformv1alpha1.RunStateEnvironmentReady {
 				t.Fatal(got.Status.State)
 			}
+			if got := reconcileRun(t, r, "r"); got.Status.State != platformv1alpha1.RunStateEnvironmentReady || !acceptanceAttempted(&got) {
+				t.Fatalf("acceptance marker state=%s attempted=%t", got.Status.State, acceptanceAttempted(&got))
+			}
 			if got := reconcileRun(t, r, "r"); got.Status.State != platformv1alpha1.RunStateAdapterAccepted {
 				t.Fatal(got.Status.State)
 			}
@@ -388,6 +414,7 @@ func TestDifferentAdapterShapesDriveSameLifecycleContract(t *testing.T) {
 	foregroundRun := readyRun("foreground")
 	foreground := &foregroundAdapter{process: AdapterObservationRunning}
 	foregroundReconciler := reconciler(t, foreground, foregroundRun, readyEnvironment(foregroundRun))
+	reconcileRun(t, foregroundReconciler, foregroundRun.Name) // acceptance attempt marker
 	reconcileRun(t, foregroundReconciler, foregroundRun.Name) // acceptance
 	if got := reconcileRun(t, foregroundReconciler, foregroundRun.Name); got.Status.State != platformv1alpha1.RunStateRunning {
 		t.Fatalf("foreground state = %s", got.Status.State)
@@ -400,6 +427,7 @@ func TestDifferentAdapterShapesDriveSameLifecycleContract(t *testing.T) {
 	serviceRun := readyRun("service")
 	service := &serviceAdapter{event: AdapterObservationRunning}
 	serviceReconciler := reconciler(t, service, serviceRun, readyEnvironment(serviceRun))
+	reconcileRun(t, serviceReconciler, serviceRun.Name) // acceptance attempt marker
 	reconcileRun(t, serviceReconciler, serviceRun.Name) // task acknowledgement
 	reconcileRun(t, serviceReconciler, serviceRun.Name) // running event
 	service.event = AdapterObservationNeedsInput
@@ -465,7 +493,7 @@ func TestCancellationWhilePausedRequiresNoAdapterRPC(t *testing.T) {
 		EnvironmentRef: &platformv1alpha1.RunEnvironmentReference{Name: "shared", UID: "env-uid", Ownership: platformv1alpha1.EnvironmentOwnershipClaimed},
 		Conditions:     []metav1.Condition{{Type: runConditionAdapterAccepted, Status: metav1.ConditionTrue}},
 	}}
-	env := &platformv1alpha1.Environment{ObjectMeta: metav1.ObjectMeta{Name: "shared", Namespace: "ns", UID: "env-uid"}, Status: platformv1alpha1.EnvironmentStatus{
+	env := &platformv1alpha1.Environment{ObjectMeta: metav1.ObjectMeta{Name: "shared", Namespace: "ns", UID: "env-uid"}, Spec: platformv1alpha1.EnvironmentSpec{Paused: true}, Status: platformv1alpha1.EnvironmentStatus{
 		Phase: platformv1alpha1.EnvironmentPhasePaused, ClaimedBy: &platformv1alpha1.RunReference{Name: run.Name, UID: run.UID},
 	}}
 	adapter := &scriptedAdapter{}
@@ -480,6 +508,179 @@ func TestCancellationWhilePausedRequiresNoAdapterRPC(t *testing.T) {
 	}
 	if retained.Status.ClaimedBy != nil || adapter.cancelled != 0 {
 		t.Fatalf("claim = %#v, adapter cancellations = %d", retained.Status.ClaimedBy, adapter.cancelled)
+	}
+}
+
+func TestLostAcceptanceStatusCancelsBeforeClaimRelease(t *testing.T) {
+	for _, deleting := range []bool{false, true} {
+		name := "cancel"
+		if deleting {
+			name = "delete"
+		}
+		t.Run(name, func(t *testing.T) {
+			run := &platformv1alpha1.Run{ObjectMeta: metav1.ObjectMeta{Name: "r", Namespace: "ns", UID: "run-uid", Finalizers: []string{runFinalizer}}, Spec: platformv1alpha1.RunSpec{Agent: "test"}, Status: platformv1alpha1.RunStatus{
+				State:          platformv1alpha1.RunStateEnvironmentReady,
+				EnvironmentRef: &platformv1alpha1.RunEnvironmentReference{Name: "shared", UID: "env-uid", Ownership: platformv1alpha1.EnvironmentOwnershipClaimed},
+				Conditions:     []metav1.Condition{{Type: runConditionAdapterAcceptanceAttempted, Status: metav1.ConditionTrue}},
+			}}
+			env := &platformv1alpha1.Environment{ObjectMeta: metav1.ObjectMeta{Name: "shared", Namespace: "ns", UID: "env-uid"}, Status: platformv1alpha1.EnvironmentStatus{
+				Phase: platformv1alpha1.EnvironmentPhaseReady, PodName: "env-shared", Endpoints: platformv1alpha1.EnvironmentEndpoints{Sandboxd: "10.0.0.1:50051"},
+				ClaimedBy: &platformv1alpha1.RunReference{Name: run.Name, UID: run.UID},
+			}}
+			adapter := &scriptedAdapter{}
+			r := reconciler(t, adapter, run, env)
+			fault := &failAcceptedStatusClient{Client: r.Client, fail: true}
+			r.Client = fault
+			if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(run)}); err == nil {
+				t.Fatal("acceptance status update unexpectedly succeeded")
+			}
+			if adapter.accepted != 1 {
+				t.Fatalf("acceptance calls = %d, want 1", adapter.accepted)
+			}
+			var storedRun platformv1alpha1.Run
+			if err := r.Get(context.Background(), client.ObjectKeyFromObject(run), &storedRun); err != nil {
+				t.Fatal(err)
+			}
+			if storedRun.Status.State != platformv1alpha1.RunStateEnvironmentReady || !acceptanceAttempted(&storedRun) || runAccepted(&storedRun) {
+				t.Fatalf("stored status after lost update = %#v", storedRun.Status)
+			}
+			if deleting {
+				if err := r.Delete(context.Background(), &storedRun); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				storedRun.Spec.Cancel = true
+				if err := r.Update(context.Background(), &storedRun); err != nil {
+					t.Fatal(err)
+				}
+			}
+			adapter.onCancel = func() {
+				var current platformv1alpha1.Environment
+				if err := r.Get(context.Background(), client.ObjectKeyFromObject(env), &current); err != nil || current.Status.ClaimedBy == nil {
+					t.Fatal("claim was released before uncertain acceptance was cancelled")
+				}
+			}
+			if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(run)}); err != nil {
+				t.Fatal(err)
+			}
+			if !deleting {
+				reconcileRun(t, r, run.Name)
+			}
+			var retained platformv1alpha1.Environment
+			if err := r.Get(context.Background(), client.ObjectKeyFromObject(env), &retained); err != nil {
+				t.Fatal(err)
+			}
+			if adapter.cancelled == 0 || retained.Status.ClaimedBy != nil {
+				t.Fatalf("cancellations = %d, claim = %#v", adapter.cancelled, retained.Status.ClaimedBy)
+			}
+		})
+	}
+}
+
+func TestAcceptedUnreachableClaimIsFencedBeforeCancellationCleanup(t *testing.T) {
+	run := &platformv1alpha1.Run{ObjectMeta: metav1.ObjectMeta{Name: "r", Namespace: "ns", UID: "run-uid", Finalizers: []string{runFinalizer}}, Spec: platformv1alpha1.RunSpec{Agent: "test", Cancel: true}, Status: platformv1alpha1.RunStatus{
+		State:          platformv1alpha1.RunStateAdapterAccepted,
+		EnvironmentRef: &platformv1alpha1.RunEnvironmentReference{Name: "shared", UID: "env-uid", Ownership: platformv1alpha1.EnvironmentOwnershipClaimed},
+		Conditions:     []metav1.Condition{{Type: runConditionAdapterAccepted, Status: metav1.ConditionTrue}},
+	}}
+	env := &platformv1alpha1.Environment{ObjectMeta: metav1.ObjectMeta{Name: "shared", Namespace: "ns", UID: "env-uid"}, Status: platformv1alpha1.EnvironmentStatus{
+		Phase: platformv1alpha1.EnvironmentPhaseFailed, PodName: "env-shared", ClaimedBy: &platformv1alpha1.RunReference{Name: run.Name, UID: run.UID},
+	}}
+	adapter := &scriptedAdapter{}
+	r := reconciler(t, adapter, run, env)
+	result, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(run)})
+	if err != nil || result.RequeueAfter != adapterPollInterval {
+		t.Fatalf("fence request = (%#v, %v)", result, err)
+	}
+	var fencing platformv1alpha1.Environment
+	if err := r.Get(context.Background(), client.ObjectKeyFromObject(env), &fencing); err != nil {
+		t.Fatal(err)
+	}
+	if !fencing.Spec.Paused || fencing.Status.ClaimedBy == nil || adapter.cancelled != 0 {
+		t.Fatalf("fencing Environment = %#v, cancellations = %d", fencing, adapter.cancelled)
+	}
+	fencing.Status.Phase = platformv1alpha1.EnvironmentPhasePaused
+	fencing.Status.PodName = ""
+	fencing.Status.Endpoints = platformv1alpha1.EnvironmentEndpoints{}
+	if err := r.Status().Update(context.Background(), &fencing); err != nil {
+		t.Fatal(err)
+	}
+	if got := reconcileRun(t, r, run.Name); got.Status.State != platformv1alpha1.RunStateCancelled {
+		t.Fatalf("state after fence = %s", got.Status.State)
+	}
+	reconcileRun(t, r, run.Name)
+	if err := r.Get(context.Background(), client.ObjectKeyFromObject(env), &fencing); err != nil {
+		t.Fatal(err)
+	}
+	if fencing.Status.ClaimedBy != nil || adapter.cancelled != 0 {
+		t.Fatalf("post-fence claim = %#v, cancellations = %d", fencing.Status.ClaimedBy, adapter.cancelled)
+	}
+}
+
+func TestAcceptedUnreachableOwnedFinalizerWaitsForFence(t *testing.T) {
+	now := metav1.Now()
+	run := &platformv1alpha1.Run{ObjectMeta: metav1.ObjectMeta{Name: "r", Namespace: "ns", UID: "run-uid", Finalizers: []string{runFinalizer}, DeletionTimestamp: &now}, Spec: platformv1alpha1.RunSpec{Agent: "test"}, Status: platformv1alpha1.RunStatus{
+		EnvironmentRef: &platformv1alpha1.RunEnvironmentReference{Name: "owned", UID: "env-uid", Ownership: platformv1alpha1.EnvironmentOwnershipOwned},
+		Conditions:     []metav1.Condition{{Type: runConditionAdapterAccepted, Status: metav1.ConditionTrue}},
+	}}
+	env := &platformv1alpha1.Environment{ObjectMeta: metav1.ObjectMeta{Name: "owned", Namespace: "ns", UID: "env-uid", OwnerReferences: []metav1.OwnerReference{{
+		APIVersion: platformv1alpha1.GroupVersion.String(), Kind: "Run", Name: run.Name, UID: run.UID, Controller: ptr(true),
+	}}}, Status: platformv1alpha1.EnvironmentStatus{Phase: platformv1alpha1.EnvironmentPhaseCreating}}
+	adapter := &scriptedAdapter{}
+	r := reconciler(t, adapter, run, env)
+	result, err := r.finalize(context.Background(), run)
+	if err != nil || result.RequeueAfter != adapterPollInterval {
+		t.Fatalf("fence request = (%#v, %v)", result, err)
+	}
+	var fencing platformv1alpha1.Environment
+	if err := r.Get(context.Background(), client.ObjectKeyFromObject(env), &fencing); err != nil {
+		t.Fatal(err)
+	}
+	var retainedRun platformv1alpha1.Run
+	if err := r.Get(context.Background(), client.ObjectKeyFromObject(run), &retainedRun); err != nil || !controllerutil.ContainsFinalizer(&retainedRun, runFinalizer) || !fencing.Spec.Paused {
+		t.Fatal("owned Run finalizer or fence request was not retained")
+	}
+	fencing.Status.Phase = platformv1alpha1.EnvironmentPhasePaused
+	if err := r.Status().Update(context.Background(), &fencing); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.finalize(context.Background(), &retainedRun); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Get(context.Background(), client.ObjectKeyFromObject(env), &fencing); err != nil || adapter.cancelled != 0 || !exactControllerOwner(&fencing, platformv1alpha1.GroupVersion.String(), "Run", run.Name, run.UID) {
+		t.Fatalf("owned Environment after fenced finalization = %#v, cancellations = %d", fencing, adapter.cancelled)
+	}
+}
+
+func TestAcceptedUnreachableOwnedTerminalCleanupWaitsForFence(t *testing.T) {
+	run := &platformv1alpha1.Run{ObjectMeta: metav1.ObjectMeta{Name: "r", Namespace: "ns", UID: "run-uid", Finalizers: []string{runFinalizer}}, Spec: platformv1alpha1.RunSpec{Agent: "test"}, Status: platformv1alpha1.RunStatus{
+		State:          platformv1alpha1.RunStateSucceeded,
+		EnvironmentRef: &platformv1alpha1.RunEnvironmentReference{Name: "owned", UID: "env-uid", Ownership: platformv1alpha1.EnvironmentOwnershipOwned},
+		Conditions:     []metav1.Condition{{Type: runConditionAdapterAccepted, Status: metav1.ConditionTrue}},
+	}}
+	env := &platformv1alpha1.Environment{ObjectMeta: metav1.ObjectMeta{Name: "owned", Namespace: "ns", UID: "env-uid", OwnerReferences: []metav1.OwnerReference{{
+		APIVersion: platformv1alpha1.GroupVersion.String(), Kind: "Run", Name: run.Name, UID: run.UID, Controller: ptr(true),
+	}}}, Status: platformv1alpha1.EnvironmentStatus{Phase: platformv1alpha1.EnvironmentPhaseFailed, PodName: "env-owned"}}
+	adapter := &scriptedAdapter{}
+	r := reconciler(t, adapter, run, env)
+	result, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(run)})
+	if err != nil || result.RequeueAfter != adapterPollInterval {
+		t.Fatalf("terminal fence request = (%#v, %v)", result, err)
+	}
+	var fencing platformv1alpha1.Environment
+	if err := r.Get(context.Background(), client.ObjectKeyFromObject(env), &fencing); err != nil || !fencing.Spec.Paused || adapter.cancelled != 0 {
+		t.Fatalf("terminal fencing Environment = %#v, cancellations = %d, error = %v", fencing, adapter.cancelled, err)
+	}
+	fencing.Status.Phase = platformv1alpha1.EnvironmentPhasePaused
+	fencing.Status.PodName = ""
+	if err := r.Status().Update(context.Background(), &fencing); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(run)}); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Get(context.Background(), client.ObjectKeyFromObject(env), &fencing); err != nil || !fencing.Spec.Paused || adapter.cancelled != 0 {
+		t.Fatalf("terminal cleanup after fence = %#v, cancellations = %d, error = %v", fencing, adapter.cancelled, err)
 	}
 }
 
@@ -548,10 +749,12 @@ func TestFinalizePausedAndTransientlyUnreachableAcceptedClaims(t *testing.T) {
 	for _, tc := range []struct {
 		name        string
 		phase       platformv1alpha1.EnvironmentPhase
+		specPaused  bool
 		wantRequeue bool
 		wantClaim   bool
 	}{
-		{name: "paused is fenced", phase: platformv1alpha1.EnvironmentPhasePaused},
+		{name: "paused is fenced", phase: platformv1alpha1.EnvironmentPhasePaused, specPaused: true},
+		{name: "stale paused status is not fenced", phase: platformv1alpha1.EnvironmentPhasePaused, wantRequeue: true, wantClaim: true},
 		{name: "setup is ambiguous", phase: platformv1alpha1.EnvironmentPhaseSetup, wantRequeue: true, wantClaim: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -560,7 +763,7 @@ func TestFinalizePausedAndTransientlyUnreachableAcceptedClaims(t *testing.T) {
 				EnvironmentRef: &platformv1alpha1.RunEnvironmentReference{Name: "shared", UID: "env-uid", Ownership: platformv1alpha1.EnvironmentOwnershipClaimed},
 				Conditions:     []metav1.Condition{{Type: runConditionAdapterAccepted, Status: metav1.ConditionTrue}},
 			}}
-			env := &platformv1alpha1.Environment{ObjectMeta: metav1.ObjectMeta{Name: "shared", Namespace: "ns", UID: "env-uid"}, Status: platformv1alpha1.EnvironmentStatus{Phase: tc.phase, ClaimedBy: &platformv1alpha1.RunReference{Name: run.Name, UID: run.UID}}}
+			env := &platformv1alpha1.Environment{ObjectMeta: metav1.ObjectMeta{Name: "shared", Namespace: "ns", UID: "env-uid"}, Spec: platformv1alpha1.EnvironmentSpec{Paused: tc.specPaused}, Status: platformv1alpha1.EnvironmentStatus{Phase: tc.phase, ClaimedBy: &platformv1alpha1.RunReference{Name: run.Name, UID: run.UID}}}
 			adapter := &scriptedAdapter{}
 			r := reconciler(t, adapter, run, env)
 			result, err := r.finalize(context.Background(), run)
@@ -581,6 +784,44 @@ func TestFinalizePausedAndTransientlyUnreachableAcceptedClaims(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestMissingAdapterCleanupFallsBackToBackendFence(t *testing.T) {
+	now := metav1.Now()
+	run := &platformv1alpha1.Run{ObjectMeta: metav1.ObjectMeta{Name: "r", Namespace: "ns", UID: "run-uid", Finalizers: []string{runFinalizer}, DeletionTimestamp: &now}, Spec: platformv1alpha1.RunSpec{Agent: "removed-adapter"}, Status: platformv1alpha1.RunStatus{
+		EnvironmentRef: &platformv1alpha1.RunEnvironmentReference{Name: "shared", UID: "env-uid", Ownership: platformv1alpha1.EnvironmentOwnershipClaimed},
+		Conditions:     []metav1.Condition{{Type: runConditionAdapterAcceptanceAttempted, Status: metav1.ConditionTrue}},
+	}}
+	env := &platformv1alpha1.Environment{ObjectMeta: metav1.ObjectMeta{Name: "shared", Namespace: "ns", UID: "env-uid"}, Status: platformv1alpha1.EnvironmentStatus{
+		Phase: platformv1alpha1.EnvironmentPhaseReady, PodName: "env-shared", Endpoints: platformv1alpha1.EnvironmentEndpoints{Sandboxd: "10.0.0.1:50051"},
+		ClaimedBy: &platformv1alpha1.RunReference{Name: run.Name, UID: run.UID},
+	}}
+	r := reconciler(t, &scriptedAdapter{}, run, env)
+	r.Adapters = map[string]AdapterLifecycle{}
+	result, err := r.finalize(context.Background(), run)
+	if err != nil || result.RequeueAfter != adapterPollInterval {
+		t.Fatalf("missing-adapter fence = (%#v, %v)", result, err)
+	}
+	var fencing platformv1alpha1.Environment
+	if err := r.Get(context.Background(), client.ObjectKeyFromObject(env), &fencing); err != nil {
+		t.Fatal(err)
+	}
+	var retainedRun platformv1alpha1.Run
+	if !fencing.Spec.Paused || fencing.Status.ClaimedBy == nil || r.Get(context.Background(), client.ObjectKeyFromObject(run), &retainedRun) != nil || !controllerutil.ContainsFinalizer(&retainedRun, runFinalizer) {
+		t.Fatal("missing adapter released ownership before backend fencing")
+	}
+	fencing.Status.Phase = platformv1alpha1.EnvironmentPhasePaused
+	fencing.Status.PodName = ""
+	fencing.Status.Endpoints = platformv1alpha1.EnvironmentEndpoints{}
+	if err := r.Status().Update(context.Background(), &fencing); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.finalize(context.Background(), &retainedRun); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Get(context.Background(), client.ObjectKeyFromObject(env), &fencing); err != nil || fencing.Status.ClaimedBy != nil {
+		t.Fatalf("fenced missing-adapter claim = %#v, error = %v", fencing.Status.ClaimedBy, err)
 	}
 }
 

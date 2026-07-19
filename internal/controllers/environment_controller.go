@@ -112,6 +112,12 @@ func (r *EnvironmentReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		}
 		return ctrl.Result{Requeue: true}, nil
 	}
+	// Fencing must not depend on a still-readable template or successful setup.
+	// Cancellation/finalization can therefore stop an execution domain even
+	// after its template was deleted or provisioning became permanently broken.
+	if env.Spec.Paused {
+		return r.reconcilePaused(ctx, &env)
+	}
 	var tmpl platformv1alpha1.EnvironmentTemplate
 	if err := r.Get(ctx, types.NamespacedName{Namespace: env.Namespace, Name: env.Spec.TemplateRef}, &tmpl); err != nil {
 		return ctrl.Result{}, r.fail(ctx, &env, fmt.Errorf("get template %q: %w", env.Spec.TemplateRef, err))
@@ -132,9 +138,6 @@ func (r *EnvironmentReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		return ctrl.Result{Requeue: true}, nil
 	}
 
-	if env.Spec.Paused {
-		return r.reconcilePaused(ctx, &env)
-	}
 	if env.Status.Phase == platformv1alpha1.EnvironmentPhasePaused {
 		now := metav1.Now()
 		env.Status.LastActiveAt = &now

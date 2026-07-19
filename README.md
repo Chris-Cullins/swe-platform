@@ -90,8 +90,10 @@ container, PID, tmux, or OS-signal semantics.
 
 Run states are observable milestones: `Allocating`, `EnvironmentReady`,
 `AdapterAccepted`, `Running`, `NeedsInput`, `Paused`, and terminal `Succeeded`, `Failed`,
-or `Cancelled`. Conditions additionally report environment readiness and adapter
-acceptance. An unavailable adapter fails explicitly rather than pretending work started.
+or `Cancelled`. Conditions additionally report environment readiness, a durable adapter
+acceptance-attempt marker written before the acceptance RPC, and confirmed adapter acceptance.
+The attempt marker makes cancellation conservative after an uncertain response. An unavailable
+adapter fails explicitly rather than pretending work started.
 
 Environment ownership and cleanup are explicit:
 
@@ -105,7 +107,8 @@ Pause is not process checkpointing. Pausing fences the current execution domain 
 backend equivalent), while retaining the workspace disk and adapter-owned transcript.
 Accepted work is cancelled only while that exact execution incarnation is securely
 reachable, or cleanup proceeds without an RPC after pause has removed its pod and
-endpoint; transient setup/resume states retain the claim and cleanup finalizer.
+endpoint. For unreachable or unavailable-adapter cleanup, the Run controller requests backend
+pause and retains the claim/finalizer until the Environment reports the pod and endpoint gone.
 Resume creates a fresh sandboxd epoch, runs the repository resume hook, and calls the
 adapter's idempotent acceptance path again with the same Run UID. Adapters reconstruct or
 restart their processes from workspace/transcript state; no old process incarnation is

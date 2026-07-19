@@ -74,7 +74,6 @@ rules:
   resources:
   - runs
   verbs:
-  - delete
   - get
   - list
   - patch
