@@ -65,7 +65,13 @@ func (r *WarmPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 	}
 
 	var environments platformv1alpha1.EnvironmentList
-	if err := r.List(ctx, &environments,
+	reader := r.APIReader
+	if reader == nil {
+		// Unit tests construct reconcilers without a manager. Production always
+		// installs the uncached API reader in SetupWithManager.
+		reader = r.Client
+	}
+	if err := reader.List(ctx, &environments,
 		client.InNamespace(tmpl.Namespace),
 		client.MatchingLabels{warmPoolLabel: tmpl.Name},
 	); err != nil {

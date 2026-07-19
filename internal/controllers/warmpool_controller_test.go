@@ -557,6 +557,113 @@ func TestWarmPoolReplacementSurgeRemainsBoundedWhenEveryMemberFails(t *testing.T
 	}
 }
 
+func TestWarmPoolLiveMembershipSnapshotBoundsSurgeWithStaleCache(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := platformv1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	tmpl := &platformv1alpha1.EnvironmentTemplate{
+		ObjectMeta: metav1.ObjectMeta{Name: "small", Namespace: "default", UID: "template-uid"},
+		Spec:       platformv1alpha1.EnvironmentTemplateSpec{WarmPool: &platformv1alpha1.WarmPoolSpec{Min: 2}},
+	}
+	liveClient := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(tmpl, &platformv1alpha1.Environment{}).WithObjects(tmpl).Build()
+	cachedMembershipLists := 0
+	staleCache := interceptor.NewClient(liveClient, interceptor.Funcs{
+		List: func(ctx context.Context, underlying client.WithWatch, list client.ObjectList, options ...client.ListOption) error {
+			if environments, ok := list.(*platformv1alpha1.EnvironmentList); ok {
+				cachedMembershipLists++
+				*environments = platformv1alpha1.EnvironmentList{}
+				return nil
+			}
+			return underlying.List(ctx, list, options...)
+		},
+	})
+	r := &WarmPoolReconciler{Client: staleCache, APIReader: liveClient, Scheme: scheme, Now: func() time.Time { return time.Unix(4_500, 0) }}
+	request := ctrl.Request{NamespacedName: client.ObjectKeyFromObject(tmpl)}
+	liveMembers := func() platformv1alpha1.EnvironmentList {
+		t.Helper()
+		var members platformv1alpha1.EnvironmentList
+		if err := liveClient.List(context.Background(), &members, client.MatchingLabels{warmPoolLabel: tmpl.Name}); err != nil {
+			t.Fatal(err)
+		}
+		return members
+	}
+	assertBounded := func() {
+		t.Helper()
+		exact := 0
+		members := liveMembers()
+		for i := range members.Items {
+			env := &members.Items[i]
+			if warmPoolMember(env, tmpl) && env.Status.ClaimedBy == nil && env.DeletionTimestamp.IsZero() {
+				exact++
+			}
+		}
+		if exact > 4 {
+			t.Fatalf("live exact membership = %d, want at most 2*min", exact)
+		}
+	}
+
+	if _, err := r.Reconcile(context.Background(), request); err != nil {
+		t.Fatal(err)
+	}
+	initial := liveMembers()
+	if len(initial.Items) != 2 {
+		t.Fatalf("initial live membership = %d, want min 2", len(initial.Items))
+	}
+	for i := range initial.Items {
+		env := &initial.Items[i]
+		env.Status.ObservedGeneration = env.Generation
+		env.Status.Phase = platformv1alpha1.EnvironmentPhaseFailed
+		if err := liveClient.Status().Update(context.Background(), env); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := r.Reconcile(context.Background(), request); err != nil {
+		t.Fatal(err)
+	}
+	assertBounded()
+
+	// Reconcile repeatedly while the simulated informer still omits every
+	// created member. The live snapshot must prevent additional surge.
+	for range 3 {
+		if _, err := r.Reconcile(context.Background(), request); err != nil {
+			t.Fatal(err)
+		}
+		assertBounded()
+	}
+
+	members := liveMembers()
+	ready := 0
+	for i := range members.Items {
+		env := &members.Items[i]
+		if env.Status.Phase == platformv1alpha1.EnvironmentPhaseFailed {
+			continue
+		}
+		applyEnvironmentStatus(env, platformv1alpha1.EnvironmentPhaseReady, "pod-"+env.Name, "10.0.0.1:50051", "SandboxdReady", "ready", nil)
+		if err := liveClient.Status().Update(context.Background(), env); err != nil {
+			t.Fatal(err)
+		}
+		ready++
+	}
+	if ready != 2 {
+		t.Fatalf("healthy replacements = %d, want min 2", ready)
+	}
+	if _, err := r.Reconcile(context.Background(), request); err != nil {
+		t.Fatal(err)
+	}
+	assertBounded()
+	if cachedMembershipLists != 0 {
+		t.Fatalf("membership accounting used stale cache %d times", cachedMembershipLists)
+	}
+	var updated platformv1alpha1.EnvironmentTemplate
+	if err := liveClient.Get(context.Background(), client.ObjectKeyFromObject(tmpl), &updated); err != nil {
+		t.Fatal(err)
+	}
+	if updated.Status.WarmPoolReady != 2 {
+		t.Fatalf("WarmPoolReady = %d, want healthy min 2", updated.Status.WarmPoolReady)
+	}
+}
+
 func TestWarmPoolIdentityUpdateEnqueuesOldAndNewPools(t *testing.T) {
 	scheme := runtime.NewScheme()
 	if err := platformv1alpha1.AddToScheme(scheme); err != nil {
