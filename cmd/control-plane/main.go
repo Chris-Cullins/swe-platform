@@ -57,23 +57,29 @@ func main() {
 		log.Error("SWE_BOOTSTRAP_TOKEN must contain at least 32 characters")
 		os.Exit(1)
 	}
+	sessions := controlplane.NewMemorySessionStore(controlplane.MemorySessionStoreOptions{})
 	access := controlplane.KubernetesAccessController{
 		Client:         clientset,
 		BootstrapToken: bootstrapToken,
 		Audience:       os.Getenv("SWE_TOKEN_AUDIENCE"),
+		Sessions:       sessions,
 	}
+	resources := &controlplane.KubernetesResourceService{Client: kubeClient}
 	transcripts := controlplane.NewMemoryTranscriptStore(controlplane.DefaultMemoryTranscriptStoreOptions())
 	streamLifecycle, cancelStreams := context.WithCancel(context.Background())
 	defer cancelStreams()
 	server := &http.Server{
 		Addr: *address,
 		Handler: controlplane.NewServer(log, controlplane.ServerOptions{
-			Access:          access,
-			Runs:            controlplane.KubernetesRunResolver{Client: kubeClient},
-			TranscriptStore: transcripts,
-			TerminalDialer:  controlplane.KubernetesTerminalDialer{Client: kubeClient},
-			TrustProxy:      strings.EqualFold(os.Getenv("SWE_TRUST_PROXY_HEADERS"), "true"),
-			StreamLifecycle: streamLifecycle,
+			Access:                access,
+			Sessions:              access,
+			Resources:             resources,
+			Runs:                  controlplane.KubernetesRunResolver{Client: kubeClient},
+			TranscriptStore:       transcripts,
+			TerminalDialer:        controlplane.KubernetesTerminalDialer{Client: kubeClient},
+			TrustProxy:            strings.EqualFold(os.Getenv("SWE_TRUST_PROXY_HEADERS"), "true"),
+			AllowInsecureSessions: strings.EqualFold(os.Getenv("SWE_ALLOW_INSECURE_SESSIONS"), "true"),
+			StreamLifecycle:       streamLifecycle,
 		}).Handler(),
 		ReadHeaderTimeout: 5 * time.Second,
 		IdleTimeout:       2 * time.Minute,

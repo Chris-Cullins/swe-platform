@@ -13,6 +13,7 @@ controlPlane:
     tag: latest
     pullPolicy: Always
   auth:
+    allowInsecureSessions: true
     bootstrapTokenSecret:
       # Created out of band by hack/argocd-up.sh; only the name is referenced.
       name: swe-platform-bootstrap

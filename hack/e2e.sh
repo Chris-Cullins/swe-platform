@@ -257,6 +257,40 @@ subjects:
 EOF
 PRODUCER_TOKEN=$(kubectl create token e2e-transcript-producer --audience=swe-platform)
 
+echo "==> configuring a console API user"
+cat <<'EOF' | kubectl apply -f -
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: e2e-console
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: e2e-console
+rules:
+  - apiGroups: ["swe.dev"]
+    resources: ["runs"]
+    verbs: ["create", "get", "list", "update"]
+  - apiGroups: ["swe.dev"]
+    resources: ["environments"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: e2e-console
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: e2e-console
+subjects:
+  - kind: ServiceAccount
+    name: e2e-console
+    namespace: default
+EOF
+CONSOLE_TOKEN=$(kubectl create token e2e-console --audience=swe-platform)
+
 echo "==> verifying live transcript stream through the control plane"
 kubectl port-forward service/swe-platform-swe-platform-control-plane 18080:80 >/tmp/swe-platform-port-forward.log 2>&1 &
 PORT_FORWARD_PID=$!
@@ -266,6 +300,61 @@ for _ in $(seq 1 30); do
 	fi
 	sleep 1
 done
+
+echo "==> verifying browser session and typed resource APIs"
+COOKIE_JAR=/tmp/swe-platform-console-cookies
+rm -f "$COOKIE_JAR"
+SESSION_STATUS=$(curl --silent --output /tmp/swe-platform-session.json --write-out '%{http_code}' \
+	--cookie-jar "$COOKIE_JAR" -X POST -H "Authorization: Bearer ${CONSOLE_TOKEN}" \
+	http://127.0.0.1:18080/api/v1/session)
+if [[ "$SESSION_STATUS" != "200" ]] || ! grep -q '"authenticated":true' /tmp/swe-platform-session.json; then
+	echo "FAIL: session exchange returned ${SESSION_STATUS}: $(cat /tmp/swe-platform-session.json)"
+	exit 1
+fi
+if grep -Fq "$CONSOLE_TOKEN" "$COOKIE_JAR"; then
+	echo "FAIL: session cookie contains the Kubernetes bearer token"
+	exit 1
+fi
+SESSION_GET_STATUS=$(curl --silent --output /dev/null --write-out '%{http_code}' \
+	--cookie "$COOKIE_JAR" http://127.0.0.1:18080/api/v1/session)
+RUN_LIST_STATUS=$(curl --silent --output /tmp/swe-platform-runs.json --write-out '%{http_code}' \
+	--cookie "$COOKIE_JAR" 'http://127.0.0.1:18080/api/v1/namespaces/default/runs?limit=1')
+ENV_GET_STATUS=$(curl --silent --output /tmp/swe-platform-environment.json --write-out '%{http_code}' \
+	--cookie "$COOKIE_JAR" "http://127.0.0.1:18080/api/v1/namespaces/default/environments/${ENV_NAME}")
+if [[ "$SESSION_GET_STATUS" != "200" || "$RUN_LIST_STATUS" != "200" || "$ENV_GET_STATUS" != "200" ]]; then
+	echo "FAIL: typed read API statuses session=${SESSION_GET_STATUS} runs=${RUN_LIST_STATUS} environment=${ENV_GET_STATUS}"
+	exit 1
+fi
+API_RUN_BODY='{"name":"e2e-api-run","selector":{"template":"small"},"agent":"e2e","prompt":"resource API acceptance"}'
+API_CREATE_STATUS=$(curl --silent --output /tmp/swe-platform-api-run.json --write-out '%{http_code}' \
+	--cookie "$COOKIE_JAR" -H 'Origin: http://127.0.0.1:18080' -H 'Content-Type: application/json' \
+	-d "$API_RUN_BODY" http://127.0.0.1:18080/api/v1/namespaces/default/runs)
+API_RETRY_STATUS=$(curl --silent --output /dev/null --write-out '%{http_code}' \
+	--cookie "$COOKIE_JAR" -H 'Origin: http://127.0.0.1:18080' -H 'Content-Type: application/json' \
+	-d "$API_RUN_BODY" http://127.0.0.1:18080/api/v1/namespaces/default/runs)
+CSRF_STATUS=$(curl --silent --output /dev/null --write-out '%{http_code}' \
+	--cookie "$COOKIE_JAR" -X POST http://127.0.0.1:18080/api/v1/namespaces/default/runs/e2e-api-run/cancel)
+API_CANCEL_STATUS=$(curl --silent --output /dev/null --write-out '%{http_code}' \
+	--cookie "$COOKIE_JAR" -X POST -H 'Origin: http://127.0.0.1:18080' \
+	http://127.0.0.1:18080/api/v1/namespaces/default/runs/e2e-api-run/cancel)
+if [[ "$API_CREATE_STATUS" != "201" || "$API_RETRY_STATUS" != "200" || "$CSRF_STATUS" != "403" || "$API_CANCEL_STATUS" != "200" ]]; then
+	echo "FAIL: typed mutation API statuses create=${API_CREATE_STATUS} retry=${API_RETRY_STATUS} csrf=${CSRF_STATUS} cancel=${API_CANCEL_STATUS}"
+	exit 1
+fi
+SESSION_DELETE_STATUS=$(curl --silent --output /dev/null --write-out '%{http_code}' \
+	--cookie "$COOKIE_JAR" --cookie-jar "$COOKIE_JAR" -X DELETE -H 'Origin: http://127.0.0.1:18080' \
+	http://127.0.0.1:18080/api/v1/session)
+if [[ "$SESSION_DELETE_STATUS" != "204" ]]; then
+	echo "FAIL: session delete status was ${SESSION_DELETE_STATUS}, expected 204"
+	exit 1
+fi
+LOGOUT_REPLAY_STATUS=$(curl --silent --output /dev/null --write-out '%{http_code}' \
+	--cookie "$COOKIE_JAR" http://127.0.0.1:18080/api/v1/session)
+if [[ "$LOGOUT_REPLAY_STATUS" != "401" ]]; then
+	echo "FAIL: logged-out session replay status was ${LOGOUT_REPLAY_STATUS}, expected 401"
+	exit 1
+fi
+
 ANONYMOUS_STATUS=$(curl --silent --output /dev/null --write-out '%{http_code}' \
 	"http://127.0.0.1:18080/api/v1/namespaces/default/runs/${RUN_NAME}/transcript")
 if [[ "$ANONYMOUS_STATUS" != "401" ]]; then

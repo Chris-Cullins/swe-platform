@@ -136,13 +136,59 @@ func TestBrowserSessionAuthenticatesReadsButNotProducerWrites(t *testing.T) {
 	client.PrependReactor("create", "subjectaccessreviews", func(ktesting.Action) (bool, runtime.Object, error) {
 		return true, &authorizationv1.SubjectAccessReview{Status: authorizationv1.SubjectAccessReviewStatus{Allowed: true}}, nil
 	})
-	controller := KubernetesAccessController{Client: client}
+	store := NewMemorySessionStore(MemorySessionStoreOptions{})
+	sessionID, err := store.Create("browser-session-token")
+	if err != nil {
+		t.Fatal(err)
+	}
+	controller := KubernetesAccessController{Client: client, Sessions: store}
 	request := httptest.NewRequest(http.MethodGet, transcriptURL, nil)
-	request.AddCookie(&http.Cookie{Name: sessionCookieName, Value: "browser-session-token"})
+	request.AddCookie(&http.Cookie{Name: sessionCookieName, Value: sessionID})
 	if err := controller.Authorize(request, ResourceAccess{}, true); err != nil {
 		t.Fatalf("browser reader session rejected: %v", err)
 	}
 	if err := controller.Authorize(request, ResourceAccess{}, false); !errors.Is(err, errUnauthenticated) {
 		t.Fatalf("browser producer session error = %v, want unauthenticated", err)
+	}
+}
+
+func TestKubernetesAccessControllerSessionExchangeAndValidation(t *testing.T) {
+	client := fake.NewClientset()
+	reviews := 0
+	client.PrependReactor("create", "tokenreviews", func(action ktesting.Action) (bool, runtime.Object, error) {
+		reviews++
+		review := action.(ktesting.CreateAction).GetObject().(*authenticationv1.TokenReview)
+		if review.Spec.Token != "short-lived-kubernetes-token" {
+			t.Fatalf("reviewed token = %q", review.Spec.Token)
+		}
+		return true, &authenticationv1.TokenReview{Status: authenticationv1.TokenReviewStatus{
+			Authenticated: true,
+			Audiences:     []string{defaultTokenAudience},
+			User:          authenticationv1.UserInfo{Username: "console-user"},
+		}}, nil
+	})
+	controller := KubernetesAccessController{Client: client, Sessions: NewMemorySessionStore(MemorySessionStoreOptions{})}
+
+	post := httptest.NewRequest(http.MethodPost, "https://console.test/api/v1/session", nil)
+	post.Header.Set("Authorization", "Bearer short-lived-kubernetes-token")
+	session, token, err := controller.CreateSession(post)
+	if err != nil || token == "" || token == "short-lived-kubernetes-token" || !session.Authenticated || session.Username != "console-user" {
+		t.Fatalf("exchange = %#v, token %q, err %v", session, token, err)
+	}
+	get := httptest.NewRequest(http.MethodGet, "https://console.test/api/v1/session", nil)
+	get.AddCookie(&http.Cookie{Name: sessionCookieName, Value: token})
+	session, err = controller.CurrentSession(get)
+	if err != nil || session.Username != "console-user" || reviews != 2 {
+		t.Fatalf("current = %#v, reviews %d, err %v", session, reviews, err)
+	}
+}
+
+func TestKubernetesAccessControllerRejectsBootstrapSessionExchange(t *testing.T) {
+	bootstrapToken := "bootstrap-secret-at-least-32-bytes"
+	controller := KubernetesAccessController{BootstrapToken: bootstrapToken, Sessions: NewMemorySessionStore(MemorySessionStoreOptions{})}
+	request := httptest.NewRequest(http.MethodPost, "https://console.test/api/v1/session", nil)
+	request.Header.Set("Authorization", "Bearer "+bootstrapToken)
+	if _, _, err := controller.CreateSession(request); !errors.Is(err, errForbidden) {
+		t.Fatalf("bootstrap exchange error = %v, want forbidden", err)
 	}
 }

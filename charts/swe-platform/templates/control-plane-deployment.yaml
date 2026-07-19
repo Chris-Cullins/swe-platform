@@ -43,6 +43,8 @@ spec:
               value: {{ .Values.controlPlane.auth.tokenAudience | quote }}
             - name: SWE_TRUST_PROXY_HEADERS
               value: {{ .Values.controlPlane.auth.trustProxyHeaders | quote }}
+            - name: SWE_ALLOW_INSECURE_SESSIONS
+              value: {{ .Values.controlPlane.auth.allowInsecureSessions | quote }}
             {{- with .Values.controlPlane.auth.bootstrapTokenSecret.name }}
             - name: SWE_BOOTSTRAP_TOKEN
               valueFrom:

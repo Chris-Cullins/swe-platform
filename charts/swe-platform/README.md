@@ -33,6 +33,8 @@ digest-pinned installation overrides.
 
 | Preset | Assumptions |
 |---|---|
+| `values-kind.yaml` | Local kind development with `:dev` images; explicitly permits insecure HTTP browser sessions. |
+| `values-argocd.yaml` | Local Argo CD mirror with mutable `:latest` images and an out-of-band bootstrap Secret; explicitly permits insecure HTTP browser sessions. |
 | `values-k3s.yaml` | A default CSI-backed StorageClass is available. Uses one operator replica and the default OCI runtime because k3s does not ship gVisor. |
 | `values-gke.yaml` | GKE Sandbox is enabled on every node that can host environments. Sets `runtimeClass: gvisor` and runs two operator replicas with leader election. |
 | `values-eks.yaml` | A default EBS CSI StorageClass is available. Runs two operator replicas with leader election. EKS does not provide a standard gVisor RuntimeClass, so environments use the cluster default unless you override `environmentTemplates[].spec.runtimeClass`. |
@@ -62,6 +64,11 @@ exact namespace, resource name, and subresource on every request:
 
 | Operation | Kubernetes authorization attributes |
 |---|---|
+| List Runs | `list` on `runs` with an empty `resourceName` |
+| Create a Run | `create` on `runs` with an empty `resourceName` |
+| Read a Run | `get` on `runs` with the requested Run `resourceName` |
+| Cancel a Run | `update` on base `runs` with the requested Run `resourceName` |
+| Read an Environment | `get` on `environments` with the requested Environment `resourceName` |
 | Read a transcript | `get` on `runs/transcript` with the requested Run `resourceName` |
 | Append a transcript event | `update` on `runs/transcript` with the requested Run `resourceName` |
 | Open a terminal | `get` on `environments/terminal` with the requested Environment `resourceName` |
@@ -73,11 +80,25 @@ rejected before transcript state is allocated; an already-open stream is not con
 reauthorized or closed when its Run is deleted. Transcript event `data` remains opaque,
 adapter-owned JSON.
 
-Service clients send `Authorization: Bearer <token>`. Browser transcript readers and
-terminal clients may instead use an `HttpOnly`, `Secure`, `SameSite=Strict` cookie named
-`swe-platform-session`; a trusted authentication proxy is responsible for creating that
-session. Session cookies are deliberately rejected for transcript appends, which require
-an explicit bearer service credential. WebSocket requests with an `Origin` must be
+Service clients send `Authorization: Bearer <token>`. A browser exchanges an explicit,
+non-bootstrap bearer credential with `POST /api/v1/session`. After a successful TokenReview,
+the control plane stores that credential in a bounded process-local session and places only a
+random 256-bit opaque identifier in an `HttpOnly`, `Secure`, `SameSite=Strict`, `Path=/`
+cookie named `swe-platform-session`; it does not issue a platform token or refresh token.
+Every cookie-authenticated request resolves the server-side credential and repeats TokenReview
+before SAR, so upstream expiry and revocation still apply. Sessions have a one-hour absolute
+lifetime, credentials are limited to 16 KiB, and one process accepts at most 10,000 active
+sessions. Logout, absolute expiry, or a failed TokenReview deletes the server-side entry.
+Because sessions are process-local, a control-plane restart logs browsers out; the chart's
+single-replica requirement prevents session routing ambiguity. `GET /api/v1/session` validates
+the current session and `DELETE /api/v1/session` revokes it. Production session exchange requires HTTPS. Only the
+kind and Argo development presets set `controlPlane.auth.allowInsecureSessions=true`, which
+allows HTTP and omits the cookie's `Secure` flag.
+
+Cookie-authenticated Run creation, cancellation, and session deletion require an exact
+same-origin `Origin`; explicit bearer service clients remain supported without `Origin`.
+Session cookies remain rejected for transcript appends, which require an explicit bearer
+service credential. WebSocket requests with an `Origin` must be
 same-origin, including scheme, host, and port. Forwarded headers are ignored by default.
 Behind a trusted reverse proxy, set `controlPlane.auth.trustProxyHeaders=true`; the control
 plane then requires single-valued `X-Forwarded-Host` and `X-Forwarded-Proto` headers, so
@@ -141,6 +162,32 @@ subjects:
 
 Create the ServiceAccount, then mint a short-lived credential with
 `kubectl create token run-123-adapter -n project-a --audience=swe-platform`.
+
+## Run and Environment resource API
+
+The console-facing resource API exposes explicit DTOs rather than Kubernetes objects:
+
+- `GET/POST /api/v1/namespaces/{namespace}/runs`
+- `GET /api/v1/namespaces/{namespace}/runs/{name}`
+- `POST /api/v1/namespaces/{namespace}/runs/{name}/cancel`
+- `GET /api/v1/namespaces/{namespace}/environments/{name}`
+
+Representative JSON contracts are committed in
+[`internal/controlplane/testdata/contracts`](../../internal/controlplane/testdata/contracts).
+Run lists default to 50 items and accept `limit=1..200` plus an opaque, bounded `continue`
+token. Create bodies are limited to 1 MiB, reject unknown fields, and require a caller-chosen
+Kubernetes DNS-subdomain `name` as the retry key. An existing same-name Run is returned only
+when the caller is separately authorized to get that exact Run and its immutable intent
+matches; otherwise the API returns a conflict without exposing it. Clients select either an
+existing Environment or a Project/Template allocation intent. Only the Run is created—the
+Run controller exclusively allocates or claims Environments. Cancellation monotonically sets
+`spec.cancel` and retries bounded Kubernetes update conflicts.
+
+Run and Environment responses omit raw CRDs, managed fields, conditions, transcript storage
+references, sandboxd/terminal endpoints, pod names, image IDs, and secrets. Environment
+`ready` is derived only from the current generation's Ready condition. New REST errors use
+`application/problem+json`; existing transcript SSE and terminal WebSocket wire contracts are
+unchanged.
 
 ## Transcript API
 
