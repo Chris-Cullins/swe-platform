@@ -401,10 +401,10 @@ func TestTerminalHeartbeatProtectsSlowWakeBeforeConnection(t *testing.T) {
 	if err := closer.Close(); err != nil {
 		t.Fatal(err)
 	}
-	writesAfterClose := activityClient.count()
+	writesAfterClose := waitForActivityWritesToQuiesce(t, activityClient, 60*time.Millisecond)
 	time.Sleep(60 * time.Millisecond)
 	if writes := activityClient.count(); writes != writesAfterClose {
-		t.Fatalf("activity writes after terminal close = %d, want %d", writes, writesAfterClose)
+		t.Fatalf("activity writes continued after terminal close = %d, want %d", writes, writesAfterClose)
 	}
 }
 
@@ -445,13 +445,29 @@ func TestTerminalHeartbeatCancelsWhenWakeOrDialFails(t *testing.T) {
 			if _, _, err := dialer.DialTerminal(context.Background(), environment.Namespace, environment.Name); err == nil {
 				t.Fatalf("DialTerminal() succeeded during %s failure", test.name)
 			}
-			writesAfterFailure := activityClient.count()
+			writesAfterFailure := waitForActivityWritesToQuiesce(t, activityClient, 60*time.Millisecond)
 			time.Sleep(60 * time.Millisecond)
 			if writes := activityClient.count(); writes != writesAfterFailure {
-				t.Fatalf("activity writes after %s failure = %d, want %d", test.name, writes, writesAfterFailure)
+				t.Fatalf("activity writes continued after %s failure = %d, want %d", test.name, writes, writesAfterFailure)
 			}
 		})
 	}
+}
+
+func waitForActivityWritesToQuiesce(t *testing.T, activityClient *activityCountingClient, quietFor time.Duration) int {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	writes := activityClient.count()
+	for time.Now().Before(deadline) {
+		time.Sleep(quietFor)
+		next := activityClient.count()
+		if next == writes {
+			return next
+		}
+		writes = next
+	}
+	t.Fatal("terminal activity writes did not quiesce after cancellation")
+	return 0
 }
 
 type activityCountingClient struct {
