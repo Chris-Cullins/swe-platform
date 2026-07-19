@@ -95,6 +95,10 @@ connection-bound `Exec` supports explicit stdin EOF but is not retry-safe; keyed
 epoch-scoped `ProcessService` provides duplicate-safe launch, portable tree controls,
 timeouts, opaque execution identity, and bounded cursor output with observable loss.
 It supports both foreground agent processes and reconnectable long-lived services.
+The workspace-only filesystem contract in
+[`FILESYSTEM.md`](sandboxd/proto/sandboxd/v1/FILESYSTEM.md) uses portable logical paths,
+race-safe workspace-confined traversal, ranged reads, atomic streamed writes with SHA-256
+preconditions, portable metadata, and paginated listings.
 
 Run states are observable milestones: `Allocating`, `EnvironmentReady`,
 `AdapterAccepted`, `Running`, `NeedsInput`, `Paused`, and terminal `Succeeded`, `Failed`,

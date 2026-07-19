@@ -38,7 +38,7 @@ func newConn(t *testing.T, workspace string) *grpc.ClientConn {
 	sandboxdv1.RegisterHealthServiceServer(grpcServer, &HealthServer{Version: "test"})
 	sandboxdv1.RegisterExecServiceServer(grpcServer, NewExecServer(workspace, supervisor))
 	sandboxdv1.RegisterProcessServiceServer(grpcServer, processServer)
-	sandboxdv1.RegisterFilesystemServiceServer(grpcServer, &FilesystemServer{Workspace: workspace})
+	sandboxdv1.RegisterFilesystemServiceServer(grpcServer, newTestFilesystemServer(t, workspace))
 	sandboxdv1.RegisterTerminalServiceServer(grpcServer, &TerminalServer{
 		Workspace:  workspace,
 		SocketName: socketName,
@@ -203,38 +203,6 @@ func TestNormalizeEnvReplaceAndStable(t *testing.T) {
 	}
 	if strings.Join(env, ",") != "A=1,B=2" {
 		t.Fatalf("replace env = %v", env)
-	}
-}
-
-func TestFilesystemRoundTrip(t *testing.T) {
-	workspace := t.TempDir()
-	conn := newConn(t, workspace)
-	fs := sandboxdv1.NewFilesystemServiceClient(conn)
-	ctx := context.Background()
-
-	if _, err := fs.Write(ctx, &sandboxdv1.WriteRequest{Path: "notes/hello.txt", Content: []byte("hi there")}); err != nil {
-		t.Fatalf("write: %v", err)
-	}
-
-	read, err := fs.Read(ctx, &sandboxdv1.ReadRequest{Path: "notes/hello.txt"})
-	if err != nil {
-		t.Fatalf("read: %v", err)
-	}
-	if string(read.Content) != "hi there" {
-		t.Fatalf("unexpected content: %q", read.Content)
-	}
-
-	list, err := fs.List(ctx, &sandboxdv1.ListRequest{Path: "notes"})
-	if err != nil {
-		t.Fatalf("list: %v", err)
-	}
-	if len(list.Entries) != 1 || list.Entries[0].Name != "hello.txt" {
-		t.Fatalf("unexpected entries: %+v", list.Entries)
-	}
-
-	// The file must have landed inside the workspace.
-	if _, err := os.Stat(filepath.Join(workspace, "notes", "hello.txt")); err != nil {
-		t.Fatalf("file not in workspace: %v", err)
 	}
 }
 
