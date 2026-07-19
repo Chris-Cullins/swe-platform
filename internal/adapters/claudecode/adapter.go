@@ -6,6 +6,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sync"
 
@@ -49,11 +50,10 @@ type outputEvent struct {
 }
 
 type resultEvent struct {
-	Type              string            `json:"type"`
-	Subtype           string            `json:"subtype"`
-	IsError           *bool             `json:"is_error"`
-	Result            string            `json:"result"`
-	PermissionDenials []json.RawMessage `json:"permission_denials"`
+	Type    string `json:"type"`
+	Subtype string `json:"subtype"`
+	IsError *bool  `json:"is_error"`
+	Result  string `json:"result"`
 }
 
 func (a *Adapter) executable() string {
@@ -76,6 +76,7 @@ func (a *Adapter) processSpec(task controllers.AdapterTask) *sandboxdv1.ProcessS
 			"--verbose",
 			"--permission-mode", "bypassPermissions",
 			"--no-session-persistence",
+			"--",
 			task.Prompt,
 		},
 		EnvMode: sandboxdv1.EnvironmentMode_ENVIRONMENT_MODE_INHERIT,
@@ -109,6 +110,9 @@ func (a *Adapter) Observe(ctx context.Context, task controllers.AdapterTask, san
 		return "", "", err
 	}
 	if err := a.forwardOutput(ctx, client, task, sandbox, process); err != nil {
+		if errors.Is(err, controllers.ErrAdapterEventRejected) {
+			return controllers.AdapterObservationFailed, "Claude Code transcript output was permanently rejected", nil
+		}
 		return "", "", err
 	}
 
@@ -138,9 +142,6 @@ func (a *Adapter) Observe(ctx context.Context, task controllers.AdapterTask, san
 		if *result.IsError || result.Subtype != "success" {
 			return controllers.AdapterObservationFailed, processMessage("Claude Code reported "+result.Subtype, result.Result), nil
 		}
-		if len(result.PermissionDenials) != 0 {
-			return controllers.AdapterObservationNeedsInput, "Claude Code requires permission or user input", nil
-		}
 		return controllers.AdapterObservationSucceeded, processMessage("Claude Code completed", result.Result), nil
 	default:
 		return controllers.AdapterObservationFailed, fmt.Sprintf("Claude Code returned invalid process state %s", process.State), nil
@@ -166,7 +167,11 @@ func (a *Adapter) Cancel(ctx context.Context, task controllers.AdapterTask, sand
 	case sandboxdv1.ProcessState_PROCESS_STATE_RUNNING, sandboxdv1.ProcessState_PROCESS_STATE_STOPPING:
 		return controllers.ErrAdapterCancellationPending
 	case sandboxdv1.ProcessState_PROCESS_STATE_EXITED, sandboxdv1.ProcessState_PROCESS_STATE_FAILED:
-		return a.forwardOutput(ctx, client, task, sandbox, process)
+		err := a.forwardOutput(ctx, client, task, sandbox, process)
+		if errors.Is(err, controllers.ErrAdapterEventRejected) {
+			return nil
+		}
+		return err
 	default:
 		return fmt.Errorf("Claude Code cancellation returned invalid process state %s", process.State)
 	}

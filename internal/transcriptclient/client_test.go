@@ -3,11 +3,13 @@ package transcriptclient
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/Chris-Cullins/swe-platform/internal/controllers"
@@ -42,16 +44,82 @@ func TestAppendUsesProjectedCredentialAndOpaqueEvent(t *testing.T) {
 	}
 }
 
-func TestAppendReportsControlPlaneFailure(t *testing.T) {
+func TestAppendClassifiesControlPlaneFailures(t *testing.T) {
 	tokenFile := filepath.Join(t.TempDir(), "token")
 	if err := os.WriteFile(tokenFile, []byte("token"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		http.Error(w, "full", http.StatusInsufficientStorage)
-	}))
-	defer server.Close()
-	if err := (Client{BaseURL: server.URL, TokenFile: tokenFile}).Append(context.Background(), "ns", "run", controllers.AdapterEvent{Source: "a", IdempotencyKey: "k", Type: "t", Data: json.RawMessage(`{}`)}); err == nil {
-		t.Fatal("Append() succeeded on control-plane failure")
+	tests := []struct {
+		status    int
+		permanent bool
+	}{
+		{http.StatusBadRequest, true},
+		{http.StatusForbidden, true},
+		{http.StatusConflict, true},
+		{http.StatusRequestEntityTooLarge, true},
+		{http.StatusInsufficientStorage, true},
+		{http.StatusUnauthorized, false},
+		{http.StatusRequestTimeout, false},
+		{http.StatusTooManyRequests, false},
+		{http.StatusInternalServerError, false},
+	}
+	for _, test := range tests {
+		t.Run(http.StatusText(test.status), func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				http.Error(w, "rejected", test.status)
+			}))
+			defer server.Close()
+			err := (Client{BaseURL: server.URL, TokenFile: tokenFile}).Append(context.Background(), "ns", "run", controllers.AdapterEvent{Source: "a", IdempotencyKey: "k", Type: "t", Data: json.RawMessage(`{}`)})
+			if err == nil || errors.Is(err, controllers.ErrAdapterEventRejected) != test.permanent {
+				t.Fatalf("Append() error = %v, permanent = %t", err, test.permanent)
+			}
+		})
+	}
+}
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(request *http.Request) (*http.Response, error) { return f(request) }
+
+type trackingBody struct {
+	*strings.Reader
+	closed bool
+}
+
+func (b *trackingBody) Close() error {
+	b.closed = true
+	return nil
+}
+
+func TestAppendDrainsSuccessfulResponse(t *testing.T) {
+	tokenFile := filepath.Join(t.TempDir(), "token")
+	if err := os.WriteFile(tokenFile, []byte("token"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	body := &trackingBody{Reader: strings.NewReader(strings.Repeat("x", 32*1024))}
+	httpClient := &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: http.StatusCreated, Status: "201 Created", Body: body, Header: make(http.Header)}, nil
+	})}
+	err := (Client{BaseURL: "http://control-plane", TokenFile: tokenFile, HTTP: httpClient}).Append(context.Background(), "ns", "run", controllers.AdapterEvent{Source: "a", IdempotencyKey: "k", Type: "t", Data: json.RawMessage(`{}`)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if body.Len() != 0 || !body.closed {
+		t.Fatalf("successful response remaining/closed = %d/%t", body.Len(), body.closed)
+	}
+}
+
+func TestAppendTransportFailureIsRetryable(t *testing.T) {
+	tokenFile := filepath.Join(t.TempDir(), "token")
+	if err := os.WriteFile(tokenFile, []byte("token"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	transportErr := errors.New("connection reset after uncertain append")
+	httpClient := &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		return nil, transportErr
+	})}
+	err := (Client{BaseURL: "http://control-plane", TokenFile: tokenFile, HTTP: httpClient}).Append(context.Background(), "ns", "run", controllers.AdapterEvent{Source: "a", IdempotencyKey: "k", Type: "t", Data: json.RawMessage(`{}`)})
+	if !errors.Is(err, transportErr) || errors.Is(err, controllers.ErrAdapterEventRejected) {
+		t.Fatalf("Append() error = %v, want retryable transport error", err)
 	}
 }

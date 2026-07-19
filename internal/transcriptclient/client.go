@@ -54,9 +54,29 @@ func (c Client) Append(ctx context.Context, namespace, run string, event control
 		return fmt.Errorf("append transcript event: %w", err)
 	}
 	defer response.Body.Close()
+	if response.StatusCode >= 200 && response.StatusCode < 300 {
+		if _, err := io.Copy(io.Discard, io.LimitReader(response.Body, 2<<20)); err != nil {
+			return fmt.Errorf("drain transcript response: %w", err)
+		}
+		return nil
+	}
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
 		message, _ := io.ReadAll(io.LimitReader(response.Body, 4096))
-		return fmt.Errorf("append transcript event: control plane returned %s: %s", response.Status, strings.TrimSpace(string(message)))
+		err := fmt.Errorf("append transcript event: control plane returned %s: %s", response.Status, strings.TrimSpace(string(message)))
+		if permanentRejection(response.StatusCode) {
+			return fmt.Errorf("%w: %v", controllers.ErrAdapterEventRejected, err)
+		}
+		return err
 	}
 	return nil
+}
+
+func permanentRejection(statusCode int) bool {
+	if statusCode == http.StatusUnauthorized || statusCode == http.StatusRequestTimeout || statusCode == http.StatusTooManyRequests {
+		return false
+	}
+	if statusCode >= 500 && statusCode != http.StatusInsufficientStorage {
+		return false
+	}
+	return true
 }

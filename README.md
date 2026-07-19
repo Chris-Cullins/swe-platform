@@ -186,10 +186,11 @@ delivery and GitHub App token minting remain blocked on issue #9; until that exi
 must provision authentication at the Environment layer and accept that it is not yet scoped
 to one adapter process. Never put a credential in a Run prompt.
 
-Current limitations: permission denials in Claude's final structured result map to
-`NeedsInput`, but there is no reply/resume-input protocol yet; other non-success results,
-non-zero exits, missing executables, and malformed/missing final result events map to
-`Failed`. Transcript storage is currently process-local to one control-plane replica.
+Current limitations: Claude print mode has no live input continuation channel, so an exit-zero
+successful result remains `Succeeded` even when its history contains permission denials.
+Non-success results, non-zero exits, missing executables, malformed/missing final result
+events, and permanent transcript rejection map to `Failed`. Transcript storage is currently
+process-local to one control-plane replica.
 
 `--name` is the create idempotency key: retry an uncertain request with the same name and
 immutable task arguments. The CLI returns the existing Run only when its intent matches;

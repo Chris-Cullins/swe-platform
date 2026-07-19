@@ -111,6 +111,13 @@ func TestAcceptanceIsDuplicateSafeAndResumeKeepsTaskIdentity(t *testing.T) {
 	}
 }
 
+func TestPromptIsSeparatedFromClaudeFlags(t *testing.T) {
+	spec := (&Adapter{}).processSpec(controllers.AdapterTask{Prompt: "--version"})
+	if got := spec.Argv[len(spec.Argv)-2:]; !reflect.DeepEqual(got, []string{"--", "--version"}) {
+		t.Fatalf("argv suffix = %#v, want flag terminator and prompt", got)
+	}
+}
+
 func TestCancelStopsOnlyRunOwnedProcessTree(t *testing.T) {
 	client := &fakeProcessClient{}
 	task := controllers.AdapterTask{ID: "run-uid"}
@@ -142,7 +149,7 @@ func TestObservationMapping(t *testing.T) {
 		{name: "start failure", process: &sandboxdv1.Process{State: sandboxdv1.ProcessState_PROCESS_STATE_FAILED, Error: "executable not found", ExecutionId: "e"}, want: controllers.AdapterObservationFailed},
 		{name: "nonzero exit", process: &sandboxdv1.Process{State: sandboxdv1.ProcessState_PROCESS_STATE_EXITED, ExitCode: &exit1, ExecutionId: "e"}, want: controllers.AdapterObservationFailed},
 		{name: "success", process: &sandboxdv1.Process{State: sandboxdv1.ProcessState_PROCESS_STATE_EXITED, ExitCode: &exit0, ExecutionId: "e"}, stdout: "{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"done\"}\n", want: controllers.AdapterObservationSucceeded},
-		{name: "needs input", process: &sandboxdv1.Process{State: sandboxdv1.ProcessState_PROCESS_STATE_EXITED, ExitCode: &exit0, ExecutionId: "e"}, stdout: "{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"permission_denials\":[{\"tool\":\"Bash\"}]}\n", want: controllers.AdapterObservationNeedsInput},
+		{name: "success with historical denial", process: &sandboxdv1.Process{State: sandboxdv1.ProcessState_PROCESS_STATE_EXITED, ExitCode: &exit0, ExecutionId: "e"}, stdout: "{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"permission_denials\":[{\"tool\":\"Bash\"}]}\n", want: controllers.AdapterObservationSucceeded},
 		{name: "reported error", process: &sandboxdv1.Process{State: sandboxdv1.ProcessState_PROCESS_STATE_EXITED, ExitCode: &exit0, ExecutionId: "e"}, stdout: "{\"type\":\"result\",\"subtype\":\"error_max_turns\",\"is_error\":true}\n", want: controllers.AdapterObservationFailed},
 		{name: "error with denial", process: &sandboxdv1.Process{State: sandboxdv1.ProcessState_PROCESS_STATE_EXITED, ExitCode: &exit0, ExecutionId: "e"}, stdout: "{\"type\":\"result\",\"subtype\":\"error_during_execution\",\"is_error\":true,\"permission_denials\":[{}]}\n", want: controllers.AdapterObservationFailed},
 		{name: "missing error marker", process: &sandboxdv1.Process{State: sandboxdv1.ProcessState_PROCESS_STATE_EXITED, ExitCode: &exit0, ExecutionId: "e"}, stdout: "{\"type\":\"result\",\"subtype\":\"success\"}\n", want: controllers.AdapterObservationFailed},
@@ -219,6 +226,55 @@ func TestOutputRetryAfterRestartUsesContentAddressedKeys(t *testing.T) {
 	}
 	if len(keys) != 2 || keys[0] == keys[1] {
 		t.Fatalf("restart output keys = %#v, want distinct keys for evolved payloads", keys)
+	}
+}
+
+func TestTransientOutputFailureRetriesSameEvent(t *testing.T) {
+	client := &fakeProcessClient{process: &sandboxdv1.Process{State: sandboxdv1.ProcessState_PROCESS_STATE_RUNNING, ExecutionId: "execution"}, stdout: []byte("output")}
+	transient := errors.New("temporary transcript outage")
+	var keys []string
+	sandbox := sandboxFor(client)
+	sandbox.EmitEvent = func(_ context.Context, event controllers.AdapterEvent) error {
+		keys = append(keys, event.IdempotencyKey)
+		if len(keys) == 1 {
+			return transient
+		}
+		return nil
+	}
+	adapter := &Adapter{}
+	if _, _, err := adapter.Observe(context.Background(), controllers.AdapterTask{ID: "run"}, sandbox); !errors.Is(err, transient) {
+		t.Fatalf("first Observe() error = %v, want transient error", err)
+	}
+	got, _, err := adapter.Observe(context.Background(), controllers.AdapterTask{ID: "run"}, sandbox)
+	if err != nil || got != controllers.AdapterObservationRunning {
+		t.Fatalf("retry Observe() = (%q, %v)", got, err)
+	}
+	if len(keys) != 2 || keys[0] != keys[1] {
+		t.Fatalf("retry keys = %#v, want same idempotency key", keys)
+	}
+}
+
+func TestPermanentOutputRejectionFailsObservation(t *testing.T) {
+	client := &fakeProcessClient{process: &sandboxdv1.Process{State: sandboxdv1.ProcessState_PROCESS_STATE_RUNNING, ExecutionId: "execution"}, stdout: []byte("output")}
+	sandbox := sandboxFor(client)
+	sandbox.EmitEvent = func(context.Context, controllers.AdapterEvent) error {
+		return controllers.ErrAdapterEventRejected
+	}
+	got, message, err := (&Adapter{}).Observe(context.Background(), controllers.AdapterTask{ID: "run"}, sandbox)
+	if err != nil || got != controllers.AdapterObservationFailed || !strings.Contains(message, "permanently rejected") {
+		t.Fatalf("Observe() = (%q, %q, %v)", got, message, err)
+	}
+}
+
+func TestTerminalCancellationIgnoresPermanentOutputRejection(t *testing.T) {
+	exitCode := int32(0)
+	client := &fakeProcessClient{process: &sandboxdv1.Process{State: sandboxdv1.ProcessState_PROCESS_STATE_EXITED, ExecutionId: "execution", ExitCode: &exitCode}, stdout: []byte("output")}
+	sandbox := sandboxFor(client)
+	sandbox.EmitEvent = func(context.Context, controllers.AdapterEvent) error {
+		return controllers.ErrAdapterEventRejected
+	}
+	if err := (&Adapter{}).Cancel(context.Background(), controllers.AdapterTask{ID: "run"}, sandbox); err != nil {
+		t.Fatalf("Cancel() error = %v", err)
 	}
 }
 

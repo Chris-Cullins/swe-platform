@@ -38,6 +38,10 @@ var errExplicitEnvironmentClaimed = errors.New("explicit environment is already 
 // adapter-owned execution tree has not reached a terminal state yet.
 var ErrAdapterCancellationPending = errors.New("adapter cancellation is pending")
 
+// ErrAdapterEventRejected means the transcript transport permanently rejected
+// an adapter event. Retrying the same event cannot make progress.
+var ErrAdapterEventRejected = errors.New("adapter event permanently rejected")
+
 const (
 	runConditionEnvironmentReady           = "EnvironmentReady"
 	runConditionAdapterAcceptanceAttempted = "AdapterAcceptanceAttempted"
@@ -72,6 +76,7 @@ type AdapterEvent struct {
 }
 
 // AdapterEventSink forwards opaque adapter events for one namespaced Run.
+// Permanent rejection wraps ErrAdapterEventRejected; other errors are retryable.
 type AdapterEventSink interface {
 	Append(context.Context, string, string, AdapterEvent) error
 }
