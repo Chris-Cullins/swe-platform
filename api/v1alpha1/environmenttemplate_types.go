@@ -28,6 +28,7 @@ type EnvironmentTemplateSpec struct {
 
 	// Backend selects where environments execute. Only "pod" is supported in v1alpha1.
 	// +kubebuilder:default=pod
+	// +kubebuilder:validation:Enum=pod
 	Backend EnvironmentBackend `json:"backend,omitempty"`
 
 	// IdleTimeout is how long an environment may be inactive before it is paused.

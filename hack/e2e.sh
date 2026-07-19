@@ -300,7 +300,9 @@ if ! kubectl get environment "$RUN_ENV_NAME" >/dev/null 2>&1; then
 fi
 
 echo "==> verifying shared terminal through swe attach"
-printf 'printf terminal-e2e-ok; printf "\\n%%s\\n" "$SWE_E2E_PROJECT_CONFIG"; exit\n' | bin/swe attach "$ENV_NAME" > /tmp/swe-platform-terminal.out
+printf 'printf terminal-e2e-ok; printf "\\n%%s\\n" "$SWE_E2E_PROJECT_CONFIG"; exit\n' | \
+	SWE_CONTROL_PLANE_URL=http://127.0.0.1:18080 SWE_CONTROL_PLANE_TOKEN="$E2E_BOOTSTRAP_TOKEN" \
+	bin/swe attach "$ENV_NAME" > /tmp/swe-platform-terminal.out
 if ! grep -q 'terminal-e2e-ok' /tmp/swe-platform-terminal.out; then
 	echo "FAIL: terminal output was not received through swe attach"
 	cat /tmp/swe-platform-terminal.out
@@ -375,40 +377,9 @@ if [[ "${PHASE:-}" != "Paused" ]] || kubectl get pod "$POD_NAME" >/dev/null 2>&1
 	echo "FAIL: idle environment did not pause and remove its pod"
 	exit 1
 fi
-WEB_TERMINAL_CLIENT=$(mktemp /tmp/swe-web-terminal-XXXXXX.go)
-cat > "$WEB_TERMINAL_CLIENT" <<'EOF'
-package main
-
-import (
-	"fmt"
-	"net/http"
-	"os"
-	"strings"
-	"time"
-
-	"github.com/gorilla/websocket"
-)
-
-func main() {
-	header := http.Header{"Authorization": []string{"Bearer " + os.Args[2]}}
-	connection, _, err := websocket.DefaultDialer.Dial(os.Args[1], header)
-	if err != nil { panic(err) }
-	defer connection.Close()
-	_ = connection.SetReadDeadline(time.Now().Add(15 * time.Second))
-	if err := connection.WriteJSON(map[string]any{"type": "open", "cols": 80, "rows": 24}); err != nil { panic(err) }
-	if err := connection.WriteMessage(websocket.BinaryMessage, []byte("printf web-terminal-e2e-ok\n")); err != nil { panic(err) }
-	var output strings.Builder
-	for !strings.Contains(output.String(), "web-terminal-e2e-ok") {
-		messageType, data, err := connection.ReadMessage()
-		if err != nil { panic(err) }
-		if messageType == websocket.BinaryMessage { _, _ = output.Write(data) }
-	}
-	fmt.Print(output.String())
-}
-EOF
-go run "$WEB_TERMINAL_CLIENT" \
-	"ws://127.0.0.1:18080/api/v1/namespaces/default/environments/${ENV_NAME}/terminal" \
-	"$E2E_BOOTSTRAP_TOKEN" > /tmp/swe-platform-web-terminal.out
+printf 'printf web-terminal-e2e-ok; exit\n' | \
+	SWE_CONTROL_PLANE_URL=http://127.0.0.1:18080 SWE_CONTROL_PLANE_TOKEN="$E2E_BOOTSTRAP_TOKEN" \
+	bin/swe attach "$ENV_NAME" > /tmp/swe-platform-web-terminal.out
 if ! grep -q 'web-terminal-e2e-ok' /tmp/swe-platform-web-terminal.out; then
 	echo "FAIL: terminal output was not received through the control-plane websocket"
 	cat /tmp/swe-platform-web-terminal.out

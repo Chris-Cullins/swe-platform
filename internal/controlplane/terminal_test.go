@@ -118,7 +118,7 @@ func TestKubernetesTerminalDialerMarksEnvironmentActive(t *testing.T) {
 	kubeClient := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(environment).WithObjects(environment).Build()
 	dialer := KubernetesTerminalDialer{Client: kubeClient}
 
-	if err := dialer.markActive(context.Background(), environment); err != nil {
+	if err := dialer.markActive(context.Background(), environment, environment.UID); err != nil {
 		t.Fatalf("markActive() error = %v", err)
 	}
 	var updated platformv1alpha1.Environment
@@ -127,6 +127,28 @@ func TestKubernetesTerminalDialerMarksEnvironmentActive(t *testing.T) {
 	}
 	if updated.Status.LastActiveAt == nil || !updated.Status.LastActiveAt.After(oldActivity.Time) {
 		t.Fatalf("LastActiveAt = %v, want after %s", updated.Status.LastActiveAt, oldActivity.Time)
+	}
+}
+
+func TestKubernetesTerminalDialerDoesNotMarkReplacementEnvironmentActive(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := platformv1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	original := &platformv1alpha1.Environment{ObjectMeta: metav1.ObjectMeta{Name: "env-1", Namespace: "project-1", UID: "old-uid"}}
+	replacement := original.DeepCopy()
+	replacement.UID = "new-uid"
+	kubeClient := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(replacement).WithObjects(replacement).Build()
+	dialer := KubernetesTerminalDialer{Client: kubeClient}
+	if err := dialer.markActive(context.Background(), original, original.UID); err == nil || !strings.Contains(err.Error(), "incarnation changed") {
+		t.Fatalf("markActive() replacement error = %v", err)
+	}
+	var updated platformv1alpha1.Environment
+	if err := kubeClient.Get(context.Background(), client.ObjectKeyFromObject(replacement), &updated); err != nil {
+		t.Fatal(err)
+	}
+	if updated.Status.LastActiveAt != nil {
+		t.Fatal("replacement Environment was marked active")
 	}
 }
 
@@ -156,6 +178,7 @@ func TestKubernetesTerminalDialerUsesRecreatedPodCredentialsAfterWake(t *testing
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "new-pod",
 			Namespace: environment.Namespace,
+			UID:       "new-pod-uid",
 			Annotations: map[string]string{
 				sandboxdauth.IdentityAnnotation: "new-incarnation.sandboxd.swe.dev",
 				sandboxdauth.TrustAnnotation:    testCertificatePEM(t, "new-incarnation.sandboxd.swe.dev"),
@@ -202,7 +225,7 @@ func (c wakeReadyClient) Patch(ctx context.Context, object client.Object, patch 
 	if err := c.Client.Get(ctx, types.NamespacedName{Namespace: current.Namespace, Name: c.podName}, &pod); err != nil {
 		return err
 	}
-	current.Status.Endpoints.Sandboxd = net.JoinHostPort(pod.Status.PodIP, sandboxdPort)
+	current.Status.Endpoints.Sandboxd = net.JoinHostPort(pod.Status.PodIP, "50051")
 	current.Status.ObservedGeneration = current.Generation
 	apimeta.SetStatusCondition(&current.Status.Conditions, metav1.Condition{
 		Type: platformv1alpha1.EnvironmentConditionReady, Status: metav1.ConditionTrue,
@@ -331,8 +354,9 @@ func TestKubernetesTerminalDialerRejectsPodOwnedByAnotherEnvironmentIncarnation(
 	}
 	environment := &platformv1alpha1.Environment{
 		ObjectMeta: metav1.ObjectMeta{Name: "env-1", Namespace: "project-1", UID: "current-environment"},
+		Spec:       platformv1alpha1.EnvironmentSpec{TemplateRef: "default"},
 		Status: platformv1alpha1.EnvironmentStatus{
-			Phase: platformv1alpha1.EnvironmentPhaseReady, PodName: "env-env-1",
+			Phase: platformv1alpha1.EnvironmentPhaseReady, PodName: "env-env-1", Endpoints: platformv1alpha1.EnvironmentEndpoints{Sandboxd: "192.0.2.10:50051"},
 			Conditions: []metav1.Condition{{Type: platformv1alpha1.EnvironmentConditionReady, Status: metav1.ConditionTrue, Reason: "SandboxdReady", Message: "sandboxd is ready"}},
 		},
 	}
@@ -345,7 +369,8 @@ func TestKubernetesTerminalDialerRejectsPodOwnedByAnotherEnvironmentIncarnation(
 		},
 		Status: corev1.PodStatus{PodIP: "192.0.2.10"},
 	}
-	dialer := KubernetesTerminalDialer{Client: fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(environment).WithObjects(environment, pod).Build()}
+	template := &platformv1alpha1.EnvironmentTemplate{ObjectMeta: metav1.ObjectMeta{Name: "default", Namespace: "project-1"}}
+	dialer := KubernetesTerminalDialer{Client: fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(environment).WithObjects(environment, pod, template).Build()}
 
 	_, _, err := dialer.DialTerminal(context.Background(), "project-1", "env-1")
 	if err == nil || !strings.Contains(err.Error(), "not owned by the current environment") {

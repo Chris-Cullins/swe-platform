@@ -688,6 +688,131 @@ func TestReconcileReportsStableChildOwnershipCondition(t *testing.T) {
 	}
 }
 
+func TestReconcileRejectsUnsupportedEffectiveBackendBeforeCreatingChildren(t *testing.T) {
+	tests := []struct {
+		name            string
+		environment     platformv1alpha1.EnvironmentBackend
+		template        platformv1alpha1.EnvironmentBackend
+		wantUnsupported platformv1alpha1.EnvironmentBackend
+	}{
+		{name: "template backend", template: platformv1alpha1.EnvironmentBackendKubeVirt, wantUnsupported: platformv1alpha1.EnvironmentBackendKubeVirt},
+		{name: "environment override", environment: platformv1alpha1.EnvironmentBackendExternalRunner, template: platformv1alpha1.EnvironmentBackendPod, wantUnsupported: platformv1alpha1.EnvironmentBackendExternalRunner},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			scheme := runtime.NewScheme()
+			if err := corev1.AddToScheme(scheme); err != nil {
+				t.Fatal(err)
+			}
+			if err := platformv1alpha1.AddToScheme(scheme); err != nil {
+				t.Fatal(err)
+			}
+			env := &platformv1alpha1.Environment{
+				ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default", UID: "environment-uid", Generation: 2, Finalizers: []string{environmentFinalizer}},
+				Spec:       platformv1alpha1.EnvironmentSpec{TemplateRef: "small", Backend: test.environment},
+			}
+			template := &platformv1alpha1.EnvironmentTemplate{
+				ObjectMeta: metav1.ObjectMeta{Name: "small", Namespace: "default"},
+				Spec:       platformv1alpha1.EnvironmentTemplateSpec{Backend: test.template},
+			}
+			reconciler := &EnvironmentReconciler{Client: fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(env).WithObjects(env, template).Build(), Scheme: scheme}
+			result, err := reconciler.Reconcile(context.Background(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(env)})
+			if err != nil || result.Requeue || result.RequeueAfter != 0 {
+				t.Fatalf("Reconcile() = (%#v, %v), want terminal success", result, err)
+			}
+			var updated platformv1alpha1.Environment
+			if err := reconciler.Get(context.Background(), client.ObjectKeyFromObject(env), &updated); err != nil {
+				t.Fatal(err)
+			}
+			condition := apimeta.FindStatusCondition(updated.Status.Conditions, platformv1alpha1.EnvironmentConditionReady)
+			if updated.Status.Phase != platformv1alpha1.EnvironmentPhaseFailed || condition == nil || condition.Reason != "UnsupportedBackend" || !strings.Contains(condition.Message, string(test.wantUnsupported)) {
+				t.Fatalf("unsupported backend status = phase %q, condition %#v", updated.Status.Phase, condition)
+			}
+			var pods corev1.PodList
+			var pvcs corev1.PersistentVolumeClaimList
+			if err := reconciler.List(context.Background(), &pods, client.InNamespace(env.Namespace)); err != nil {
+				t.Fatal(err)
+			}
+			if err := reconciler.List(context.Background(), &pvcs, client.InNamespace(env.Namespace)); err != nil {
+				t.Fatal(err)
+			}
+			if len(pods.Items) != 0 || len(pvcs.Items) != 0 {
+				t.Fatalf("unsupported backend created %d Pods and %d PVCs", len(pods.Items), len(pvcs.Items))
+			}
+		})
+	}
+}
+
+func TestEffectiveEnvironmentBackendPrecedence(t *testing.T) {
+	template := &platformv1alpha1.EnvironmentTemplate{Spec: platformv1alpha1.EnvironmentTemplateSpec{Backend: platformv1alpha1.EnvironmentBackendKubeVirt}}
+	environment := &platformv1alpha1.Environment{}
+	if got := platformv1alpha1.EffectiveEnvironmentBackend(environment, template); got != platformv1alpha1.EnvironmentBackendKubeVirt {
+		t.Fatalf("template backend = %q, want kubevirt", got)
+	}
+	environment.Spec.Backend = platformv1alpha1.EnvironmentBackendPod
+	if got := platformv1alpha1.EffectiveEnvironmentBackend(environment, template); got != platformv1alpha1.EnvironmentBackendPod {
+		t.Fatalf("environment override = %q, want pod", got)
+	}
+	if got := platformv1alpha1.EffectiveEnvironmentBackend(&platformv1alpha1.Environment{}, &platformv1alpha1.EnvironmentTemplate{}); got != platformv1alpha1.EnvironmentBackendPod {
+		t.Fatalf("empty backend default = %q, want pod", got)
+	}
+}
+
+func TestUnsupportedBackendWithdrawsReadinessBeforeStoppingOwnedPod(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	if err := platformv1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	env := &platformv1alpha1.Environment{
+		ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default", UID: "environment-uid", Generation: 2},
+		Status: platformv1alpha1.EnvironmentStatus{
+			ObservedGeneration: 2, Phase: platformv1alpha1.EnvironmentPhaseReady, PodName: "env-test",
+			Endpoints:  platformv1alpha1.EnvironmentEndpoints{Sandboxd: "10.0.0.1:50051"},
+			Conditions: []metav1.Condition{{Type: platformv1alpha1.EnvironmentConditionReady, Status: metav1.ConditionTrue, ObservedGeneration: 2, Reason: "SandboxdReady"}},
+		},
+	}
+	controller := true
+	owner := metav1.OwnerReference{APIVersion: platformv1alpha1.GroupVersion.String(), Kind: "Environment", Name: env.Name, UID: env.UID, Controller: &controller}
+	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: envPodName(env), Namespace: env.Namespace, UID: "pod-uid", OwnerReferences: []metav1.OwnerReference{owner}}}
+	secret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: envCredentialName(env), Namespace: env.Namespace, UID: "secret-uid", OwnerReferences: []metav1.OwnerReference{owner}}}
+	pvc := &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: envPVCName(env), Namespace: env.Namespace, UID: "pvc-uid", OwnerReferences: []metav1.OwnerReference{owner}}}
+	reconciler := &EnvironmentReconciler{Client: fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(env).WithObjects(env, pod, secret, pvc).Build(), Scheme: scheme}
+
+	result, err := reconciler.reconcileUnsupportedBackend(context.Background(), env, platformv1alpha1.EnvironmentBackendKubeVirt)
+	if err != nil || !result.Requeue {
+		t.Fatalf("withdraw readiness = (%#v, %v)", result, err)
+	}
+	var updated platformv1alpha1.Environment
+	if err := reconciler.Get(context.Background(), client.ObjectKeyFromObject(env), &updated); err != nil {
+		t.Fatal(err)
+	}
+	ready := apimeta.FindStatusCondition(updated.Status.Conditions, platformv1alpha1.EnvironmentConditionReady)
+	if platformv1alpha1.IsEnvironmentReady(&updated) || updated.Status.PodName != "" || updated.Status.Endpoints.Sandboxd != "" || ready == nil || ready.Reason != "UnsupportedBackend" {
+		t.Fatalf("readiness was not withdrawn first: %#v", updated.Status)
+	}
+	if err := reconciler.Get(context.Background(), client.ObjectKeyFromObject(pod), &corev1.Pod{}); err != nil {
+		t.Fatal("pod was deleted before readiness withdrawal")
+	}
+	if _, err := reconciler.reconcileUnsupportedBackend(context.Background(), &updated, platformv1alpha1.EnvironmentBackendKubeVirt); err != nil {
+		t.Fatal(err)
+	}
+	if err := reconciler.Get(context.Background(), client.ObjectKeyFromObject(pod), &corev1.Pod{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("owned pod still exists: %v", err)
+	}
+	if _, err := reconciler.reconcileUnsupportedBackend(context.Background(), &updated, platformv1alpha1.EnvironmentBackendKubeVirt); err != nil {
+		t.Fatal(err)
+	}
+	if err := reconciler.Get(context.Background(), client.ObjectKeyFromObject(secret), &corev1.Secret{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("credential still exists: %v", err)
+	}
+	if err := reconciler.Get(context.Background(), client.ObjectKeyFromObject(pvc), &corev1.PersistentVolumeClaim{}); err != nil {
+		t.Fatal("workspace PVC was not retained")
+	}
+}
+
 func TestReconcilePausedRefusesForeignPod(t *testing.T) {
 	scheme := runtime.NewScheme()
 	if err := corev1.AddToScheme(scheme); err != nil {

@@ -57,10 +57,9 @@ type AdapterTask struct {
 // AdapterSandbox is the backend-neutral handle exposed to adapters. Adapters
 // use sandboxd and never inspect pods, containers, VMs, PIDs, or OS signals.
 type AdapterSandbox struct {
-	EnvironmentName  string
-	EnvironmentUID   types.UID
-	SandboxdEndpoint string
-	DialProcess      func(context.Context) (sandboxdv1.ProcessServiceClient, func() error, error)
+	EnvironmentName string
+	EnvironmentUID  types.UID
+	DialProcess     func(context.Context) (sandboxdv1.ProcessServiceClient, func() error, error)
 }
 
 // AdapterLifecycle translates one agent's execution model into normalized Run
@@ -670,13 +669,13 @@ func adapterTask(run *platformv1alpha1.Run) AdapterTask {
 }
 
 func (r *RunReconciler) adapterSandbox(run *platformv1alpha1.Run, env *platformv1alpha1.Environment) AdapterSandbox {
-	return AdapterSandbox{EnvironmentName: env.Name, EnvironmentUID: env.UID, SandboxdEndpoint: env.Status.Endpoints.Sandboxd,
+	return AdapterSandbox{EnvironmentName: env.Name, EnvironmentUID: env.UID,
 		DialProcess: func(ctx context.Context) (sandboxdv1.ProcessServiceClient, func() error, error) {
 			current, err := r.getAllocatedEnvironment(ctx, run)
 			if err != nil {
 				return nil, nil, err
 			}
-			return sandboxclient.DialProcess(ctx, r.Client, current.Namespace, current.Name, current.UID)
+			return (sandboxclient.Connector{Reader: r.Client}).DialProcess(ctx, current.Namespace, current.Name, current.UID)
 		}}
 }
 

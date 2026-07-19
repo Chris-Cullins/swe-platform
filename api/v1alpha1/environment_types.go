@@ -23,8 +23,10 @@ const (
 	EnvironmentPhaseTerminated EnvironmentPhase = "Terminated"
 )
 
-// EnvironmentBackend selects where the environment executes.
-// +kubebuilder:validation:Enum=pod;kubevirt;external-runner
+// EnvironmentBackend selects where the environment executes. The v1alpha1 Go
+// API retains planned backend names for compatibility, but CRD admission only
+// accepts pod until another backend is implemented.
+// +kubebuilder:validation:Enum=pod
 type EnvironmentBackend string
 
 const (
@@ -42,7 +44,9 @@ type EnvironmentSpec struct {
 	// TemplateRef is the name of the EnvironmentTemplate to build from.
 	TemplateRef string `json:"templateRef"`
 
-	// Backend overrides the template's backend.
+	// Backend overrides the template's backend when set. Only pod is currently
+	// supported.
+	// +kubebuilder:validation:Enum=pod
 	// +optional
 	Backend EnvironmentBackend `json:"backend,omitempty"`
 
@@ -103,6 +107,19 @@ func IsEnvironmentReady(environment *Environment) bool {
 	condition := apimeta.FindStatusCondition(environment.Status.Conditions, EnvironmentConditionReady)
 	return environment.Status.ObservedGeneration == environment.Generation && condition != nil &&
 		condition.ObservedGeneration == environment.Generation && condition.Status == metav1.ConditionTrue
+}
+
+// EffectiveEnvironmentBackend resolves an Environment's explicit override
+// before its template default. Empty values preserve the admission default of
+// pod for objects created before CRD defaulting or in tests.
+func EffectiveEnvironmentBackend(environment *Environment, template *EnvironmentTemplate) EnvironmentBackend {
+	if environment.Spec.Backend != "" {
+		return environment.Spec.Backend
+	}
+	if template.Spec.Backend != "" {
+		return template.Spec.Backend
+	}
+	return EnvironmentBackendPod
 }
 
 // +kubebuilder:object:root=true

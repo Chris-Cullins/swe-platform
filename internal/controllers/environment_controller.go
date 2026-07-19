@@ -157,6 +157,10 @@ func (r *EnvironmentReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	if err := r.Get(ctx, types.NamespacedName{Namespace: env.Namespace, Name: env.Spec.TemplateRef}, &tmpl); err != nil {
 		return ctrl.Result{}, r.fail(ctx, &env, fmt.Errorf("get template %q: %w", env.Spec.TemplateRef, err))
 	}
+	backend := platformv1alpha1.EffectiveEnvironmentBackend(&env, &tmpl)
+	if backend != platformv1alpha1.EnvironmentBackendPod {
+		return r.reconcileUnsupportedBackend(ctx, &env, backend)
+	}
 
 	pvcReady, err := r.ensureWorkspacePVC(ctx, &env, &tmpl)
 	if err != nil {
@@ -197,6 +201,47 @@ func (r *EnvironmentReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		return ctrl.Result{}, nil
 	}
 	return r.reconcileIdle(ctx, &env, &tmpl)
+}
+
+// reconcileUnsupportedBackend withdraws the published connection identity
+// before stopping any legacy pod admitted under an older CRD. It retains the
+// workspace PVC and removes credentials only after the pod is gone.
+func (r *EnvironmentReconciler) reconcileUnsupportedBackend(ctx context.Context, env *platformv1alpha1.Environment, backend platformv1alpha1.EnvironmentBackend) (ctrl.Result, error) {
+	hadPublishedConnection := env.Status.PodName != "" || env.Status.Endpoints.Sandboxd != "" || platformv1alpha1.IsEnvironmentReady(env)
+	message := fmt.Sprintf("environment backend %q is not supported; only %q is available", backend, platformv1alpha1.EnvironmentBackendPod)
+	if err := r.setEnvironmentStatus(ctx, env, platformv1alpha1.EnvironmentPhaseFailed, "", "", "UnsupportedBackend", message); err != nil {
+		return ctrl.Result{}, err
+	}
+	if hadPublishedConnection {
+		return ctrl.Result{Requeue: true}, nil
+	}
+
+	var pod corev1.Pod
+	if err := r.Get(ctx, types.NamespacedName{Namespace: env.Namespace, Name: envPodName(env)}, &pod); err == nil {
+		if !metav1.IsControlledBy(&pod, env) {
+			return ctrl.Result{}, nil
+		}
+		if err := r.deleteObservedChild(ctx, &pod); err != nil && !errors.IsNotFound(err) {
+			return ctrl.Result{}, fmt.Errorf("delete pod for unsupported backend: %w", err)
+		}
+		return ctrl.Result{Requeue: true}, nil
+	} else if !errors.IsNotFound(err) {
+		return ctrl.Result{}, err
+	}
+
+	var credentials corev1.Secret
+	if err := r.Get(ctx, types.NamespacedName{Namespace: env.Namespace, Name: envCredentialName(env)}, &credentials); err == nil {
+		if !metav1.IsControlledBy(&credentials, env) {
+			return ctrl.Result{}, nil
+		}
+		if err := r.deleteObservedChild(ctx, &credentials); err != nil && !errors.IsNotFound(err) {
+			return ctrl.Result{}, fmt.Errorf("revoke credentials for unsupported backend: %w", err)
+		}
+		return ctrl.Result{Requeue: true}, nil
+	} else if !errors.IsNotFound(err) {
+		return ctrl.Result{}, err
+	}
+	return ctrl.Result{}, nil
 }
 
 // reconcileIdle schedules the next activity check or requests a pause once the

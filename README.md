@@ -174,6 +174,12 @@ immediately replenishes the pool. Claiming for a Project recreates the generic w
 against its existing workspace volume so repository setup completes before the run is
 reported ready.
 
+Only the `pod` environment backend is currently supported. An explicit
+`Environment.spec.backend` takes precedence over its template's backend; unsupported
+values on existing resources fail with an `UnsupportedBackend` Ready-condition reason
+before the operator creates a Pod or PVC. CRD admission rejects unsupported values for
+new Environments and templates.
+
 The authenticated control plane exposes a browser terminal at
 `GET /api/v1/namespaces/{namespace}/environments/{name}/terminal`. The WebSocket client
 first sends `{"type":"open","cols":80,"rows":24}`, then uses binary frames for terminal
@@ -182,6 +188,12 @@ terminal. Kubernetes TokenReview authenticates bearer credentials and SubjectAcc
 authorizes the exact namespaced environment; the namespace is never accepted from a query
 parameter. See the [Helm chart documentation](charts/swe-platform/README.md#control-plane-authentication-and-authorization)
 for credentials, browser sessions, RBAC, and self-hosted bootstrap setup.
+The CLI uses this gateway rather than Kubernetes pod discovery or port forwarding:
+
+```sh
+SWE_CONTROL_PLANE_URL=https://swe.example.com \
+SWE_CONTROL_PLANE_TOKEN="$TOKEN" swe attach my-environment
+```
 
 ## Contributing
 

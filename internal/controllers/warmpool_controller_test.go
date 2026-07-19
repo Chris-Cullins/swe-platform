@@ -42,8 +42,8 @@ func TestWarmPoolReconcileCreatesMinimum(t *testing.T) {
 		t.Fatalf("warm environments = %d, want 2", len(environments.Items))
 	}
 	for _, env := range environments.Items {
-		if env.Spec.TemplateRef != "small" || env.Spec.Backend != platformv1alpha1.EnvironmentBackendPod {
-			t.Errorf("environment spec = %#v, want small pod template", env.Spec)
+		if env.Spec.TemplateRef != "small" || env.Spec.Backend != "" {
+			t.Errorf("environment spec = %#v, want inheritance from small template", env.Spec)
 		}
 		if !metav1.IsControlledBy(&env, tmpl) {
 			t.Errorf("environment %q is not controlled by template", env.Name)
@@ -51,6 +51,36 @@ func TestWarmPoolReconcileCreatesMinimum(t *testing.T) {
 		if env.OwnerReferences[0].BlockOwnerDeletion == nil || *env.OwnerReferences[0].BlockOwnerDeletion {
 			t.Errorf("environment %q blocks template deletion", env.Name)
 		}
+	}
+}
+
+func TestWarmPoolDoesNotReplenishUnsupportedBackend(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := platformv1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	template := &platformv1alpha1.EnvironmentTemplate{
+		ObjectMeta: metav1.ObjectMeta{Name: "legacy", Namespace: "default", UID: "template-uid"},
+		Spec: platformv1alpha1.EnvironmentTemplateSpec{
+			Backend:  platformv1alpha1.EnvironmentBackendKubeVirt,
+			WarmPool: &platformv1alpha1.WarmPoolSpec{Min: 2},
+		},
+		Status: platformv1alpha1.EnvironmentTemplateStatus{WarmPoolReady: 1},
+	}
+	reconciler := &WarmPoolReconciler{Client: fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(template).WithObjects(template).Build(), Scheme: scheme}
+	if _, err := reconciler.Reconcile(context.Background(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(template)}); err != nil {
+		t.Fatal(err)
+	}
+	var environments platformv1alpha1.EnvironmentList
+	if err := reconciler.List(context.Background(), &environments); err != nil {
+		t.Fatal(err)
+	}
+	var updated platformv1alpha1.EnvironmentTemplate
+	if err := reconciler.Get(context.Background(), client.ObjectKeyFromObject(template), &updated); err != nil {
+		t.Fatal(err)
+	}
+	if len(environments.Items) != 0 || updated.Status.WarmPoolReady != 0 {
+		t.Fatalf("unsupported warm pool created %d environments and reports %d ready", len(environments.Items), updated.Status.WarmPoolReady)
 	}
 }
 

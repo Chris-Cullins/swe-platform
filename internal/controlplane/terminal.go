@@ -5,15 +5,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"net"
 	"net/http"
 	"net/url"
 	"strings"
 	"time"
 
 	"github.com/gorilla/websocket"
-	"google.golang.org/grpc"
-	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/util/retry"
@@ -25,7 +22,6 @@ import (
 )
 
 const (
-	sandboxdPort     = "50051"
 	wakeTimeout      = 2 * time.Minute
 	wakePollInterval = 250 * time.Millisecond
 )
@@ -45,19 +41,25 @@ type activeTerminalConnection struct {
 	cancel context.CancelFunc
 }
 
+type closeFunc func() error
+
+func (f closeFunc) Close() error { return f() }
+
 func (c *activeTerminalConnection) Close() error {
 	c.cancel()
 	return c.Closer.Close()
 }
 
 // DialTerminal records terminal activity, wakes a paused environment, and then
-// connects directly to sandboxd in its active pod.
+// requests an authenticated sandboxd connection through the environment
+// connector. Backend transport details stay out of terminal feature code.
 func (d KubernetesTerminalDialer) DialTerminal(ctx context.Context, namespace, name string) (sandboxdv1.TerminalServiceClient, io.Closer, error) {
 	var environment platformv1alpha1.Environment
 	if err := d.Client.Get(ctx, types.NamespacedName{Namespace: namespace, Name: name}, &environment); err != nil {
 		return nil, nil, fmt.Errorf("get environment: %w", err)
 	}
-	if err := d.markActive(ctx, &environment); err != nil {
+	expectedUID := environment.UID
+	if err := d.markActive(ctx, &environment, expectedUID); err != nil {
 		return nil, nil, err
 	}
 	if environment.Spec.Paused {
@@ -66,37 +68,17 @@ func (d KubernetesTerminalDialer) DialTerminal(ctx context.Context, namespace, n
 		if err := d.Client.Patch(ctx, &environment, client.MergeFrom(before)); err != nil {
 			return nil, nil, fmt.Errorf("wake environment: %w", err)
 		}
-		if err := d.waitUntilReady(ctx, namespace, name, &environment); err != nil {
+		if err := d.waitUntilReady(ctx, namespace, name, expectedUID, &environment); err != nil {
 			return nil, nil, err
 		}
-		if err := d.markActive(ctx, &environment); err != nil {
+		if err := d.markActive(ctx, &environment, expectedUID); err != nil {
 			return nil, nil, err
 		}
 	}
 	if !platformv1alpha1.IsEnvironmentReady(&environment) {
 		return nil, nil, fmt.Errorf("environment is not ready for its current generation")
 	}
-	if environment.Status.PodName == "" {
-		return nil, nil, fmt.Errorf("environment has no active pod")
-	}
-
-	var pod corev1.Pod
-	if err := d.Client.Get(ctx, types.NamespacedName{Namespace: namespace, Name: environment.Status.PodName}, &pod); err != nil {
-		return nil, nil, fmt.Errorf("get environment pod: %w", err)
-	}
-	if !metav1.IsControlledBy(&pod, &environment) {
-		return nil, nil, fmt.Errorf("environment pod is not owned by the current environment")
-	}
-	if !pod.DeletionTimestamp.IsZero() || !terminalPodReady(&pod) || pod.Status.PodIP == "" ||
-		environment.Status.Endpoints.Sandboxd != net.JoinHostPort(pod.Status.PodIP, sandboxdPort) {
-		return nil, nil, fmt.Errorf("environment pod is not the current ready sandboxd endpoint")
-	}
-	dialOptions, err := sandboxclient.DialOptions(&pod)
-	if err != nil {
-		return nil, nil, fmt.Errorf("load sandboxd credentials: %w", err)
-	}
-
-	connection, err := grpc.NewClient(net.JoinHostPort(pod.Status.PodIP, sandboxdPort), dialOptions...)
+	terminal, closeConnection, err := (sandboxclient.Connector{Reader: d.Client}).DialTerminal(ctx, namespace, name, expectedUID)
 	if err != nil {
 		return nil, nil, fmt.Errorf("connect to sandboxd: %w", err)
 	}
@@ -104,21 +86,12 @@ func (d KubernetesTerminalDialer) DialTerminal(ctx context.Context, namespace, n
 	heartbeatInterval, err := d.activityHeartbeatInterval(ctx, &environment)
 	if err != nil {
 		cancelHeartbeat()
-		_ = connection.Close()
+		_ = closeConnection()
 		return nil, nil, err
 	}
-	go d.heartbeatActivity(heartbeatContext, types.NamespacedName{Namespace: namespace, Name: name}, heartbeatInterval)
-	closer := &activeTerminalConnection{Closer: connection, cancel: cancelHeartbeat}
-	return sandboxdv1.NewTerminalServiceClient(connection), closer, nil
-}
-
-func terminalPodReady(pod *corev1.Pod) bool {
-	for _, condition := range pod.Status.Conditions {
-		if condition.Type == corev1.PodReady {
-			return condition.Status == corev1.ConditionTrue
-		}
-	}
-	return false
+	go d.heartbeatActivity(heartbeatContext, types.NamespacedName{Namespace: namespace, Name: name}, expectedUID, heartbeatInterval)
+	closer := &activeTerminalConnection{Closer: closeFunc(closeConnection), cancel: cancelHeartbeat}
+	return terminal, closer, nil
 }
 
 func (d KubernetesTerminalDialer) activityHeartbeatInterval(ctx context.Context, environment *platformv1alpha1.Environment) (time.Duration, error) {
@@ -137,7 +110,7 @@ func (d KubernetesTerminalDialer) activityHeartbeatInterval(ctx context.Context,
 	return timeout / 2, nil
 }
 
-func (d KubernetesTerminalDialer) heartbeatActivity(ctx context.Context, key types.NamespacedName, interval time.Duration) {
+func (d KubernetesTerminalDialer) heartbeatActivity(ctx context.Context, key types.NamespacedName, expectedUID types.UID, interval time.Duration) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for {
@@ -149,18 +122,21 @@ func (d KubernetesTerminalDialer) heartbeatActivity(ctx context.Context, key typ
 			if err := d.Client.Get(ctx, key, &environment); err != nil {
 				return
 			}
-			if err := d.markActive(ctx, &environment); err != nil {
+			if err := d.markActive(ctx, &environment, expectedUID); err != nil {
 				return
 			}
 		}
 	}
 }
 
-func (d KubernetesTerminalDialer) markActive(ctx context.Context, environment *platformv1alpha1.Environment) error {
+func (d KubernetesTerminalDialer) markActive(ctx context.Context, environment *platformv1alpha1.Environment, expectedUID types.UID) error {
 	key := client.ObjectKeyFromObject(environment)
 	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		if err := d.Client.Get(ctx, key, environment); err != nil {
 			return err
+		}
+		if environment.UID != expectedUID {
+			return fmt.Errorf("environment incarnation changed")
 		}
 		now := metav1.Now()
 		environment.Status.LastActiveAt = &now
@@ -171,7 +147,7 @@ func (d KubernetesTerminalDialer) markActive(ctx context.Context, environment *p
 	return nil
 }
 
-func (d KubernetesTerminalDialer) waitUntilReady(ctx context.Context, namespace, name string, environment *platformv1alpha1.Environment) error {
+func (d KubernetesTerminalDialer) waitUntilReady(ctx context.Context, namespace, name string, expectedUID types.UID, environment *platformv1alpha1.Environment) error {
 	wakeContext, cancel := context.WithTimeout(ctx, wakeTimeout)
 	defer cancel()
 	ticker := time.NewTicker(wakePollInterval)
@@ -181,7 +157,10 @@ func (d KubernetesTerminalDialer) waitUntilReady(ctx context.Context, namespace,
 		if err := d.Client.Get(wakeContext, key, environment); err != nil {
 			return fmt.Errorf("wait for environment wake: %w", err)
 		}
-		if platformv1alpha1.IsEnvironmentReady(environment) && environment.Status.PodName != "" {
+		if environment.UID != expectedUID {
+			return fmt.Errorf("wait for environment wake: environment incarnation changed")
+		}
+		if platformv1alpha1.IsEnvironmentReady(environment) {
 			return nil
 		}
 		select {
@@ -240,9 +219,13 @@ func (s *Server) handleTerminal(w http.ResponseWriter, r *http.Request, namespac
 	}
 	defer connection.Close()
 	connection.SetReadLimit(1 << 20)
-	if err := bridgeWebTerminal(r.Context(), connection, terminal); err != nil && r.Context().Err() == nil {
-		s.log.Debug("web terminal closed", "namespace", namespace, "environment", environment, "error", err)
+	if err := bridgeWebTerminal(r.Context(), connection, terminal); err != nil {
+		if r.Context().Err() == nil {
+			s.log.Debug("web terminal closed", "namespace", namespace, "environment", environment, "error", err)
+		}
+		return
 	}
+	_ = connection.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""), time.Now().Add(time.Second))
 }
 
 func (s *Server) checkWebSocketOrigin(r *http.Request) bool {

@@ -38,6 +38,16 @@ func (r *WarmPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 	if tmpl.Spec.WarmPool != nil {
 		minimum = tmpl.Spec.WarmPool.Min
 	}
+	if platformv1alpha1.EffectiveEnvironmentBackend(&platformv1alpha1.Environment{}, &tmpl) != platformv1alpha1.EnvironmentBackendPod {
+		if tmpl.Status.WarmPoolReady != 0 {
+			before := tmpl.DeepCopy()
+			tmpl.Status.WarmPoolReady = 0
+			if err := r.Status().Patch(ctx, &tmpl, client.MergeFrom(before)); err != nil {
+				return ctrl.Result{}, fmt.Errorf("clear unsupported warm pool status: %w", err)
+			}
+		}
+		return ctrl.Result{}, nil
+	}
 
 	var environments platformv1alpha1.EnvironmentList
 	if err := r.List(ctx, &environments,
@@ -88,7 +98,6 @@ func (r *WarmPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 			},
 			Spec: platformv1alpha1.EnvironmentSpec{
 				TemplateRef: tmpl.Name,
-				Backend:     tmpl.Spec.Backend,
 			},
 		}
 		if err := controllerutil.SetControllerReference(&tmpl, env, r.Scheme, controllerutil.WithBlockOwnerDeletion(false)); err != nil {

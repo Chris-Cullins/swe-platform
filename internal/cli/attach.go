@@ -6,150 +6,88 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
+	"path"
+	"strings"
 	"syscall"
+	"time"
 
+	"github.com/gorilla/websocket"
 	"github.com/spf13/cobra"
 	"golang.org/x/term"
-	"google.golang.org/grpc"
-	corev1 "k8s.io/api/core/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/client-go/tools/portforward"
-	"k8s.io/client-go/transport/spdy"
-
-	platformv1alpha1 "github.com/Chris-Cullins/swe-platform/api/v1alpha1"
-	"github.com/Chris-Cullins/swe-platform/internal/sandboxclient"
-	sandboxdv1 "github.com/Chris-Cullins/swe-platform/sandboxd/gen/proto/sandboxd/v1"
 )
 
 func newAttachCommand() *cobra.Command {
+	var controlPlaneURL string
+	var token string
 	cmd := &cobra.Command{
 		Use:   "attach <environment>",
-		Short: "Attach a terminal to an environment (via sandboxd)",
-		Long:  "Attach to an environment's shared terminal via sandboxd. Press Ctrl-] to detach.",
+		Short: "Attach a terminal to an environment through the control plane",
+		Long:  "Attach to an environment's shared terminal through the authenticated control-plane gateway. Press Ctrl-] to detach.",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			namespace, _ := cmd.Flags().GetString("namespace")
-			return attachTerminal(cmd, namespace, args[0])
+			return attachTerminal(cmd, controlPlaneURL, token, namespace, args[0])
 		},
 	}
+	cmd.Flags().StringVar(&controlPlaneURL, "control-plane", os.Getenv("SWE_CONTROL_PLANE_URL"), "Control-plane base URL (or SWE_CONTROL_PLANE_URL)")
+	cmd.Flags().StringVar(&token, "token", os.Getenv("SWE_CONTROL_PLANE_TOKEN"), "Control-plane bearer token (or SWE_CONTROL_PLANE_TOKEN)")
 	return cmd
 }
 
-func attachTerminal(cmd *cobra.Command, namespace, envName string) error {
-	clients, err := newKubeClients()
+func attachTerminal(cmd *cobra.Command, controlPlaneURL, token, namespace, envName string) error {
+	endpoint, err := terminalGatewayURL(controlPlaneURL, namespace, envName)
 	if err != nil {
 		return err
 	}
-	env := &platformv1alpha1.Environment{}
-	if err := clients.Get(cmd.Context(), types.NamespacedName{Namespace: namespace, Name: envName}, env); err != nil {
-		return fmt.Errorf("get environment %s: %w", envName, err)
+	if token == "" {
+		return fmt.Errorf("control-plane token is required (set --token or SWE_CONTROL_PLANE_TOKEN)")
 	}
-	if !platformv1alpha1.IsEnvironmentReady(env) {
-		return fmt.Errorf("environment %s is not ready for its current generation", envName)
-	}
-	if env.Status.PodName == "" {
-		return fmt.Errorf("environment %s has no backing pod", envName)
-	}
-	pod := &corev1.Pod{}
-	if err := clients.Get(cmd.Context(), types.NamespacedName{Namespace: namespace, Name: env.Status.PodName}, pod); err != nil {
-		return fmt.Errorf("get environment pod %s: %w", env.Status.PodName, err)
-	}
-	if !metav1.IsControlledBy(pod, env) {
-		return fmt.Errorf("environment pod %s is not owned by the current environment", env.Status.PodName)
-	}
-	if !pod.DeletionTimestamp.IsZero() || !podReadyForAttach(pod) {
-		return fmt.Errorf("environment pod %s is not ready", env.Status.PodName)
-	}
-	dialOptions, err := sandboxclient.DialOptions(pod)
+	header := http.Header{"Authorization": []string{"Bearer " + token}}
+	connection, response, err := websocket.DefaultDialer.DialContext(cmd.Context(), endpoint, header)
 	if err != nil {
-		return fmt.Errorf("load sandboxd credentials: %w", err)
-	}
-
-	localPort, stopForward, forwardErr, err := forwardSandboxd(cmd.Context(), clients, namespace, env.Status.PodName, cmd.ErrOrStderr())
-	if err != nil {
-		return err
-	}
-	defer stopForward()
-
-	conn, err := grpc.NewClient(fmt.Sprintf("127.0.0.1:%d", localPort), dialOptions...)
-	if err != nil {
-		return fmt.Errorf("connect to sandboxd: %w", err)
-	}
-	defer conn.Close()
-
-	if err := bridgeTerminal(cmd.Context(), sandboxdv1.NewTerminalServiceClient(conn), cmd.InOrStdin(), cmd.OutOrStdout()); err != nil {
-		select {
-		case portErr := <-forwardErr:
-			if portErr != nil {
-				return fmt.Errorf("port-forward to pod %s: %w", env.Status.PodName, portErr)
-			}
-		default:
+		if response != nil {
+			return fmt.Errorf("connect to environment terminal: control plane returned %s", response.Status)
 		}
-		return err
+		return fmt.Errorf("connect to environment terminal: %w", err)
 	}
-	return nil
+	defer connection.Close()
+	return bridgeTerminal(cmd.Context(), connection, cmd.InOrStdin(), cmd.OutOrStdout())
 }
 
-func podReadyForAttach(pod *corev1.Pod) bool {
-	for _, condition := range pod.Status.Conditions {
-		if condition.Type == corev1.PodReady {
-			return condition.Status == corev1.ConditionTrue
-		}
+func terminalGatewayURL(baseURL, namespace, environment string) (string, error) {
+	if baseURL == "" {
+		return "", fmt.Errorf("control-plane URL is required (set --control-plane or SWE_CONTROL_PLANE_URL)")
 	}
-	return false
+	parsed, err := url.Parse(baseURL)
+	if err != nil {
+		return "", fmt.Errorf("parse control-plane URL: %w", err)
+	}
+	if parsed.Host == "" || parsed.RawQuery != "" || parsed.Fragment != "" {
+		return "", fmt.Errorf("control-plane URL must be an HTTP(S) base URL without a query or fragment")
+	}
+	switch strings.ToLower(parsed.Scheme) {
+	case "http":
+		parsed.Scheme = "ws"
+	case "https":
+		parsed.Scheme = "wss"
+	default:
+		return "", fmt.Errorf("control-plane URL scheme must be http or https")
+	}
+	parsed.Path = path.Join(parsed.Path, "api/v1/namespaces", namespace, "environments", environment, "terminal")
+	return parsed.String(), nil
 }
 
-func forwardSandboxd(ctx context.Context, clients *kubeClients, namespace, podName string, errOut io.Writer) (uint16, func(), <-chan error, error) {
-	transport, upgrader, err := spdy.RoundTripperFor(clients.RESTConfig)
-	if err != nil {
-		return 0, nil, nil, fmt.Errorf("build port-forward transport: %w", err)
-	}
-	requestURL := clients.Clientset.CoreV1().RESTClient().Post().
-		Resource("pods").Namespace(namespace).Name(podName).SubResource("portforward").URL()
-	dialer := spdy.NewDialer(upgrader, &http.Client{Transport: transport}, http.MethodPost, requestURL)
-	stop := make(chan struct{})
-	ready := make(chan struct{})
-	forwarder, err := portforward.NewOnAddresses(dialer, []string{"127.0.0.1"}, []string{"0:50051"}, stop, ready, io.Discard, errOut)
-	if err != nil {
-		return 0, nil, nil, fmt.Errorf("configure port-forward: %w", err)
-	}
-	forwardErr := make(chan error, 1)
-	go func() { forwardErr <- forwarder.ForwardPorts() }()
-
-	select {
-	case <-ctx.Done():
-		close(stop)
-		return 0, nil, nil, ctx.Err()
-	case err := <-forwardErr:
-		close(stop)
-		return 0, nil, nil, fmt.Errorf("start port-forward to pod %s: %w", podName, err)
-	case <-ready:
-	}
-	ports, err := forwarder.GetPorts()
-	if err != nil {
-		close(stop)
-		return 0, nil, nil, fmt.Errorf("get forwarded sandboxd port: %w", err)
-	}
-	if len(ports) != 1 {
-		close(stop)
-		return 0, nil, nil, fmt.Errorf("expected one forwarded sandboxd port, got %d", len(ports))
-	}
-	var once bool
-	stopForward := func() {
-		if !once {
-			once = true
-			close(stop)
-		}
-	}
-	return ports[0].Local, stopForward, forwardErr, nil
-}
-
-func bridgeTerminal(ctx context.Context, client sandboxdv1.TerminalServiceClient, input io.Reader, output io.Writer) error {
+func bridgeTerminal(ctx context.Context, connection *websocket.Conn, input io.Reader, output io.Writer) error {
 	streamCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
+	go func() {
+		<-streamCtx.Done()
+		_ = connection.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""), time.Now().Add(time.Second))
+		_ = connection.Close()
+	}()
 	cols, rows := 80, 24
 	var terminalFile *os.File
 	if file, ok := input.(*os.File); ok && term.IsTerminal(int(file.Fd())) {
@@ -164,13 +102,7 @@ func bridgeTerminal(ctx context.Context, client sandboxdv1.TerminalServiceClient
 		defer term.Restore(int(file.Fd()), state)
 	}
 
-	stream, err := client.Terminal(streamCtx)
-	if err != nil {
-		return fmt.Errorf("open terminal stream: %w", err)
-	}
-	if err := stream.Send(&sandboxdv1.TerminalMessage{Kind: &sandboxdv1.TerminalMessage_Open{
-		Open: &sandboxdv1.TerminalOpen{Cols: uint32(cols), Rows: uint32(rows)},
-	}}); err != nil {
+	if err := connection.WriteJSON(map[string]any{"type": "open", "cols": cols, "rows": rows}); err != nil {
 		return fmt.Errorf("open terminal: %w", err)
 	}
 
@@ -207,13 +139,14 @@ func bridgeTerminal(ctx context.Context, client sandboxdv1.TerminalServiceClient
 			case result := <-inputCh:
 				if detachAt := bytes.IndexByte(result.data, 0x1d); detachAt >= 0 {
 					if detachAt > 0 {
-						_ = stream.Send(&sandboxdv1.TerminalMessage{Kind: &sandboxdv1.TerminalMessage_Data{Data: result.data[:detachAt]}})
+						_ = connection.WriteMessage(websocket.BinaryMessage, result.data[:detachAt])
 					}
+					_ = connection.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""), time.Now().Add(time.Second))
 					cancel()
 					return
 				}
 				if len(result.data) > 0 {
-					if stream.Send(&sandboxdv1.TerminalMessage{Kind: &sandboxdv1.TerminalMessage_Data{Data: result.data}}) != nil {
+					if connection.WriteMessage(websocket.BinaryMessage, result.data) != nil {
 						return
 					}
 				}
@@ -223,9 +156,7 @@ func bridgeTerminal(ctx context.Context, client sandboxdv1.TerminalServiceClient
 			case <-resizeCh:
 				width, height, err := term.GetSize(int(terminalFile.Fd()))
 				if err == nil {
-					if stream.Send(&sandboxdv1.TerminalMessage{Kind: &sandboxdv1.TerminalMessage_Resize{
-						Resize: &sandboxdv1.TerminalResize{Cols: uint32(width), Rows: uint32(height)},
-					}}) != nil {
+					if connection.WriteJSON(map[string]any{"type": "resize", "cols": width, "rows": height}) != nil {
 						return
 					}
 				}
@@ -234,17 +165,20 @@ func bridgeTerminal(ctx context.Context, client sandboxdv1.TerminalServiceClient
 	}()
 
 	for {
-		message, err := stream.Recv()
-		if err == io.EOF {
-			return nil
-		}
+		messageType, message, err := connection.ReadMessage()
 		if err != nil {
 			if streamCtx.Err() != nil {
 				return nil
 			}
+			if websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway) {
+				return nil
+			}
 			return fmt.Errorf("terminal stream: %w", err)
 		}
-		if _, err := output.Write(message.GetData()); err != nil {
+		if messageType != websocket.BinaryMessage {
+			continue
+		}
+		if _, err := output.Write(message); err != nil {
 			return fmt.Errorf("write terminal output: %w", err)
 		}
 	}

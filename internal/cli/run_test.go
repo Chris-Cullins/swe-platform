@@ -1,16 +1,125 @@
 package cli
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
+	"time"
 
+	"github.com/gorilla/websocket"
+	"github.com/spf13/cobra"
 	"k8s.io/apimachinery/pkg/runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	platformv1alpha1 "github.com/Chris-Cullins/swe-platform/api/v1alpha1"
 )
+
+func TestTerminalGatewayURL(t *testing.T) {
+	tests := []struct {
+		base string
+		want string
+	}{
+		{base: "http://control.example", want: "ws://control.example/api/v1/namespaces/project-a/environments/env-1/terminal"},
+		{base: "https://control.example/platform/", want: "wss://control.example/platform/api/v1/namespaces/project-a/environments/env-1/terminal"},
+	}
+	for _, test := range tests {
+		got, err := terminalGatewayURL(test.base, "project-a", "env-1")
+		if err != nil {
+			t.Fatalf("terminalGatewayURL(%q): %v", test.base, err)
+		}
+		if got != test.want {
+			t.Errorf("terminalGatewayURL(%q) = %q, want %q", test.base, got, test.want)
+		}
+	}
+	for _, invalid := range []string{"", "ftp://control.example", "https://control.example?token=secret"} {
+		if _, err := terminalGatewayURL(invalid, "project-a", "env-1"); err == nil {
+			t.Errorf("terminalGatewayURL(%q) succeeded", invalid)
+		}
+	}
+}
+
+func TestAttachTerminalUsesAuthenticatedGateway(t *testing.T) {
+	serverErrors := make(chan error, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v1/namespaces/project-a/environments/env-1/terminal" || r.Header.Get("Authorization") != "Bearer terminal-token" {
+			serverErrors <- errors.New("gateway request did not carry the environment identity and bearer token")
+			http.Error(w, "bad request", http.StatusBadRequest)
+			return
+		}
+		connection, err := (&websocket.Upgrader{}).Upgrade(w, r, nil)
+		if err != nil {
+			serverErrors <- err
+			return
+		}
+		defer connection.Close()
+		if _, _, err := connection.ReadMessage(); err != nil {
+			serverErrors <- err
+			return
+		}
+		messageType, input, err := connection.ReadMessage()
+		if err != nil || messageType != websocket.BinaryMessage || string(input) != "echo hello\n" {
+			serverErrors <- errors.New("gateway did not receive terminal input")
+			return
+		}
+		if err := connection.WriteMessage(websocket.BinaryMessage, []byte("terminal output")); err != nil {
+			serverErrors <- err
+			return
+		}
+		serverErrors <- connection.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""), time.Now().Add(time.Second))
+	}))
+	defer server.Close()
+
+	command := &cobra.Command{}
+	command.SetContext(context.Background())
+	command.SetIn(strings.NewReader("echo hello\n"))
+	var output bytes.Buffer
+	command.SetOut(&output)
+	if err := attachTerminal(command, server.URL, "terminal-token", "project-a", "env-1"); err != nil {
+		t.Fatalf("attachTerminal() error = %v", err)
+	}
+	if err := <-serverErrors; err != nil {
+		t.Fatal(err)
+	}
+	if output.String() != "terminal output" {
+		t.Fatalf("terminal output = %q", output.String())
+	}
+}
+
+func TestAttachTerminalReturnsWhenContextIsCancelled(t *testing.T) {
+	opened := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		connection, err := (&websocket.Upgrader{}).Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer connection.Close()
+		if _, _, err := connection.ReadMessage(); err != nil {
+			return
+		}
+		close(opened)
+		_, _, _ = connection.ReadMessage()
+	}))
+	defer server.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	command := &cobra.Command{}
+	command.SetContext(ctx)
+	command.SetIn(strings.NewReader(""))
+	done := make(chan error, 1)
+	go func() { done <- attachTerminal(command, server.URL, "terminal-token", "default", "env-1") }()
+	<-opened
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("attachTerminal did not return after context cancellation")
+	}
+}
 
 type uncertainCreateClient struct {
 	client.Client

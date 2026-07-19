@@ -50,11 +50,11 @@ spec:
             description: EnvironmentSpec defines the desired state of Environment.
             properties:
               backend:
-                description: Backend overrides the template's backend.
+                description: |-
+                  Backend overrides the template's backend when set. Only pod is currently
+                  supported.
                 enum:
                 - pod
-                - kubevirt
-                - external-runner
                 type: string
               paused:
                 description: Paused requests that the environment be paused (pod deleted,

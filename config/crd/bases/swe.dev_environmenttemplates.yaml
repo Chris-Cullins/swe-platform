@@ -45,8 +45,6 @@ spec:
                   is supported in v1alpha1.
                 enum:
                 - pod
-                - kubevirt
-                - external-runner
                 type: string
               diskSize:
                 anyOf:
