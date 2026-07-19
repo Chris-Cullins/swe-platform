@@ -2,6 +2,7 @@
 package controlplane
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -12,10 +13,15 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+
+	platformv1alpha1 "github.com/Chris-Cullins/swe-platform/api/v1alpha1"
 )
 
-const transcriptPathPrefix = "/api/v1/runs/"
-const terminalPathPrefix = "/api/v1/environments/"
+const namespacedPathPrefix = "/api/v1/namespaces/"
 
 // TranscriptEvent is one adapter-owned transcript event.
 type TranscriptEvent struct {
@@ -34,19 +40,52 @@ type appendTranscriptRequest struct {
 type Server struct {
 	log            *slog.Logger
 	store          *transcriptStore
+	access         AccessController
+	runs           RunResolver
 	terminalDialer TerminalDialer
+	trustProxy     bool
+}
+
+// RunResolver verifies that a namespaced Run exists before transcript state is used.
+type RunResolver interface {
+	ResolveRun(context.Context, string, string) (types.UID, error)
+}
+
+// KubernetesRunResolver resolves Runs through the Kubernetes API.
+type KubernetesRunResolver struct {
+	Client client.Client
+}
+
+// ResolveRun verifies that the requested Run exists in the authorized namespace.
+func (r KubernetesRunResolver) ResolveRun(ctx context.Context, namespace, name string) (types.UID, error) {
+	var run platformv1alpha1.Run
+	if err := r.Client.Get(ctx, types.NamespacedName{Namespace: namespace, Name: name}, &run); err != nil {
+		return "", err
+	}
+	return run.UID, nil
+}
+
+// ServerOptions supplies the control plane's resource and authorization dependencies.
+type ServerOptions struct {
+	Access         AccessController
+	Runs           RunResolver
+	TerminalDialer TerminalDialer
+	TrustProxy     bool
 }
 
 // NewServer constructs a control-plane API handler.
-func NewServer(log *slog.Logger, terminalDialer ...TerminalDialer) *Server {
+func NewServer(log *slog.Logger, options ServerOptions) *Server {
 	if log == nil {
 		log = slog.Default()
 	}
-	server := &Server{log: log, store: newTranscriptStore()}
-	if len(terminalDialer) > 0 {
-		server.terminalDialer = terminalDialer[0]
+	return &Server{
+		log:            log,
+		store:          newTranscriptStore(),
+		access:         options.Access,
+		runs:           options.Runs,
+		terminalDialer: options.TerminalDialer,
+		trustProxy:     options.TrustProxy,
 	}
-	return server
 }
 
 // Handler returns the HTTP handler for the API.
@@ -55,36 +94,86 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
 	})
-	mux.HandleFunc("GET "+terminalPathPrefix, s.handleTerminal)
-	mux.HandleFunc(transcriptPathPrefix, s.handleTranscript)
+	mux.HandleFunc(namespacedPathPrefix, s.handleNamespacedAPI)
 	return mux
 }
 
-func (s *Server) handleTranscript(w http.ResponseWriter, r *http.Request) {
-	run, ok := transcriptRun(r.URL.Path)
+func (s *Server) handleNamespacedAPI(w http.ResponseWriter, r *http.Request) {
+	namespace, resource, name, subresource, ok := namespacedResource(r.URL.Path)
 	if !ok {
 		http.NotFound(w, r)
 		return
 	}
+	if resource == "runs" && subresource == "transcript" {
+		s.handleTranscript(w, r, namespace, name)
+		return
+	}
+	if resource == "environments" && subresource == "terminal" && r.Method == http.MethodGet {
+		s.handleTerminal(w, r, namespace, name)
+		return
+	}
+	http.NotFound(w, r)
+}
+
+func namespacedResource(path string) (namespace, resource, name, subresource string, ok bool) {
+	remainder := strings.TrimPrefix(path, namespacedPathPrefix)
+	if remainder == path {
+		return "", "", "", "", false
+	}
+	parts := strings.Split(remainder, "/")
+	if len(parts) != 4 {
+		return "", "", "", "", false
+	}
+	for _, part := range parts {
+		if part == "" {
+			return "", "", "", "", false
+		}
+	}
+	return parts[0], parts[1], parts[2], parts[3], true
+}
+
+func (s *Server) handleTranscript(w http.ResponseWriter, r *http.Request, namespace, run string) {
+	verb := "get"
+	allowSession := true
+	if r.Method == http.MethodPost {
+		verb = "update"
+		allowSession = false
+	}
+	if r.Method != http.MethodGet && r.Method != http.MethodPost {
+		w.Header().Set("Allow", "GET, POST")
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if s.access == nil {
+		writeAccessError(w, errUnauthenticated)
+		return
+	}
+	if err := s.access.Authorize(r, ResourceAccess{Namespace: namespace, Verb: verb, Resource: "runs", Subresource: "transcript", Name: run}, allowSession); err != nil {
+		writeAccessError(w, err)
+		return
+	}
+	if s.runs == nil {
+		http.Error(w, "run resolver is unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	uid, err := s.runs.ResolveRun(r.Context(), namespace, run)
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			http.Error(w, "run not found", http.StatusNotFound)
+		} else {
+			s.log.Warn("resolve transcript run", "namespace", namespace, "run", run, "error", err)
+			http.Error(w, "run resolver is unavailable", http.StatusServiceUnavailable)
+		}
+		return
+	}
+	key := namespace + "/" + string(uid)
 
 	switch r.Method {
 	case http.MethodGet:
-		s.streamTranscript(w, r, run)
+		s.streamTranscript(w, r, key)
 	case http.MethodPost:
-		s.appendTranscript(w, r, run)
-	default:
-		w.Header().Set("Allow", "GET, POST")
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		s.appendTranscript(w, r, key)
 	}
-}
-
-func transcriptRun(path string) (string, bool) {
-	remainder := strings.TrimPrefix(path, transcriptPathPrefix)
-	if remainder == path || !strings.HasSuffix(remainder, "/transcript") {
-		return "", false
-	}
-	run := strings.TrimSuffix(remainder, "/transcript")
-	return run, run != "" && !strings.Contains(run, "/")
 }
 
 func (s *Server) appendTranscript(w http.ResponseWriter, r *http.Request, run string) {

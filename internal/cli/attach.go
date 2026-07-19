@@ -13,12 +13,14 @@ import (
 	"github.com/spf13/cobra"
 	"golang.org/x/term"
 	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials/insecure"
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/portforward"
 	"k8s.io/client-go/transport/spdy"
 
 	platformv1alpha1 "github.com/Chris-Cullins/swe-platform/api/v1alpha1"
+	"github.com/Chris-Cullins/swe-platform/internal/sandboxclient"
 	sandboxdv1 "github.com/Chris-Cullins/swe-platform/sandboxd/gen/proto/sandboxd/v1"
 )
 
@@ -48,6 +50,17 @@ func attachTerminal(cmd *cobra.Command, namespace, envName string) error {
 	if env.Status.PodName == "" {
 		return fmt.Errorf("environment %s has no backing pod", envName)
 	}
+	pod := &corev1.Pod{}
+	if err := clients.Get(cmd.Context(), types.NamespacedName{Namespace: namespace, Name: env.Status.PodName}, pod); err != nil {
+		return fmt.Errorf("get environment pod %s: %w", env.Status.PodName, err)
+	}
+	if !metav1.IsControlledBy(pod, env) {
+		return fmt.Errorf("environment pod %s is not owned by the current environment", env.Status.PodName)
+	}
+	dialOptions, err := sandboxclient.DialOptions(pod)
+	if err != nil {
+		return fmt.Errorf("load sandboxd credentials: %w", err)
+	}
 
 	localPort, stopForward, forwardErr, err := forwardSandboxd(cmd.Context(), clients, namespace, env.Status.PodName, cmd.ErrOrStderr())
 	if err != nil {
@@ -55,7 +68,7 @@ func attachTerminal(cmd *cobra.Command, namespace, envName string) error {
 	}
 	defer stopForward()
 
-	conn, err := grpc.NewClient(fmt.Sprintf("127.0.0.1:%d", localPort), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	conn, err := grpc.NewClient(fmt.Sprintf("127.0.0.1:%d", localPort), dialOptions...)
 	if err != nil {
 		return fmt.Errorf("connect to sandboxd: %w", err)
 	}

@@ -2,12 +2,23 @@ package controllers
 
 import (
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/base64"
+	"encoding/json"
+	"encoding/pem"
 	stderrors "errors"
 	"fmt"
+	"math/big"
 	"net"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	networkingv1 "k8s.io/api/networking/v1"
+	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -22,6 +33,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	platformv1alpha1 "github.com/Chris-Cullins/swe-platform/api/v1alpha1"
+	sandboxdauth "github.com/Chris-Cullins/swe-platform/sandboxd/auth"
 )
 
 // sizePresets maps EnvironmentTemplate size names to pod resource requests/limits.
@@ -42,6 +54,13 @@ const (
 
 var errPodReplacing = stderrors.New("environment pod is being replaced")
 
+const (
+	sandboxdCredentialMount    = "/var/run/swe-platform/sandboxd"
+	sandboxdSecurityRevision   = "1"
+	sandboxdRevisionAnnotation = "swe.dev/sandboxd-security-revision"
+	environmentFinalizer       = "swe.dev/environment-security"
+)
+
 const projectSetupScript = `set -eu
 if [ ! -d /workspace/.git ]; then
 	git clone -- "$SWE_REPOSITORY" /workspace
@@ -60,7 +79,10 @@ fi
 // EnvironmentReconciler reconciles Environment objects into pods + workspace volumes.
 type EnvironmentReconciler struct {
 	client.Client
-	Scheme *runtime.Scheme
+	Scheme                *runtime.Scheme
+	ControlPlaneNamespace string
+	ControlPlaneName      string
+	ControlPlaneInstance  string
 }
 
 // +kubebuilder:rbac:groups=swe.dev,resources=environments,verbs=get;list;watch;create;update;patch;delete
@@ -69,6 +91,8 @@ type EnvironmentReconciler struct {
 // +kubebuilder:rbac:groups=swe.dev,resources=projects,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=persistentvolumeclaims,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups="",resources=secrets,verbs=get;create;update;delete
+// +kubebuilder:rbac:groups=networking.k8s.io,resources=networkpolicies,verbs=get;list;watch;create;update;patch;delete
 
 // Reconcile drives an Environment toward its desired state:
 // pod + PVC present when active, pod deleted (PVC retained) when paused.
@@ -79,16 +103,33 @@ func (r *EnvironmentReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	}
 
 	if !env.DeletionTimestamp.IsZero() {
-		// Owned pods/PVCs are garbage-collected via owner references.
-		return ctrl.Result{}, nil
+		return r.reconcileDeleting(ctx, &env)
+	}
+	if !controllerutil.ContainsFinalizer(&env, environmentFinalizer) {
+		controllerutil.AddFinalizer(&env, environmentFinalizer)
+		if err := r.Update(ctx, &env); err != nil {
+			return ctrl.Result{}, err
+		}
+		return ctrl.Result{Requeue: true}, nil
 	}
 	var tmpl platformv1alpha1.EnvironmentTemplate
 	if err := r.Get(ctx, types.NamespacedName{Namespace: env.Namespace, Name: env.Spec.TemplateRef}, &tmpl); err != nil {
 		return ctrl.Result{}, r.fail(ctx, &env, fmt.Errorf("get template %q: %w", env.Spec.TemplateRef, err))
 	}
 
-	if err := r.ensureWorkspacePVC(ctx, &env, &tmpl); err != nil {
+	pvcReady, err := r.ensureWorkspacePVC(ctx, &env, &tmpl)
+	if err != nil {
 		return ctrl.Result{}, r.fail(ctx, &env, fmt.Errorf("ensure workspace PVC: %w", err))
+	}
+	if !pvcReady {
+		return ctrl.Result{Requeue: true}, nil
+	}
+	policyReady, err := r.ensureSandboxdNetworkPolicy(ctx, &env)
+	if err != nil {
+		return ctrl.Result{}, r.fail(ctx, &env, fmt.Errorf("ensure sandboxd network policy: %w", err))
+	}
+	if !policyReady {
+		return ctrl.Result{Requeue: true}, nil
 	}
 
 	if env.Spec.Paused {
@@ -106,6 +147,9 @@ func (r *EnvironmentReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	}
 	if err != nil {
 		return ctrl.Result{}, r.fail(ctx, &env, fmt.Errorf("ensure pod: %w", err))
+	}
+	if pod == nil {
+		return ctrl.Result{Requeue: true}, nil
 	}
 
 	if err := r.syncStatus(ctx, &env, pod); err != nil {
@@ -147,14 +191,89 @@ func (r *EnvironmentReconciler) reconcileIdle(ctx context.Context, env *platform
 	return ctrl.Result{Requeue: true}, nil
 }
 
+// reconcileDeleting orders revocation: stop sandboxd, remove its credentials,
+// then remove network isolation and allow the Environment to disappear.
+func (r *EnvironmentReconciler) reconcileDeleting(ctx context.Context, env *platformv1alpha1.Environment) (ctrl.Result, error) {
+	if !controllerutil.ContainsFinalizer(env, environmentFinalizer) {
+		return ctrl.Result{}, nil
+	}
+	var pod corev1.Pod
+	if err := r.Get(ctx, types.NamespacedName{Namespace: env.Namespace, Name: envPodName(env)}, &pod); err == nil {
+		if !metav1.IsControlledBy(&pod, env) {
+			// A foreign fixed-name object must not be destroyed by this finalizer.
+		} else if err := r.Delete(ctx, &pod); err != nil && !errors.IsNotFound(err) {
+			return ctrl.Result{}, fmt.Errorf("delete pod during environment deletion: %w", err)
+		} else {
+			return ctrl.Result{Requeue: true}, nil
+		}
+	} else if !errors.IsNotFound(err) {
+		return ctrl.Result{}, err
+	}
+	var credentials corev1.Secret
+	if err := r.Get(ctx, types.NamespacedName{Namespace: env.Namespace, Name: envCredentialName(env)}, &credentials); err == nil {
+		if !metav1.IsControlledBy(&credentials, env) {
+			// Leave foreign objects untouched.
+		} else if err := r.Delete(ctx, &credentials); err != nil && !errors.IsNotFound(err) {
+			return ctrl.Result{}, fmt.Errorf("revoke sandboxd credentials during environment deletion: %w", err)
+		} else {
+			return ctrl.Result{Requeue: true}, nil
+		}
+	} else if !errors.IsNotFound(err) {
+		return ctrl.Result{}, err
+	}
+	var policy networkingv1.NetworkPolicy
+	if err := r.Get(ctx, types.NamespacedName{Namespace: env.Namespace, Name: envNetworkPolicyName(env)}, &policy); err == nil {
+		if !metav1.IsControlledBy(&policy, env) {
+			// Leave foreign objects untouched.
+		} else if err := r.Delete(ctx, &policy); err != nil && !errors.IsNotFound(err) {
+			return ctrl.Result{}, fmt.Errorf("delete sandboxd network policy: %w", err)
+		} else {
+			return ctrl.Result{Requeue: true}, nil
+		}
+	} else if !errors.IsNotFound(err) {
+		return ctrl.Result{}, err
+	}
+	var pvc corev1.PersistentVolumeClaim
+	if err := r.Get(ctx, types.NamespacedName{Namespace: env.Namespace, Name: envPVCName(env)}, &pvc); err == nil {
+		if !metav1.IsControlledBy(&pvc, env) {
+			// Leave foreign objects untouched.
+		} else if err := r.Delete(ctx, &pvc); err != nil && !errors.IsNotFound(err) {
+			return ctrl.Result{}, fmt.Errorf("delete workspace during environment deletion: %w", err)
+		} else {
+			return ctrl.Result{Requeue: true}, nil
+		}
+	} else if !errors.IsNotFound(err) {
+		return ctrl.Result{}, err
+	}
+	controllerutil.RemoveFinalizer(env, environmentFinalizer)
+	return ctrl.Result{}, r.Update(ctx, env)
+}
+
 // reconcilePaused deletes the pod (if any) and keeps the workspace volume.
 func (r *EnvironmentReconciler) reconcilePaused(ctx context.Context, env *platformv1alpha1.Environment) (ctrl.Result, error) {
 	podName := envPodName(env)
 	var pod corev1.Pod
 	err := r.Get(ctx, types.NamespacedName{Namespace: env.Namespace, Name: podName}, &pod)
 	if err == nil {
+		current, stale := dependentOwnership(&pod, env)
+		if !current && !stale {
+			return ctrl.Result{}, fmt.Errorf("pod %q is not owned by this environment", podName)
+		}
 		if delErr := r.Delete(ctx, &pod); delErr != nil && !errors.IsNotFound(delErr) {
 			return ctrl.Result{}, fmt.Errorf("delete pod for pause: %w", delErr)
+		}
+		return ctrl.Result{Requeue: true}, nil
+	} else if !errors.IsNotFound(err) {
+		return ctrl.Result{}, err
+	}
+	var credentials corev1.Secret
+	if err := r.Get(ctx, types.NamespacedName{Namespace: env.Namespace, Name: envCredentialName(env)}, &credentials); err == nil {
+		current, stale := dependentOwnership(&credentials, env)
+		if !current && !stale {
+			return ctrl.Result{}, fmt.Errorf("Secret %q is not owned by this environment", credentials.Name)
+		}
+		if err := r.Delete(ctx, &credentials); err != nil && !errors.IsNotFound(err) {
+			return ctrl.Result{}, fmt.Errorf("revoke sandboxd credentials: %w", err)
 		}
 		return ctrl.Result{Requeue: true}, nil
 	} else if !errors.IsNotFound(err) {
@@ -164,15 +283,25 @@ func (r *EnvironmentReconciler) reconcilePaused(ctx context.Context, env *platfo
 	return ctrl.Result{}, r.setPhase(ctx, env, platformv1alpha1.EnvironmentPhasePaused, "", "")
 }
 
-func (r *EnvironmentReconciler) ensureWorkspacePVC(ctx context.Context, env *platformv1alpha1.Environment, tmpl *platformv1alpha1.EnvironmentTemplate) error {
+func (r *EnvironmentReconciler) ensureWorkspacePVC(ctx context.Context, env *platformv1alpha1.Environment, tmpl *platformv1alpha1.EnvironmentTemplate) (bool, error) {
 	pvcName := envPVCName(env)
 	var pvc corev1.PersistentVolumeClaim
 	err := r.Get(ctx, types.NamespacedName{Namespace: env.Namespace, Name: pvcName}, &pvc)
 	if err == nil {
-		return nil
+		current, stale := dependentOwnership(&pvc, env)
+		if current {
+			return true, nil
+		}
+		if !stale {
+			return false, fmt.Errorf("PVC %q is not owned by this environment", pvcName)
+		}
+		if err := r.Delete(ctx, &pvc); err != nil && !errors.IsNotFound(err) {
+			return false, err
+		}
+		return false, nil
 	}
 	if !errors.IsNotFound(err) {
-		return err
+		return false, err
 	}
 
 	size := resource.MustParse(defaultDiskSize)
@@ -194,9 +323,12 @@ func (r *EnvironmentReconciler) ensureWorkspacePVC(ctx context.Context, env *pla
 		},
 	}
 	if err := controllerutil.SetControllerReference(env, &pvc, r.Scheme); err != nil {
-		return err
+		return false, err
 	}
-	return r.Create(ctx, &pvc)
+	if err := r.Create(ctx, &pvc); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 // ensurePod returns the backing pod, creating it if necessary.
@@ -205,19 +337,57 @@ func (r *EnvironmentReconciler) ensurePod(ctx context.Context, env *platformv1al
 	var pod corev1.Pod
 	err := r.Get(ctx, types.NamespacedName{Namespace: env.Namespace, Name: podName}, &pod)
 	if err == nil {
-		if pod.Annotations[projectAnnotation] != env.Spec.ProjectRef {
-			if err := r.setPhase(ctx, env, platformv1alpha1.EnvironmentPhaseSetup, "", ""); err != nil {
+		current, stale := dependentOwnership(&pod, env)
+		if current {
+			secure, err := r.currentSandboxdPod(ctx, env, &pod)
+			if err != nil {
 				return nil, err
 			}
-			if err := r.Delete(ctx, &pod); err != nil {
-				return nil, fmt.Errorf("replace pod for project change: %w", err)
+			if pod.Annotations[projectAnnotation] != env.Spec.ProjectRef {
+				if err := r.setPhase(ctx, env, platformv1alpha1.EnvironmentPhaseSetup, "", ""); err != nil {
+					return nil, err
+				}
+				if err := r.Delete(ctx, &pod); err != nil {
+					return nil, fmt.Errorf("replace pod for project change: %w", err)
+				}
+				return nil, errPodReplacing
 			}
-			return nil, errPodReplacing
+			if secure {
+				return &pod, nil
+			}
 		}
-		return &pod, nil
+		if !current && !stale {
+			return nil, fmt.Errorf("pod %q is not owned by this environment", podName)
+		}
+		if err := r.Delete(ctx, &pod); err != nil && !errors.IsNotFound(err) {
+			return nil, err
+		}
+		return nil, nil
 	}
 	if !errors.IsNotFound(err) {
 		return nil, err
+	}
+	var existingCredentials corev1.Secret
+	err = r.Get(ctx, types.NamespacedName{Namespace: env.Namespace, Name: envCredentialName(env)}, &existingCredentials)
+	if err == nil {
+		current, stale := dependentOwnership(&existingCredentials, env)
+		if stale {
+			if err := r.Delete(ctx, &existingCredentials); err != nil && !errors.IsNotFound(err) {
+				return nil, err
+			}
+			return nil, nil
+		}
+		if !current {
+			return nil, fmt.Errorf("Secret %q is not owned by this environment", existingCredentials.Name)
+		}
+		// The prior pod disappeared, so rotate this incarnation's Secret in place.
+	}
+	if err != nil && !errors.IsNotFound(err) {
+		return nil, err
+	}
+	identity, trust, terminalToken, err := r.rotateSandboxdCredentials(ctx, env)
+	if err != nil {
+		return nil, fmt.Errorf("rotate sandboxd credentials: %w", err)
 	}
 
 	resources, ok := sizePresets[tmpl.Spec.Size]
@@ -231,11 +401,16 @@ func (r *EnvironmentReconciler) ensurePod(ctx context.Context, env *platformv1al
 			Name:      podName,
 			Labels:    envLabels(env),
 			Annotations: map[string]string{
-				projectAnnotation: env.Spec.ProjectRef,
+				projectAnnotation:               env.Spec.ProjectRef,
+				sandboxdauth.IdentityAnnotation: identity,
+				sandboxdauth.TrustAnnotation:    string(trust),
+				sandboxdauth.TokenAnnotation:    terminalToken,
+				sandboxdRevisionAnnotation:      sandboxdSecurityRevision,
 			},
 		},
 		Spec: corev1.PodSpec{
-			RestartPolicy: corev1.RestartPolicyAlways,
+			RestartPolicy:                corev1.RestartPolicyAlways,
+			AutomountServiceAccountToken: ptr(false),
 			SecurityContext: &corev1.PodSecurityContext{
 				SeccompProfile: &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault},
 			},
@@ -244,6 +419,11 @@ func (r *EnvironmentReconciler) ensurePod(ctx context.Context, env *platformv1al
 				Image:           tmpl.Spec.Image,
 				ImagePullPolicy: corev1.PullIfNotPresent,
 				Command:         []string{"sandboxd", "serve"},
+				Args: []string{
+					"-tls-cert=" + sandboxdCredentialMount + "/" + sandboxdauth.TLSCertKey,
+					"-tls-key=" + sandboxdCredentialMount + "/" + sandboxdauth.TLSKeyKey,
+					"-capabilities=" + sandboxdCredentialMount + "/" + sandboxdauth.CapabilitiesKey,
+				},
 				Ports: []corev1.ContainerPort{{
 					Name:          "sandboxd",
 					ContainerPort: 50051,
@@ -259,19 +439,26 @@ func (r *EnvironmentReconciler) ensurePod(ctx context.Context, env *platformv1al
 					AllowPrivilegeEscalation: ptr(false),
 					Capabilities:             &corev1.Capabilities{Drop: []corev1.Capability{"ALL"}},
 				},
-				VolumeMounts: []corev1.VolumeMount{{
-					Name:      "workspace",
-					MountPath: "/workspace",
-				}},
-			}},
-			Volumes: []corev1.Volume{{
-				Name: "workspace",
-				VolumeSource: corev1.VolumeSource{
-					PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
-						ClaimName: envPVCName(env),
-					},
+				VolumeMounts: []corev1.VolumeMount{
+					{Name: "workspace", MountPath: "/workspace"},
+					{Name: "sandboxd-credentials", MountPath: sandboxdCredentialMount, ReadOnly: true},
 				},
 			}},
+			Volumes: []corev1.Volume{
+				{
+					Name: "workspace",
+					VolumeSource: corev1.VolumeSource{
+						PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: envPVCName(env)},
+					},
+				},
+				{
+					Name: "sandboxd-credentials",
+					VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{
+						SecretName:  envCredentialName(env),
+						DefaultMode: ptr(int32(0o444)),
+					}},
+				},
+			},
 		},
 	}
 	if tmpl.Spec.RuntimeClass != "" {
@@ -303,7 +490,7 @@ func (r *EnvironmentReconciler) ensurePod(ctx context.Context, env *platformv1al
 				AllowPrivilegeEscalation: ptr(false),
 				Capabilities:             &corev1.Capabilities{Drop: []corev1.Capability{"ALL"}},
 			},
-			VolumeMounts: pod.Spec.Containers[0].VolumeMounts,
+			VolumeMounts: []corev1.VolumeMount{{Name: "workspace", MountPath: "/workspace"}},
 		}}
 		if project.Spec.SecretRef != nil {
 			projectSecret := []corev1.EnvFromSource{{
@@ -320,6 +507,213 @@ func (r *EnvironmentReconciler) ensurePod(ctx context.Context, env *platformv1al
 		return nil, err
 	}
 	return &pod, nil
+}
+
+func (r *EnvironmentReconciler) currentSandboxdPod(ctx context.Context, env *platformv1alpha1.Environment, pod *corev1.Pod) (bool, error) {
+	if !metav1.IsControlledBy(pod, env) || pod.Annotations[sandboxdRevisionAnnotation] != sandboxdSecurityRevision ||
+		pod.Annotations[sandboxdauth.IdentityAnnotation] == "" || pod.Annotations[sandboxdauth.TrustAnnotation] == "" ||
+		pod.Annotations[sandboxdauth.TokenAnnotation] == "" {
+		return false, nil
+	}
+	var secret corev1.Secret
+	if err := r.Get(ctx, types.NamespacedName{Namespace: env.Namespace, Name: envCredentialName(env)}, &secret); err != nil {
+		if errors.IsNotFound(err) {
+			return false, nil
+		}
+		return false, fmt.Errorf("get sandboxd credentials: %w", err)
+	}
+	return metav1.IsControlledBy(&secret, env) &&
+		secret.Annotations[sandboxdauth.IdentityAnnotation] == pod.Annotations[sandboxdauth.IdentityAnnotation] &&
+		len(secret.Data[sandboxdauth.TLSCertKey]) > 0 && len(secret.Data[sandboxdauth.TLSKeyKey]) > 0 &&
+		len(secret.Data[sandboxdauth.CapabilitiesKey]) > 0, nil
+}
+
+func (r *EnvironmentReconciler) rotateSandboxdCredentials(ctx context.Context, env *platformv1alpha1.Environment) (string, []byte, string, error) {
+	identity, err := randomCredential(18)
+	if err != nil {
+		return "", nil, "", err
+	}
+	serverName := identity + ".sandboxd.swe.dev"
+	certificate, privateKey, err := issueSandboxdCertificate(serverName)
+	if err != nil {
+		return "", nil, "", err
+	}
+	terminalToken, err := randomCredential(32)
+	if err != nil {
+		return "", nil, "", err
+	}
+	capabilities, err := json.Marshal(sandboxdauth.Config{Grants: []sandboxdauth.Grant{
+		{Token: terminalToken, Capabilities: []sandboxdauth.Capability{sandboxdauth.CapabilityHealth, sandboxdauth.CapabilityTerminal}},
+	}})
+	if err != nil {
+		return "", nil, "", err
+	}
+
+	key := types.NamespacedName{Namespace: env.Namespace, Name: envCredentialName(env)}
+	var secret corev1.Secret
+	err = r.Get(ctx, key, &secret)
+	if errors.IsNotFound(err) {
+		secret = corev1.Secret{ObjectMeta: metav1.ObjectMeta{Namespace: key.Namespace, Name: key.Name}}
+		if err := controllerutil.SetControllerReference(env, &secret, r.Scheme); err != nil {
+			return "", nil, "", err
+		}
+		secret.Data = sandboxdCredentialData(certificate, privateKey, capabilities)
+		secret.Annotations = map[string]string{sandboxdauth.IdentityAnnotation: serverName}
+		if err := r.Create(ctx, &secret); err != nil {
+			return "", nil, "", err
+		}
+	} else if err != nil {
+		return "", nil, "", err
+	} else {
+		secret.Data = sandboxdCredentialData(certificate, privateKey, capabilities)
+		if secret.Annotations == nil {
+			secret.Annotations = map[string]string{}
+		}
+		secret.Annotations[sandboxdauth.IdentityAnnotation] = serverName
+		if err := r.Update(ctx, &secret); err != nil {
+			return "", nil, "", err
+		}
+	}
+	return serverName, certificate, terminalToken, nil
+}
+
+func sandboxdCredentialData(certificate, privateKey, capabilities []byte) map[string][]byte {
+	return map[string][]byte{
+		sandboxdauth.TLSCertKey:      certificate,
+		sandboxdauth.TLSKeyKey:       privateKey,
+		sandboxdauth.CapabilitiesKey: capabilities,
+	}
+}
+
+func issueSandboxdCertificate(serverName string) ([]byte, []byte, error) {
+	privateKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		return nil, nil, err
+	}
+	serial, err := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 128))
+	if err != nil {
+		return nil, nil, err
+	}
+	now := time.Now()
+	template := &x509.Certificate{
+		SerialNumber:          serial,
+		Subject:               pkix.Name{CommonName: serverName},
+		DNSNames:              []string{serverName},
+		NotBefore:             now.Add(-5 * time.Minute),
+		NotAfter:              now.Add(365 * 24 * time.Hour),
+		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageCertSign,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		IsCA:                  true,
+		BasicConstraintsValid: true,
+	}
+	der, err := x509.CreateCertificate(rand.Reader, template, template, &privateKey.PublicKey, privateKey)
+	if err != nil {
+		return nil, nil, err
+	}
+	encodedKey, err := x509.MarshalPKCS8PrivateKey(privateKey)
+	if err != nil {
+		return nil, nil, err
+	}
+	return pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}), pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: encodedKey}), nil
+}
+
+func randomCredential(size int) (string, error) {
+	contents := make([]byte, size)
+	if _, err := rand.Read(contents); err != nil {
+		return "", err
+	}
+	return base64.RawURLEncoding.EncodeToString(contents), nil
+}
+
+func (r *EnvironmentReconciler) ensureSandboxdNetworkPolicy(ctx context.Context, env *platformv1alpha1.Environment) (bool, error) {
+	name := envNetworkPolicyName(env)
+	var policy networkingv1.NetworkPolicy
+	err := r.Get(ctx, types.NamespacedName{Namespace: env.Namespace, Name: name}, &policy)
+	if err != nil && !errors.IsNotFound(err) {
+		return false, err
+	}
+	creating := errors.IsNotFound(err)
+	if creating {
+		policy = networkingv1.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{Namespace: env.Namespace, Name: name}}
+	}
+	original := policy.DeepCopy()
+	if !creating {
+		current, stale := dependentOwnership(&policy, env)
+		if !current && !stale {
+			return false, fmt.Errorf("NetworkPolicy %q is not owned by this environment", name)
+		}
+		if stale {
+			if err := r.Delete(ctx, &policy); err != nil && !errors.IsNotFound(err) {
+				return false, err
+			}
+			return false, nil
+		}
+	}
+	policy.Labels = envLabels(env)
+
+	controlPlaneNamespace := r.ControlPlaneNamespace
+	if controlPlaneNamespace == "" {
+		controlPlaneNamespace = env.Namespace
+	}
+	controlPlaneName := r.ControlPlaneName
+	if controlPlaneName == "" {
+		controlPlaneName = "swe-platform"
+	}
+	controlPlaneInstance := r.ControlPlaneInstance
+	if controlPlaneInstance == "" {
+		controlPlaneInstance = "swe-platform"
+	}
+	protocol := corev1.ProtocolTCP
+	policy.Spec = networkingv1.NetworkPolicySpec{
+		PodSelector: metav1.LabelSelector{MatchLabels: map[string]string{"swe.dev/environment": env.Name}},
+		PolicyTypes: []networkingv1.PolicyType{networkingv1.PolicyTypeIngress},
+		Ingress: []networkingv1.NetworkPolicyIngressRule{{
+			From: []networkingv1.NetworkPolicyPeer{{
+				NamespaceSelector: &metav1.LabelSelector{MatchLabels: map[string]string{
+					"kubernetes.io/metadata.name": controlPlaneNamespace,
+				}},
+				PodSelector: &metav1.LabelSelector{MatchLabels: map[string]string{
+					"app.kubernetes.io/name":      controlPlaneName,
+					"app.kubernetes.io/instance":  controlPlaneInstance,
+					"app.kubernetes.io/component": "control-plane",
+				}},
+			}},
+			Ports: []networkingv1.NetworkPolicyPort{{Protocol: &protocol, Port: ptr(intstr.FromInt32(50051))}},
+		}},
+	}
+	if err := controllerutil.SetControllerReference(env, &policy, r.Scheme); err != nil {
+		return false, err
+	}
+	if creating {
+		if err := r.Create(ctx, &policy); err != nil {
+			return false, err
+		}
+		return true, nil
+	}
+	if apiequality.Semantic.DeepEqual(original.Labels, policy.Labels) &&
+		apiequality.Semantic.DeepEqual(original.OwnerReferences, policy.OwnerReferences) &&
+		apiequality.Semantic.DeepEqual(original.Spec, policy.Spec) {
+		return true, nil
+	}
+	if err := r.Update(ctx, &policy); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// dependentOwnership distinguishes the current owner from a stale incarnation
+// with the same Environment name. Unowned and differently owned objects are
+// foreign collisions and must never be adopted or deleted.
+func dependentOwnership(object metav1.Object, env *platformv1alpha1.Environment) (current, stale bool) {
+	if metav1.IsControlledBy(object, env) {
+		return true, false
+	}
+	owner := metav1.GetControllerOf(object)
+	if owner == nil {
+		return false, false
+	}
+	return false, owner.APIVersion == platformv1alpha1.GroupVersion.String() &&
+		owner.Kind == "Environment" && owner.Name == env.Name && owner.UID != env.UID
 }
 
 // syncStatus maps pod state onto the Environment phase.
@@ -383,6 +777,12 @@ func (r *EnvironmentReconciler) fail(ctx context.Context, env *platformv1alpha1.
 
 func envPodName(env *platformv1alpha1.Environment) string { return "env-" + env.Name }
 func envPVCName(env *platformv1alpha1.Environment) string { return "env-" + env.Name }
+func envCredentialName(env *platformv1alpha1.Environment) string {
+	return "env-" + env.Name + "-sandboxd"
+}
+func envNetworkPolicyName(env *platformv1alpha1.Environment) string {
+	return "env-" + env.Name + "-sandboxd"
+}
 
 func envLabels(env *platformv1alpha1.Environment) map[string]string {
 	return map[string]string{
@@ -405,6 +805,7 @@ func (r *EnvironmentReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		For(&platformv1alpha1.Environment{}).
 		Owns(&corev1.Pod{}).
 		Owns(&corev1.PersistentVolumeClaim{}).
+		Owns(&networkingv1.NetworkPolicy{}).
 		Watches(&platformv1alpha1.EnvironmentTemplate{}, handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, object client.Object) []reconcile.Request {
 			var environments platformv1alpha1.EnvironmentList
 			if err := r.List(ctx, &environments, client.InNamespace(object.GetNamespace()), client.MatchingFields{templateRefField: object.GetName()}); err != nil {

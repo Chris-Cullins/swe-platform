@@ -2,8 +2,16 @@ package controlplane
 
 import (
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/pem"
 	"io"
+	"math/big"
 	"net"
+	"net/http"
 	"net/http/httptest"
 	"strings"
 	"sync"
@@ -14,12 +22,15 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/test/bufconn"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
 	platformv1alpha1 "github.com/Chris-Cullins/swe-platform/api/v1alpha1"
+	sandboxdauth "github.com/Chris-Cullins/swe-platform/sandboxd/auth"
 	sandboxdv1 "github.com/Chris-Cullins/swe-platform/sandboxd/gen/proto/sandboxd/v1"
 )
 
@@ -39,11 +50,12 @@ func TestWebTerminalBridgesSandboxd(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = connection.Close() })
 	dialer := &terminalTestDialer{client: sandboxdv1.NewTerminalServiceClient(connection)}
-	server := httptest.NewServer(NewServer(nil, dialer).Handler())
+	server := httptest.NewServer(NewServer(nil, ServerOptions{Access: &fakeAccess{}, TerminalDialer: dialer}).Handler())
 	t.Cleanup(server.Close)
 
-	websocketURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/api/v1/environments/env-1/terminal?namespace=project-1"
-	websocketConnection, _, err := websocket.DefaultDialer.Dial(websocketURL, nil)
+	websocketURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/api/v1/namespaces/project-1/environments/env-1/terminal"
+	header := http.Header{"Authorization": []string{"Bearer reader"}}
+	websocketConnection, _, err := websocket.DefaultDialer.Dial(websocketURL, header)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -82,9 +94,10 @@ func TestWebTerminalBridgesSandboxd(t *testing.T) {
 }
 
 func TestWebTerminalRequiresDialer(t *testing.T) {
-	request := httptest.NewRequest("GET", "/api/v1/environments/env-1/terminal", nil)
+	request := httptest.NewRequest("GET", "/api/v1/namespaces/project-1/environments/env-1/terminal", nil)
+	setWebSocketUpgrade(request)
 	response := httptest.NewRecorder()
-	NewServer(nil).Handler().ServeHTTP(response, request)
+	NewServer(nil, ServerOptions{Access: &fakeAccess{}}).Handler().ServeHTTP(response, request)
 	if response.Code != 503 {
 		t.Fatalf("status = %d, want 503", response.Code)
 	}
@@ -115,15 +128,229 @@ func TestKubernetesTerminalDialerMarksEnvironmentActive(t *testing.T) {
 	}
 }
 
+func TestKubernetesTerminalDialerUsesRecreatedPodCredentialsAfterWake(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	if err := platformv1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	environment := &platformv1alpha1.Environment{
+		ObjectMeta: metav1.ObjectMeta{Name: "env-1", Namespace: "project-1", UID: "current-environment"},
+		Spec: platformv1alpha1.EnvironmentSpec{
+			Paused:      true,
+			TemplateRef: "default",
+		},
+		Status: platformv1alpha1.EnvironmentStatus{
+			Phase:   platformv1alpha1.EnvironmentPhasePaused,
+			PodName: "old-pod",
+		},
+	}
+	template := &platformv1alpha1.EnvironmentTemplate{
+		ObjectMeta: metav1.ObjectMeta{Name: "default", Namespace: environment.Namespace},
+	}
+	newPod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "new-pod",
+			Namespace: environment.Namespace,
+			Annotations: map[string]string{
+				sandboxdauth.IdentityAnnotation: "new-incarnation.sandboxd.swe.dev",
+				sandboxdauth.TrustAnnotation:    testCertificatePEM(t, "new-incarnation.sandboxd.swe.dev"),
+				sandboxdauth.TokenAnnotation:    "new-terminal-token",
+			},
+		},
+		Status: corev1.PodStatus{PodIP: "192.0.2.10"},
+	}
+	if err := controllerutil.SetControllerReference(environment, newPod, scheme); err != nil {
+		t.Fatal(err)
+	}
+	baseClient := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(environment).WithObjects(environment, template, newPod).Build()
+	dialer := KubernetesTerminalDialer{Client: wakeReadyClient{Client: baseClient, podName: newPod.Name}}
+
+	_, closer, err := dialer.DialTerminal(context.Background(), environment.Namespace, environment.Name)
+	if err != nil {
+		t.Fatalf("DialTerminal() error = %v; wake did not use the recreated pod credential bundle", err)
+	}
+	if err := closer.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+type wakeReadyClient struct {
+	client.Client
+	podName string
+}
+
+func (c wakeReadyClient) Patch(ctx context.Context, object client.Object, patch client.Patch, options ...client.PatchOption) error {
+	if err := c.Client.Patch(ctx, object, patch, options...); err != nil {
+		return err
+	}
+	environment, ok := object.(*platformv1alpha1.Environment)
+	if !ok {
+		return nil
+	}
+	var current platformv1alpha1.Environment
+	if err := c.Client.Get(ctx, client.ObjectKeyFromObject(environment), &current); err != nil {
+		return err
+	}
+	current.Status.Phase = platformv1alpha1.EnvironmentPhaseReady
+	current.Status.PodName = c.podName
+	return c.Client.Status().Update(ctx, &current)
+}
+
+func testCertificatePEM(t *testing.T, serverName string) string {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	template := &x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		Subject:      pkix.Name{CommonName: serverName},
+		DNSNames:     []string{serverName},
+		NotBefore:    time.Now().Add(-time.Minute),
+		NotAfter:     time.Now().Add(time.Hour),
+		IsCA:         true,
+		KeyUsage:     x509.KeyUsageCertSign | x509.KeyUsageDigitalSignature,
+	}
+	certificate, err := x509.CreateCertificate(rand.Reader, template, template, &key.PublicKey, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certificate}))
+}
+
+func TestWebTerminalAuthorizesBeforeDial(t *testing.T) {
+	dialer := &terminalTestDialer{}
+	handler := NewServer(nil, ServerOptions{Access: &fakeAccess{err: errUnauthenticated}, TerminalDialer: dialer}).Handler()
+	request := httptest.NewRequest(http.MethodGet, "/api/v1/namespaces/project-a/environments/shared/terminal?namespace=project-b", nil)
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want %d", response.Code, http.StatusUnauthorized)
+	}
+	if dialer.calls != 0 {
+		t.Fatalf("terminal dialed %d times before authorization", dialer.calls)
+	}
+}
+
+func TestWebTerminalSameNamedEnvironmentCannotCrossNamespace(t *testing.T) {
+	dialer := &terminalTestDialer{}
+	access := &fakeAccess{allow: func(resource ResourceAccess) bool { return resource.Namespace == "project-a" }}
+	handler := NewServer(nil, ServerOptions{Access: access, TerminalDialer: dialer}).Handler()
+	request := httptest.NewRequest(http.MethodGet, "/api/v1/namespaces/project-b/environments/shared/terminal", nil)
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want %d", response.Code, http.StatusForbidden)
+	}
+	if dialer.calls != 0 {
+		t.Fatal("cross-namespace terminal request reached dialer")
+	}
+}
+
+func TestWebSocketOriginPolicy(t *testing.T) {
+	tests := []struct {
+		name           string
+		host           string
+		origin         string
+		forwardedHost  string
+		forwardedProto string
+		trustProxy     bool
+		want           bool
+	}{
+		{name: "non-browser bearer client", host: "control.internal", want: true},
+		{name: "same origin", host: "console.example.com", origin: "http://console.example.com", want: true},
+		{name: "scheme mismatch", host: "console.example.com", origin: "https://console.example.com", want: false},
+		{name: "cross origin", host: "console.example.com", origin: "http://evil.example.com", want: false},
+		{name: "same origin behind trusted proxy", host: "control.internal", origin: "https://console.example.com", forwardedHost: "console.example.com", forwardedProto: "https", trustProxy: true, want: true},
+		{name: "forwarded headers ignored by default", host: "control.internal", origin: "https://console.example.com", forwardedHost: "console.example.com", forwardedProto: "https", want: false},
+		{name: "cross origin behind proxy", host: "control.internal", origin: "https://evil.example.com", forwardedHost: "console.example.com", forwardedProto: "https", trustProxy: true, want: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			request := httptest.NewRequest(http.MethodGet, "http://"+tt.host+"/terminal", nil)
+			request.Header.Set("Authorization", "Bearer reader")
+			request.Header.Set("Origin", tt.origin)
+			request.Header.Set("X-Forwarded-Host", tt.forwardedHost)
+			request.Header.Set("X-Forwarded-Proto", tt.forwardedProto)
+			server := &Server{trustProxy: tt.trustProxy}
+			if got := server.checkWebSocketOrigin(request); got != tt.want {
+				t.Fatalf("checkWebSocketOrigin() = %t, want %t", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestWebTerminalRejectsCookieWithoutOriginAndCrossOriginBeforeDial(t *testing.T) {
+	for _, origin := range []string{"", "https://evil.example.com"} {
+		dialer := &terminalTestDialer{}
+		handler := NewServer(nil, ServerOptions{Access: &fakeAccess{}, TerminalDialer: dialer}).Handler()
+		request := httptest.NewRequest(http.MethodGet, "/api/v1/namespaces/project-a/environments/env-1/terminal", nil)
+		setWebSocketUpgrade(request)
+		request.Header.Del("Authorization")
+		request.Header.Set("Origin", origin)
+		request.AddCookie(&http.Cookie{Name: sessionCookieName, Value: "reader-session"})
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, request)
+		if response.Code != http.StatusForbidden {
+			t.Fatalf("origin %q status = %d, want %d", origin, response.Code, http.StatusForbidden)
+		}
+		if dialer.calls != 0 {
+			t.Fatalf("origin %q reached terminal dialer", origin)
+		}
+	}
+}
+
+func setWebSocketUpgrade(request *http.Request) {
+	request.Header.Set("Authorization", "Bearer reader")
+	request.Header.Set("Connection", "upgrade")
+	request.Header.Set("Upgrade", "websocket")
+}
+
+func TestKubernetesTerminalDialerRejectsPodOwnedByAnotherEnvironmentIncarnation(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	if err := platformv1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	environment := &platformv1alpha1.Environment{
+		ObjectMeta: metav1.ObjectMeta{Name: "env-1", Namespace: "project-1", UID: "current-environment"},
+		Status:     platformv1alpha1.EnvironmentStatus{PodName: "env-env-1"},
+	}
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "env-env-1", Namespace: "project-1",
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: platformv1alpha1.GroupVersion.String(), Kind: "Environment", Name: "env-1", UID: "old-environment", Controller: ptrTo(true),
+			}},
+		},
+		Status: corev1.PodStatus{PodIP: "192.0.2.10"},
+	}
+	dialer := KubernetesTerminalDialer{Client: fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(environment).WithObjects(environment, pod).Build()}
+
+	_, _, err := dialer.DialTerminal(context.Background(), "project-1", "env-1")
+	if err == nil || !strings.Contains(err.Error(), "not owned by the current environment") {
+		t.Fatalf("DialTerminal() error = %v, want stale pod rejection", err)
+	}
+}
+
+func ptrTo[T any](value T) *T { return &value }
+
 type terminalTestDialer struct {
 	mu          sync.Mutex
 	client      sandboxdv1.TerminalServiceClient
 	namespace   string
 	environment string
+	calls       int
 }
 
 func (d *terminalTestDialer) DialTerminal(_ context.Context, namespace, environment string) (sandboxdv1.TerminalServiceClient, io.Closer, error) {
 	d.mu.Lock()
+	d.calls++
 	d.namespace = namespace
 	d.environment = environment
 	d.mu.Unlock()
