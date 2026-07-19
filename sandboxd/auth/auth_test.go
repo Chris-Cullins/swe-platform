@@ -31,7 +31,7 @@ import (
 
 func TestAuthorizerRejectsUnauthenticatedAndWrongEnvironmentTokens(t *testing.T) {
 	authorizer := newTestAuthorizer(t, Config{Grants: []Grant{{
-		Token:        "environment-a-token",
+		TokenHash:    TokenVerifier("environment-a-token"),
 		Capabilities: []Capability{CapabilityHealth},
 	}}})
 
@@ -57,7 +57,7 @@ func TestAuthorizerRejectsUnauthenticatedAndWrongEnvironmentTokens(t *testing.T)
 
 func TestLimitedCapabilityCannotInvokeUnrelatedService(t *testing.T) {
 	authorizer := newTestAuthorizer(t, Config{Grants: []Grant{{
-		Token:        "terminal-only-token",
+		TokenHash:    TokenVerifier("terminal-only-token"),
 		Capabilities: []Capability{CapabilityTerminal},
 	}}})
 	ctx := metadata.NewIncomingContext(context.Background(), metadata.Pairs(
@@ -77,7 +77,7 @@ func TestLimitedCapabilityCannotInvokeUnrelatedService(t *testing.T) {
 
 func TestProcessCapabilityAuthorizesManagedProcesses(t *testing.T) {
 	authorizer := newTestAuthorizer(t, Config{Grants: []Grant{{
-		Token:        "adapter-token",
+		TokenHash:    TokenVerifier("adapter-token"),
 		Capabilities: []Capability{CapabilityProcess},
 	}}})
 	ctx := metadata.NewIncomingContext(context.Background(), metadata.Pairs(
@@ -93,13 +93,14 @@ func TestProcessCapabilityAuthorizesManagedProcesses(t *testing.T) {
 
 func TestTLSAndCapabilityInterceptorsEndToEnd(t *testing.T) {
 	const (
-		serverName = "incarnation-a.sandboxd.swe.dev"
-		token      = "environment-a-terminal-token"
+		serverName   = "incarnation-a.sandboxd.swe.dev"
+		token        = "environment-a-terminal-token"
+		processToken = "environment-a-process-token"
 	)
 	certificate, roots := testCertificate(t, serverName)
 	authorizer := newTestAuthorizer(t, Config{Grants: []Grant{{
-		Token: token, Capabilities: []Capability{CapabilityHealth, CapabilityTerminal},
-	}}})
+		TokenHash: TokenVerifier(token), Capabilities: []Capability{CapabilityHealth, CapabilityTerminal},
+	}, {TokenHash: TokenVerifier(processToken), Capabilities: []Capability{CapabilityProcess}}}})
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -112,6 +113,7 @@ func TestTLSAndCapabilityInterceptorsEndToEnd(t *testing.T) {
 	)
 	sandboxdv1.RegisterHealthServiceServer(grpcServer, authorizationTestHealthServer{})
 	sandboxdv1.RegisterExecServiceServer(grpcServer, execServer)
+	sandboxdv1.RegisterProcessServiceServer(grpcServer, authorizationTestProcessServer{})
 	go func() { _ = grpcServer.Serve(listener) }()
 	t.Cleanup(grpcServer.Stop)
 
@@ -163,6 +165,23 @@ func TestTLSAndCapabilityInterceptorsEndToEnd(t *testing.T) {
 	if execServer.called.Load() {
 		t.Fatal("unauthorized stream reached Exec handler")
 	}
+	if _, err := sandboxdv1.NewProcessServiceClient(dial(t, serverName, processToken)).Start(context.Background(), &sandboxdv1.StartProcessRequest{}); err != nil {
+		t.Fatalf("process credential Process call: %v", err)
+	}
+	if _, err := sandboxdv1.NewProcessServiceClient(dial(t, serverName, token)).Start(context.Background(), &sandboxdv1.StartProcessRequest{}); status.Code(err) != codes.PermissionDenied {
+		t.Fatalf("terminal credential Process status = %v, want PermissionDenied", err)
+	}
+	if _, err := sandboxdv1.NewHealthServiceClient(dial(t, serverName, processToken)).Check(context.Background(), &sandboxdv1.HealthCheckRequest{}); status.Code(err) != codes.PermissionDenied {
+		t.Fatalf("process credential Health status = %v, want PermissionDenied", err)
+	}
+	replacement := newTestAuthorizer(t, Config{Grants: []Grant{{TokenHash: TokenVerifier("replacement-process-token"), Capabilities: []Capability{CapabilityProcess}}}})
+	staleContext := metadata.NewIncomingContext(context.Background(), metadata.Pairs("authorization", "Bearer "+processToken))
+	if _, err := replacement.UnaryServerInterceptor(staleContext, nil, &grpc.UnaryServerInfo{FullMethod: "/sandboxd.v1.ProcessService/Start"}, func(context.Context, any) (any, error) {
+		t.Fatal("stale process credential reached replacement handler")
+		return nil, nil
+	}); status.Code(err) != codes.Unauthenticated {
+		t.Fatalf("stale replacement credential status = %v, want Unauthenticated", err)
+	}
 
 	plaintext, err := grpc.NewClient(listener.Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
@@ -185,6 +204,14 @@ func (authorizationTestHealthServer) Check(context.Context, *sandboxdv1.HealthCh
 type authorizationTestExecServer struct {
 	sandboxdv1.UnimplementedExecServiceServer
 	called atomic.Bool
+}
+
+type authorizationTestProcessServer struct {
+	sandboxdv1.UnimplementedProcessServiceServer
+}
+
+func (authorizationTestProcessServer) Start(context.Context, *sandboxdv1.StartProcessRequest) (*sandboxdv1.Process, error) {
+	return &sandboxdv1.Process{}, nil
 }
 
 func (s *authorizationTestExecServer) Exec(sandboxdv1.ExecService_ExecServer) error {

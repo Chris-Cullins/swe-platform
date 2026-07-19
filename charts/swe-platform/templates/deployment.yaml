@@ -16,6 +16,7 @@ spec:
       labels:
         app.kubernetes.io/name: {{ include "swe-platform.name" . }}
         app.kubernetes.io/instance: {{ .Release.Name }}
+        app.kubernetes.io/component: operator
       {{- with .Values.podAnnotations }}
       annotations:
         {{- toYaml . | nindent 8 }}

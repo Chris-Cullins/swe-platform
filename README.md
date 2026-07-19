@@ -79,7 +79,8 @@ The ownership boundary is independent of Kubernetes container layout:
 | Agent-specific command/protocol and transcript interpretation | Adapter |
 | Agent and declared-service process start, observation, and stop | `sandboxd` managed-process API |
 
-Adapters receive only an immutable Run UID/task and a backend-neutral sandboxd endpoint.
+Adapters receive only an immutable Run UID/task and a backend-neutral, securely pinned
+sandboxd process dial handle.
 Every adapter lifecycle operation is idempotent. A foreground CLI adapter can map one
 managed agent process's state to Run status; a long-lived service adapter can keep an
 Environment-scoped service process and map its task-acknowledgement/events instead. The
@@ -102,6 +103,9 @@ Environment ownership and cleanup are explicit:
 Pause is not process checkpointing. Pausing fences the current execution domain and stops
 **every** agent and declared-service process by removing the environment pod (or the
 backend equivalent), while retaining the workspace disk and adapter-owned transcript.
+Accepted work is cancelled only while that exact execution incarnation is securely
+reachable, or cleanup proceeds without an RPC after pause has removed its pod and
+endpoint; transient setup/resume states retain the claim and cleanup finalizer.
 Resume creates a fresh sandboxd epoch, runs the repository resume hook, and calls the
 adapter's idempotent acceptance path again with the same Run UID. Adapters reconstruct or
 restart their processes from workspace/transcript state; no old process incarnation is

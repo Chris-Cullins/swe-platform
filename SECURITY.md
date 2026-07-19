@@ -25,22 +25,25 @@ to a different environment, a stale pod, or a process without the current privat
 fails.
 
 Bearer tokens are random per incarnation and map to explicit service capabilities (`health`,
-`terminal`, `exec`, `process`, `filesystem`, and `ports`). sandboxd interceptors authorize both unary and
-streaming RPCs before handlers run. The only issued credential currently grants `health` and
-`terminal`; other capabilities currently have no issued token. Possession of one environment's
-token grants nothing in another environment. A future non-terminal caller must receive a
-separate, narrowly scoped grant rather than expanding the existing caller.
+`terminal`, `exec`, `process`, `filesystem`, and `ports`). sandboxd interceptors authorize both
+unary and streaming RPCs before handlers run. The terminal credential grants `health` and
+`terminal`; a separate operator-held adapter credential grants only `process`. The mounted
+authorization file contains SHA-256 verifiers, not raw tokens, and the raw process token is not
+projected into the environment pod or published in pod annotations. Possession of one
+environment's token grants nothing in another environment.
 
-The server-only Secret contains the private key and authorization configuration. Clients never
-receive it. The public trust certificate and terminal token are published atomically as pod
+The Environment-owned Secret contains the private key, authorization configuration, and raw
+process token. The public trust certificate and terminal token are published atomically as pod
 annotations, which makes pod `get` plus `pods/portforward` the Kubernetes authorization boundary
 for CLI attachment without granting callers access to arbitrary namespace Secrets. The control
-plane has pod `get` but not Secret access. HTTP authorization for its terminal endpoint remains
-a separate requirement.
+plane has pod `get` but not Secret access. The operator validates the exact Run, Environment,
+pod, and Secret incarnations before constructing a pinned process-only connection for an
+adapter. HTTP authorization for the control-plane terminal endpoint remains a separate
+requirement.
 
 The operator also creates an ingress NetworkPolicy for every environment pod. Port 50051 is
-admitted only from pods matching this installation's name, instance, and control-plane labels in
-the operator's configured control-plane namespace. Thus an
+admitted only from pods matching this installation's name and instance and either its
+control-plane or operator component label in the configured namespace. Thus an
 environment pod is denied direct ingress to another environment's sandboxd by NetworkPolicy,
 while protocol authentication remains the durable boundary on clusters without NetworkPolicy
 enforcement. Environment pods do not receive a Kubernetes service-account token by default.
@@ -51,9 +54,10 @@ port-forwarding is governed by `pods/portforward` RBAC rather than this policy.
 
 1. **Bootstrap:** before creating a pod, the operator generates a new certificate, private key,
    random identity, and random capability tokens. It writes them to an Environment-owned
-   Kubernetes Secret, then mounts that Secret read-only at
-   `/var/run/swe-platform/sandboxd`. sandboxd fails closed if any TLS or capability file is
-   absent or invalid.
+   Kubernetes Secret. The pod projects only the TLS keypair and hashed capability configuration
+   read-only at `/var/run/swe-platform/sandboxd`; the raw process token remains available only
+   through an exact-name operator Secret read. sandboxd fails closed if any TLS or capability
+   file is absent or invalid.
 2. **Rotation:** whenever the backing pod has disappeared and is recreated (including resume),
    the operator replaces every credential and annotates the new pod with the new identity.
    Container restarts within the same pod retain that pod incarnation's credentials.

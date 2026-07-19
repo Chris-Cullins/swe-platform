@@ -4,7 +4,9 @@ package auth
 
 import (
 	"context"
+	"crypto/sha256"
 	"crypto/subtle"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -31,17 +33,20 @@ const (
 
 // Credential bundle keys and identity annotation shared by provisioners and clients.
 const (
-	TLSCertKey         = "tls.crt"
-	TLSKeyKey          = "tls.key"
-	CapabilitiesKey    = "capabilities.json"
-	IdentityAnnotation = "swe.dev/sandboxd-identity"
-	TrustAnnotation    = "swe.dev/sandboxd-trust"
-	TokenAnnotation    = "swe.dev/sandboxd-terminal-token"
+	TLSCertKey          = "tls.crt"
+	TLSKeyKey           = "tls.key"
+	CapabilitiesKey     = "capabilities.json"
+	ProcessTokenKey     = "process-token"
+	IdentityAnnotation  = "swe.dev/sandboxd-identity"
+	TrustAnnotation     = "swe.dev/sandboxd-trust"
+	TokenAnnotation     = "swe.dev/sandboxd-terminal-token"
+	PodUIDAnnotation    = "swe.dev/sandboxd-pod-uid"
+	SecretUIDAnnotation = "swe.dev/sandboxd-secret-uid"
 )
 
 // Grant binds a bearer token to the services it may call.
 type Grant struct {
-	Token        string       `json:"token"`
+	TokenHash    string       `json:"tokenHash"`
 	Capabilities []Capability `json:"capabilities"`
 }
 
@@ -69,8 +74,9 @@ func Load(path string) (*Authorizer, error) {
 		return nil, fmt.Errorf("capability file contains no grants")
 	}
 	for i, grant := range config.Grants {
-		if grant.Token == "" || len(grant.Capabilities) == 0 {
-			return nil, fmt.Errorf("grant %d requires a token and capabilities", i)
+		verifier, err := hex.DecodeString(grant.TokenHash)
+		if err != nil || len(verifier) != sha256.Size || len(grant.Capabilities) == 0 {
+			return nil, fmt.Errorf("grant %d requires a SHA-256 token verifier and capabilities", i)
 		}
 		for _, capability := range grant.Capabilities {
 			if !validCapability(capability) {
@@ -106,8 +112,10 @@ func (a *Authorizer) authorize(ctx context.Context, method string) error {
 	if err != nil {
 		return err
 	}
+	presented := sha256.Sum256([]byte(token))
 	for _, grant := range a.grants {
-		if len(token) != len(grant.Token) || subtle.ConstantTimeCompare([]byte(token), []byte(grant.Token)) != 1 {
+		verifier, _ := hex.DecodeString(grant.TokenHash)
+		if subtle.ConstantTimeCompare(presented[:], verifier) != 1 {
 			continue
 		}
 		for _, granted := range grant.Capabilities {
@@ -118,6 +126,13 @@ func (a *Authorizer) authorize(ctx context.Context, method string) error {
 		return status.Errorf(codes.PermissionDenied, "token lacks %s capability", capability)
 	}
 	return status.Error(codes.Unauthenticated, "invalid bearer token")
+}
+
+// TokenVerifier returns the non-reversible verifier stored in sandboxd's
+// capability file. Raw high-entropy bearer tokens remain client-only.
+func TokenVerifier(token string) string {
+	digest := sha256.Sum256([]byte(token))
+	return hex.EncodeToString(digest[:])
 }
 
 func bearerToken(ctx context.Context) (string, error) {

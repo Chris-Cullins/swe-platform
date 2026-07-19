@@ -5,12 +5,14 @@ import (
 	"sync"
 	"testing"
 
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
 	platformv1alpha1 "github.com/Chris-Cullins/swe-platform/api/v1alpha1"
 )
@@ -18,6 +20,7 @@ import (
 type scriptedAdapter struct {
 	observations        []AdapterObservation
 	accepted, cancelled int
+	onCancel            func()
 }
 
 // foregroundAdapter models a CLI agent whose managed process exit is the task
@@ -57,6 +60,9 @@ func (a *scriptedAdapter) EnsureAccepted(context.Context, AdapterTask, AdapterSa
 }
 func (a *scriptedAdapter) Cancel(context.Context, AdapterTask, AdapterSandbox) error {
 	a.cancelled++
+	if a.onCancel != nil {
+		a.onCancel()
+	}
 	return nil
 }
 func (a *scriptedAdapter) Observe(context.Context, AdapterTask, AdapterSandbox) (AdapterObservation, string, error) {
@@ -79,6 +85,26 @@ func runScheme(t *testing.T) *runtime.Scheme {
 func reconciler(t *testing.T, adapter AdapterLifecycle, objects ...client.Object) *RunReconciler {
 	t.Helper()
 	s := runScheme(t)
+	// Most lifecycle tests predate the ownership/endpoint security fences. Give
+	// their intentionally valid fixtures the exact current Run owner and a
+	// reachable endpoint; mismatch tests construct their reconciler directly.
+	for _, object := range objects {
+		run, ok := object.(*platformv1alpha1.Run)
+		if !ok || run.Status.EnvironmentRef == nil || run.Status.EnvironmentRef.Ownership != platformv1alpha1.EnvironmentOwnershipOwned {
+			continue
+		}
+		for _, candidate := range objects {
+			env, ok := candidate.(*platformv1alpha1.Environment)
+			if !ok || env.Name != run.Status.EnvironmentRef.Name || env.UID != run.Status.EnvironmentRef.UID {
+				continue
+			}
+			env.OwnerReferences = []metav1.OwnerReference{{APIVersion: platformv1alpha1.GroupVersion.String(), Kind: "Run", Name: run.Name, UID: run.UID, Controller: ptr(true)}}
+			if env.Status.Phase == platformv1alpha1.EnvironmentPhaseReady || env.Status.Phase == platformv1alpha1.EnvironmentPhaseRunning {
+				env.Status.PodName = "env-" + env.Name
+				env.Status.Endpoints.Sandboxd = "10.0.0.1:50051"
+			}
+		}
+	}
 	c := fake.NewClientBuilder().WithScheme(s).WithStatusSubresource(&platformv1alpha1.Run{}, &platformv1alpha1.Environment{}).WithObjects(objects...).Build()
 	return &RunReconciler{Client: c, Scheme: s, Adapters: map[string]AdapterLifecycle{"test": adapter}}
 }
@@ -300,7 +326,7 @@ func TestTerminalCleanupPausesOwnedEnvironment(t *testing.T) {
 	reconcileRun(t, r, "r")
 	var got platformv1alpha1.Environment
 	_ = r.Get(context.Background(), client.ObjectKeyFromObject(env), &got)
-	if !got.Spec.Paused || a.cancelled != 1 {
+	if !got.Spec.Paused || a.cancelled != 0 {
 		t.Fatalf("paused=%v cancels=%d", got.Spec.Paused, a.cancelled)
 	}
 }
@@ -392,5 +418,305 @@ func TestNonterminalAdapterObservationSchedulesPolling(t *testing.T) {
 	}
 	if result.RequeueAfter != adapterPollInterval {
 		t.Fatalf("RequeueAfter = %s, want %s", result.RequeueAfter, adapterPollInterval)
+	}
+}
+
+func TestExplicitPausedClaimWakesDuringAllocationAndRecovery(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		recovery bool
+	}{
+		{name: "allocation"},
+		{name: "claim-before-status recovery", recovery: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			run := &platformv1alpha1.Run{ObjectMeta: metav1.ObjectMeta{Name: "r", Namespace: "ns", UID: "run-uid"}, Spec: platformv1alpha1.RunSpec{EnvironmentRef: "shared", Agent: "test"}}
+			env := &platformv1alpha1.Environment{ObjectMeta: metav1.ObjectMeta{Name: "shared", Namespace: "ns", UID: "env-uid"}, Spec: platformv1alpha1.EnvironmentSpec{Paused: true}}
+			if tc.recovery {
+				env.Status.ClaimedBy = &platformv1alpha1.RunReference{Name: run.Name, UID: run.UID}
+				run.Finalizers = []string{runFinalizer}
+			}
+			r := reconciler(t, &scriptedAdapter{}, run, env)
+			var ref *platformv1alpha1.RunEnvironmentReference
+			var err error
+			if tc.recovery {
+				got := reconcileRun(t, r, run.Name)
+				ref = got.Status.EnvironmentRef
+			} else {
+				ref, err = r.allocateEnvironment(context.Background(), run)
+			}
+			if err != nil || ref == nil || ref.Ownership != platformv1alpha1.EnvironmentOwnershipClaimed {
+				t.Fatalf("reference = %#v, error = %v", ref, err)
+			}
+			var got platformv1alpha1.Environment
+			if err := r.Get(context.Background(), client.ObjectKeyFromObject(env), &got); err != nil {
+				t.Fatal(err)
+			}
+			if got.Spec.Paused || got.Status.ClaimedBy == nil || got.Status.ClaimedBy.UID != run.UID {
+				t.Fatalf("claimed environment = %#v", got)
+			}
+		})
+	}
+}
+
+func TestCancellationWhilePausedRequiresNoAdapterRPC(t *testing.T) {
+	run := &platformv1alpha1.Run{ObjectMeta: metav1.ObjectMeta{Name: "r", Namespace: "ns", UID: "run-uid", Finalizers: []string{runFinalizer}}, Spec: platformv1alpha1.RunSpec{Agent: "test", Cancel: true}, Status: platformv1alpha1.RunStatus{
+		State:          platformv1alpha1.RunStatePaused,
+		EnvironmentRef: &platformv1alpha1.RunEnvironmentReference{Name: "shared", UID: "env-uid", Ownership: platformv1alpha1.EnvironmentOwnershipClaimed},
+		Conditions:     []metav1.Condition{{Type: runConditionAdapterAccepted, Status: metav1.ConditionTrue}},
+	}}
+	env := &platformv1alpha1.Environment{ObjectMeta: metav1.ObjectMeta{Name: "shared", Namespace: "ns", UID: "env-uid"}, Status: platformv1alpha1.EnvironmentStatus{
+		Phase: platformv1alpha1.EnvironmentPhasePaused, ClaimedBy: &platformv1alpha1.RunReference{Name: run.Name, UID: run.UID},
+	}}
+	adapter := &scriptedAdapter{}
+	r := reconciler(t, adapter, run, env)
+	if got := reconcileRun(t, r, run.Name); got.Status.State != platformv1alpha1.RunStateCancelled {
+		t.Fatalf("state = %s, want Cancelled", got.Status.State)
+	}
+	reconcileRun(t, r, run.Name)
+	var retained platformv1alpha1.Environment
+	if err := r.Get(context.Background(), client.ObjectKeyFromObject(env), &retained); err != nil {
+		t.Fatal("claimed Environment was deleted")
+	}
+	if retained.Status.ClaimedBy != nil || adapter.cancelled != 0 {
+		t.Fatalf("claim = %#v, adapter cancellations = %d", retained.Status.ClaimedBy, adapter.cancelled)
+	}
+}
+
+func TestFinalizeClaimedEnvironmentOrdersCancellationBeforeRelease(t *testing.T) {
+	now := metav1.Now()
+	run := &platformv1alpha1.Run{ObjectMeta: metav1.ObjectMeta{Name: "r", Namespace: "ns", UID: "run-uid", Finalizers: []string{runFinalizer}, DeletionTimestamp: &now}, Spec: platformv1alpha1.RunSpec{Agent: "test"}, Status: platformv1alpha1.RunStatus{
+		EnvironmentRef: &platformv1alpha1.RunEnvironmentReference{Name: "shared", UID: "env-uid", Ownership: platformv1alpha1.EnvironmentOwnershipClaimed},
+		Conditions:     []metav1.Condition{{Type: runConditionAdapterAccepted, Status: metav1.ConditionTrue}},
+	}}
+	env := &platformv1alpha1.Environment{ObjectMeta: metav1.ObjectMeta{Name: "shared", Namespace: "ns", UID: "env-uid"}, Status: platformv1alpha1.EnvironmentStatus{
+		Phase: platformv1alpha1.EnvironmentPhaseReady, PodName: "env-shared", Endpoints: platformv1alpha1.EnvironmentEndpoints{Sandboxd: "10.0.0.1:50051"},
+		ClaimedBy: &platformv1alpha1.RunReference{Name: run.Name, UID: run.UID},
+	}}
+	adapter := &scriptedAdapter{}
+	r := reconciler(t, adapter, run, env)
+	adapter.onCancel = func() {
+		var current platformv1alpha1.Environment
+		if err := r.Get(context.Background(), client.ObjectKeyFromObject(env), &current); err != nil || current.Status.ClaimedBy == nil {
+			t.Fatal("claim was released before adapter cancellation")
+		}
+	}
+	if result, err := r.finalize(context.Background(), run); err != nil || result.RequeueAfter != 0 {
+		t.Fatalf("finalize = (%#v, %v)", result, err)
+	}
+	var retained platformv1alpha1.Environment
+	if err := r.Get(context.Background(), client.ObjectKeyFromObject(env), &retained); err != nil {
+		t.Fatal("claimed Environment was deleted")
+	}
+	if retained.Status.ClaimedBy != nil || adapter.cancelled != 1 {
+		t.Fatalf("claim = %#v, cancellations = %d", retained.Status.ClaimedBy, adapter.cancelled)
+	}
+	var deletedRun platformv1alpha1.Run
+	if err := r.Get(context.Background(), client.ObjectKeyFromObject(run), &deletedRun); err == nil {
+		if controllerutil.ContainsFinalizer(&deletedRun, runFinalizer) {
+			t.Fatal("Run finalizer was not removed")
+		}
+	} else if !apierrors.IsNotFound(err) {
+		t.Fatal(err)
+	}
+}
+
+func TestFinalizeOwnedEnvironmentLeavesGCReference(t *testing.T) {
+	now := metav1.Now()
+	run := &platformv1alpha1.Run{ObjectMeta: metav1.ObjectMeta{Name: "r", Namespace: "ns", UID: "run-uid", Finalizers: []string{runFinalizer}, DeletionTimestamp: &now}, Spec: platformv1alpha1.RunSpec{Agent: "test"}, Status: platformv1alpha1.RunStatus{
+		EnvironmentRef: &platformv1alpha1.RunEnvironmentReference{Name: "owned", UID: "env-uid", Ownership: platformv1alpha1.EnvironmentOwnershipOwned},
+		Conditions:     []metav1.Condition{{Type: runConditionAdapterAccepted, Status: metav1.ConditionTrue}},
+	}}
+	env := &platformv1alpha1.Environment{ObjectMeta: metav1.ObjectMeta{Name: "owned", Namespace: "ns", UID: "env-uid", OwnerReferences: []metav1.OwnerReference{{
+		APIVersion: platformv1alpha1.GroupVersion.String(), Kind: "Run", Name: run.Name, UID: run.UID, Controller: ptr(true),
+	}}}, Status: platformv1alpha1.EnvironmentStatus{Phase: platformv1alpha1.EnvironmentPhaseReady, PodName: "env-owned", Endpoints: platformv1alpha1.EnvironmentEndpoints{Sandboxd: "10.0.0.1:50051"}}}
+	adapter := &scriptedAdapter{}
+	r := reconciler(t, adapter, run, env)
+	if _, err := r.finalize(context.Background(), run); err != nil {
+		t.Fatal(err)
+	}
+	var retained platformv1alpha1.Environment
+	if err := r.Get(context.Background(), client.ObjectKeyFromObject(env), &retained); err != nil {
+		t.Fatal("owned Environment was directly deleted instead of left to GC")
+	}
+	if !metav1.IsControlledBy(&retained, run) || adapter.cancelled != 1 {
+		t.Fatalf("owner = %#v, cancellations = %d", metav1.GetControllerOf(&retained), adapter.cancelled)
+	}
+}
+
+func TestFinalizePausedAndTransientlyUnreachableAcceptedClaims(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		phase       platformv1alpha1.EnvironmentPhase
+		wantRequeue bool
+		wantClaim   bool
+	}{
+		{name: "paused is fenced", phase: platformv1alpha1.EnvironmentPhasePaused},
+		{name: "setup is ambiguous", phase: platformv1alpha1.EnvironmentPhaseSetup, wantRequeue: true, wantClaim: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			now := metav1.Now()
+			run := &platformv1alpha1.Run{ObjectMeta: metav1.ObjectMeta{Name: "r", Namespace: "ns", UID: "run-uid", Finalizers: []string{runFinalizer}, DeletionTimestamp: &now}, Spec: platformv1alpha1.RunSpec{Agent: "test"}, Status: platformv1alpha1.RunStatus{
+				EnvironmentRef: &platformv1alpha1.RunEnvironmentReference{Name: "shared", UID: "env-uid", Ownership: platformv1alpha1.EnvironmentOwnershipClaimed},
+				Conditions:     []metav1.Condition{{Type: runConditionAdapterAccepted, Status: metav1.ConditionTrue}},
+			}}
+			env := &platformv1alpha1.Environment{ObjectMeta: metav1.ObjectMeta{Name: "shared", Namespace: "ns", UID: "env-uid"}, Status: platformv1alpha1.EnvironmentStatus{Phase: tc.phase, ClaimedBy: &platformv1alpha1.RunReference{Name: run.Name, UID: run.UID}}}
+			adapter := &scriptedAdapter{}
+			r := reconciler(t, adapter, run, env)
+			result, err := r.finalize(context.Background(), run)
+			if err != nil || (result.RequeueAfter != 0) != tc.wantRequeue {
+				t.Fatalf("finalize = (%#v, %v)", result, err)
+			}
+			var retained platformv1alpha1.Environment
+			if err := r.Get(context.Background(), client.ObjectKeyFromObject(env), &retained); err != nil {
+				t.Fatal(err)
+			}
+			if (retained.Status.ClaimedBy != nil) != tc.wantClaim || adapter.cancelled != 0 {
+				t.Fatalf("claim = %#v, cancellations = %d", retained.Status.ClaimedBy, adapter.cancelled)
+			}
+			if tc.wantRequeue {
+				var retainedRun platformv1alpha1.Run
+				if err := r.Get(context.Background(), client.ObjectKeyFromObject(run), &retainedRun); err != nil || !controllerutil.ContainsFinalizer(&retainedRun, runFinalizer) {
+					t.Fatal("ambiguous accepted work did not retain Run finalizer")
+				}
+			}
+		})
+	}
+}
+
+func TestFinalizeRecoversLostClaimStatusAndOnlyReleasesMatchingUID(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		claimUID  types.UID
+		wantClaim bool
+	}{
+		{name: "matching recovery", claimUID: "run-uid"},
+		{name: "same-name replacement claim", claimUID: "other-run", wantClaim: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			now := metav1.Now()
+			run := &platformv1alpha1.Run{ObjectMeta: metav1.ObjectMeta{Name: "r", Namespace: "ns", UID: "run-uid", Finalizers: []string{runFinalizer}, DeletionTimestamp: &now}, Spec: platformv1alpha1.RunSpec{Agent: "test", EnvironmentRef: "shared"}}
+			env := &platformv1alpha1.Environment{ObjectMeta: metav1.ObjectMeta{Name: "shared", Namespace: "ns", UID: "env-uid"}, Spec: platformv1alpha1.EnvironmentSpec{Paused: true}, Status: platformv1alpha1.EnvironmentStatus{Phase: platformv1alpha1.EnvironmentPhasePaused, ClaimedBy: &platformv1alpha1.RunReference{Name: run.Name, UID: tc.claimUID}}}
+			r := reconciler(t, &scriptedAdapter{}, run, env)
+			if _, err := r.finalize(context.Background(), run); err != nil {
+				t.Fatal(err)
+			}
+			var retained platformv1alpha1.Environment
+			if err := r.Get(context.Background(), client.ObjectKeyFromObject(env), &retained); err != nil {
+				t.Fatal(err)
+			}
+			if (retained.Status.ClaimedBy != nil) != tc.wantClaim {
+				t.Fatalf("claim = %#v", retained.Status.ClaimedBy)
+			}
+			if !retained.Spec.Paused {
+				t.Fatal("deletion recovery unexpectedly woke the paused Environment")
+			}
+		})
+	}
+}
+
+func TestCancelRecoveryDoesNotWakePausedClaim(t *testing.T) {
+	run := &platformv1alpha1.Run{ObjectMeta: metav1.ObjectMeta{Name: "r", Namespace: "ns", UID: "run-uid", Finalizers: []string{runFinalizer}}, Spec: platformv1alpha1.RunSpec{Agent: "test", EnvironmentRef: "shared", Cancel: true}}
+	env := &platformv1alpha1.Environment{ObjectMeta: metav1.ObjectMeta{Name: "shared", Namespace: "ns", UID: "env-uid"}, Spec: platformv1alpha1.EnvironmentSpec{Paused: true}, Status: platformv1alpha1.EnvironmentStatus{
+		Phase: platformv1alpha1.EnvironmentPhasePaused, ClaimedBy: &platformv1alpha1.RunReference{Name: run.Name, UID: run.UID},
+	}}
+	adapter := &scriptedAdapter{}
+	r := reconciler(t, adapter, run, env)
+	reconcileRun(t, r, run.Name)
+	if got := reconcileRun(t, r, run.Name); got.Status.State != platformv1alpha1.RunStateCancelled {
+		t.Fatalf("state = %s, want Cancelled", got.Status.State)
+	}
+	var retained platformv1alpha1.Environment
+	if err := r.Get(context.Background(), client.ObjectKeyFromObject(env), &retained); err != nil {
+		t.Fatal(err)
+	}
+	if !retained.Spec.Paused || adapter.cancelled != 0 {
+		t.Fatalf("paused = %t, cancellations = %d", retained.Spec.Paused, adapter.cancelled)
+	}
+}
+
+func TestFinalizeRecoversOwnedEnvironmentWithLostRunStatus(t *testing.T) {
+	now := metav1.Now()
+	run := &platformv1alpha1.Run{ObjectMeta: metav1.ObjectMeta{Name: "r", Namespace: "ns", UID: "run-uid", Finalizers: []string{runFinalizer}, DeletionTimestamp: &now}, Spec: platformv1alpha1.RunSpec{Agent: "test", TemplateRef: "small"}}
+	env := &platformv1alpha1.Environment{ObjectMeta: metav1.ObjectMeta{Name: "run-run-uid", Namespace: "ns", UID: "env-uid", OwnerReferences: []metav1.OwnerReference{{
+		APIVersion: platformv1alpha1.GroupVersion.String(), Kind: "Run", Name: run.Name, UID: run.UID, Controller: ptr(true),
+	}}}, Spec: platformv1alpha1.EnvironmentSpec{Paused: true}, Status: platformv1alpha1.EnvironmentStatus{Phase: platformv1alpha1.EnvironmentPhasePaused}}
+	adapter := &scriptedAdapter{}
+	r := reconciler(t, adapter, run, env)
+	if _, err := r.finalize(context.Background(), run); err != nil {
+		t.Fatal(err)
+	}
+	var retained platformv1alpha1.Environment
+	if err := r.Get(context.Background(), client.ObjectKeyFromObject(env), &retained); err != nil {
+		t.Fatal("owned Environment should remain for API-server GC")
+	}
+	if !exactControllerOwner(&retained, platformv1alpha1.GroupVersion.String(), "Run", run.Name, run.UID) || adapter.cancelled != 0 {
+		t.Fatalf("owner = %#v, cancellations = %d", metav1.GetControllerOf(&retained), adapter.cancelled)
+	}
+}
+
+func TestCleanupRecoveryDoesNotPromoteWarmClaim(t *testing.T) {
+	for _, deleting := range []bool{false, true} {
+		name := "cancel"
+		if deleting {
+			name = "delete"
+		}
+		t.Run(name, func(t *testing.T) {
+			run := &platformv1alpha1.Run{ObjectMeta: metav1.ObjectMeta{Name: "r", Namespace: "ns", UID: "run-uid", Finalizers: []string{runFinalizer}}, Spec: platformv1alpha1.RunSpec{Agent: "test", TemplateRef: "small", ProjectRef: "project", Cancel: !deleting}}
+			if deleting {
+				now := metav1.Now()
+				run.DeletionTimestamp = &now
+			}
+			warm := &platformv1alpha1.Environment{ObjectMeta: metav1.ObjectMeta{Name: "warm-small-1", Namespace: "ns", UID: "warm-uid", Labels: map[string]string{warmPoolLabel: "small"}, OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: platformv1alpha1.GroupVersion.String(), Kind: "EnvironmentTemplate", Name: "small", UID: "template-uid", Controller: ptr(true),
+			}}}, Spec: platformv1alpha1.EnvironmentSpec{TemplateRef: "small"}, Status: platformv1alpha1.EnvironmentStatus{
+				Phase: platformv1alpha1.EnvironmentPhaseReady, PodName: "env-warm-small-1", Endpoints: platformv1alpha1.EnvironmentEndpoints{Sandboxd: "10.0.0.1:50051"},
+				ClaimedBy: &platformv1alpha1.RunReference{Name: run.Name, UID: run.UID},
+			}}
+			adapter := &scriptedAdapter{}
+			r := reconciler(t, adapter, run, warm)
+			if deleting {
+				if _, err := r.finalize(context.Background(), run); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				reconcileRun(t, r, run.Name)
+				reconcileRun(t, r, run.Name)
+			}
+			var retained platformv1alpha1.Environment
+			if err := r.Get(context.Background(), client.ObjectKeyFromObject(warm), &retained); err != nil {
+				t.Fatal(err)
+			}
+			owner := metav1.GetControllerOf(&retained)
+			if retained.Labels[warmPoolLabel] != "small" || owner == nil || owner.Kind != "EnvironmentTemplate" || owner.Name != "small" ||
+				retained.Spec.ProjectRef != "" || retained.Status.ClaimedBy != nil || retained.Status.Phase != platformv1alpha1.EnvironmentPhaseReady || retained.Status.PodName == "" || retained.Status.Endpoints.Sandboxd == "" || adapter.cancelled != 0 {
+				t.Fatalf("warm Environment was promoted during cleanup recovery: %#v, cancellations = %d", retained, adapter.cancelled)
+			}
+		})
+	}
+}
+
+func TestOwnershipMismatchNeverCancelsOrMutatesEnvironment(t *testing.T) {
+	run := &platformv1alpha1.Run{ObjectMeta: metav1.ObjectMeta{Name: "r", Namespace: "ns", UID: "run-uid"}, Spec: platformv1alpha1.RunSpec{Agent: "test"}, Status: platformv1alpha1.RunStatus{
+		State:          platformv1alpha1.RunStateSucceeded,
+		EnvironmentRef: &platformv1alpha1.RunEnvironmentReference{Name: "owned", UID: "env-uid", Ownership: platformv1alpha1.EnvironmentOwnershipOwned},
+		Conditions:     []metav1.Condition{{Type: runConditionAdapterAccepted, Status: metav1.ConditionTrue}},
+	}}
+	env := &platformv1alpha1.Environment{ObjectMeta: metav1.ObjectMeta{Name: "owned", Namespace: "ns", UID: "env-uid", OwnerReferences: []metav1.OwnerReference{{
+		APIVersion: platformv1alpha1.GroupVersion.String(), Kind: "Run", Name: "other", UID: run.UID, Controller: ptr(true),
+	}}}, Status: platformv1alpha1.EnvironmentStatus{Phase: platformv1alpha1.EnvironmentPhaseReady, PodName: "env-owned", Endpoints: platformv1alpha1.EnvironmentEndpoints{Sandboxd: "10.0.0.1:50051"}}}
+	s := runScheme(t)
+	c := fake.NewClientBuilder().WithScheme(s).WithStatusSubresource(&platformv1alpha1.Run{}, &platformv1alpha1.Environment{}).WithObjects(run, env).Build()
+	adapter := &scriptedAdapter{}
+	r := &RunReconciler{Client: c, Scheme: s, Adapters: map[string]AdapterLifecycle{"test": adapter}}
+	if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(run)}); err != nil {
+		t.Fatal(err)
+	}
+	var retained platformv1alpha1.Environment
+	if err := r.Get(context.Background(), client.ObjectKeyFromObject(env), &retained); err != nil {
+		t.Fatal(err)
+	}
+	if retained.Spec.Paused || adapter.cancelled != 0 || metav1.GetControllerOf(&retained).Name != "other" {
+		t.Fatalf("environment mutated or cancelled: %#v, cancellations = %d", retained, adapter.cancelled)
 	}
 }

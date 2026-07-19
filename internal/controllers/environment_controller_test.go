@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"encoding/pem"
 	stderrors "errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -121,6 +122,11 @@ func TestEnsurePodCreatesAndRotatesEphemeralSandboxdCredentials(t *testing.T) {
 	if pod.Spec.Volumes[1].Secret.DefaultMode == nil || *pod.Spec.Volumes[1].Secret.DefaultMode != 0o444 {
 		t.Fatalf("credential mode = %v, want readable by non-root sandboxd", pod.Spec.Volumes[1].Secret.DefaultMode)
 	}
+	for _, item := range pod.Spec.Volumes[1].Secret.Items {
+		if item.Key == sandboxdauth.ProcessTokenKey {
+			t.Fatal("private adapter process token was mounted into the environment pod")
+		}
+	}
 
 	var first corev1.Secret
 	if err := reconciler.Get(context.Background(), client.ObjectKey{Namespace: env.Namespace, Name: envCredentialName(env)}, &first); err != nil {
@@ -133,8 +139,11 @@ func TestEnsurePodCreatesAndRotatesEphemeralSandboxdCredentials(t *testing.T) {
 	if err := json.Unmarshal(first.Data[sandboxdauth.CapabilitiesKey], &capabilityConfig); err != nil {
 		t.Fatal(err)
 	}
-	if len(capabilityConfig.Grants) != 1 || len(capabilityConfig.Grants[0].Capabilities) != 2 {
-		t.Fatalf("capability grants = %#v, want one terminal/health grant", capabilityConfig.Grants)
+	if len(capabilityConfig.Grants) != 2 || len(capabilityConfig.Grants[0].Capabilities) != 2 || len(capabilityConfig.Grants[1].Capabilities) != 1 || capabilityConfig.Grants[1].Capabilities[0] != sandboxdauth.CapabilityProcess {
+		t.Fatalf("capability grants = %#v, want terminal/health and distinct process grants", capabilityConfig.Grants)
+	}
+	if _, published := pod.Annotations[sandboxdauth.ProcessTokenKey]; published {
+		t.Fatal("process token was published on pod")
 	}
 	block, _ := pem.Decode(first.Data[sandboxdauth.TLSCertKey])
 	if block == nil {
@@ -153,6 +162,13 @@ func TestEnsurePodCreatesAndRotatesEphemeralSandboxdCredentials(t *testing.T) {
 		t.Fatalf("certificate cannot be used as the pinned TLS identity: %v", err)
 	}
 	firstToken := pod.Annotations[sandboxdauth.TokenAnnotation]
+	if string(first.Data[sandboxdauth.ProcessTokenKey]) == "" || string(first.Data[sandboxdauth.ProcessTokenKey]) == firstToken {
+		t.Fatal("Secret must contain a distinct private process token")
+	}
+	if string(first.Data[sandboxdauth.CapabilitiesKey]) == string(first.Data[sandboxdauth.ProcessTokenKey]) ||
+		strings.Contains(string(first.Data[sandboxdauth.CapabilitiesKey]), string(first.Data[sandboxdauth.ProcessTokenKey])) {
+		t.Fatal("mounted capability data exposes the raw process token")
+	}
 
 	if err := reconciler.Delete(context.Background(), pod); err != nil {
 		t.Fatal(err)
@@ -197,7 +213,7 @@ func TestSandboxdNetworkPolicyOnlyAllowsControlPlaneIngress(t *testing.T) {
 	if err := reconciler.Get(context.Background(), client.ObjectKey{Namespace: env.Namespace, Name: envNetworkPolicyName(env)}, &policy); err != nil {
 		t.Fatal(err)
 	}
-	if len(policy.Spec.Ingress) != 1 || len(policy.Spec.Ingress[0].From) != 1 {
+	if len(policy.Spec.Ingress) != 1 || len(policy.Spec.Ingress[0].From) != 2 {
 		t.Fatalf("unexpected ingress policy: %#v", policy.Spec.Ingress)
 	}
 	peer := policy.Spec.Ingress[0].From[0]
@@ -211,6 +227,9 @@ func TestSandboxdNetworkPolicyOnlyAllowsControlPlaneIngress(t *testing.T) {
 	}
 	if len(policy.Spec.Ingress[0].Ports) != 1 || policy.Spec.Ingress[0].Ports[0].Port.IntVal != 50051 {
 		t.Fatalf("ingress ports = %#v, want sandboxd only", policy.Spec.Ingress[0].Ports)
+	}
+	if got := policy.Spec.Ingress[0].From[1].PodSelector.MatchLabels["app.kubernetes.io/component"]; got != "operator" {
+		t.Fatalf("second ingress peer component = %q, want operator", got)
 	}
 }
 

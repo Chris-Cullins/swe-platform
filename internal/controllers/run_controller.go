@@ -19,6 +19,8 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 
 	platformv1alpha1 "github.com/Chris-Cullins/swe-platform/api/v1alpha1"
+	"github.com/Chris-Cullins/swe-platform/internal/sandboxclient"
+	sandboxdv1 "github.com/Chris-Cullins/swe-platform/sandboxd/gen/proto/sandboxd/v1"
 )
 
 const runFinalizer = "swe.dev/run-cleanup"
@@ -56,6 +58,7 @@ type AdapterSandbox struct {
 	EnvironmentName  string
 	EnvironmentUID   types.UID
 	SandboxdEndpoint string
+	DialProcess      func(context.Context) (sandboxdv1.ProcessServiceClient, func() error, error)
 }
 
 // AdapterLifecycle translates one agent's execution model into normalized Run
@@ -90,10 +93,10 @@ func (r *RunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.R
 	}
 
 	if !run.DeletionTimestamp.IsZero() {
-		return ctrl.Result{}, r.finalize(ctx, &run)
+		return r.finalize(ctx, &run)
 	}
 	if terminalRunState(run.Status.State) {
-		return ctrl.Result{}, r.cleanupTerminal(ctx, &run)
+		return r.cleanupTerminal(ctx, &run)
 	}
 	if run.Spec.Cancel && run.Status.EnvironmentRef == nil {
 		ref, err := r.recoverEnvironmentReference(ctx, &run)
@@ -102,6 +105,18 @@ func (r *RunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.R
 		}
 		if ref == nil {
 			return ctrl.Result{}, r.setRunState(ctx, &run, platformv1alpha1.RunStateCancelled, "Cancelled", "cancelled before allocation")
+		}
+		if ref.Ownership == platformv1alpha1.EnvironmentOwnershipClaimed {
+			var recovered platformv1alpha1.Environment
+			if err := r.Get(ctx, types.NamespacedName{Namespace: run.Namespace, Name: ref.Name}, &recovered); err != nil {
+				return ctrl.Result{}, err
+			}
+			if unpromotedWarmClaim(&recovered, &run) {
+				if err := r.releaseClaim(ctx, &run, &recovered); err != nil {
+					return ctrl.Result{}, err
+				}
+				return ctrl.Result{}, r.setRunState(ctx, &run, platformv1alpha1.RunStateCancelled, "Cancelled", "cancelled before warm environment promotion")
+			}
 		}
 		run.Status.EnvironmentRef = ref
 		return ctrl.Result{Requeue: true}, r.setRunState(ctx, &run, platformv1alpha1.RunStateAllocating, "EnvironmentRecovered", fmt.Sprintf("recovered environment %s before cancellation", ref.Name))
@@ -118,6 +133,16 @@ func (r *RunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.R
 		}
 		if ref == nil {
 			ref, err = r.allocateEnvironment(ctx, &run)
+		} else if ref.Ownership == platformv1alpha1.EnvironmentOwnershipClaimed {
+			var recovered platformv1alpha1.Environment
+			if getErr := r.Get(ctx, types.NamespacedName{Namespace: run.Namespace, Name: ref.Name}, &recovered); getErr != nil {
+				return ctrl.Result{}, getErr
+			}
+			if run.Spec.EnvironmentRef != "" {
+				err = r.wakeExplicitClaim(ctx, &recovered)
+			} else {
+				err = r.promoteWarmEnvironment(ctx, &run, &recovered)
+			}
 		}
 		if err != nil {
 			return ctrl.Result{}, err
@@ -134,8 +159,15 @@ func (r *RunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.R
 		return ctrl.Result{}, err
 	}
 	if run.Spec.Cancel {
-		if adapter := r.Adapters[run.Spec.Agent]; adapter != nil {
-			if err := adapter.Cancel(ctx, adapterTask(&run), adapterSandbox(env)); err != nil {
+		if runAccepted(&run) && !environmentFenced(env) {
+			if !environmentReachable(env) {
+				return ctrl.Result{RequeueAfter: adapterPollInterval}, nil
+			}
+			adapter := r.Adapters[run.Spec.Agent]
+			if adapter == nil {
+				return ctrl.Result{}, fmt.Errorf("adapter %q is not registered; accepted work cannot be cancelled safely", run.Spec.Agent)
+			}
+			if err := adapter.Cancel(ctx, adapterTask(&run), r.adapterSandbox(&run, env)); err != nil {
 				return ctrl.Result{}, err
 			}
 		}
@@ -152,6 +184,9 @@ func (r *RunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.R
 	default:
 		return ctrl.Result{}, r.setRunState(ctx, &run, platformv1alpha1.RunStateAllocating, "EnvironmentNotReady", fmt.Sprintf("environment phase is %s", env.Status.Phase))
 	}
+	if !environmentReachable(env) {
+		return ctrl.Result{RequeueAfter: adapterPollInterval}, r.setRunState(ctx, &run, platformv1alpha1.RunStateAllocating, "EnvironmentNotReachable", "sandboxd endpoint is not currently reachable")
+	}
 
 	if run.Status.State == platformv1alpha1.RunStateAllocating || run.Status.State == platformv1alpha1.RunStatePaused || run.Status.State == "" {
 		return ctrl.Result{Requeue: true}, r.setRunState(ctx, &run, platformv1alpha1.RunStateEnvironmentReady, "EnvironmentReady", "sandboxd is ready")
@@ -161,13 +196,13 @@ func (r *RunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.R
 		return ctrl.Result{}, r.setRunState(ctx, &run, platformv1alpha1.RunStateFailed, "AdapterUnavailable", fmt.Sprintf("adapter %q is not registered", run.Spec.Agent))
 	}
 	if run.Status.State == platformv1alpha1.RunStateEnvironmentReady {
-		if err := adapter.EnsureAccepted(ctx, adapterTask(&run), adapterSandbox(env)); err != nil {
+		if err := adapter.EnsureAccepted(ctx, adapterTask(&run), r.adapterSandbox(&run, env)); err != nil {
 			return ctrl.Result{}, err
 		}
 		return ctrl.Result{Requeue: true}, r.setRunState(ctx, &run, platformv1alpha1.RunStateAdapterAccepted, "AdapterAccepted", "adapter accepted the task")
 	}
 
-	observation, message, err := adapter.Observe(ctx, adapterTask(&run), adapterSandbox(env))
+	observation, message, err := adapter.Observe(ctx, adapterTask(&run), r.adapterSandbox(&run, env))
 	if err != nil {
 		return ctrl.Result{}, err
 	}
@@ -215,6 +250,13 @@ func (r *RunReconciler) allocateEnvironment(ctx context.Context, run *platformv1
 				return nil, err
 			}
 		}
+		if env.Spec.Paused {
+			before := env.DeepCopy()
+			env.Spec.Paused = false
+			if err := r.Patch(ctx, &env, client.MergeFromWithOptions(before, client.MergeFromWithOptimisticLock{})); err != nil {
+				return nil, err
+			}
+		}
 		return &platformv1alpha1.RunEnvironmentReference{Name: env.Name, UID: env.UID, Ownership: platformv1alpha1.EnvironmentOwnershipClaimed}, nil
 	}
 
@@ -251,7 +293,7 @@ func (r *RunReconciler) allocateEnvironment(ctx context.Context, run *platformv1
 	} else if err != nil {
 		return nil, err
 	}
-	if !metav1.IsControlledBy(&env, run) {
+	if !exactControllerOwner(&env, platformv1alpha1.GroupVersion.String(), "Run", run.Name, run.UID) {
 		return nil, fmt.Errorf("deterministic environment %q is not owned by run UID %s", env.Name, run.UID)
 	}
 	return &platformv1alpha1.RunEnvironmentReference{Name: env.Name, UID: env.UID, Ownership: platformv1alpha1.EnvironmentOwnershipOwned}, nil
@@ -266,8 +308,17 @@ func (r *RunReconciler) getAllocatedEnvironment(ctx context.Context, run *platfo
 	if env.UID != ref.UID {
 		return nil, fmt.Errorf("%w: environment %q was replaced (wanted UID %s, got %s)", errAllocatedEnvironmentGone, env.Name, ref.UID, env.UID)
 	}
-	if ref.Ownership == platformv1alpha1.EnvironmentOwnershipClaimed && (env.Status.ClaimedBy == nil || env.Status.ClaimedBy.Name != run.Name || env.Status.ClaimedBy.UID != run.UID) {
-		return nil, fmt.Errorf("%w: environment %q claim does not match run UID %s", errAllocatedEnvironmentGone, env.Name, run.UID)
+	switch ref.Ownership {
+	case platformv1alpha1.EnvironmentOwnershipOwned:
+		if !exactControllerOwner(&env, platformv1alpha1.GroupVersion.String(), "Run", run.Name, run.UID) {
+			return nil, fmt.Errorf("%w: environment %q is not owned by run UID %s", errAllocatedEnvironmentGone, env.Name, run.UID)
+		}
+	case platformv1alpha1.EnvironmentOwnershipClaimed:
+		if metav1.GetControllerOf(&env) != nil || env.Status.ClaimedBy == nil || env.Status.ClaimedBy.Name != run.Name || env.Status.ClaimedBy.UID != run.UID {
+			return nil, fmt.Errorf("%w: environment %q claim does not match run UID %s", errAllocatedEnvironmentGone, env.Name, run.UID)
+		}
+	default:
+		return nil, fmt.Errorf("%w: environment %q has unknown ownership", errAllocatedEnvironmentGone, env.Name)
 	}
 	return &env, nil
 }
@@ -284,6 +335,9 @@ func (r *RunReconciler) recoverEnvironmentReference(ctx context.Context, run *pl
 			return nil, err
 		}
 		if env.Status.ClaimedBy != nil && env.Status.ClaimedBy.Name == run.Name && env.Status.ClaimedBy.UID == run.UID {
+			if metav1.GetControllerOf(&env) != nil {
+				return nil, nil
+			}
 			return &platformv1alpha1.RunEnvironmentReference{Name: env.Name, UID: env.UID, Ownership: platformv1alpha1.EnvironmentOwnershipClaimed}, nil
 		}
 		return nil, nil
@@ -295,9 +349,6 @@ func (r *RunReconciler) recoverEnvironmentReference(ctx context.Context, run *pl
 	for i := range environments.Items {
 		env := &environments.Items[i]
 		if env.Status.ClaimedBy != nil && env.Status.ClaimedBy.Name == run.Name && env.Status.ClaimedBy.UID == run.UID {
-			if err := r.promoteWarmEnvironment(ctx, run, env); err != nil {
-				return nil, err
-			}
 			return &platformv1alpha1.RunEnvironmentReference{Name: env.Name, UID: env.UID, Ownership: platformv1alpha1.EnvironmentOwnershipClaimed}, nil
 		}
 	}
@@ -308,7 +359,7 @@ func (r *RunReconciler) recoverEnvironmentReference(ctx context.Context, run *pl
 		}
 		return nil, err
 	}
-	if !metav1.IsControlledBy(&env, run) {
+	if !exactControllerOwner(&env, platformv1alpha1.GroupVersion.String(), "Run", run.Name, run.UID) {
 		return nil, nil
 	}
 	return &platformv1alpha1.RunEnvironmentReference{Name: env.Name, UID: env.UID, Ownership: platformv1alpha1.EnvironmentOwnershipOwned}, nil
@@ -396,63 +447,125 @@ func (r *RunReconciler) touchEnvironmentActivity(ctx context.Context, env *platf
 	return r.Status().Update(ctx, env)
 }
 
-func (r *RunReconciler) cleanupTerminal(ctx context.Context, run *platformv1alpha1.Run) error {
-	if run.Status.EnvironmentRef == nil {
+func (r *RunReconciler) wakeExplicitClaim(ctx context.Context, env *platformv1alpha1.Environment) error {
+	if !env.Spec.Paused {
 		return nil
+	}
+	before := env.DeepCopy()
+	env.Spec.Paused = false
+	return r.Patch(ctx, env, client.MergeFromWithOptions(before, client.MergeFromWithOptimisticLock{}))
+}
+
+func environmentReachable(env *platformv1alpha1.Environment) bool {
+	return (env.Status.Phase == platformv1alpha1.EnvironmentPhaseReady || env.Status.Phase == platformv1alpha1.EnvironmentPhaseRunning) &&
+		env.Status.PodName != "" && env.Status.Endpoints.Sandboxd != ""
+}
+
+func exactControllerOwner(object metav1.Object, apiVersion, kind, name string, uid types.UID) bool {
+	owner := metav1.GetControllerOf(object)
+	return owner != nil && owner.APIVersion == apiVersion && owner.Kind == kind && owner.Name == name && owner.UID == uid
+}
+
+func unpromotedWarmClaim(env *platformv1alpha1.Environment, run *platformv1alpha1.Run) bool {
+	template := env.Labels[warmPoolLabel]
+	owner := metav1.GetControllerOf(env)
+	return template != "" && env.Spec.TemplateRef == template && env.Status.ClaimedBy != nil &&
+		env.Status.ClaimedBy.Name == run.Name && env.Status.ClaimedBy.UID == run.UID &&
+		owner != nil && owner.APIVersion == platformv1alpha1.GroupVersion.String() && owner.Kind == "EnvironmentTemplate" && owner.Name == template
+}
+
+func environmentFenced(env *platformv1alpha1.Environment) bool {
+	return env.Status.Phase == platformv1alpha1.EnvironmentPhasePaused && env.Status.PodName == "" && env.Status.Endpoints.Sandboxd == ""
+}
+
+func runAccepted(run *platformv1alpha1.Run) bool {
+	condition := apiMeta.FindStatusCondition(run.Status.Conditions, runConditionAdapterAccepted)
+	return condition != nil && condition.Status == metav1.ConditionTrue
+}
+
+func (r *RunReconciler) cleanupTerminal(ctx context.Context, run *platformv1alpha1.Run) (ctrl.Result, error) {
+	if run.Status.EnvironmentRef == nil {
+		return ctrl.Result{}, nil
 	}
 	env, err := r.getAllocatedEnvironment(ctx, run)
 	if apierrors.IsNotFound(err) || errors.Is(err, errAllocatedEnvironmentGone) {
-		return nil
+		return ctrl.Result{}, nil
 	}
 	if err != nil {
-		return err
+		return ctrl.Result{}, err
 	}
-	if adapter := r.Adapters[run.Spec.Agent]; adapter != nil {
-		if err := adapter.Cancel(ctx, adapterTask(run), adapterSandbox(env)); err != nil {
-			return err
+	if runAccepted(run) && !environmentFenced(env) {
+		if !environmentReachable(env) {
+			return ctrl.Result{RequeueAfter: adapterPollInterval}, nil
+		}
+		adapter := r.Adapters[run.Spec.Agent]
+		if adapter == nil {
+			return ctrl.Result{}, fmt.Errorf("adapter %q is not registered; accepted work cannot be cleaned up safely", run.Spec.Agent)
+		}
+		if err := adapter.Cancel(ctx, adapterTask(run), r.adapterSandbox(run, env)); err != nil {
+			return ctrl.Result{}, err
 		}
 	}
 	if run.Status.EnvironmentRef.Ownership == platformv1alpha1.EnvironmentOwnershipOwned {
 		if !env.Spec.Paused {
 			env.Spec.Paused = true
-			return r.Update(ctx, env)
+			return ctrl.Result{}, r.Update(ctx, env)
 		}
-		return nil
+		return ctrl.Result{}, nil
 	}
-	return r.releaseClaim(ctx, run, env)
+	return ctrl.Result{}, r.releaseClaim(ctx, run, env)
 }
 
-func (r *RunReconciler) finalize(ctx context.Context, run *platformv1alpha1.Run) error {
+func (r *RunReconciler) finalize(ctx context.Context, run *platformv1alpha1.Run) (ctrl.Result, error) {
 	if !controllerutil.ContainsFinalizer(run, runFinalizer) {
-		return nil
+		return ctrl.Result{}, nil
 	}
 	if run.Status.EnvironmentRef == nil {
 		ref, err := r.recoverEnvironmentReference(ctx, run)
 		if err != nil {
-			return err
+			return ctrl.Result{}, err
+		}
+		if ref != nil && ref.Ownership == platformv1alpha1.EnvironmentOwnershipClaimed {
+			var recovered platformv1alpha1.Environment
+			if err := r.Get(ctx, types.NamespacedName{Namespace: run.Namespace, Name: ref.Name}, &recovered); err != nil {
+				return ctrl.Result{}, err
+			}
+			if unpromotedWarmClaim(&recovered, run) {
+				if err := r.releaseClaim(ctx, run, &recovered); err != nil {
+					return ctrl.Result{}, err
+				}
+				ref = nil
+			}
 		}
 		run.Status.EnvironmentRef = ref
 	}
 	if run.Status.EnvironmentRef != nil {
 		env, err := r.getAllocatedEnvironment(ctx, run)
 		if err != nil && !apierrors.IsNotFound(err) && !errors.Is(err, errAllocatedEnvironmentGone) {
-			return err
+			return ctrl.Result{}, err
 		}
 		if err == nil {
-			if adapter := r.Adapters[run.Spec.Agent]; adapter != nil {
-				if err := adapter.Cancel(ctx, adapterTask(run), adapterSandbox(env)); err != nil {
-					return err
+			if runAccepted(run) && !environmentFenced(env) {
+				if !environmentReachable(env) {
+					return ctrl.Result{RequeueAfter: adapterPollInterval}, nil
+				}
+				adapter := r.Adapters[run.Spec.Agent]
+				if adapter == nil {
+					return ctrl.Result{}, fmt.Errorf("adapter %q is not registered; accepted work cannot be finalized safely", run.Spec.Agent)
+				}
+				if err := adapter.Cancel(ctx, adapterTask(run), r.adapterSandbox(run, env)); err != nil {
+					return ctrl.Result{}, err
 				}
 			}
 			if run.Status.EnvironmentRef.Ownership == platformv1alpha1.EnvironmentOwnershipClaimed {
 				if err := r.releaseClaim(ctx, run, env); err != nil {
-					return err
+					return ctrl.Result{}, err
 				}
 			}
 		}
 	}
 	controllerutil.RemoveFinalizer(run, runFinalizer)
-	return r.Update(ctx, run)
+	return ctrl.Result{}, r.Update(ctx, run)
 }
 
 func (r *RunReconciler) releaseClaim(ctx context.Context, run *platformv1alpha1.Run, env *platformv1alpha1.Environment) error {
@@ -471,7 +584,7 @@ func (r *RunReconciler) setRunState(ctx context.Context, run *platformv1alpha1.R
 	apiMeta.SetStatusCondition(&run.Status.Conditions, metav1.Condition{
 		Type: runConditionEnvironmentReady, Status: boolConditionStatus(environmentReady), Reason: reason, Message: message, ObservedGeneration: run.Generation,
 	})
-	adapterAccepted := state == platformv1alpha1.RunStateAdapterAccepted || state == platformv1alpha1.RunStateRunning || state == platformv1alpha1.RunStateNeedsInput || state == platformv1alpha1.RunStateSucceeded || (state == platformv1alpha1.RunStateFailed && reason == string(AdapterObservationFailed))
+	adapterAccepted := runAccepted(run) || state == platformv1alpha1.RunStateAdapterAccepted || state == platformv1alpha1.RunStateRunning || state == platformv1alpha1.RunStateNeedsInput || state == platformv1alpha1.RunStateSucceeded || (state == platformv1alpha1.RunStateFailed && reason == string(AdapterObservationFailed))
 	apiMeta.SetStatusCondition(&run.Status.Conditions, metav1.Condition{
 		Type: runConditionAdapterAccepted, Status: boolConditionStatus(adapterAccepted), Reason: reason, Message: message, ObservedGeneration: run.Generation,
 	})
@@ -496,8 +609,15 @@ func adapterTask(run *platformv1alpha1.Run) AdapterTask {
 	return AdapterTask{ID: string(run.UID), Prompt: run.Spec.Prompt}
 }
 
-func adapterSandbox(env *platformv1alpha1.Environment) AdapterSandbox {
-	return AdapterSandbox{EnvironmentName: env.Name, EnvironmentUID: env.UID, SandboxdEndpoint: env.Status.Endpoints.Sandboxd}
+func (r *RunReconciler) adapterSandbox(run *platformv1alpha1.Run, env *platformv1alpha1.Environment) AdapterSandbox {
+	return AdapterSandbox{EnvironmentName: env.Name, EnvironmentUID: env.UID, SandboxdEndpoint: env.Status.Endpoints.Sandboxd,
+		DialProcess: func(ctx context.Context) (sandboxdv1.ProcessServiceClient, func() error, error) {
+			current, err := r.getAllocatedEnvironment(ctx, run)
+			if err != nil {
+				return nil, nil, err
+			}
+			return sandboxclient.DialProcess(ctx, r.Client, current.Namespace, current.Name, current.UID)
+		}}
 }
 
 // SetupWithManager registers Run watches. Owned Environments enqueue through
