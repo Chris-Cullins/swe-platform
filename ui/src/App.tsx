@@ -5,7 +5,7 @@ import {
   useNavigate, useOutletContext, useParams,
 } from 'react-router-dom'
 import {
-  api, ApiProblem, isTerminal, listPollInterval, onUnauthorized,
+  api, ApiProblem, isTerminal, listAllRuns, listPollInterval, onUnauthorized,
   queryKeys, runPollInterval,
 } from './api'
 import type { CreateRun, Run, Selector } from './contracts'
@@ -46,8 +46,20 @@ const age = (createdAt: string) => {
   return `${Math.floor(hours / 24)}d ago`
 }
 
+function loginDestination(state: unknown) {
+  if (!state || typeof state !== 'object' || !('from' in state)) return '/'
+  const from = (state as { from?: unknown }).from
+  if (!from || typeof from !== 'object') return '/'
+  const candidate = from as { pathname?: unknown; search?: unknown; hash?: unknown }
+  if (typeof candidate.pathname !== 'string' || !candidate.pathname.startsWith('/') || candidate.pathname.startsWith('//') || candidate.pathname.includes('\\')) return '/'
+  const search = typeof candidate.search === 'string' && (candidate.search === '' || candidate.search.startsWith('?')) ? candidate.search : ''
+  const hash = typeof candidate.hash === 'string' && (candidate.hash === '' || candidate.hash.startsWith('#')) ? candidate.hash : ''
+  return `${candidate.pathname}${search}${hash}`
+}
+
 function Login() {
   const [token, setToken] = React.useState('')
+  const location = useLocation()
   const navigate = useNavigate()
   const queryClient = useQueryClient()
   const mutation = useMutation({
@@ -55,7 +67,7 @@ function Login() {
     onSettled: () => setToken(''),
     onSuccess: session => {
       queryClient.setQueryData(queryKeys.session, session)
-      navigate('/', { replace: true })
+      navigate(loginDestination(location.state), { replace: true })
     },
   })
   return <main className="login"><form onSubmit={event => { event.preventDefault(); mutation.mutate(token) }}>
@@ -72,8 +84,8 @@ function Auth() {
   const queryClient = useQueryClient()
   React.useEffect(() => onUnauthorized(() => {
     queryClient.clear()
-    navigate('/login', { replace: true })
-  }), [navigate, queryClient])
+    navigate('/login', { state: { from: location }, replace: true })
+  }), [location, navigate, queryClient])
   const session = useQuery({ queryKey: queryKeys.session, queryFn: api.session, retry: false })
   if (session.isPending) return <main><Busy label="Checking session" /></main>
   if (session.error instanceof ApiProblem && session.error.status === 401) return <Navigate to="/login" state={{ from: location }} replace />
@@ -97,8 +109,8 @@ function RunList() {
   const { namespace = '' } = useParams()
   const query = useQuery({
     queryKey: queryKeys.runs(namespace),
-    queryFn: () => api.runs(namespace),
-    refetchInterval: state => listPollInterval(state.state.data),
+    queryFn: () => listAllRuns(namespace),
+    refetchInterval: listPollInterval,
   })
   return <main>
     <div className="title"><div><h1>Runs</h1><p>Agent tasks in {namespace}</p></div><Link className="button" to="new">New run</Link></div>

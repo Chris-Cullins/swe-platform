@@ -78,7 +78,10 @@ export function Transcript({ namespace, run }: { namespace: string; run: string 
   useEffect(() => {
     setTimeline([])
     setStatus('Connecting')
-    const stream = new EventSource(api.transcriptUrl(namespace, run))
+    const url = api.transcriptUrl(namespace, run)
+    let stream: EventSource | undefined
+    let disposed = false
+    let freshRecoveryUsed = false
     const onTranscript = (raw: Event) => {
       const entry = parseEntry(raw as MessageEvent)
       if (!entry) return
@@ -99,11 +102,48 @@ export function Transcript({ namespace, run }: { namespace: string; run: string 
         return [...current, next].sort((a, b) => a.position - b.position || (a.kind === 'gap' ? -1 : 1))
       })
     }
-    stream.onopen = () => setStatus('Connected')
-    stream.onerror = () => setStatus('Reconnecting')
-    stream.addEventListener('transcript', onTranscript)
-    stream.addEventListener('transcript-gap', onGap)
-    return () => stream.close()
+    const connect = () => {
+      const next = new EventSource(url)
+      stream = next
+      let opened = false
+      next.onopen = () => {
+        if (disposed || stream !== next) return
+        opened = true
+        freshRecoveryUsed = false
+        setStatus('Connected')
+      }
+      next.onerror = async () => {
+        if (disposed || stream !== next) return
+        if (next.readyState === EventSource.CONNECTING) {
+          setStatus('Reconnecting')
+          return
+        }
+        if (next.readyState !== EventSource.CLOSED) return
+        setStatus('Checking session')
+        try {
+          await api.session()
+        } catch (error) {
+          if (!disposed && stream === next) setStatus(error instanceof Error ? error.message : 'Disconnected')
+          return
+        }
+        if (disposed || stream !== next || next.readyState !== EventSource.CLOSED) return
+        if (!opened || freshRecoveryUsed) {
+          setStatus('Disconnected')
+          return
+        }
+        freshRecoveryUsed = true
+        next.close()
+        setStatus('Recovering transcript')
+        connect()
+      }
+      next.addEventListener('transcript', onTranscript)
+      next.addEventListener('transcript-gap', onGap)
+    }
+    connect()
+    return () => {
+      disposed = true
+      stream?.close()
+    }
   }, [namespace, run])
   return <section><p role="status" aria-live="polite">Transcript: {status}</p>
     {!timeline.length ? <p>No transcript events yet.</p> : <ol className="transcript">

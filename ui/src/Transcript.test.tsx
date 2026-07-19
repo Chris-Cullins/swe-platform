@@ -4,16 +4,23 @@ import { Transcript } from './Transcript'
 
 class Events {
   static current: Events
+  static instances: Events[] = []
+  static CONNECTING = 0
+  static OPEN = 1
+  static CLOSED = 2
   listeners = new Map<string, EventListener>()
+  readyState = Events.CONNECTING
   onopen: (() => void) | null = null
   onerror: (() => void) | null = null
   close = vi.fn()
-  constructor(public url: string) { Events.current = this }
+  constructor(public url: string) { Events.current = this; Events.instances.push(this) }
   addEventListener(type: string, listener: EventListener) { this.listeners.set(type, listener) }
   emit(type: string, data: string, id = '') { this.listeners.get(type)?.(new MessageEvent(type, { data, lastEventId: id })) }
+  open() { this.readyState = Events.OPEN; this.onopen?.() }
+  async fail(state = Events.CLOSED) { this.readyState = state; await this.onerror?.() }
 }
 
-afterEach(() => vi.unstubAllGlobals())
+afterEach(() => { Events.instances = []; vi.restoreAllMocks(); vi.unstubAllGlobals() })
 describe('Transcript', () => {
   it('uses an unchanged encoded EventSource URL, orders events, and deduplicates IDs and sequences', () => {
     vi.stubGlobal('EventSource', Events)
@@ -70,5 +77,45 @@ describe('Transcript', () => {
     expect(screen.getByText(/"x": 1/)).toBeInTheDocument()
     expect(screen.getByText('hello')).toBeInTheDocument()
     expect(screen.getByText('plain output')).toBeInTheDocument()
+  })
+
+  it('checks auth then replaces a fatally closed opened source for gap-aware replay', async () => {
+    const fetch = vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(JSON.stringify({ authenticated: true, username: 'alex' })))
+    vi.stubGlobal('EventSource', Events)
+    render(<Transcript namespace="n" run="r" />)
+    const stale = Events.current
+    act(() => {
+      stale.open()
+      stale.emit('transcript', '{"sequence":1,"data":"before disconnect"}', 'cursor-1')
+    })
+    await act(async () => stale.fail())
+    expect(fetch).toHaveBeenCalledWith('/api/v1/session', expect.objectContaining({ credentials: 'same-origin' }))
+    expect(stale.close).toHaveBeenCalledOnce()
+    expect(Events.instances).toHaveLength(2)
+    const fresh = Events.current
+    expect(fresh).not.toBe(stale)
+    expect(fresh.url).toBe(stale.url)
+    act(() => {
+      fresh.open()
+      fresh.emit('transcript-gap', '{"resumeAfter":"fresh-cursor","earliestSequence":3,"latestSequence":4}')
+      fresh.emit('transcript', '{"sequence":3,"data":"retained replay"}', 'cursor-3')
+    })
+    expect(screen.getAllByRole('listitem').map(item => item.textContent)).toEqual([
+      'Eventbefore disconnect',
+      expect.stringContaining('Transcript gap'),
+      'Eventretained replay',
+    ])
+  })
+
+  it('leaves CONNECTING errors to native cursor-aware reconnect', async () => {
+    const fetch = vi.spyOn(globalThis, 'fetch')
+    vi.stubGlobal('EventSource', Events)
+    render(<Transcript namespace="n" run="r" />)
+    const stream = Events.current
+    act(() => stream.open())
+    await act(async () => stream.fail(Events.CONNECTING))
+    expect(screen.getByRole('status')).toHaveTextContent('Reconnecting')
+    expect(Events.instances).toHaveLength(1)
+    expect(fetch).not.toHaveBeenCalled()
   })
 })

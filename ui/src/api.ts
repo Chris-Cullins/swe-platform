@@ -50,6 +50,7 @@ async function request<T>(path: string, init: RequestInit = {}, options?: { toke
 const base = (namespace: string) => `/api/v1/namespaces/${encodeURIComponent(namespace)}`
 
 export interface RunListOptions { limit?: number; continue?: string }
+const MAX_RUN_LIST_PAGES = 100
 
 export const api = {
   session: () => request<Session>('/api/v1/session'),
@@ -73,10 +74,24 @@ export const api = {
   terminalPath: (namespace: string, environment: string) => `${base(namespace)}/environments/${encodeURIComponent(environment)}/terminal`,
 }
 
+export async function listAllRuns(namespace: string): Promise<RunList> {
+  const items: Run[] = []
+  const seenCursors = new Set<string>()
+  let cursor: string | undefined
+  for (let pageNumber = 0; pageNumber < MAX_RUN_LIST_PAGES; pageNumber += 1) {
+    const page = await api.runs(namespace, { limit: 200, ...(cursor ? { continue: cursor } : {}) })
+    items.push(...page.items)
+    if (!page.continue || seenCursors.has(page.continue)) return { items }
+    seenCursors.add(page.continue)
+    cursor = page.continue
+  }
+  return { items, continue: cursor }
+}
+
 const terminalStates = new Set(['Succeeded', 'Failed', 'Cancelled'])
 export const isTerminal = (state?: string) => !!state && terminalStates.has(state)
 export const runPollInterval = (run?: Run) => run && !isTerminal(run.state) ? 4000 : false
-export const listPollInterval = (list?: RunList) => Array.isArray(list?.items) && list.items.some(run => !isTerminal(run.state)) ? 4000 : false
+export const listPollInterval = 4000
 
 export const queryKeys = {
   session: ['session'] as const,

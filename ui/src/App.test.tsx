@@ -1,9 +1,10 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
-import { render, screen, waitFor } from '@testing-library/react'
+import { act, render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
-import { MemoryRouter } from 'react-router-dom'
+import { MemoryRouter, useLocation } from 'react-router-dom'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { App } from './App'
+import { queryKeys } from './api'
 import type { Environment, Run } from './contracts'
 
 const run: Run = {
@@ -14,12 +15,18 @@ const run: Run = {
 }
 const environment: Environment = { name: 'repair-env', uid: 'env-uid', createdAt: '2026-07-19T12:00:01Z', project: 'platform', template: 'small', backend: 'pod', paused: false, phase: 'Running', ready: true }
 const response = (body: unknown, status = 200) => new Response(status === 204 ? null : JSON.stringify(body), { status, headers: { 'Content-Type': 'application/json' } })
-function show(path: string) {
+function LocationProbe() {
+  const location = useLocation()
+  return <output data-testid="location">{`${location.pathname}${location.search}${location.hash}`}</output>
+}
+function show(path: string, state?: unknown) {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } })
-  return { client, ...render(<QueryClientProvider client={client}><MemoryRouter initialEntries={[path]}><App /></MemoryRouter></QueryClientProvider>) }
+  const location = new URL(path, 'https://console.test')
+  const entry = { pathname: location.pathname, search: location.search, hash: location.hash, state }
+  return { client, ...render(<QueryClientProvider client={client}><MemoryRouter initialEntries={[entry]}><LocationProbe /><App /></MemoryRouter></QueryClientProvider>) }
 }
 
-afterEach(() => vi.restoreAllMocks())
+afterEach(() => { vi.useRealTimers(); vi.restoreAllMocks() })
 describe('App frozen API integration', () => {
   it('redirects a session 401 to login', async () => {
     vi.spyOn(globalThis, 'fetch').mockResolvedValue(response({ type: 'auth', title: 'Unauthorized', status: 401 }, 401))
@@ -31,7 +38,20 @@ describe('App frozen API integration', () => {
     const fetch = vi.spyOn(globalThis, 'fetch').mockImplementation(async path => path === '/api/v1/session' ? response({ authenticated: true, username: 'alex' }) : response({ items: [] }))
     show('/namespaces/team%2Fa/runs')
     expect(await screen.findByText('No runs found.')).toHaveAttribute('role', 'status')
-    expect(fetch).toHaveBeenCalledWith('/api/v1/namespaces/team%2Fa/runs', expect.anything())
+    expect(fetch).toHaveBeenCalledWith('/api/v1/namespaces/team%2Fa/runs?limit=200', expect.anything())
+  })
+
+  it('keeps polling an empty feed and discovers a run created elsewhere', async () => {
+    vi.useFakeTimers()
+    const fetch = vi.spyOn(globalThis, 'fetch').mockResolvedValue(response({ items: [run] }))
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false, staleTime: Infinity } } })
+    client.setQueryData(queryKeys.session, { authenticated: true, username: 'alex' })
+    client.setQueryData(queryKeys.runs('default'), { items: [] })
+    render(<QueryClientProvider client={client}><MemoryRouter initialEntries={['/namespaces/default/runs']}><App /></MemoryRouter></QueryClientProvider>)
+    expect(screen.getByText('No runs found.')).toBeInTheDocument()
+    await act(async () => { await vi.advanceTimersByTimeAsync(4001); await Promise.resolve() })
+    expect(screen.getByText('repair-ui')).toBeInTheDocument()
+    expect(fetch).toHaveBeenCalledOnce()
   })
 
   it('shows accessible loading and problem error states', async () => {
@@ -47,13 +67,47 @@ describe('App frozen API integration', () => {
   })
 
   it('returns to login when an ordinary API request reports an expired session', async () => {
-    vi.spyOn(globalThis, 'fetch').mockImplementation(async path => path === '/api/v1/session'
-      ? response({ authenticated: true, username: 'alex' })
-      : response({ type: 'https://swe-platform.dev/problems/unauthenticated', title: 'Session expired', status: 401 }, 401))
-    const { client } = show('/namespaces/default/runs')
+    let loggedIn = false
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (path, init) => {
+      if (path === '/api/v1/session' && init?.method === 'POST') { loggedIn = true; return response({ authenticated: true, username: 'alex' }) }
+      if (path === '/api/v1/session') return response({ authenticated: true, username: 'alex' })
+      if (!loggedIn) return response({ type: 'https://swe-platform.dev/problems/unauthenticated', title: 'Session expired', status: 401 }, 401)
+      return response(run)
+    })
+    const deepLink = '/namespaces/default/runs/repair-ui/overview?panel=usage#tokens'
+    const { client } = show(deepLink)
     client.setQueryData(['prior-user-data'], { prompt: 'secret task' })
-    expect(await screen.findByLabelText('Access token')).toBeInTheDocument()
+    const token = await screen.findByLabelText('Access token')
     expect(client.getQueryData(['prior-user-data'])).toBeUndefined()
+    await userEvent.type(token, 'new-token')
+    await userEvent.click(screen.getByRole('button', { name: 'Sign in' }))
+    expect(await screen.findByRole('heading', { name: 'repair-ui' })).toBeInTheDocument()
+    expect(screen.getByTestId('location')).toHaveTextContent(deepLink)
+  })
+
+  it('preserves an initial deep link through login and rejects external redirect state', async () => {
+    let authenticated = false
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (path, init) => {
+      if (path === '/api/v1/session' && init?.method === 'POST') { authenticated = true; return response({ authenticated: true, username: 'alex' }) }
+      if (path === '/api/v1/session' && !authenticated) return response({ type: 'auth', title: 'Unauthorized', status: 401 }, 401)
+      if (path === '/api/v1/session') return response({ authenticated: true, username: 'alex' })
+      return response(run)
+    })
+    const deepLink = '/namespaces/default/runs/repair-ui/overview?panel=usage#tokens'
+    const firstView = show(deepLink)
+    const token = await screen.findByLabelText('Access token')
+    await userEvent.type(token, 'token')
+    await userEvent.click(screen.getByRole('button', { name: 'Sign in' }))
+    expect(await screen.findByRole('heading', { name: 'repair-ui' })).toBeInTheDocument()
+    expect(screen.getByTestId('location')).toHaveTextContent(deepLink)
+
+    firstView.unmount()
+    authenticated = false
+    show('/login', { from: { pathname: '/\\evil.example', search: '?steal=1' } })
+    const externalToken = screen.getAllByLabelText('Access token').at(-1)!
+    await userEvent.type(externalToken, 'token')
+    await userEvent.click(screen.getAllByRole('button', { name: 'Sign in' }).at(-1)!)
+    await waitFor(() => expect(screen.getAllByTestId('location').at(-1)).toHaveTextContent('/namespaces/default/runs'))
   })
 
   it('renders exact Run usage, operational facts, environment status and ownership', async () => {
