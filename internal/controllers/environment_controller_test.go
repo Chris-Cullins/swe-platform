@@ -362,7 +362,7 @@ func TestEnsurePodRefusesWrongOwnerPod(t *testing.T) {
 			APIVersion: platformv1alpha1.GroupVersion.String(), Kind: "Environment", Name: env.Name,
 			UID: "old-environment", Controller: ptr(true),
 		}},
-	}}
+	}, Status: corev1.PodStatus{Phase: corev1.PodFailed}}
 	reconciler := &EnvironmentReconciler{
 		Client: fake.NewClientBuilder().WithScheme(scheme).WithObjects(legacyPod).Build(), Scheme: scheme,
 	}
@@ -663,6 +663,230 @@ func TestTerminatingPodCannotRemainReady(t *testing.T) {
 	ready := apimeta.FindStatusCondition(updated.Status.Conditions, platformv1alpha1.EnvironmentConditionReady)
 	if platformv1alpha1.IsEnvironmentReady(&updated) || updated.Status.PodName != "" || updated.Status.Endpoints.Sandboxd != "" || ready == nil || ready.Reason != "PodTerminating" {
 		t.Fatalf("terminating pod status = %#v", updated.Status)
+	}
+}
+
+func TestTerminalPodsRecoverAfterBackoffAndRetainPVC(t *testing.T) {
+	for _, phase := range []corev1.PodPhase{corev1.PodFailed, corev1.PodSucceeded} {
+		t.Run(string(phase), func(t *testing.T) {
+			scheme := runtime.NewScheme()
+			if err := corev1.AddToScheme(scheme); err != nil {
+				t.Fatal(err)
+			}
+			if err := platformv1alpha1.AddToScheme(scheme); err != nil {
+				t.Fatal(err)
+			}
+			now := time.Date(2026, 7, 19, 12, 0, 0, 0, time.UTC)
+			env := &platformv1alpha1.Environment{ObjectMeta: metav1.ObjectMeta{
+				Name: "test", Namespace: "default", UID: "env-uid", Generation: 4,
+			}, Status: platformv1alpha1.EnvironmentStatus{
+				ObservedGeneration: 4, Phase: platformv1alpha1.EnvironmentPhaseReady, PodName: "env-test",
+				Endpoints: platformv1alpha1.EnvironmentEndpoints{Sandboxd: "10.0.0.1:50051"},
+				Conditions: []metav1.Condition{{Type: platformv1alpha1.EnvironmentConditionReady, Status: metav1.ConditionTrue,
+					ObservedGeneration: 4, Reason: "SandboxdReady", Message: "sandboxd is ready"}},
+			}}
+			pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: envPodName(env), Namespace: env.Namespace, UID: "dead-pod"}, Status: corev1.PodStatus{Phase: phase}}
+			pvc := &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: envPVCName(env), Namespace: env.Namespace, UID: "workspace-pvc"}}
+			if err := controllerutil.SetControllerReference(env, pod, scheme); err != nil {
+				t.Fatal(err)
+			}
+			if err := controllerutil.SetControllerReference(env, pvc, scheme); err != nil {
+				t.Fatal(err)
+			}
+			reconciler := &EnvironmentReconciler{
+				Client: fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(env).WithObjects(env, pod, pvc).Build(),
+				Scheme: scheme, Now: func() time.Time { return now },
+			}
+
+			result, err := reconciler.reconcileTerminalPod(context.Background(), env, pod)
+			if err != nil || result.Requeue || result.RequeueAfter != podRecoveryDelay {
+				t.Fatalf("schedule recovery = (%#v, %v), want %s delay", result, err, podRecoveryDelay)
+			}
+			var pending platformv1alpha1.Environment
+			if err := reconciler.Get(context.Background(), client.ObjectKeyFromObject(env), &pending); err != nil {
+				t.Fatal(err)
+			}
+			ready := apimeta.FindStatusCondition(pending.Status.Conditions, platformv1alpha1.EnvironmentConditionReady)
+			if platformv1alpha1.IsEnvironmentReady(&pending) || pending.Status.PodName != "" || pending.Status.Endpoints.Sandboxd != "" ||
+				pending.Status.PodRecoveryUID != pod.UID || pending.Status.PodRecoveryAttempts != 0 || pending.Status.PodRecoveryNextAttemptAt == nil ||
+				ready == nil || ready.Reason != "PodRecoveryPending" {
+				t.Fatalf("pending recovery status = %#v", pending.Status)
+			}
+			if err := reconciler.Get(context.Background(), client.ObjectKeyFromObject(pod), &corev1.Pod{}); err != nil {
+				t.Fatalf("terminal Pod deleted before backoff: %v", err)
+			}
+
+			now = now.Add(podRecoveryDelay)
+			result, handled, err := reconciler.reconcilePendingPodRecovery(context.Background(), &pending)
+			if err != nil || !handled || !result.Requeue {
+				t.Fatalf("advance recovery = (%#v, %t, %v), want immediate requeue", result, handled, err)
+			}
+			if err := reconciler.Get(context.Background(), client.ObjectKeyFromObject(env), &pending); err != nil {
+				t.Fatal(err)
+			}
+			result, err = reconciler.reconcileTerminalPod(context.Background(), &pending, pod)
+			if err != nil || !result.Requeue {
+				t.Fatalf("perform recovery = (%#v, %v), want immediate requeue", result, err)
+			}
+			if err := reconciler.Get(context.Background(), client.ObjectKeyFromObject(pod), &corev1.Pod{}); !apierrors.IsNotFound(err) {
+				t.Fatalf("terminal Pod still exists after recovery: %v", err)
+			}
+			if err := reconciler.Get(context.Background(), client.ObjectKeyFromObject(pvc), &corev1.PersistentVolumeClaim{}); err != nil {
+				t.Fatalf("workspace PVC was not retained: %v", err)
+			}
+			var recovering platformv1alpha1.Environment
+			if err := reconciler.Get(context.Background(), client.ObjectKeyFromObject(env), &recovering); err != nil {
+				t.Fatal(err)
+			}
+			ready = apimeta.FindStatusCondition(recovering.Status.Conditions, platformv1alpha1.EnvironmentConditionReady)
+			if recovering.Status.PodRecoveryAttempts != 1 || recovering.Status.PodRecoveryNextAttemptAt != nil || ready == nil || ready.Reason != "PodRecovering" {
+				t.Fatalf("recovering status = %#v", recovering.Status)
+			}
+		})
+	}
+}
+
+func TestReconcileHonorsRecoveryWhenTerminalPodIsMissing(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		exhausted  bool
+		due        bool
+		wantDelay  time.Duration
+		wantReason string
+	}{
+		{name: "pending backoff", wantDelay: 10 * time.Second, wantReason: "PodRecoveryPending"},
+		{name: "due attempt is counted before creation", due: true, wantReason: "PodRecovering"},
+		{name: "exhaustion remains latched", exhausted: true, wantReason: "PodRecoveryExhausted"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			scheme := runtime.NewScheme()
+			if err := corev1.AddToScheme(scheme); err != nil {
+				t.Fatal(err)
+			}
+			if err := networkingv1.AddToScheme(scheme); err != nil {
+				t.Fatal(err)
+			}
+			if err := platformv1alpha1.AddToScheme(scheme); err != nil {
+				t.Fatal(err)
+			}
+			now := time.Date(2026, 7, 19, 12, 0, 0, 0, time.UTC)
+			next := metav1.NewTime(now.Add(10 * time.Second))
+			if test.due {
+				next = metav1.NewTime(now)
+			}
+			reason := "PodRecoveryPending"
+			attempts := int32(1)
+			if test.exhausted {
+				reason = "PodRecoveryExhausted"
+				attempts = podRecoveryLimit
+				next = metav1.Time{}
+			}
+			env := &platformv1alpha1.Environment{
+				ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default", UID: "env-uid", Generation: 3, Finalizers: []string{environmentFinalizer}},
+				Spec:       platformv1alpha1.EnvironmentSpec{TemplateRef: "small"},
+				Status: platformv1alpha1.EnvironmentStatus{
+					ObservedGeneration: 3, Phase: platformv1alpha1.EnvironmentPhaseCreating,
+					PodRecoveryAttempts: attempts, PodRecoveryObservedGeneration: 3, PodRecoveryUID: "missing-dead-pod",
+					Conditions: []metav1.Condition{{Type: platformv1alpha1.EnvironmentConditionReady, Status: metav1.ConditionFalse,
+						ObservedGeneration: 3, Reason: reason, Message: "recovering"}},
+				},
+			}
+			if !test.exhausted {
+				env.Status.PodRecoveryNextAttemptAt = &next
+			}
+			template := &platformv1alpha1.EnvironmentTemplate{ObjectMeta: metav1.ObjectMeta{Name: "small", Namespace: env.Namespace}}
+			pvc := &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: envPVCName(env), Namespace: env.Namespace, UID: "workspace-pvc"}}
+			if err := controllerutil.SetControllerReference(env, pvc, scheme); err != nil {
+				t.Fatal(err)
+			}
+			objects := []client.Object{env, pvc}
+			if !test.exhausted {
+				objects = append(objects, template)
+			}
+			reconciler := &EnvironmentReconciler{
+				Client: fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(env).WithObjects(objects...).Build(),
+				Scheme: scheme, Now: func() time.Time { return now },
+			}
+
+			result, err := reconciler.Reconcile(context.Background(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(env)})
+			if err != nil || result.RequeueAfter != test.wantDelay || (test.due && !result.Requeue) {
+				t.Fatalf("Reconcile() = (%#v, %v), want delay %s", result, err, test.wantDelay)
+			}
+			if err := reconciler.Get(context.Background(), types.NamespacedName{Namespace: env.Namespace, Name: envPodName(env)}, &corev1.Pod{}); !apierrors.IsNotFound(err) {
+				t.Fatalf("missing terminal Pod was replaced before recovery allowed it: %v", err)
+			}
+			var updated platformv1alpha1.Environment
+			if err := reconciler.Get(context.Background(), client.ObjectKeyFromObject(env), &updated); err != nil {
+				t.Fatal(err)
+			}
+			ready := apimeta.FindStatusCondition(updated.Status.Conditions, platformv1alpha1.EnvironmentConditionReady)
+			if ready == nil || ready.Reason != test.wantReason {
+				t.Fatalf("recovery condition = %#v, want %s", ready, test.wantReason)
+			}
+			if test.due && (updated.Status.PodRecoveryAttempts != attempts+1 || updated.Status.PodRecoveryNextAttemptAt != nil) {
+				t.Fatalf("due recovery status = %#v", updated.Status)
+			}
+		})
+	}
+}
+
+func TestTerminalPodRecoveryUsesPersistedExponentialBackoff(t *testing.T) {
+	if got := []time.Duration{podRecoveryBackoff(0), podRecoveryBackoff(1), podRecoveryBackoff(2)}; got[0] != 5*time.Second || got[1] != 10*time.Second || got[2] != 20*time.Second {
+		t.Fatalf("recovery backoff = %v, want [5s 10s 20s]", got)
+	}
+
+	scheme := runtime.NewScheme()
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	if err := platformv1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 7, 19, 12, 0, 0, 0, time.UTC)
+	next := metav1.NewTime(now.Add(10 * time.Second))
+	env := &platformv1alpha1.Environment{ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default", Generation: 2}, Status: platformv1alpha1.EnvironmentStatus{
+		PodRecoveryAttempts: 1, PodRecoveryObservedGeneration: 2, PodRecoveryUID: "dead-pod", PodRecoveryNextAttemptAt: &next,
+	}}
+	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "env-test", Namespace: "default", UID: "dead-pod"}, Status: corev1.PodStatus{Phase: corev1.PodFailed}}
+	reconciler := &EnvironmentReconciler{Client: fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(env).WithObjects(env, pod).Build(), Scheme: scheme, Now: func() time.Time { return now }}
+
+	result, err := reconciler.reconcileTerminalPod(context.Background(), env, pod)
+	if err != nil || result.RequeueAfter != 10*time.Second {
+		t.Fatalf("persisted backoff = (%#v, %v), want 10s", result, err)
+	}
+	if err := reconciler.Get(context.Background(), client.ObjectKeyFromObject(pod), &corev1.Pod{}); err != nil {
+		t.Fatalf("Pod deleted before persisted deadline: %v", err)
+	}
+}
+
+func TestTerminalPodRecoveryStopsAfterBoundedAttempts(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	if err := platformv1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	env := &platformv1alpha1.Environment{ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default", Generation: 3}, Status: platformv1alpha1.EnvironmentStatus{
+		PodRecoveryAttempts: podRecoveryLimit, PodRecoveryObservedGeneration: 3, PodRecoveryUID: "previous-dead-pod",
+	}}
+	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "env-test", Namespace: "default", UID: "final-dead-pod"}, Status: corev1.PodStatus{Phase: corev1.PodFailed}}
+	reconciler := &EnvironmentReconciler{Client: fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(env).WithObjects(env, pod).Build(), Scheme: scheme}
+
+	result, err := reconciler.reconcileTerminalPod(context.Background(), env, pod)
+	if err != nil || result.Requeue || result.RequeueAfter != 0 {
+		t.Fatalf("exhausted recovery = (%#v, %v), want terminal success", result, err)
+	}
+	if err := reconciler.Get(context.Background(), client.ObjectKeyFromObject(pod), &corev1.Pod{}); err != nil {
+		t.Fatalf("exhausted terminal Pod was deleted: %v", err)
+	}
+	var exhausted platformv1alpha1.Environment
+	if err := reconciler.Get(context.Background(), client.ObjectKeyFromObject(env), &exhausted); err != nil {
+		t.Fatal(err)
+	}
+	ready := apimeta.FindStatusCondition(exhausted.Status.Conditions, platformv1alpha1.EnvironmentConditionReady)
+	if exhausted.Status.Phase != platformv1alpha1.EnvironmentPhaseFailed || exhausted.Status.PodName != pod.Name || ready == nil || ready.Reason != "PodRecoveryExhausted" {
+		t.Fatalf("exhausted status = %#v", exhausted.Status)
 	}
 }
 
@@ -1009,7 +1233,10 @@ func TestSyncStatusPublishesSandboxdEndpoint(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	env := &platformv1alpha1.Environment{ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default", Generation: 4}}
+	nextRecovery := metav1.Now()
+	env := &platformv1alpha1.Environment{ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default", Generation: 4}, Status: platformv1alpha1.EnvironmentStatus{
+		PodRecoveryAttempts: 2, PodRecoveryObservedGeneration: 4, PodRecoveryUID: "old-pod", PodRecoveryNextAttemptAt: &nextRecovery,
+	}}
 	reconciler := &EnvironmentReconciler{
 		Client: fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(env).WithObjects(env).Build(),
 		Scheme: scheme,
@@ -1039,6 +1266,9 @@ func TestSyncStatusPublishesSandboxdEndpoint(t *testing.T) {
 	ready := apimeta.FindStatusCondition(updated.Status.Conditions, platformv1alpha1.EnvironmentConditionReady)
 	if updated.Status.ObservedGeneration != updated.Generation || ready == nil || ready.Status != metav1.ConditionTrue || ready.ObservedGeneration != updated.Generation || ready.Reason != "SandboxdReady" {
 		t.Fatalf("generation-aware Ready condition = %#v, status generation = %d", ready, updated.Status.ObservedGeneration)
+	}
+	if updated.Status.PodRecoveryAttempts != 0 || updated.Status.PodRecoveryObservedGeneration != 0 || updated.Status.PodRecoveryUID != "" || updated.Status.PodRecoveryNextAttemptAt != nil {
+		t.Fatalf("recovery budget was not reset after health-aware readiness: %#v", updated.Status)
 	}
 }
 

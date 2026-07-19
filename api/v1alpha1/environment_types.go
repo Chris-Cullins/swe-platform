@@ -3,6 +3,7 @@ package v1alpha1
 import (
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 )
 
 const EnvironmentConditionReady = "Ready"
@@ -96,6 +97,26 @@ type EnvironmentStatus struct {
 	// The idle reaper uses it to decide when to pause.
 	// +optional
 	LastActiveAt *metav1.Time `json:"lastActiveAt,omitempty"`
+
+	// PodRecoveryAttempts is the number of terminal Pod replacements attempted
+	// for PodRecoveryObservedGeneration.
+	// +optional
+	PodRecoveryAttempts int32 `json:"podRecoveryAttempts,omitempty"`
+
+	// PodRecoveryObservedGeneration is the Environment generation for which the
+	// Pod recovery budget is being tracked.
+	// +optional
+	PodRecoveryObservedGeneration int64 `json:"podRecoveryObservedGeneration,omitempty"`
+
+	// PodRecoveryUID identifies the exact terminal Pod covered by the pending or
+	// in-progress recovery attempt.
+	// +optional
+	PodRecoveryUID types.UID `json:"podRecoveryUID,omitempty"`
+
+	// PodRecoveryNextAttemptAt is when the controller may next replace a
+	// terminal Pod.
+	// +optional
+	PodRecoveryNextAttemptAt *metav1.Time `json:"podRecoveryNextAttemptAt,omitempty"`
 
 	// +optional
 	// +listType=map

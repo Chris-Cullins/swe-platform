@@ -195,6 +195,29 @@ spec:
               podName:
                 description: PodName is the name of the backing pod, when one exists.
                 type: string
+              podRecoveryAttempts:
+                description: |-
+                  PodRecoveryAttempts is the number of terminal Pod replacements attempted
+                  for PodRecoveryObservedGeneration.
+                format: int32
+                type: integer
+              podRecoveryNextAttemptAt:
+                description: |-
+                  PodRecoveryNextAttemptAt is when the controller may next replace a
+                  terminal Pod.
+                format: date-time
+                type: string
+              podRecoveryObservedGeneration:
+                description: |-
+                  PodRecoveryObservedGeneration is the Environment generation for which the
+                  Pod recovery budget is being tracked.
+                format: int64
+                type: integer
+              podRecoveryUID:
+                description: |-
+                  PodRecoveryUID identifies the exact terminal Pod covered by the pending or
+                  in-progress recovery attempt.
+                type: string
             type: object
         type: object
     served: true

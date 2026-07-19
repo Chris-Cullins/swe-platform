@@ -112,6 +112,10 @@ func (in *EnvironmentStatus) DeepCopyInto(out *EnvironmentStatus) {
 		in, out := &in.LastActiveAt, &out.LastActiveAt
 		*out = (*in).DeepCopy()
 	}
+	if in.PodRecoveryNextAttemptAt != nil {
+		in, out := &in.PodRecoveryNextAttemptAt, &out.PodRecoveryNextAttemptAt
+		*out = (*in).DeepCopy()
+	}
 	if in.Conditions != nil {
 		in, out := &in.Conditions, &out.Conditions
 		*out = make([]v1.Condition, len(*in))
