@@ -54,7 +54,14 @@ func (d *processDomain) terminate() error { return d.signal(syscall.SIGTERM) }
 func (d *processDomain) force() error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	if d.cmd.Process == nil || d.terminal || d.closed || d.forced || d.closing != nil {
+	if d.closing != nil {
+		return nil
+	}
+	return d.forceLocked()
+}
+
+func (d *processDomain) forceLocked() error {
+	if d.cmd.Process == nil || d.terminal || d.closed || d.forced {
 		return nil
 	}
 	err := syscall.Kill(-d.cmd.Process.Pid, syscall.SIGKILL)
@@ -68,7 +75,6 @@ func (d *processDomain) force() error {
 // close does not publish a terminal domain until SIGKILL has taken effect for
 // every running member. Signal delivery alone is asynchronous.
 func (d *processDomain) close() error {
-	forceErr := d.force()
 	d.mu.Lock()
 	if d.closed {
 		err := d.closeErr
@@ -86,6 +92,7 @@ func (d *processDomain) close() error {
 	}
 	d.closing = make(chan struct{})
 	closing := d.closing
+	forceErr := d.forceLocked()
 	pid := 0
 	if d.cmd.Process != nil {
 		pid = d.cmd.Process.Pid
