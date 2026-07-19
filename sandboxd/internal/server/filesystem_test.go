@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"io"
 	"net"
 	"os"
 	"path/filepath"
@@ -441,7 +442,21 @@ func TestFilesystemSymlinkSwapCannotEscapeRoot(t *testing.T) {
 	<-done
 }
 
-func TestFilesystemConcurrentTruncateNeverReturnsFabricatedBytes(t *testing.T) {
+func TestReadChunkRejectsShortReadWithoutExposingBufferTail(t *testing.T) {
+	for name, input := range map[string]string{"immediate EOF": "", "partial read": "x"} {
+		t.Run(name, func(t *testing.T) {
+			data, err := readChunk(strings.NewReader(input), 4)
+			if !errors.Is(err, io.ErrUnexpectedEOF) {
+				t.Fatalf("short read error = %v; want %v", err, io.ErrUnexpectedEOF)
+			}
+			if data != nil {
+				t.Fatalf("short read returned %d bytes from incomplete buffer", len(data))
+			}
+		})
+	}
+}
+
+func TestFilesystemConcurrentMutationPreservesReadResponseInvariants(t *testing.T) {
 	workspace := t.TempDir()
 	path := filepath.Join(workspace, "changing")
 	content := bytes.Repeat([]byte("x"), 256*1024)
@@ -470,10 +485,10 @@ func TestFilesystemConcurrentTruncateNeverReturnsFabricatedBytes(t *testing.T) {
 			<-done
 			t.Fatalf("read during truncate: %v", err)
 		}
-		if err == nil && bytes.IndexByte(read.Data, 0) >= 0 {
+		if err == nil && (read.Offset != 0 || read.NextOffset != uint64(len(read.Data)) || len(read.Data) > 128*1024 || read.NextOffset > read.Size || len(read.Data) == 0 && !read.Eof || read.Eof != (read.NextOffset == read.Size)) {
 			close(stop)
 			<-done
-			t.Fatal("read fabricated zero-filled bytes")
+			t.Fatalf("incoherent read response: offset=%d next=%d size=%d eof=%v data=%d", read.Offset, read.NextOffset, read.Size, read.Eof, len(read.Data))
 		}
 	}
 	close(stop)

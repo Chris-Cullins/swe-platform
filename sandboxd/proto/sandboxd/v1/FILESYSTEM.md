@@ -76,11 +76,14 @@ consistent and clients may restart from an empty token to obtain a fresh travers
 
 Malformed paths, tokens, headers, and limits are `InvalidArgument`; stale offsets are
 `OutOfRange`; missing objects are `NotFound`; symlinks, wrong object types, and failed
-write preconditions are `FailedPrecondition`; stream/file/concurrency bounds are
-`ResourceExhausted`; cancellation is `Canceled` or `DeadlineExceeded`; and unexpected
-host I/O failures are `Internal`. RPC contexts are checked during hashing, transfer,
-directory scans, staging, and commit.
+write preconditions are `FailedPrecondition`; a short read detected during concurrent
+mutation is `Aborted`; stream/file/concurrency bounds are `ResourceExhausted`;
+cancellation is `Canceled` or `DeadlineExceeded`; and unexpected host I/O failures are
+`Internal`. RPC contexts are checked during hashing, transfer, directory scans, staging,
+and commit.
 
-Separate ranged reads are weakly consistent when another process changes the file
-between calls. Clients that need a stable edit base request a version and use
-`MATCH_VERSION` when publishing their replacement.
+Ranged reads are weakly consistent when another process changes the file during or
+between calls. A successful call's data and metadata need not represent one filesystem
+snapshot during concurrent mutation, but `data` contains only bytes returned by the
+host read and `next_offset` advances by exactly its length. Clients that need a stable
+edit base request a version and use `MATCH_VERSION` when publishing their replacement.
