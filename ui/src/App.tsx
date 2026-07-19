@@ -159,9 +159,8 @@ function NewRun() {
   const [validation, setValidation] = React.useState('')
   const mutation = useMutation({
     mutationFn: (value: CreateRun) => api.createRun(namespace, value),
-    onSuccess: run => {
+    onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: queryKeys.runs(namespace) })
-      navigate(`/namespaces/${encodeURIComponent(namespace)}/runs/${encodeURIComponent(run.name)}/overview`)
     },
   })
   const field = (key: keyof RunForm, label: string, area = false) => <label>{label}{area
@@ -174,7 +173,7 @@ function NewRun() {
     const value = { name: form.name.trim(), agent: form.agent.trim(), prompt: form.prompt, selector }
     const error = validateCreateRun(value)
     setValidation(error || '')
-    if (!error) mutation.mutate(value)
+    if (!error) mutation.mutate(value, { onSuccess: run => navigate(`/namespaces/${encodeURIComponent(namespace)}/runs/${encodeURIComponent(run.name)}/overview`) })
   }}>
     {field('name', 'Name')}{field('agent', 'Agent')}{field('prompt', 'Prompt / task', true)}
     {field('project', 'Project reference')}{field('template', 'Template reference')}{field('environment', 'Existing environment reference')}

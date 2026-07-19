@@ -231,6 +231,33 @@ describe('App frozen API integration', () => {
     expect(await screen.findByRole('heading', { name: 'repair-ui' })).toBeInTheDocument()
   })
 
+  it('does not leave the selected namespace when an old-namespace create completes', async () => {
+    let resolveCreate!: (value: Response) => void
+    const fetch = vi.spyOn(globalThis, 'fetch').mockImplementation(async (path, init) => {
+      if (path === '/api/v1/session') return response({ authenticated: true, username: 'alex' })
+      if (path === '/api/v1/namespaces/default/runs' && init?.method === 'POST') return new Promise<Response>(resolve => { resolveCreate = resolve })
+      if (path === '/api/v1/namespaces/swe-platform-system/runs?limit=200') return response({ items: [] })
+      throw new Error(`Unexpected request: ${path}`)
+    })
+    const { client } = show('/namespaces/default/runs/new')
+    client.setQueryData(queryKeys.runs('default'), { items: [] })
+    const invalidate = vi.spyOn(client, 'invalidateQueries')
+    await userEvent.type(await screen.findByLabelText('Name'), 'repair-ui')
+    await userEvent.type(screen.getByLabelText('Prompt / task'), 'Repair UI')
+    await userEvent.type(screen.getByLabelText('Template reference'), 'small')
+    await userEvent.click(screen.getByRole('button', { name: 'Create run' }))
+    await waitFor(() => expect(fetch).toHaveBeenCalledWith('/api/v1/namespaces/default/runs', expect.objectContaining({ method: 'POST' })))
+    await userEvent.clear(screen.getByLabelText('Namespace'))
+    await userEvent.type(screen.getByLabelText('Namespace'), 'swe-platform-system')
+    await userEvent.click(screen.getByRole('button', { name: 'Switch' }))
+    expect(await screen.findByText('No runs found.')).toBeInTheDocument()
+    resolveCreate(response(run, 201))
+    await waitFor(() => expect(invalidate).toHaveBeenCalledWith({ queryKey: queryKeys.runs('default') }))
+    await waitFor(() => expect(client.getQueryState(queryKeys.runs('default'))?.isInvalidated).toBe(true))
+    expect(screen.getByTestId('location')).toHaveTextContent('/namespaces/swe-platform-system/runs')
+    expect(screen.queryByRole('heading', { name: 'repair-ui' })).not.toBeInTheDocument()
+  })
+
   it('cancels with an empty POST and invalidates list and detail data', async () => {
     const cancelled = { ...run, cancelRequested: true }
     const fetch = vi.spyOn(globalThis, 'fetch').mockImplementation(async (path, init) => {
