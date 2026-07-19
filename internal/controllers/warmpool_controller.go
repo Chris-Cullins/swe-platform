@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"sort"
+	"time"
 
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -17,16 +18,22 @@ import (
 	platformv1alpha1 "github.com/Chris-Cullins/swe-platform/api/v1alpha1"
 )
 
+const (
+	warmPoolCleanupAnnotation = "swe.dev/warm-pool-unusable-since"
+	warmPoolCleanupGrace      = 5 * time.Minute
+)
+
 // WarmPoolReconciler keeps the requested number of unclaimed environments
 // provisioned for each EnvironmentTemplate.
 type WarmPoolReconciler struct {
 	client.Client
 	Scheme *runtime.Scheme
+	Now    func() time.Time
 }
 
 // +kubebuilder:rbac:groups=swe.dev,resources=environmenttemplates,verbs=get;list;watch
 // +kubebuilder:rbac:groups=swe.dev,resources=environmenttemplates/status,verbs=get;update;patch
-// +kubebuilder:rbac:groups=swe.dev,resources=environments,verbs=get;list;watch;create;delete
+// +kubebuilder:rbac:groups=swe.dev,resources=environments,verbs=get;list;watch;create;patch;delete
 
 func (r *WarmPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	var tmpl platformv1alpha1.EnvironmentTemplate
@@ -59,7 +66,8 @@ func (r *WarmPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 
 	ready := int32(0)
 	for i := range environments.Items {
-		if platformv1alpha1.IsEnvironmentReady(&environments.Items[i]) && environments.Items[i].Status.ClaimedBy == nil {
+		env := &environments.Items[i]
+		if warmPoolMember(env, &tmpl) && platformv1alpha1.IsEnvironmentReady(env) && env.Status.ClaimedBy == nil {
 			ready++
 		}
 	}
@@ -72,20 +80,53 @@ func (r *WarmPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 	}
 
 	active := make([]*platformv1alpha1.Environment, 0, len(environments.Items))
+	var requeueAfter time.Duration
+	now := r.now()
 	for i := range environments.Items {
 		env := &environments.Items[i]
-		if env.Status.ClaimedBy != nil || !env.DeletionTimestamp.IsZero() {
+		if !warmPoolMember(env, &tmpl) || env.Status.ClaimedBy != nil || !env.DeletionTimestamp.IsZero() {
 			continue
 		}
 		statusCurrent := env.Status.ObservedGeneration == env.Generation
 		if env.Spec.Paused || statusCurrent && (env.Status.Phase == platformv1alpha1.EnvironmentPhaseFailed || env.Status.Phase == platformv1alpha1.EnvironmentPhaseTerminated) {
+			unusableSince, marked := warmPoolUnusableSince(env)
+			if !marked || unusableSince.After(now) {
+				before := env.DeepCopy()
+				if env.Annotations == nil {
+					env.Annotations = make(map[string]string)
+				}
+				env.Annotations[warmPoolCleanupAnnotation] = now.UTC().Format(time.RFC3339Nano)
+				if err := r.Patch(ctx, env, client.MergeFromWithOptions(before, client.MergeFromWithOptimisticLock{})); errors.IsConflict(err) || errors.IsNotFound(err) {
+					return ctrl.Result{Requeue: true}, nil
+				} else if err != nil {
+					return ctrl.Result{}, fmt.Errorf("mark unusable warm environment %q: %w", env.Name, err)
+				}
+				unusableSince = now
+			}
+			remaining := unusableSince.Add(warmPoolCleanupGrace).Sub(now)
+			if remaining > 0 {
+				if requeueAfter == 0 || remaining < requeueAfter {
+					requeueAfter = remaining
+				}
+				continue
+			}
 			resourceVersion := env.ResourceVersion
-			if err := r.Delete(ctx, env, client.Preconditions{ResourceVersion: &resourceVersion}); errors.IsConflict(err) || errors.IsNotFound(err) {
+			uid := env.UID
+			if err := r.Delete(ctx, env, client.Preconditions{UID: &uid, ResourceVersion: &resourceVersion}); errors.IsConflict(err) || errors.IsNotFound(err) {
 				return ctrl.Result{Requeue: true}, nil
 			} else if err != nil {
 				return ctrl.Result{}, fmt.Errorf("delete unusable warm environment %q: %w", env.Name, err)
 			}
 			continue
+		}
+		if _, marked := warmPoolUnusableSince(env); marked {
+			before := env.DeepCopy()
+			delete(env.Annotations, warmPoolCleanupAnnotation)
+			if err := r.Patch(ctx, env, client.MergeFromWithOptions(before, client.MergeFromWithOptimisticLock{})); errors.IsConflict(err) || errors.IsNotFound(err) {
+				return ctrl.Result{Requeue: true}, nil
+			} else if err != nil {
+				return ctrl.Result{}, fmt.Errorf("clear warm environment cleanup marker %q: %w", env.Name, err)
+			}
 		}
 		active = append(active, env)
 	}
@@ -115,7 +156,8 @@ func (r *WarmPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 		})
 		for _, env := range active[:int32(len(active))-minimum] {
 			resourceVersion := env.ResourceVersion
-			if err := r.Delete(ctx, env, client.Preconditions{ResourceVersion: &resourceVersion}); errors.IsConflict(err) || errors.IsNotFound(err) {
+			uid := env.UID
+			if err := r.Delete(ctx, env, client.Preconditions{UID: &uid, ResourceVersion: &resourceVersion}); errors.IsConflict(err) || errors.IsNotFound(err) {
 				return ctrl.Result{Requeue: true}, nil
 			} else if err != nil {
 				return ctrl.Result{}, fmt.Errorf("delete excess warm environment %q: %w", env.Name, err)
@@ -123,7 +165,28 @@ func (r *WarmPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 		}
 	}
 
-	return ctrl.Result{}, nil
+	return ctrl.Result{RequeueAfter: requeueAfter}, nil
+}
+
+func (r *WarmPoolReconciler) now() time.Time {
+	if r.Now != nil {
+		return r.Now()
+	}
+	return time.Now()
+}
+
+func warmPoolMember(env *platformv1alpha1.Environment, tmpl *platformv1alpha1.EnvironmentTemplate) bool {
+	return env.Labels[warmPoolLabel] == tmpl.Name && env.Spec.TemplateRef == tmpl.Name &&
+		exactControllerOwner(env, platformv1alpha1.GroupVersion.String(), "EnvironmentTemplate", tmpl.Name, tmpl.UID)
+}
+
+func warmPoolUnusableSince(env *platformv1alpha1.Environment) (time.Time, bool) {
+	value := env.Annotations[warmPoolCleanupAnnotation]
+	if value == "" {
+		return time.Time{}, false
+	}
+	markedAt, err := time.Parse(time.RFC3339Nano, value)
+	return markedAt, err == nil
 }
 
 // SetupWithManager registers the warm-pool controller with the manager.

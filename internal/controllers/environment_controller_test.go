@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"encoding/pem"
 	stderrors "errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -1331,6 +1332,121 @@ func TestReconcileReportsStableChildOwnershipCondition(t *testing.T) {
 	}
 	if err := reconciler.Get(context.Background(), client.ObjectKeyFromObject(foreignPVC), &corev1.PersistentVolumeClaim{}); err != nil {
 		t.Fatal("foreign PVC was modified or deleted")
+	}
+}
+
+func TestOperationalFailureRetriesAndRecoversReadiness(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	if err := networkingv1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	if err := platformv1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	env := &platformv1alpha1.Environment{
+		ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default", UID: "environment-uid", Generation: 2, Finalizers: []string{environmentFinalizer}},
+		Spec:       platformv1alpha1.EnvironmentSpec{TemplateRef: "small"},
+	}
+	template := &platformv1alpha1.EnvironmentTemplate{ObjectMeta: metav1.ObjectMeta{Name: "small", Namespace: "default"}}
+	baseClient := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(env).WithObjects(env, template).Build()
+	transient := apierrors.NewServiceUnavailable("temporary template API failure")
+	failTemplateGet := true
+	interceptedClient := interceptor.NewClient(baseClient, interceptor.Funcs{
+		Get: func(ctx context.Context, underlying client.WithWatch, key client.ObjectKey, object client.Object, options ...client.GetOption) error {
+			if failTemplateGet && key == client.ObjectKeyFromObject(template) {
+				failTemplateGet = false
+				return transient
+			}
+			return underlying.Get(ctx, key, object, options...)
+		},
+	})
+	reconciler := &EnvironmentReconciler{Client: interceptedClient, Scheme: scheme}
+	request := ctrl.Request{NamespacedName: client.ObjectKeyFromObject(env)}
+	if _, err := reconciler.Reconcile(context.Background(), request); !stderrors.Is(err, transient) {
+		t.Fatalf("Reconcile() error = %v, want transient retry", err)
+	}
+	var retrying platformv1alpha1.Environment
+	if err := baseClient.Get(context.Background(), client.ObjectKeyFromObject(env), &retrying); err != nil {
+		t.Fatal(err)
+	}
+	condition := apimeta.FindStatusCondition(retrying.Status.Conditions, platformv1alpha1.EnvironmentConditionReady)
+	if retrying.Status.Phase != platformv1alpha1.EnvironmentPhaseCreating || condition == nil || condition.Status != metav1.ConditionFalse || condition.Reason != "OperationalError" {
+		t.Fatalf("transient failure status = phase %q, condition %#v", retrying.Status.Phase, condition)
+	}
+	if result, err := reconciler.Reconcile(context.Background(), request); err != nil {
+		t.Fatalf("recovery Reconcile() = (%#v, %v), want provisioning to resume", result, err)
+	}
+	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "pod"}, Status: corev1.PodStatus{
+		Phase: corev1.PodRunning,
+		PodIP: "10.0.0.1",
+		Conditions: []corev1.PodCondition{{
+			Type: corev1.PodReady, Status: corev1.ConditionTrue,
+		}},
+	}}
+	if err := reconciler.syncStatus(context.Background(), &retrying, pod); err != nil {
+		t.Fatal(err)
+	}
+	if err := baseClient.Get(context.Background(), client.ObjectKeyFromObject(env), &retrying); err != nil {
+		t.Fatal(err)
+	}
+	condition = apimeta.FindStatusCondition(retrying.Status.Conditions, platformv1alpha1.EnvironmentConditionReady)
+	if !platformv1alpha1.IsEnvironmentReady(&retrying) || condition == nil || condition.Reason != "SandboxdReady" {
+		t.Fatalf("recovered status = %#v", retrying.Status)
+	}
+}
+
+func TestMissingTemplateIsTerminalValidationFailure(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := platformv1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	env := &platformv1alpha1.Environment{
+		ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default", UID: "environment-uid", Generation: 1, Finalizers: []string{environmentFinalizer}},
+		Spec:       platformv1alpha1.EnvironmentSpec{TemplateRef: "missing"},
+	}
+	reconciler := &EnvironmentReconciler{Client: fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(env).WithObjects(env).Build(), Scheme: scheme}
+	result, err := reconciler.Reconcile(context.Background(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(env)})
+	if err != nil || result.Requeue || result.RequeueAfter != 0 {
+		t.Fatalf("Reconcile() = (%#v, %v), want terminal success without retry", result, err)
+	}
+	var failed platformv1alpha1.Environment
+	if err := reconciler.Get(context.Background(), client.ObjectKeyFromObject(env), &failed); err != nil {
+		t.Fatal(err)
+	}
+	condition := apimeta.FindStatusCondition(failed.Status.Conditions, platformv1alpha1.EnvironmentConditionReady)
+	if failed.Status.Phase != platformv1alpha1.EnvironmentPhaseFailed || condition == nil || condition.Reason != "InvalidConfiguration" || condition.ObservedGeneration != env.Generation {
+		t.Fatalf("validation failure status = phase %q, condition %#v", failed.Status.Phase, condition)
+	}
+}
+
+func TestProjectRepositoryValidationIsTerminal(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	if err := platformv1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	project := &platformv1alpha1.Project{ObjectMeta: metav1.ObjectMeta{Name: "project", Namespace: "default"}}
+	env := &platformv1alpha1.Environment{ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default", UID: "environment-uid", Generation: 1}, Spec: platformv1alpha1.EnvironmentSpec{TemplateRef: "small", ProjectRef: project.Name}}
+	reconciler := &EnvironmentReconciler{Client: fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(env).WithObjects(env, project).Build(), Scheme: scheme}
+	_, err := reconciler.ensurePod(context.Background(), env, &platformv1alpha1.EnvironmentTemplate{Spec: platformv1alpha1.EnvironmentTemplateSpec{Image: "example/environment:dev"}})
+	if err == nil {
+		t.Fatal("ensurePod() accepted a project without exactly one repository")
+	}
+	if err := reconciler.fail(context.Background(), env, fmt.Errorf("ensure pod: %w", err)); err != nil {
+		t.Fatalf("terminal validation requested retry: %v", err)
+	}
+	var failed platformv1alpha1.Environment
+	if err := reconciler.Get(context.Background(), client.ObjectKeyFromObject(env), &failed); err != nil {
+		t.Fatal(err)
+	}
+	condition := apimeta.FindStatusCondition(failed.Status.Conditions, platformv1alpha1.EnvironmentConditionReady)
+	if failed.Status.Phase != platformv1alpha1.EnvironmentPhaseFailed || condition == nil || condition.Reason != "InvalidConfiguration" {
+		t.Fatalf("project validation status = phase %q, condition %#v", failed.Status.Phase, condition)
 	}
 }
 

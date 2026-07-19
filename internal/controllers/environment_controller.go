@@ -57,6 +57,7 @@ const (
 	podRecoveryLimit   = int32(3)
 	podRecoveryDelay   = 5 * time.Second
 	templateRefField   = "spec.templateRef"
+	projectRefField    = "spec.projectRef"
 	warmPoolLabel      = "swe.dev/warm-pool"
 	projectAnnotation  = "swe.dev/project"
 )
@@ -74,6 +75,17 @@ type childOwnershipCollisionError struct {
 
 func (e *childOwnershipCollisionError) Error() string {
 	return fmt.Sprintf("%s %q is not owned by this environment", e.kind, e.name)
+}
+
+type terminalEnvironmentError struct {
+	err error
+}
+
+func (e *terminalEnvironmentError) Error() string { return e.err.Error() }
+func (e *terminalEnvironmentError) Unwrap() error { return e.err }
+
+func terminalEnvironment(err error) error {
+	return &terminalEnvironmentError{err: err}
 }
 
 const (
@@ -173,7 +185,11 @@ func (r *EnvironmentReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	}
 	var tmpl platformv1alpha1.EnvironmentTemplate
 	if err := r.Get(ctx, types.NamespacedName{Namespace: env.Namespace, Name: env.Spec.TemplateRef}, &tmpl); err != nil {
-		return ctrl.Result{}, r.fail(ctx, &env, fmt.Errorf("get template %q: %w", env.Spec.TemplateRef, err))
+		wrapped := fmt.Errorf("get template %q: %w", env.Spec.TemplateRef, err)
+		if errors.IsNotFound(err) {
+			wrapped = terminalEnvironment(wrapped)
+		}
+		return ctrl.Result{}, r.fail(ctx, &env, wrapped)
 	}
 	backend := platformv1alpha1.EffectiveEnvironmentBackend(&env, &tmpl)
 	if backend != platformv1alpha1.EnvironmentBackendPod {
@@ -221,7 +237,15 @@ func (r *EnvironmentReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	if pod.Status.Phase != corev1.PodRunning {
 		return ctrl.Result{}, nil
 	}
-	return r.reconcileIdle(ctx, &env, &tmpl)
+	result, err = r.reconcileIdle(ctx, &env, &tmpl)
+	if errors.IsConflict(err) {
+		// A concurrent claim or activity update won the optimistic pause race.
+		return ctrl.Result{Requeue: true}, nil
+	}
+	if err != nil {
+		return ctrl.Result{}, r.fail(ctx, &env, fmt.Errorf("reconcile idle policy: %w", err))
+	}
+	return result, nil
 }
 
 // reconcilePendingPodRecovery advances persisted recovery before ensurePod can
@@ -773,10 +797,14 @@ func (r *EnvironmentReconciler) ensurePod(ctx context.Context, env *platformv1al
 	if env.Spec.ProjectRef != "" {
 		var project platformv1alpha1.Project
 		if err := r.Get(ctx, types.NamespacedName{Namespace: env.Namespace, Name: env.Spec.ProjectRef}, &project); err != nil {
-			return nil, fmt.Errorf("get project %q: %w", env.Spec.ProjectRef, err)
+			wrapped := fmt.Errorf("get project %q: %w", env.Spec.ProjectRef, err)
+			if errors.IsNotFound(err) {
+				wrapped = terminalEnvironment(wrapped)
+			}
+			return nil, wrapped
 		}
 		if len(project.Spec.Repositories) != 1 {
-			return nil, fmt.Errorf("project %q must have exactly one repository, got %d", env.Spec.ProjectRef, len(project.Spec.Repositories))
+			return nil, terminalEnvironment(fmt.Errorf("project %q must have exactly one repository, got %d", env.Spec.ProjectRef, len(project.Spec.Repositories)))
 		}
 		repository := project.Spec.Repositories[0]
 		projectEnv := []corev1.EnvVar{
@@ -1208,12 +1236,18 @@ func (r *EnvironmentReconciler) setPhase(ctx context.Context, env *platformv1alp
 func (r *EnvironmentReconciler) fail(ctx context.Context, env *platformv1alpha1.Environment, err error) error {
 	log.FromContext(ctx).Error(err, "reconcile failed", "environment", env.Name)
 	var collision *childOwnershipCollisionError
-	reason := "ReconcileFailed"
-	if invalidEnvironmentConfiguration(err) {
+	var terminal *terminalEnvironmentError
+	phase := platformv1alpha1.EnvironmentPhaseCreating
+	reason := "OperationalError"
+	if stderrors.As(err, &terminal) {
+		phase = platformv1alpha1.EnvironmentPhaseFailed
 		reason = "InvalidConfiguration"
+	} else if stderrors.As(err, &collision) {
+		phase = platformv1alpha1.EnvironmentPhaseFailed
+		reason = "ResourceCollision"
 	}
 	statusErr := r.updateEnvironmentStatus(ctx, env, func(current *platformv1alpha1.Environment) {
-		applyEnvironmentStatus(current, platformv1alpha1.EnvironmentPhaseFailed, "", "", reason, err.Error(), env.Status.LastActiveAt)
+		applyEnvironmentStatus(current, phase, "", "", reason, err.Error(), env.Status.LastActiveAt)
 		if stderrors.As(err, &collision) {
 			apimeta.SetStatusCondition(&current.Status.Conditions, metav1.Condition{
 				Type:               "ChildOwnershipConflict",
@@ -1227,7 +1261,7 @@ func (r *EnvironmentReconciler) fail(ctx context.Context, env *platformv1alpha1.
 	if statusErr != nil {
 		return statusErr
 	}
-	if collision != nil {
+	if collision != nil || terminal != nil {
 		return nil
 	}
 	return err
@@ -1345,11 +1379,6 @@ func phaseReadiness(phase platformv1alpha1.EnvironmentPhase) (string, string) {
 	}
 }
 
-func invalidEnvironmentConfiguration(err error) bool {
-	message := err.Error()
-	return strings.Contains(message, "get template ") || strings.Contains(message, "get project ") || strings.Contains(message, " has no repositories")
-}
-
 func clearChildOwnershipCollision(env *platformv1alpha1.Environment) bool {
 	if apimeta.FindStatusCondition(env.Status.Conditions, "ChildOwnershipConflict") == nil {
 		return false
@@ -1431,6 +1460,15 @@ func (r *EnvironmentReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	}); err != nil {
 		return fmt.Errorf("index environments by template: %w", err)
 	}
+	if err := mgr.GetFieldIndexer().IndexField(context.Background(), &platformv1alpha1.Environment{}, projectRefField, func(object client.Object) []string {
+		environment := object.(*platformv1alpha1.Environment)
+		if environment.Spec.ProjectRef == "" {
+			return nil
+		}
+		return []string{environment.Spec.ProjectRef}
+	}); err != nil {
+		return fmt.Errorf("index environments by project: %w", err)
+	}
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&platformv1alpha1.Environment{}).
 		Owns(&corev1.Pod{}).
@@ -1447,6 +1485,18 @@ func (r *EnvironmentReconciler) SetupWithManager(mgr ctrl.Manager) error {
 			var environments platformv1alpha1.EnvironmentList
 			if err := r.List(ctx, &environments, client.InNamespace(object.GetNamespace()), client.MatchingFields{templateRefField: object.GetName()}); err != nil {
 				log.FromContext(ctx).Error(err, "list environments for template", "template", object.GetName())
+				return nil
+			}
+			requests := make([]reconcile.Request, 0, len(environments.Items))
+			for i := range environments.Items {
+				requests = append(requests, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(&environments.Items[i])})
+			}
+			return requests
+		})).
+		Watches(&platformv1alpha1.Project{}, handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, object client.Object) []reconcile.Request {
+			var environments platformv1alpha1.EnvironmentList
+			if err := r.List(ctx, &environments, client.InNamespace(object.GetNamespace()), client.MatchingFields{projectRefField: object.GetName()}); err != nil {
+				log.FromContext(ctx).Error(err, "list environments for project", "project", object.GetName())
 				return nil
 			}
 			requests := make([]reconcile.Request, 0, len(environments.Items))
