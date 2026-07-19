@@ -14,8 +14,9 @@ import (
 )
 
 // DialOptions pins the current pod incarnation's TLS identity and attaches its
-// terminal capability. The client bundle is published atomically on the Pod;
-// callers never receive the server's private credential Secret.
+// terminal token, which grants only terminal and health capabilities. The
+// client bundle is published atomically on the Pod; callers never receive the
+// server's private credential Secret.
 func DialOptions(pod *corev1.Pod) ([]grpc.DialOption, error) {
 	identity := pod.Annotations[sandboxdauth.IdentityAnnotation]
 	if identity == "" {

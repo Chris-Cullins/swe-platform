@@ -32,21 +32,21 @@ type Connector struct {
 }
 
 // DialTerminal resolves the current ready Environment incarnation and returns
-// a terminal-capable sandboxd client.
-func (c Connector) DialTerminal(ctx context.Context, namespace, environment string, environmentUID types.UID) (sandboxdv1.TerminalServiceClient, func() error, error) {
+// terminal and health clients sharing one authenticated, pod-pinned connection.
+func (c Connector) DialTerminal(ctx context.Context, namespace, environment string, environmentUID types.UID) (sandboxdv1.TerminalServiceClient, sandboxdv1.HealthServiceClient, func() error, error) {
 	env, pod, err := c.resolvePod(ctx, namespace, environment, environmentUID)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	dialOptions, err := DialOptions(pod)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	conn, err := grpc.NewClient(env.Status.Endpoints.Sandboxd, dialOptions...)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
-	return sandboxdv1.NewTerminalServiceClient(conn), conn.Close, nil
+	return sandboxdv1.NewTerminalServiceClient(conn), sandboxdv1.NewHealthServiceClient(conn), conn.Close, nil
 }
 
 // DialProcess resolves the exact Environment UID immediately before dialing
