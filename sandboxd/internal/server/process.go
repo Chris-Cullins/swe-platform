@@ -26,6 +26,7 @@ type managedProcess struct {
 	key           *sandboxdv1.ProcessKey
 	spec          *sandboxdv1.ProcessSpec
 	cmd           *exec.Cmd
+	started       bool
 	state         sandboxdv1.ProcessState
 	exitCode      int32
 	err           string
@@ -123,6 +124,7 @@ func (s *ProcessServer) Start(_ context.Context, req *sandboxdv1.StartProcessReq
 		p.state, p.exitCode, p.err = sandboxdv1.ProcessState_PROCESS_STATE_FAILED, -1, err.Error()
 		return processResponse(p), nil
 	}
+	p.started = true
 	p.state = sandboxdv1.ProcessState_PROCESS_STATE_RUNNING
 	go s.wait(key, p)
 	return processResponse(p), nil
@@ -187,18 +189,22 @@ func (s *ProcessServer) Stop(_ context.Context, req *sandboxdv1.StopProcessReque
 			State: sandboxdv1.ProcessState_PROCESS_STATE_EXITED,
 		}, nil
 	}
-	if p.state != sandboxdv1.ProcessState_PROCESS_STATE_RUNNING && p.state != sandboxdv1.ProcessState_PROCESS_STATE_STOPPING {
+	if !p.started {
 		return processResponse(p), nil
 	}
 	if req.Mode == sandboxdv1.StopMode_STOP_MODE_FORCE {
 		p.stopRequested = true
-		p.state = sandboxdv1.ProcessState_PROCESS_STATE_STOPPING
+		if p.state == sandboxdv1.ProcessState_PROCESS_STATE_RUNNING || p.state == sandboxdv1.ProcessState_PROCESS_STATE_STOPPING {
+			p.state = sandboxdv1.ProcessState_PROCESS_STATE_STOPPING
+		}
 		_ = killManagedProcess(p.cmd)
 		return processResponse(p), nil
 	}
-	if p.state == sandboxdv1.ProcessState_PROCESS_STATE_RUNNING {
+	if !p.stopRequested {
 		p.stopRequested = true
-		p.state = sandboxdv1.ProcessState_PROCESS_STATE_STOPPING
+		if p.state == sandboxdv1.ProcessState_PROCESS_STATE_RUNNING {
+			p.state = sandboxdv1.ProcessState_PROCESS_STATE_STOPPING
+		}
 		if err := interruptManagedProcess(p.cmd); err != nil {
 			_ = killManagedProcess(p.cmd) // interruption is unsupported on some hosts
 		} else {
@@ -229,9 +235,11 @@ func (s *ProcessServer) Close() {
 	s.closed = true
 	commands := make([]*exec.Cmd, 0, len(s.processes))
 	for _, p := range s.processes {
-		if p.state == sandboxdv1.ProcessState_PROCESS_STATE_RUNNING || p.state == sandboxdv1.ProcessState_PROCESS_STATE_STOPPING {
+		if p.started {
 			p.stopRequested = true
-			p.state = sandboxdv1.ProcessState_PROCESS_STATE_STOPPING
+			if p.state == sandboxdv1.ProcessState_PROCESS_STATE_RUNNING || p.state == sandboxdv1.ProcessState_PROCESS_STATE_STOPPING {
+				p.state = sandboxdv1.ProcessState_PROCESS_STATE_STOPPING
+			}
 			commands = append(commands, p.cmd)
 		}
 	}
