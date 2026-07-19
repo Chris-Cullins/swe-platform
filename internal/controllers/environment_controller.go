@@ -134,7 +134,14 @@ type EnvironmentReconciler struct {
 
 // Reconcile drives an Environment toward its desired state:
 // pod + PVC present when active, pod deleted (PVC retained) when paused.
-func (r *EnvironmentReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+func (r *EnvironmentReconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ctrl.Result, err error) {
+	defer func() {
+		if stderrors.Is(err, errEnvironmentIncarnationChanged) {
+			result = ctrl.Result{}
+			err = nil
+		}
+	}()
+
 	var env platformv1alpha1.Environment
 	if err := r.Get(ctx, req.NamespacedName, &env); err != nil {
 		return ctrl.Result{}, client.IgnoreNotFound(err)

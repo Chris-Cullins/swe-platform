@@ -1132,6 +1132,117 @@ func TestHealthReadyResetRejectsSameNameReplacementEnvironment(t *testing.T) {
 	}
 }
 
+func TestReconcileDropsStaleEnvironmentIncarnationStatusWrites(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		terminal bool
+	}{
+		{name: "terminal recovery marker", terminal: true},
+		{name: "health ready reset"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			scheme := runtime.NewScheme()
+			if err := corev1.AddToScheme(scheme); err != nil {
+				t.Fatal(err)
+			}
+			if err := networkingv1.AddToScheme(scheme); err != nil {
+				t.Fatal(err)
+			}
+			if err := platformv1alpha1.AddToScheme(scheme); err != nil {
+				t.Fatal(err)
+			}
+			next := metav1.Now()
+			replacementStatus := platformv1alpha1.EnvironmentStatus{}
+			if !test.terminal {
+				replacementStatus = platformv1alpha1.EnvironmentStatus{
+					ObservedGeneration: 1, Phase: platformv1alpha1.EnvironmentPhaseCreating,
+					PodRecoveryAttempts: 2, PodRecoveryUID: "u2-terminal-pod", PodRecoveryNextAttemptAt: &next,
+					Conditions: []metav1.Condition{{Type: platformv1alpha1.EnvironmentConditionReady, Status: metav1.ConditionFalse,
+						ObservedGeneration: 1, Reason: "PodRecoveryPending", Message: "U2 recovery is pending"}},
+				}
+			}
+			replacement := &platformv1alpha1.Environment{
+				ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default", UID: "environment-u2", Generation: 1, Finalizers: []string{environmentFinalizer}},
+				Spec:       platformv1alpha1.EnvironmentSpec{TemplateRef: "small"},
+				Status:     replacementStatus,
+			}
+			stale := replacement.DeepCopy()
+			stale.UID = "environment-u1"
+			if !test.terminal {
+				stale.Status = platformv1alpha1.EnvironmentStatus{}
+			}
+			template := &platformv1alpha1.EnvironmentTemplate{ObjectMeta: metav1.ObjectMeta{Name: "small", Namespace: stale.Namespace}}
+			pvc := &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: envPVCName(stale), Namespace: stale.Namespace, UID: "u1-workspace-pvc"}}
+			pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
+				Name: envPodName(stale), Namespace: stale.Namespace, UID: "u1-pod",
+				Annotations: map[string]string{
+					sandboxdRevisionAnnotation:        sandboxdSecurityRevision,
+					sandboxdauth.IdentityAnnotation:   "sandboxd.u1",
+					sandboxdauth.TrustAnnotation:      "trust",
+					sandboxdauth.TokenAnnotation:      "token",
+					sandboxdauth.SecretNameAnnotation: envCredentialName(stale),
+					sandboxdauth.SecretUIDAnnotation:  "u1-secret",
+				},
+			}}
+			if test.terminal {
+				pod.Status.Phase = corev1.PodFailed
+			} else {
+				pod.Status = corev1.PodStatus{
+					Phase: corev1.PodRunning, PodIP: "10.0.0.1",
+					Conditions: []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}},
+				}
+			}
+			secret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{
+				Name: envCredentialName(stale), Namespace: stale.Namespace, UID: "u1-secret",
+				Annotations: map[string]string{sandboxdauth.IdentityAnnotation: "sandboxd.u1", sandboxdauth.PodUIDAnnotation: string(pod.UID)},
+			}, Data: map[string][]byte{
+				sandboxdauth.TLSCertKey: []byte("cert"), sandboxdauth.TLSKeyKey: []byte("key"),
+				sandboxdauth.CapabilitiesKey: []byte("capabilities"), sandboxdauth.HealthTokenKey: []byte("health"), sandboxdauth.ProcessTokenKey: []byte("process"),
+			}}
+			for _, object := range []client.Object{pvc, pod, secret} {
+				if err := controllerutil.SetControllerReference(stale, object, scheme); err != nil {
+					t.Fatal(err)
+				}
+			}
+			baseClient := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(replacement).WithObjects(replacement, template, pvc, pod, secret).Build()
+			initialEnvironmentRead := true
+			interceptedClient := interceptor.NewClient(baseClient, interceptor.Funcs{
+				Get: func(ctx context.Context, underlying client.WithWatch, key client.ObjectKey, object client.Object, options ...client.GetOption) error {
+					if initialEnvironmentRead && key == client.ObjectKeyFromObject(stale) {
+						if environment, ok := object.(*platformv1alpha1.Environment); ok {
+							initialEnvironmentRead = false
+							*environment = *stale.DeepCopy()
+							return nil
+						}
+					}
+					return underlying.Get(ctx, key, object, options...)
+				},
+			})
+			reconciler := &EnvironmentReconciler{Client: interceptedClient, Scheme: scheme}
+
+			result, err := reconciler.Reconcile(context.Background(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(stale)})
+			if err != nil || result != (ctrl.Result{}) {
+				t.Fatalf("stale U1 Reconcile() = (%#v, %v), want successful empty drop", result, err)
+			}
+			var retained platformv1alpha1.Environment
+			if err := baseClient.Get(context.Background(), client.ObjectKeyFromObject(replacement), &retained); err != nil {
+				t.Fatal(err)
+			}
+			if test.terminal {
+				if retained.Status.PodRecoveryAttempts != 0 || retained.Status.PodRecoveryUID != "" || retained.Status.PodRecoveryNextAttemptAt != nil || len(retained.Status.Conditions) != 0 {
+					t.Fatalf("stale U1 terminal marker mutated U2: %#v", retained.Status)
+				}
+			} else {
+				ready := apimeta.FindStatusCondition(retained.Status.Conditions, platformv1alpha1.EnvironmentConditionReady)
+				if retained.Status.PodRecoveryAttempts != 2 || retained.Status.PodRecoveryUID != "u2-terminal-pod" || retained.Status.PodRecoveryNextAttemptAt == nil ||
+					retained.Status.Endpoints.Sandboxd != "" || ready == nil || ready.Status != metav1.ConditionFalse || ready.Reason != "PodRecoveryPending" {
+					t.Fatalf("stale U1 health readiness mutated U2: %#v", retained.Status)
+				}
+			}
+		})
+	}
+}
+
 func TestNewEnvironmentRefusesTerminatingPriorIncarnationPVC(t *testing.T) {
 	scheme := runtime.NewScheme()
 	if err := corev1.AddToScheme(scheme); err != nil {
