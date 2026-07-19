@@ -50,6 +50,11 @@ kind create cluster --name "$CLUSTER"
 echo "==> building platform images"
 make docker-build >/dev/null
 
+echo "==> verifying terminal drain against patched env-base runtime"
+docker build --target terminal-test -t swe-platform-terminal-test -f images/env-base/Dockerfile . >/dev/null
+docker run --rm -e SWE_REQUIRE_PATCHED_TMUX=1 swe-platform-terminal-test \
+	-test.run '^TestTerminalDrains(OutputWhenShellExits|ImmediateOutputAfterFirstOpen)$' -test.count=1 -test.v
+
 echo "==> loading images into kind"
 kind load docker-image "$ENV_IMAGE" "$OPERATOR_IMAGE" "$CONTROL_PLANE_IMAGE" --name "$CLUSTER"
 

@@ -19,6 +19,8 @@ import (
 )
 
 const defaultTmuxSocket = "swe-platform"
+const tmuxEnableOutputDrainCommand = "pipe-pane -t swe: 'cat >/dev/null'"
+const tmuxOutputDrainReady = "swe-output-drain-ready:"
 
 var errTerminalUnavailable = errors.New("terminal backend unavailable")
 
@@ -166,6 +168,10 @@ func (b *tmuxTerminalBackend) Open(ctx context.Context, cols, rows uint32) (term
 		args = append(args, "-c", b.workspace)
 	}
 	args = append(args, b.shell...)
+	args = append(args,
+		";", "if-shell", "-F", "-t", "swe:", "#{?pane_pipe,0,1}", tmuxEnableOutputDrainCommand,
+		";", "display-message", "-p", "-t", "swe:", tmuxOutputDrainReady+"#{pane_pipe}",
+	)
 
 	commandCtx, cancel := context.WithCancel(ctx)
 	cmd := exec.CommandContext(commandCtx, "tmux", args...)
@@ -185,24 +191,84 @@ func (b *tmuxTerminalBackend) Open(ctx context.Context, cols, rows uint32) (term
 		cancel()
 		return nil, fmt.Errorf("%w: start tmux: %v", errTerminalUnavailable, err)
 	}
+	scanner := bufio.NewScanner(stdout)
+	scanner.Buffer(make([]byte, 4096), 1024*1024)
+	initialOutput, err := waitForTmuxReady(scanner, "swe")
+	if err != nil {
+		cancel()
+		_ = stdin.Close()
+		_ = cmd.Wait()
+		return nil, fmt.Errorf("%w: configure tmux output drain: %v", errTerminalUnavailable, err)
+	}
 
 	session := &tmuxTerminalSession{
-		ctx:    ctx,
-		cancel: cancel,
-		cmd:    cmd,
-		stdin:  stdin,
-		stderr: &stderr,
-		scanner: func() *bufio.Scanner {
-			scanner := bufio.NewScanner(stdout)
-			scanner.Buffer(make([]byte, 4096), 1024*1024)
-			return scanner
-		}(),
+		ctx:     ctx,
+		cancel:  cancel,
+		cmd:     cmd,
+		stdin:   stdin,
+		stderr:  &stderr,
+		scanner: scanner,
+		pending: initialOutput,
 	}
 	if err := session.Resize(cols, rows); err != nil {
 		session.abortAndWait()
 		return nil, fmt.Errorf("size terminal: %w", err)
 	}
 	return session, nil
+}
+
+func waitForTmuxReady(scanner *bufio.Scanner, sessionName string) ([]byte, error) {
+	attached := false
+	ready := false
+	response := ""
+	probeSeen := false
+	probeValue := ""
+	var output []byte
+	for (!ready || !attached) && scanner.Scan() {
+		line := scanner.Text()
+		switch {
+		case strings.HasPrefix(line, "%begin "):
+			if response != "" {
+				return nil, fmt.Errorf("nested command response")
+			}
+			response = strings.TrimPrefix(line, "%begin ")
+		case strings.HasPrefix(line, "%end "):
+			if response != "" && strings.TrimPrefix(line, "%end ") == response {
+				if probeSeen {
+					if probeValue != "1" {
+						return nil, fmt.Errorf("tmux output drain is inactive")
+					}
+					ready = true
+				}
+				response = ""
+				probeSeen = false
+				probeValue = ""
+			}
+		case strings.HasPrefix(line, "%session-changed "):
+			fields := strings.Fields(line)
+			attached = len(fields) == 3 && fields[2] == sessionName
+		case strings.HasPrefix(line, "%error "):
+			if response != "" && strings.TrimPrefix(line, "%error ") == response {
+				return nil, fmt.Errorf("command failed: %s", line)
+			}
+		case strings.HasPrefix(line, "%exit"):
+			return nil, fmt.Errorf("tmux exited during setup")
+		default:
+			if response != "" && strings.HasPrefix(line, tmuxOutputDrainReady) {
+				probeSeen = true
+				probeValue = strings.TrimPrefix(line, tmuxOutputDrainReady)
+			} else if data, ok := tmuxOutput(line); ok {
+				output = append(output, data...)
+			}
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, fmt.Errorf("read command response: %w", err)
+	}
+	if !ready || !attached {
+		return nil, io.ErrUnexpectedEOF
+	}
+	return output, nil
 }
 
 type tmuxTerminalSession struct {
@@ -212,6 +278,7 @@ type tmuxTerminalSession struct {
 	stdin   io.WriteCloser
 	scanner *bufio.Scanner
 	stderr  *strings.Builder
+	pending []byte
 
 	writeMu  sync.Mutex
 	closed   atomic.Bool
@@ -220,6 +287,11 @@ type tmuxTerminalSession struct {
 }
 
 func (s *tmuxTerminalSession) Read() ([]byte, error) {
+	if len(s.pending) > 0 {
+		data := s.pending
+		s.pending = nil
+		return data, nil
+	}
 	for s.scanner.Scan() {
 		if data, ok := tmuxOutput(s.scanner.Text()); ok {
 			return data, nil
