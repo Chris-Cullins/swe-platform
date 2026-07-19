@@ -61,6 +61,7 @@ spec:
                 type: string
               image:
                 description: Image is the container image for the environment.
+                minLength: 1
                 type: string
               runtimeClass:
                 description: RuntimeClass is the RuntimeClass used for isolation (e.g.

@@ -3,6 +3,7 @@ package controllers
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -502,6 +503,239 @@ func TestWarmPoolCleanupIsFencedByConcurrentClaimOrPromotion(t *testing.T) {
 				t.Fatalf("concurrently allocated member was deleted: %v", err)
 			}
 		})
+	}
+}
+
+func TestWarmPoolReplacementSurgeRemainsBoundedWhenEveryMemberFails(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := platformv1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	tmpl := &platformv1alpha1.EnvironmentTemplate{
+		ObjectMeta: metav1.ObjectMeta{Name: "small", Namespace: "default", UID: "template-uid"},
+		Spec:       platformv1alpha1.EnvironmentTemplateSpec{WarmPool: &platformv1alpha1.WarmPoolSpec{Min: 2}},
+	}
+	baseClient := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(tmpl, &platformv1alpha1.Environment{}).WithObjects(tmpl).Build()
+	r := &WarmPoolReconciler{Client: baseClient, Scheme: scheme, Now: func() time.Time { return time.Unix(4_000, 0) }}
+	request := ctrl.Request{NamespacedName: client.ObjectKeyFromObject(tmpl)}
+	if _, err := r.Reconcile(context.Background(), request); err != nil {
+		t.Fatal(err)
+	}
+
+	for cycle := 0; cycle < 4; cycle++ {
+		var members platformv1alpha1.EnvironmentList
+		if err := baseClient.List(context.Background(), &members, client.MatchingLabels{warmPoolLabel: tmpl.Name}); err != nil {
+			t.Fatal(err)
+		}
+		for i := range members.Items {
+			env := &members.Items[i]
+			if env.Status.Phase == platformv1alpha1.EnvironmentPhaseFailed {
+				continue
+			}
+			env.Status.ObservedGeneration = env.Generation
+			env.Status.Phase = platformv1alpha1.EnvironmentPhaseFailed
+			if err := baseClient.Status().Update(context.Background(), env); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if _, err := r.Reconcile(context.Background(), request); err != nil {
+			t.Fatal(err)
+		}
+		if err := baseClient.List(context.Background(), &members, client.MatchingLabels{warmPoolLabel: tmpl.Name}); err != nil {
+			t.Fatal(err)
+		}
+		if len(members.Items) > 4 {
+			t.Fatalf("cycle %d pool size = %d, want at most 2*min", cycle, len(members.Items))
+		}
+	}
+	var bounded platformv1alpha1.EnvironmentList
+	if err := baseClient.List(context.Background(), &bounded, client.MatchingLabels{warmPoolLabel: tmpl.Name}); err != nil {
+		t.Fatal(err)
+	}
+	if len(bounded.Items) != 4 {
+		t.Fatalf("fully failed pool size = %d, want bounded surge of 4", len(bounded.Items))
+	}
+}
+
+func TestWarmPoolIdentityUpdateEnqueuesOldAndNewPools(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := platformv1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	small := &platformv1alpha1.EnvironmentTemplate{
+		ObjectMeta: metav1.ObjectMeta{Name: "small", Namespace: "default", UID: "small-uid"},
+		Spec:       platformv1alpha1.EnvironmentTemplateSpec{WarmPool: &platformv1alpha1.WarmPoolSpec{Min: 1}},
+	}
+	large := &platformv1alpha1.EnvironmentTemplate{ObjectMeta: metav1.ObjectMeta{Name: "large", Namespace: "default", UID: "large-uid"}}
+	oldEnv := &platformv1alpha1.Environment{
+		ObjectMeta: metav1.ObjectMeta{Name: "warm", Namespace: "default", UID: "env-uid", Labels: map[string]string{warmPoolLabel: small.Name}},
+		Spec:       platformv1alpha1.EnvironmentSpec{TemplateRef: small.Name},
+	}
+	setWarmPoolOwner(t, scheme, small, oldEnv)
+	newEnv := oldEnv.DeepCopy()
+	newEnv.Spec.TemplateRef = large.Name
+	newEnv.Labels[warmPoolLabel] = large.Name
+	newEnv.OwnerReferences = nil
+	setWarmPoolOwner(t, scheme, large, newEnv)
+
+	requests := append(warmPoolTemplateRequests(oldEnv), warmPoolTemplateRequests(newEnv)...)
+	requested := make(map[string]bool)
+	for _, request := range requests {
+		requested[request.Name] = true
+	}
+	if !requested[small.Name] || !requested[large.Name] {
+		t.Fatalf("identity update requests = %#v, want old and new pools", requests)
+	}
+
+	baseClient := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(small, large).WithObjects(small, large, newEnv).Build()
+	r := &WarmPoolReconciler{Client: baseClient, Scheme: scheme}
+	if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(small)}); err != nil {
+		t.Fatal(err)
+	}
+	var environments platformv1alpha1.EnvironmentList
+	if err := baseClient.List(context.Background(), &environments, client.MatchingLabels{warmPoolLabel: small.Name}); err != nil {
+		t.Fatal(err)
+	}
+	if len(environments.Items) != 1 || !warmPoolMember(&environments.Items[0], small) {
+		t.Fatalf("old pool was not immediately replenished: %#v", environments.Items)
+	}
+}
+
+func TestWarmPoolStaleTemplateIncarnationCannotMutateReplacement(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := platformv1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	stale := &platformv1alpha1.EnvironmentTemplate{
+		ObjectMeta: metav1.ObjectMeta{Name: "small", Namespace: "default", UID: "template-t1", Generation: 1, ResourceVersion: "1"},
+		Spec:       platformv1alpha1.EnvironmentTemplateSpec{WarmPool: &platformv1alpha1.WarmPoolSpec{Min: 1}},
+		Status:     platformv1alpha1.EnvironmentTemplateStatus{WarmPoolReady: 1},
+	}
+	replacement := stale.DeepCopy()
+	replacement.UID = "template-t2"
+	replacement.ResourceVersion = "2"
+	replacement.Status.WarmPoolReady = 7
+	baseClient := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(replacement).WithObjects(replacement).Build()
+	initialRead := true
+	intercepted := interceptor.NewClient(baseClient, interceptor.Funcs{
+		Get: func(ctx context.Context, underlying client.WithWatch, key client.ObjectKey, object client.Object, options ...client.GetOption) error {
+			if initialRead && key == client.ObjectKeyFromObject(stale) {
+				if template, ok := object.(*platformv1alpha1.EnvironmentTemplate); ok {
+					initialRead = false
+					*template = *stale.DeepCopy()
+					return nil
+				}
+			}
+			return underlying.Get(ctx, key, object, options...)
+		},
+	})
+	r := &WarmPoolReconciler{Client: intercepted, APIReader: baseClient, Scheme: scheme}
+	result, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(stale)})
+	if err != nil || !result.Requeue {
+		t.Fatalf("stale Reconcile() = (%#v, %v), want clean requeue", result, err)
+	}
+	var retained platformv1alpha1.EnvironmentTemplate
+	if err := baseClient.Get(context.Background(), client.ObjectKeyFromObject(replacement), &retained); err != nil {
+		t.Fatal(err)
+	}
+	if retained.UID != replacement.UID || retained.Status.WarmPoolReady != 7 {
+		t.Fatalf("replacement template was mutated by stale reconcile: %#v", retained)
+	}
+	var environments platformv1alpha1.EnvironmentList
+	if err := baseClient.List(context.Background(), &environments); err != nil {
+		t.Fatal(err)
+	}
+	if len(environments.Items) != 0 {
+		t.Fatalf("stale template created old-UID members: %#v", environments.Items)
+	}
+}
+
+func TestWarmPoolTemplateStatusPatchConflictRequeuesWithoutMutatingReplacement(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := platformv1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	stale := &platformv1alpha1.EnvironmentTemplate{
+		ObjectMeta: metav1.ObjectMeta{Name: "small", Namespace: "default", UID: "template-t1", Generation: 1},
+		Status:     platformv1alpha1.EnvironmentTemplateStatus{WarmPoolReady: 1},
+	}
+	baseClient := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(stale).WithObjects(stale).Build()
+	replacementUID := types.UID("template-t2")
+	intercepted := interceptor.NewClient(baseClient, interceptor.Funcs{
+		SubResourcePatch: func(ctx context.Context, underlying client.Client, subresource string, object client.Object, patch client.Patch, options ...client.SubResourcePatchOption) error {
+			if subresource != "status" {
+				return underlying.SubResource(subresource).Patch(ctx, object, patch, options...)
+			}
+			data, err := patch.Data(object)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !strings.Contains(string(data), `"resourceVersion"`) {
+				t.Fatalf("status patch lacks optimistic resourceVersion: %s", data)
+			}
+			var current platformv1alpha1.EnvironmentTemplate
+			if err := underlying.Get(ctx, client.ObjectKeyFromObject(stale), &current); err != nil {
+				return err
+			}
+			if err := underlying.Delete(ctx, &current); err != nil {
+				return err
+			}
+			replacement := stale.DeepCopy()
+			replacement.UID = replacementUID
+			replacement.ResourceVersion = ""
+			replacement.Status = platformv1alpha1.EnvironmentTemplateStatus{}
+			if err := underlying.Create(ctx, replacement); err != nil {
+				return err
+			}
+			return apierrors.NewConflict(schema.GroupResource{Group: platformv1alpha1.GroupVersion.Group, Resource: "environmenttemplates"}, object.GetName(), errors.New("template replaced"))
+		},
+	})
+	r := &WarmPoolReconciler{Client: intercepted, APIReader: baseClient, Scheme: scheme}
+	result, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(stale)})
+	if err != nil || !result.Requeue {
+		t.Fatalf("conflicted Reconcile() = (%#v, %v), want clean requeue", result, err)
+	}
+	var replacement platformv1alpha1.EnvironmentTemplate
+	if err := baseClient.Get(context.Background(), client.ObjectKeyFromObject(stale), &replacement); err != nil {
+		t.Fatal(err)
+	}
+	if replacement.UID != replacementUID || replacement.Status.WarmPoolReady != 0 {
+		t.Fatalf("replacement template was mutated: %#v", replacement)
+	}
+}
+
+func TestWarmPoolTemplateGenerationChangePreventsMemberCreation(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := platformv1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	tmpl := &platformv1alpha1.EnvironmentTemplate{
+		ObjectMeta: metav1.ObjectMeta{Name: "small", Namespace: "default", UID: "template-uid", Generation: 1},
+		Spec:       platformv1alpha1.EnvironmentTemplateSpec{WarmPool: &platformv1alpha1.WarmPoolSpec{Min: 1}},
+	}
+	baseClient := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(tmpl).WithObjects(tmpl).Build()
+	liveReader := interceptor.NewClient(baseClient, interceptor.Funcs{
+		Get: func(ctx context.Context, underlying client.WithWatch, key client.ObjectKey, object client.Object, options ...client.GetOption) error {
+			if err := underlying.Get(ctx, key, object, options...); err != nil {
+				return err
+			}
+			if template, ok := object.(*platformv1alpha1.EnvironmentTemplate); ok {
+				template.Generation++
+			}
+			return nil
+		},
+	})
+	r := &WarmPoolReconciler{Client: baseClient, APIReader: liveReader, Scheme: scheme}
+	result, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(tmpl)})
+	if err != nil || !result.Requeue {
+		t.Fatalf("generation-change Reconcile() = (%#v, %v), want clean requeue", result, err)
+	}
+	var environments platformv1alpha1.EnvironmentList
+	if err := baseClient.List(context.Background(), &environments); err != nil {
+		t.Fatal(err)
+	}
+	if len(environments.Items) != 0 {
+		t.Fatalf("stale generation created members: %#v", environments.Items)
 	}
 }
 

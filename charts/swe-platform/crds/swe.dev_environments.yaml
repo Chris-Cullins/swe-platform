@@ -67,6 +67,7 @@ spec:
               templateRef:
                 description: TemplateRef is the name of the EnvironmentTemplate to
                   build from.
+                minLength: 1
                 type: string
             required:
             - templateRef

@@ -180,9 +180,9 @@ contract. GitHub App token minting is not implemented yet.
 
 Transient operational reconciliation errors withdraw readiness with an `OperationalError`
 reason and use controller-runtime's rate-limited retry; they do not put the Environment in the
-terminal `Failed` phase. Invalid references and specifications report `Failed` with an
-`InvalidConfiguration` reason and wait for the referenced Template or Project, or the
-Environment spec, to change.
+terminal `Failed` phase. Missing or blank references, invalid specifications, and deterministic
+Kubernetes `Invalid` or `BadRequest` responses report `Failed` with an `InvalidConfiguration`
+reason and wait for the referenced Template or Project, or the Environment spec, to change.
 
 Environments without an active Run are automatically paused after their template's
 `idleTimeout` (15 minutes by default). An exact non-terminal Run owner or claim always
@@ -198,8 +198,10 @@ against its existing workspace volume so repository setup completes before the r
 reported ready. Deleting members never count as ready or active. Unclaimed failed, terminated,
 or explicitly paused members are replaced immediately, retained for a five-minute recovery
 grace, then deleted if they remain unusable; the persisted cleanup timestamp keeps that bound
-stable across operator restarts. Cleanup requires exact Template ownership and UID/resourceVersion
-preconditions, so concurrent claims and promotions win without being deleted.
+stable across operator restarts. Replacement surge is bounded to the configured minimum, so at
+most twice the minimum exact, unclaimed members remain while an entire replacement set is also
+quarantined. Cleanup requires exact Template ownership and UID/resourceVersion preconditions, so
+concurrent claims and promotions win without being deleted.
 
 Only the `pod` environment backend is currently supported. An explicit
 `Environment.spec.backend` takes precedence over its template's backend; unsupported

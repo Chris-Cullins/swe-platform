@@ -183,6 +183,9 @@ func (r *EnvironmentReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	if result, handled, err := r.reconcilePendingPodRecovery(ctx, &env); handled || err != nil {
 		return result, err
 	}
+	if strings.TrimSpace(env.Spec.TemplateRef) == "" {
+		return ctrl.Result{}, r.fail(ctx, &env, terminalEnvironment(fmt.Errorf("environment templateRef must not be blank")))
+	}
 	var tmpl platformv1alpha1.EnvironmentTemplate
 	if err := r.Get(ctx, types.NamespacedName{Namespace: env.Namespace, Name: env.Spec.TemplateRef}, &tmpl); err != nil {
 		wrapped := fmt.Errorf("get template %q: %w", env.Spec.TemplateRef, err)
@@ -1239,7 +1242,7 @@ func (r *EnvironmentReconciler) fail(ctx context.Context, env *platformv1alpha1.
 	var terminal *terminalEnvironmentError
 	phase := platformv1alpha1.EnvironmentPhaseCreating
 	reason := "OperationalError"
-	if stderrors.As(err, &terminal) {
+	if stderrors.As(err, &terminal) || errors.IsInvalid(err) || errors.IsBadRequest(err) {
 		phase = platformv1alpha1.EnvironmentPhaseFailed
 		reason = "InvalidConfiguration"
 	} else if stderrors.As(err, &collision) {
@@ -1261,7 +1264,7 @@ func (r *EnvironmentReconciler) fail(ctx context.Context, env *platformv1alpha1.
 	if statusErr != nil {
 		return statusErr
 	}
-	if collision != nil || terminal != nil {
+	if collision != nil || terminal != nil || errors.IsInvalid(err) || errors.IsBadRequest(err) {
 		return nil
 	}
 	return err
@@ -1452,21 +1455,41 @@ func envLabels(env *platformv1alpha1.Environment) map[string]string {
 
 func ptr[T any](v T) *T { return &v }
 
+func environmentTemplateRefIndex(object client.Object) []string {
+	environment := object.(*platformv1alpha1.Environment)
+	if environment.Spec.TemplateRef == "" {
+		return nil
+	}
+	return []string{environment.Spec.TemplateRef}
+}
+
+func environmentProjectRefIndex(object client.Object) []string {
+	environment := object.(*platformv1alpha1.Environment)
+	if environment.Spec.ProjectRef == "" {
+		return nil
+	}
+	return []string{environment.Spec.ProjectRef}
+}
+
+func (r *EnvironmentReconciler) environmentReferenceRequests(ctx context.Context, namespace, field, name string) []reconcile.Request {
+	var environments platformv1alpha1.EnvironmentList
+	if err := r.List(ctx, &environments, client.InNamespace(namespace), client.MatchingFields{field: name}); err != nil {
+		log.FromContext(ctx).Error(err, "list environments for reference", "field", field, "name", name)
+		return nil
+	}
+	requests := make([]reconcile.Request, 0, len(environments.Items))
+	for i := range environments.Items {
+		requests = append(requests, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(&environments.Items[i])})
+	}
+	return requests
+}
+
 // SetupWithManager registers the controller with the manager.
 func (r *EnvironmentReconciler) SetupWithManager(mgr ctrl.Manager) error {
-	if err := mgr.GetFieldIndexer().IndexField(context.Background(), &platformv1alpha1.Environment{}, templateRefField, func(object client.Object) []string {
-		environment := object.(*platformv1alpha1.Environment)
-		return []string{environment.Spec.TemplateRef}
-	}); err != nil {
+	if err := mgr.GetFieldIndexer().IndexField(context.Background(), &platformv1alpha1.Environment{}, templateRefField, environmentTemplateRefIndex); err != nil {
 		return fmt.Errorf("index environments by template: %w", err)
 	}
-	if err := mgr.GetFieldIndexer().IndexField(context.Background(), &platformv1alpha1.Environment{}, projectRefField, func(object client.Object) []string {
-		environment := object.(*platformv1alpha1.Environment)
-		if environment.Spec.ProjectRef == "" {
-			return nil
-		}
-		return []string{environment.Spec.ProjectRef}
-	}); err != nil {
+	if err := mgr.GetFieldIndexer().IndexField(context.Background(), &platformv1alpha1.Environment{}, projectRefField, environmentProjectRefIndex); err != nil {
 		return fmt.Errorf("index environments by project: %w", err)
 	}
 	return ctrl.NewControllerManagedBy(mgr).
@@ -1482,28 +1505,10 @@ func (r *EnvironmentReconciler) SetupWithManager(mgr ctrl.Manager) error {
 			return []reconcile.Request{{NamespacedName: types.NamespacedName{Namespace: run.Namespace, Name: run.Status.EnvironmentRef.Name}}}
 		})).
 		Watches(&platformv1alpha1.EnvironmentTemplate{}, handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, object client.Object) []reconcile.Request {
-			var environments platformv1alpha1.EnvironmentList
-			if err := r.List(ctx, &environments, client.InNamespace(object.GetNamespace()), client.MatchingFields{templateRefField: object.GetName()}); err != nil {
-				log.FromContext(ctx).Error(err, "list environments for template", "template", object.GetName())
-				return nil
-			}
-			requests := make([]reconcile.Request, 0, len(environments.Items))
-			for i := range environments.Items {
-				requests = append(requests, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(&environments.Items[i])})
-			}
-			return requests
+			return r.environmentReferenceRequests(ctx, object.GetNamespace(), templateRefField, object.GetName())
 		})).
 		Watches(&platformv1alpha1.Project{}, handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, object client.Object) []reconcile.Request {
-			var environments platformv1alpha1.EnvironmentList
-			if err := r.List(ctx, &environments, client.InNamespace(object.GetNamespace()), client.MatchingFields{projectRefField: object.GetName()}); err != nil {
-				log.FromContext(ctx).Error(err, "list environments for project", "project", object.GetName())
-				return nil
-			}
-			requests := make([]reconcile.Request, 0, len(environments.Items))
-			for i := range environments.Items {
-				requests = append(requests, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(&environments.Items[i])})
-			}
-			return requests
+			return r.environmentReferenceRequests(ctx, object.GetNamespace(), projectRefField, object.GetName())
 		})).
 		Complete(r)
 }
