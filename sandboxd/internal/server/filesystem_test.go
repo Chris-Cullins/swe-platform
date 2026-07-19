@@ -304,7 +304,20 @@ func TestFilesystemCanceledWriteCleansPinnedRenamedDirectory(t *testing.T) {
 	})
 	moved := filepath.Join(workspace, "moved")
 	if err := os.Rename(parent, moved); err != nil {
-		t.Fatal(err)
+		if runtime.GOOS != "windows" || !errors.Is(err, os.ErrPermission) {
+			t.Fatal(err)
+		}
+		// Windows denies the rename while the pinned directory handle is
+		// open, preventing the swap rather than tracking it across a rename.
+		cancel()
+		if _, err := stream.CloseAndRecv(); status.Code(err) != codes.Canceled {
+			t.Fatalf("cancelled write: %v", err)
+		}
+		waitFor(t, func() bool {
+			matches, _ := filepath.Glob(filepath.Join(parent, ".sandboxd-write-*"))
+			return len(matches) == 0
+		})
+		return
 	}
 	cancel()
 	if _, err := stream.CloseAndRecv(); status.Code(err) != codes.Canceled {
