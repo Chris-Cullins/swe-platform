@@ -400,8 +400,10 @@ if [[ "$SESSION_GET_STATUS" != "200" || "$RUN_LIST_STATUS" != "200" || "$OTHER_R
 	echo "FAIL: typed read API statuses session=${SESSION_GET_STATUS} runs=${RUN_LIST_STATUS} other-runs=${OTHER_RUN_LIST_STATUS} environment=${ENV_GET_STATUS}"
 	exit 1
 fi
-if ! grep -q '"name":"e2e-other-namespace-run"' /tmp/swe-platform-other-runs.json || \
-	grep -q '"name":"e2e-other-namespace-run"' /tmp/swe-platform-runs.json; then
+if ! grep -Fq '"name":"e2e-other-namespace-run"' /tmp/swe-platform-other-runs.json || \
+	grep -Fq '"name":"e2e-other-namespace-run"' /tmp/swe-platform-runs.json || \
+	! grep -Fq "\"name\":\"${RUN_NAME}\"" /tmp/swe-platform-runs.json || \
+	grep -Fq "\"name\":\"${RUN_NAME}\"" /tmp/swe-platform-other-runs.json; then
 	echo "FAIL: browser-session Run feeds were not isolated by namespace"
 	exit 1
 fi
