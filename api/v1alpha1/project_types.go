@@ -14,11 +14,12 @@ const (
 	ChangesWorkflowShipToMain ChangesWorkflow = "ship-to-main"
 )
 
-// ProjectSpec defines a project: one or more repos plus their shared config.
+// ProjectSpec defines a repository and its shared configuration.
 type ProjectSpec struct {
-	// Repositories are the git URLs this project works on.
-	// v1alpha1 executes single-repo; the field is a list from day one.
+	// Repositories contains the single git repository URL this project works on.
+	// It intentionally remains a list pending a future structured multi-repository contract.
 	// +kubebuilder:validation:MinItems=1
+	// +kubebuilder:validation:MaxItems=1
 	// +listType=set
 	Repositories []string `json:"repositories"`
 
@@ -53,7 +54,7 @@ type ProjectStatus struct {
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
 
-// Project is one or more repos plus the configuration environments need to work on them.
+// Project is a repository plus the configuration environments need to work on it.
 type Project struct {
 	metav1.TypeMeta   `json:",inline"`
 	metav1.ObjectMeta `json:"metadata,omitempty"`

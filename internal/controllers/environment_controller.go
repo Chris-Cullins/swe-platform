@@ -582,11 +582,12 @@ func (r *EnvironmentReconciler) ensurePod(ctx context.Context, env *platformv1al
 		if err := r.Get(ctx, types.NamespacedName{Namespace: env.Namespace, Name: env.Spec.ProjectRef}, &project); err != nil {
 			return nil, fmt.Errorf("get project %q: %w", env.Spec.ProjectRef, err)
 		}
-		if len(project.Spec.Repositories) == 0 {
-			return nil, fmt.Errorf("project %q has no repositories", env.Spec.ProjectRef)
+		if len(project.Spec.Repositories) != 1 {
+			return nil, fmt.Errorf("project %q must have exactly one repository, got %d", env.Spec.ProjectRef, len(project.Spec.Repositories))
 		}
+		repository := project.Spec.Repositories[0]
 		projectEnv := []corev1.EnvVar{
-			{Name: "SWE_REPOSITORY", Value: project.Spec.Repositories[0]},
+			{Name: "SWE_REPOSITORY", Value: repository},
 			{Name: "SWE_HOOK_TIMEOUT", Value: projectHookTimeout},
 			{Name: "SWE_HOOK_KILL_AFTER", Value: hookKillAfter},
 		}

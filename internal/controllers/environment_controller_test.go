@@ -81,9 +81,12 @@ func TestEnsurePodInjectsProjectSecret(t *testing.T) {
 	if setup.Name != "project-setup" {
 		t.Errorf("init container name = %q, want project-setup", setup.Name)
 	}
-	if len(setup.Env) != 3 || setup.Env[0].Name != "SWE_REPOSITORY" || setup.Env[0].Value != project.Spec.Repositories[0] ||
-		setup.Env[1].Name != "SWE_HOOK_TIMEOUT" || setup.Env[1].Value != projectHookTimeout ||
-		setup.Env[2].Name != "SWE_HOOK_KILL_AFTER" || setup.Env[2].Value != hookKillAfter {
+	envValues := make(map[string]string, len(setup.Env))
+	for _, envVar := range setup.Env {
+		envValues[envVar.Name] = envVar.Value
+	}
+	if len(setup.Env) != 3 || envValues["SWE_REPOSITORY"] != "https://github.com/example/repo" ||
+		envValues["SWE_HOOK_TIMEOUT"] != projectHookTimeout || envValues["SWE_HOOK_KILL_AFTER"] != hookKillAfter {
 		t.Errorf("init container Env = %#v, want repository and bounded hook timeout", setup.Env)
 	}
 	if len(setup.EnvFrom) != 1 || setup.EnvFrom[0].SecretRef == nil || setup.EnvFrom[0].SecretRef.Name != "project-config" {
@@ -91,6 +94,51 @@ func TestEnsurePodInjectsProjectSecret(t *testing.T) {
 	}
 	if len(setup.VolumeMounts) != 1 || setup.VolumeMounts[0].MountPath != "/workspace" {
 		t.Errorf("init container VolumeMounts = %#v, want /workspace", setup.VolumeMounts)
+	}
+}
+
+func TestEnsurePodRejectsInvalidProjectRepositoryCounts(t *testing.T) {
+	tests := []struct {
+		name         string
+		repositories []string
+		wantError    string
+	}{
+		{name: "zero", wantError: `project "example" must have exactly one repository, got 0`},
+		{
+			name:         "two",
+			repositories: []string{"https://github.com/example/one", "https://github.com/example/two"},
+			wantError:    `project "example" must have exactly one repository, got 2`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			scheme := runtime.NewScheme()
+			if err := corev1.AddToScheme(scheme); err != nil {
+				t.Fatal(err)
+			}
+			if err := platformv1alpha1.AddToScheme(scheme); err != nil {
+				t.Fatal(err)
+			}
+
+			project := &platformv1alpha1.Project{
+				ObjectMeta: metav1.ObjectMeta{Name: "example", Namespace: "default"},
+				Spec:       platformv1alpha1.ProjectSpec{Repositories: tt.repositories},
+			}
+			reconciler := &EnvironmentReconciler{
+				Client: fake.NewClientBuilder().WithScheme(scheme).WithObjects(project).Build(),
+				Scheme: scheme,
+			}
+			env := &platformv1alpha1.Environment{
+				ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default", UID: "environment-uid"},
+				Spec:       platformv1alpha1.EnvironmentSpec{ProjectRef: project.Name},
+			}
+
+			pod, err := reconciler.ensurePod(context.Background(), env, &platformv1alpha1.EnvironmentTemplate{})
+			if pod != nil || err == nil || err.Error() != tt.wantError {
+				t.Fatalf("ensurePod() = (%#v, %v), want (nil, %q)", pod, err, tt.wantError)
+			}
+		})
 	}
 }
 

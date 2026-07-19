@@ -154,7 +154,7 @@ swe cancel fix-flaky-42
 immutable task arguments. The CLI returns the existing Run only when its intent matches;
 the controller creates or claims the Environment server-side.
 
-The first repository configured on a Project is cloned into `/workspace` when its
+The repository configured on a Project is cloned into `/workspace` when its
 environment is created. If the repository contains `.agents/setup`, the hook runs once
 after checkout. Set `Environment.spec.paused` to `true` to delete the pod while retaining
 its workspace PVC, then set it to `false` to create a fresh pod; `.agents/resume` runs

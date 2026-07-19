@@ -17,8 +17,8 @@ spec:
   - name: v1alpha1
     schema:
       openAPIV3Schema:
-        description: Project is one or more repos plus the configuration environments
-          need to work on them.
+        description: Project is a repository plus the configuration environments need
+          to work on it.
         properties:
           apiVersion:
             description: |-
@@ -38,8 +38,7 @@ spec:
           metadata:
             type: object
           spec:
-            description: 'ProjectSpec defines a project: one or more repos plus their
-              shared config.'
+            description: ProjectSpec defines a repository and its shared configuration.
             properties:
               changesWorkflow:
                 default: branch-pr
@@ -59,10 +58,11 @@ spec:
                 x-kubernetes-list-type: set
               repositories:
                 description: |-
-                  Repositories are the git URLs this project works on.
-                  v1alpha1 executes single-repo; the field is a list from day one.
+                  Repositories contains the single git repository URL this project works on.
+                  It intentionally remains a list pending a future structured multi-repository contract.
                 items:
                   type: string
+                maxItems: 1
                 minItems: 1
                 type: array
                 x-kubernetes-list-type: set
