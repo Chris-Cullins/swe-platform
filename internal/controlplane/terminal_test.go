@@ -9,6 +9,7 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
+	"errors"
 	"io"
 	"math/big"
 	"net"
@@ -240,6 +241,70 @@ func TestKubernetesTerminalDialerDoesNotMarkReplacementEnvironmentActive(t *test
 	}
 }
 
+func TestTerminalHeartbeatRecoversAfterTransientGetFailure(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := platformv1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	oldActivity := metav1.NewTime(time.Now().Add(-time.Hour))
+	environment := &platformv1alpha1.Environment{ObjectMeta: metav1.ObjectMeta{Name: "env-1", Namespace: "project-1", UID: "env-uid"}, Status: platformv1alpha1.EnvironmentStatus{LastActiveAt: &oldActivity}}
+	baseClient := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(environment).WithObjects(environment).Build()
+	transient := &transientTerminalGetClient{Client: baseClient, getFailures: 1, updateFailures: 1}
+	dialer := KubernetesTerminalDialer{Client: transient}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go dialer.heartbeatActivity(ctx, client.ObjectKeyFromObject(environment), environment.UID, 5*time.Millisecond)
+
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		var updated platformv1alpha1.Environment
+		if err := baseClient.Get(context.Background(), client.ObjectKeyFromObject(environment), &updated); err != nil {
+			t.Fatal(err)
+		}
+		if updated.Status.LastActiveAt != nil && updated.Status.LastActiveAt.After(oldActivity.Time) {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatal("terminal heartbeat stopped after a transient Get failure")
+}
+
+type transientTerminalGetClient struct {
+	client.Client
+	mu             sync.Mutex
+	getFailures    int
+	updateFailures int
+}
+
+func (c *transientTerminalGetClient) Get(ctx context.Context, key client.ObjectKey, object client.Object, options ...client.GetOption) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.getFailures > 0 {
+		c.getFailures--
+		return errors.New("transient API failure")
+	}
+	return c.Client.Get(ctx, key, object, options...)
+}
+
+func (c *transientTerminalGetClient) Status() client.SubResourceWriter {
+	return &transientTerminalStatusWriter{SubResourceWriter: c.Client.Status(), client: c}
+}
+
+type transientTerminalStatusWriter struct {
+	client.SubResourceWriter
+	client *transientTerminalGetClient
+}
+
+func (w *transientTerminalStatusWriter) Update(ctx context.Context, object client.Object, options ...client.SubResourceUpdateOption) error {
+	w.client.mu.Lock()
+	defer w.client.mu.Unlock()
+	if w.client.updateFailures > 0 {
+		w.client.updateFailures--
+		return errors.New("transient status failure")
+	}
+	return w.SubResourceWriter.Update(ctx, object, options...)
+}
+
 func TestKubernetesTerminalDialerUsesRecreatedPodCredentialsAfterWake(t *testing.T) {
 	scheme := runtime.NewScheme()
 	if err := corev1.AddToScheme(scheme); err != nil {
@@ -288,6 +353,184 @@ func TestKubernetesTerminalDialerUsesRecreatedPodCredentialsAfterWake(t *testing
 	if err := closer.Close(); err != nil {
 		t.Fatal(err)
 	}
+}
+
+func TestTerminalHeartbeatProtectsSlowWakeBeforeConnection(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	if err := platformv1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	environment := &platformv1alpha1.Environment{
+		ObjectMeta: metav1.ObjectMeta{Name: "env-1", Namespace: "project-1", UID: "current-environment"},
+		Spec:       platformv1alpha1.EnvironmentSpec{Paused: true, TemplateRef: "default"},
+		Status:     platformv1alpha1.EnvironmentStatus{Phase: platformv1alpha1.EnvironmentPhasePaused},
+	}
+	template := &platformv1alpha1.EnvironmentTemplate{
+		ObjectMeta: metav1.ObjectMeta{Name: "default", Namespace: environment.Namespace},
+		Spec:       platformv1alpha1.EnvironmentTemplateSpec{IdleTimeout: &metav1.Duration{Duration: 40 * time.Millisecond}},
+	}
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "new-pod", Namespace: environment.Namespace, UID: "new-pod-uid",
+			Annotations: map[string]string{
+				sandboxdauth.IdentityAnnotation: "new-incarnation.sandboxd.swe.dev",
+				sandboxdauth.TrustAnnotation:    testCertificatePEM(t, "new-incarnation.sandboxd.swe.dev"),
+				sandboxdauth.TokenAnnotation:    "new-terminal-token",
+			},
+		},
+		Status: corev1.PodStatus{PodIP: "192.0.2.10", Conditions: []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}}},
+	}
+	if err := controllerutil.SetControllerReference(environment, pod, scheme); err != nil {
+		t.Fatal(err)
+	}
+	baseClient := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(environment).WithObjects(environment, template, pod).Build()
+	activityClient := &activityCountingClient{Client: baseClient}
+	wakeClient := &heartbeatWakeReadyClient{activityCountingClient: activityClient, podName: pod.Name, minimumActivityWrites: 3}
+	dialer := KubernetesTerminalDialer{Client: wakeClient}
+
+	_, closer, err := dialer.DialTerminal(context.Background(), environment.Namespace, environment.Name)
+	if err != nil {
+		t.Fatalf("DialTerminal() error = %v", err)
+	}
+	if writes := activityClient.count(); writes < wakeClient.minimumActivityWrites {
+		t.Fatalf("activity writes before ready = %d, want at least %d", writes, wakeClient.minimumActivityWrites)
+	}
+	if err := closer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	writesAfterClose := activityClient.count()
+	time.Sleep(60 * time.Millisecond)
+	if writes := activityClient.count(); writes != writesAfterClose {
+		t.Fatalf("activity writes after terminal close = %d, want %d", writes, writesAfterClose)
+	}
+}
+
+func TestTerminalHeartbeatCancelsWhenWakeOrDialFails(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		paused bool
+	}{
+		{name: "wake", paused: true},
+		{name: "dial"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			scheme := runtime.NewScheme()
+			if err := corev1.AddToScheme(scheme); err != nil {
+				t.Fatal(err)
+			}
+			if err := platformv1alpha1.AddToScheme(scheme); err != nil {
+				t.Fatal(err)
+			}
+			environment := &platformv1alpha1.Environment{
+				ObjectMeta: metav1.ObjectMeta{Name: "env-1", Namespace: "project-1", UID: "env-uid"},
+				Spec:       platformv1alpha1.EnvironmentSpec{Paused: test.paused, TemplateRef: "default"},
+			}
+			if test.paused {
+				environment.Status.Phase = platformv1alpha1.EnvironmentPhasePaused
+			} else {
+				applyReadyTerminalStatus(environment, "missing-pod")
+			}
+			template := &platformv1alpha1.EnvironmentTemplate{ObjectMeta: metav1.ObjectMeta{Name: "default", Namespace: environment.Namespace}, Spec: platformv1alpha1.EnvironmentTemplateSpec{IdleTimeout: &metav1.Duration{Duration: 40 * time.Millisecond}}}
+			baseClient := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(environment).WithObjects(environment, template).Build()
+			activityClient := &activityCountingClient{Client: baseClient}
+			var kubeClient client.Client = activityClient
+			if test.paused {
+				kubeClient = &failingWakeClient{activityCountingClient: activityClient}
+			}
+			dialer := KubernetesTerminalDialer{Client: kubeClient}
+
+			if _, _, err := dialer.DialTerminal(context.Background(), environment.Namespace, environment.Name); err == nil {
+				t.Fatalf("DialTerminal() succeeded during %s failure", test.name)
+			}
+			writesAfterFailure := activityClient.count()
+			time.Sleep(60 * time.Millisecond)
+			if writes := activityClient.count(); writes != writesAfterFailure {
+				t.Fatalf("activity writes after %s failure = %d, want %d", test.name, writes, writesAfterFailure)
+			}
+		})
+	}
+}
+
+type activityCountingClient struct {
+	client.Client
+	mu             sync.Mutex
+	activityWrites int
+}
+
+func (c *activityCountingClient) Status() client.SubResourceWriter {
+	return &activityCountingStatusWriter{SubResourceWriter: c.Client.Status(), client: c}
+}
+
+func (c *activityCountingClient) count() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.activityWrites
+}
+
+type activityCountingStatusWriter struct {
+	client.SubResourceWriter
+	client *activityCountingClient
+}
+
+func (w *activityCountingStatusWriter) Update(ctx context.Context, object client.Object, options ...client.SubResourceUpdateOption) error {
+	if err := w.SubResourceWriter.Update(ctx, object, options...); err != nil {
+		return err
+	}
+	if _, ok := object.(*platformv1alpha1.Environment); ok {
+		w.client.mu.Lock()
+		w.client.activityWrites++
+		w.client.mu.Unlock()
+	}
+	return nil
+}
+
+type heartbeatWakeReadyClient struct {
+	*activityCountingClient
+	podName               string
+	minimumActivityWrites int
+	mu                    sync.Mutex
+	readyPublished        bool
+}
+
+func (c *heartbeatWakeReadyClient) Get(ctx context.Context, key client.ObjectKey, object client.Object, options ...client.GetOption) error {
+	if _, ok := object.(*platformv1alpha1.Environment); ok && c.count() >= c.minimumActivityWrites {
+		c.mu.Lock()
+		if !c.readyPublished {
+			var current platformv1alpha1.Environment
+			if err := c.Client.Get(ctx, key, &current, options...); err != nil {
+				c.mu.Unlock()
+				return err
+			}
+			applyReadyTerminalStatus(&current, c.podName)
+			if err := c.Client.Status().Update(ctx, &current); err != nil {
+				c.mu.Unlock()
+				return err
+			}
+			c.readyPublished = true
+		}
+		c.mu.Unlock()
+	}
+	return c.Client.Get(ctx, key, object, options...)
+}
+
+type failingWakeClient struct{ *activityCountingClient }
+
+func (*failingWakeClient) Patch(context.Context, client.Object, client.Patch, ...client.PatchOption) error {
+	return errors.New("wake failed")
+}
+
+func applyReadyTerminalStatus(environment *platformv1alpha1.Environment, podName string) {
+	environment.Status.Phase = platformv1alpha1.EnvironmentPhaseReady
+	environment.Status.PodName = podName
+	environment.Status.Endpoints.Sandboxd = "192.0.2.10:50051"
+	environment.Status.ObservedGeneration = environment.Generation
+	apimeta.SetStatusCondition(&environment.Status.Conditions, metav1.Condition{
+		Type: platformv1alpha1.EnvironmentConditionReady, Status: metav1.ConditionTrue,
+		ObservedGeneration: environment.Generation, Reason: "SandboxdReady", Message: "sandboxd is ready",
+	})
 }
 
 type wakeReadyClient struct {

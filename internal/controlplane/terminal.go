@@ -3,6 +3,7 @@ package controlplane
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -26,6 +27,8 @@ const (
 	wakePollInterval         = 250 * time.Millisecond
 	terminalHandshakeTimeout = 5 * time.Second
 )
+
+var errTerminalEnvironmentIncarnationChanged = errors.New("environment incarnation changed")
 
 // TerminalDialer resolves an Environment and connects to its sandboxd API.
 type TerminalDialer interface {
@@ -63,6 +66,18 @@ func (d KubernetesTerminalDialer) DialTerminal(ctx context.Context, namespace, n
 	if err := d.markActive(ctx, &environment, expectedUID); err != nil {
 		return nil, nil, err
 	}
+	heartbeatInterval, err := d.activityHeartbeatInterval(ctx, &environment)
+	if err != nil {
+		return nil, nil, err
+	}
+	heartbeatContext, cancelHeartbeat := context.WithCancel(ctx)
+	heartbeatTransferred := false
+	defer func() {
+		if !heartbeatTransferred {
+			cancelHeartbeat()
+		}
+	}()
+	go d.heartbeatActivity(heartbeatContext, types.NamespacedName{Namespace: namespace, Name: name}, expectedUID, heartbeatInterval)
 	if environment.Spec.Paused {
 		before := environment.DeepCopy()
 		environment.Spec.Paused = false
@@ -83,15 +98,8 @@ func (d KubernetesTerminalDialer) DialTerminal(ctx context.Context, namespace, n
 	if err != nil {
 		return nil, nil, fmt.Errorf("connect to sandboxd: %w", err)
 	}
-	heartbeatContext, cancelHeartbeat := context.WithCancel(ctx)
-	heartbeatInterval, err := d.activityHeartbeatInterval(ctx, &environment)
-	if err != nil {
-		cancelHeartbeat()
-		_ = closeConnection()
-		return nil, nil, err
-	}
-	go d.heartbeatActivity(heartbeatContext, types.NamespacedName{Namespace: namespace, Name: name}, expectedUID, heartbeatInterval)
 	closer := &activeTerminalConnection{Closer: closeFunc(closeConnection), cancel: cancelHeartbeat}
+	heartbeatTransferred = true
 	return terminal, closer, nil
 }
 
@@ -112,20 +120,26 @@ func (d KubernetesTerminalDialer) activityHeartbeatInterval(ctx context.Context,
 }
 
 func (d KubernetesTerminalDialer) heartbeatActivity(ctx context.Context, key types.NamespacedName, expectedUID types.UID, interval time.Duration) {
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
+	retryInterval := interval / 4
+	if retryInterval <= 0 || retryInterval > time.Second {
+		retryInterval = time.Second
+	}
+	timer := time.NewTimer(interval)
+	defer timer.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-ticker.C:
-			var environment platformv1alpha1.Environment
-			if err := d.Client.Get(ctx, key, &environment); err != nil {
-				return
-			}
+		case <-timer.C:
+			environment := platformv1alpha1.Environment{ObjectMeta: metav1.ObjectMeta{Namespace: key.Namespace, Name: key.Name}}
 			if err := d.markActive(ctx, &environment, expectedUID); err != nil {
-				return
+				if errors.Is(err, errTerminalEnvironmentIncarnationChanged) {
+					return
+				}
+				timer.Reset(retryInterval)
+				continue
 			}
+			timer.Reset(interval)
 		}
 	}
 }
@@ -137,9 +151,12 @@ func (d KubernetesTerminalDialer) markActive(ctx context.Context, environment *p
 			return err
 		}
 		if environment.UID != expectedUID {
-			return fmt.Errorf("environment incarnation changed")
+			return errTerminalEnvironmentIncarnationChanged
 		}
 		now := metav1.Now()
+		if environment.Status.LastActiveAt != nil && !now.After(environment.Status.LastActiveAt.Time) {
+			return nil
+		}
 		environment.Status.LastActiveAt = &now
 		return d.Client.Status().Update(ctx, environment)
 	}); err != nil {

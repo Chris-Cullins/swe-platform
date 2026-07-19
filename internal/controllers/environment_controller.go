@@ -127,6 +127,7 @@ type EnvironmentReconciler struct {
 // +kubebuilder:rbac:groups=swe.dev,resources=environments/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=swe.dev,resources=environmenttemplates,verbs=get;list;watch
 // +kubebuilder:rbac:groups=swe.dev,resources=projects,verbs=get;list;watch
+// +kubebuilder:rbac:groups=swe.dev,resources=runs,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=persistentvolumeclaims,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=secrets,verbs=get;create;update;delete
@@ -382,7 +383,9 @@ func (r *EnvironmentReconciler) reconcileUnsupportedBackend(ctx context.Context,
 }
 
 // reconcileIdle schedules the next activity check or requests a pause once the
-// template's idle timeout has elapsed.
+// template's idle timeout has elapsed. An exact, non-terminal Run owner or
+// claim is authoritative activity regardless of timestamps. The subsequent
+// optimistic Environment patch closes the race with a concurrent claim.
 func (r *EnvironmentReconciler) reconcileIdle(ctx context.Context, env *platformv1alpha1.Environment, tmpl *platformv1alpha1.EnvironmentTemplate) (ctrl.Result, error) {
 	if env.Labels[warmPoolLabel] != "" {
 		return ctrl.Result{}, nil
@@ -391,9 +394,16 @@ func (r *EnvironmentReconciler) reconcileIdle(ctx context.Context, env *platform
 	if tmpl.Spec.IdleTimeout != nil {
 		timeout = tmpl.Spec.IdleTimeout.Duration
 	}
+	active, err := r.hasActiveRun(ctx, env)
+	if err != nil {
+		return ctrl.Result{}, fmt.Errorf("check active run: %w", err)
+	}
+	if active {
+		return ctrl.Result{RequeueAfter: timeout}, nil
+	}
 	remaining := timeout
 	if env.Status.LastActiveAt != nil {
-		remaining = time.Until(env.Status.LastActiveAt.Add(timeout))
+		remaining = env.Status.LastActiveAt.Add(timeout).Sub(r.now())
 	}
 	if remaining > 0 {
 		return ctrl.Result{RequeueAfter: remaining}, nil
@@ -409,6 +419,26 @@ func (r *EnvironmentReconciler) reconcileIdle(ctx context.Context, env *platform
 		return ctrl.Result{}, err
 	}
 	return ctrl.Result{Requeue: true}, nil
+}
+
+func (r *EnvironmentReconciler) hasActiveRun(ctx context.Context, env *platformv1alpha1.Environment) (bool, error) {
+	var reference *platformv1alpha1.RunReference
+	if owner := metav1.GetControllerOf(env); owner != nil && owner.APIVersion == platformv1alpha1.GroupVersion.String() && owner.Kind == "Run" {
+		reference = &platformv1alpha1.RunReference{Name: owner.Name, UID: owner.UID}
+	} else if env.Status.ClaimedBy != nil {
+		reference = env.Status.ClaimedBy
+	}
+	if reference == nil || reference.Name == "" || reference.UID == "" {
+		return false, nil
+	}
+	var run platformv1alpha1.Run
+	if err := r.Get(ctx, types.NamespacedName{Namespace: env.Namespace, Name: reference.Name}, &run); err != nil {
+		if errors.IsNotFound(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	return run.UID == reference.UID && !terminalRunState(run.Status.State), nil
 }
 
 // reconcileDeleting orders revocation: stop sandboxd, remove its credentials,
@@ -1406,6 +1436,13 @@ func (r *EnvironmentReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Owns(&corev1.Pod{}).
 		Owns(&corev1.PersistentVolumeClaim{}).
 		Owns(&networkingv1.NetworkPolicy{}).
+		Watches(&platformv1alpha1.Run{}, handler.EnqueueRequestsFromMapFunc(func(_ context.Context, object client.Object) []reconcile.Request {
+			run := object.(*platformv1alpha1.Run)
+			if run.Status.EnvironmentRef == nil {
+				return nil
+			}
+			return []reconcile.Request{{NamespacedName: types.NamespacedName{Namespace: run.Namespace, Name: run.Status.EnvironmentRef.Name}}}
+		})).
 		Watches(&platformv1alpha1.EnvironmentTemplate{}, handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, object client.Object) []reconcile.Request {
 			var environments platformv1alpha1.EnvironmentList
 			if err := r.List(ctx, &environments, client.InNamespace(object.GetNamespace()), client.MatchingFields{templateRefField: object.GetName()}); err != nil {

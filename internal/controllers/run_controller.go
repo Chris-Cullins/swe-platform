@@ -12,11 +12,14 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
+	"sigs.k8s.io/controller-runtime/pkg/predicate"
 
 	platformv1alpha1 "github.com/Chris-Cullins/swe-platform/api/v1alpha1"
 	"github.com/Chris-Cullins/swe-platform/internal/sandboxclient"
@@ -162,6 +165,11 @@ func (r *RunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.R
 		}
 		return ctrl.Result{}, err
 	}
+	if !env.Spec.Paused {
+		if err := r.touchEnvironmentActivity(ctx, env); err != nil {
+			return ctrl.Result{}, err
+		}
+	}
 	if run.Spec.Cancel {
 		if runMayHaveAccepted(&run) && !environmentFenced(env) {
 			adapter := r.Adapters[run.Spec.Agent]
@@ -222,9 +230,6 @@ func (r *RunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.R
 	case AdapterObservationAccepted:
 	case AdapterObservationRunning:
 		state = platformv1alpha1.RunStateRunning
-		if err := r.touchEnvironmentActivity(ctx, env); err != nil {
-			return ctrl.Result{}, err
-		}
 	case AdapterObservationNeedsInput:
 		state = platformv1alpha1.RunStateNeedsInput
 	case AdapterObservationSucceeded:
@@ -451,9 +456,33 @@ func (r *RunReconciler) promoteWarmEnvironment(ctx context.Context, run *platfor
 }
 
 func (r *RunReconciler) touchEnvironmentActivity(ctx context.Context, env *platformv1alpha1.Environment) error {
-	now := metav1.Now()
-	env.Status.LastActiveAt = &now
-	return r.Status().Update(ctx, env)
+	key := client.ObjectKeyFromObject(env)
+	expectedUID := env.UID
+	var updated platformv1alpha1.Environment
+	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		var current platformv1alpha1.Environment
+		if err := r.Get(ctx, key, &current); err != nil {
+			return err
+		}
+		if current.UID != expectedUID {
+			return errAllocatedEnvironmentGone
+		}
+		now := metav1.Now()
+		if current.Status.LastActiveAt != nil && now.Sub(current.Status.LastActiveAt.Time) < adapterPollInterval {
+			updated = current
+			return nil
+		}
+		current.Status.LastActiveAt = &now
+		if err := r.Status().Update(ctx, &current); err != nil {
+			return err
+		}
+		updated = current
+		return nil
+	})
+	if err == nil {
+		*env = *updated.DeepCopy()
+	}
+	return err
 }
 
 func (r *RunReconciler) wakeExplicitClaim(ctx context.Context, env *platformv1alpha1.Environment) error {
@@ -682,9 +711,19 @@ func (r *RunReconciler) adapterSandbox(run *platformv1alpha1.Run, env *platformv
 // SetupWithManager registers Run watches. Owned Environments enqueue through
 // Owns; claimed Environments enqueue Runs selected by their exact reference.
 func (r *RunReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	environmentEvents := builder.WithPredicates(predicate.Funcs{
+		CreateFunc:  func(event.CreateEvent) bool { return true },
+		DeleteFunc:  func(event.DeleteEvent) bool { return true },
+		GenericFunc: func(event.GenericEvent) bool { return true },
+		UpdateFunc: func(update event.UpdateEvent) bool {
+			oldEnvironment, oldOK := update.ObjectOld.(*platformv1alpha1.Environment)
+			newEnvironment, newOK := update.ObjectNew.(*platformv1alpha1.Environment)
+			return !oldOK || !newOK || runRelevantEnvironmentUpdate(oldEnvironment, newEnvironment)
+		},
+	})
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&platformv1alpha1.Run{}, builder.WithPredicates()).
-		Owns(&platformv1alpha1.Environment{}).
+		Owns(&platformv1alpha1.Environment{}, environmentEvents).
 		Watches(&platformv1alpha1.Environment{}, handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, object client.Object) []ctrl.Request {
 			var runs platformv1alpha1.RunList
 			if err := r.List(ctx, &runs, client.InNamespace(object.GetNamespace())); err != nil {
@@ -698,6 +737,19 @@ func (r *RunReconciler) SetupWithManager(mgr ctrl.Manager) error {
 				}
 			}
 			return requests
-		})).
+		}), environmentEvents).
 		Complete(r)
+}
+
+func runRelevantEnvironmentUpdate(oldEnvironment, newEnvironment *platformv1alpha1.Environment) bool {
+	oldStatus := oldEnvironment.Status.DeepCopy()
+	newStatus := newEnvironment.Status.DeepCopy()
+	oldStatus.LastActiveAt = nil
+	newStatus.LastActiveAt = nil
+	return oldEnvironment.Generation != newEnvironment.Generation ||
+		oldEnvironment.UID != newEnvironment.UID ||
+		!reflect.DeepEqual(oldEnvironment.DeletionTimestamp, newEnvironment.DeletionTimestamp) ||
+		!reflect.DeepEqual(oldEnvironment.OwnerReferences, newEnvironment.OwnerReferences) ||
+		!reflect.DeepEqual(oldEnvironment.Labels, newEnvironment.Labels) ||
+		!reflect.DeepEqual(*oldStatus, *newStatus)
 }
