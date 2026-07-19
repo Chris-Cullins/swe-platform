@@ -49,7 +49,9 @@ remain mandatory regardless. See [the security model](../../SECURITY.md) for cre
 lifecycle and backend requirements.
 
 For local development, use `values-kind.yaml`; it references locally loaded `:dev`
-images and disables leader election.
+images and disables leader election. `values-argocd.yaml` is the preset for the
+local Argo CD mirror (`hack/argocd-up.sh`): it tracks the mutable `:latest` images
+published from main and references an out-of-band bootstrap token Secret.
 
 ## Control-plane authentication and authorization
 

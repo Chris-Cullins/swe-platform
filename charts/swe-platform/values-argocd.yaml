@@ -1,0 +1,35 @@
+# Local Argo CD preset (hack/argocd-up.sh): tracks the mutable :latest images
+# published from main. The Image Updater rolls the operator and control plane
+# when a new :latest digest lands on GHCR; environment pods re-pull
+# env-base:latest on creation (pull policy follows the Kubernetes :latest
+# default). Not for production use.
+image:
+  repository: ghcr.io/chris-cullins/swe-platform/operator
+  tag: latest
+  pullPolicy: Always
+
+controlPlane:
+  image:
+    tag: latest
+    pullPolicy: Always
+  auth:
+    bootstrapTokenSecret:
+      # Created out of band by hack/argocd-up.sh; only the name is referenced.
+      name: swe-platform-bootstrap
+
+leaderElection: false
+
+environmentImage:
+  tag: latest
+
+environmentTemplates:
+  - name: small
+    spec:
+      image: ghcr.io/chris-cullins/swe-platform/env-base:latest
+      # Leave room for the claimed environment and its immediate pool replacement
+      # on kind's single control-plane node.
+      size: tiny
+      idleTimeout: 15m
+      diskSize: 5Gi
+      warmPool:
+        min: 1

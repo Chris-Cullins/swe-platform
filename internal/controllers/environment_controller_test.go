@@ -555,6 +555,27 @@ func TestChildNamesAreBoundedAndScopedToEnvironmentUID(t *testing.T) {
 	}
 }
 
+func TestEnvImagePullPolicyFollowsKubernetesLatestDefault(t *testing.T) {
+	cases := []struct {
+		image string
+		want  corev1.PullPolicy
+	}{
+		{"ghcr.io/chris-cullins/swe-platform/env-base:latest", corev1.PullAlways},
+		{"ghcr.io/chris-cullins/swe-platform/env-base", corev1.PullAlways},
+		{"registry.example.com:5000/swe-platform/env-base", corev1.PullAlways},
+		{"ghcr.io/chris-cullins/swe-platform/env-base:0.1.0", corev1.PullIfNotPresent},
+		{"ghcr.io/chris-cullins/swe-platform/env-base:dev", corev1.PullIfNotPresent},
+		{"ghcr.io/chris-cullins/swe-platform/env-base:sha-a1b2c3d", corev1.PullIfNotPresent},
+		{"ghcr.io/chris-cullins/swe-platform/env-base@sha256:0123456789abcdef", corev1.PullIfNotPresent},
+		{"ghcr.io/chris-cullins/swe-platform/env-base:latest@sha256:0123456789abcdef", corev1.PullIfNotPresent},
+	}
+	for _, tc := range cases {
+		if got := envImagePullPolicy(tc.image); got != tc.want {
+			t.Errorf("envImagePullPolicy(%q) = %q, want %q", tc.image, got, tc.want)
+		}
+	}
+}
+
 func TestDeleteObservedChildUsesUIDPrecondition(t *testing.T) {
 	scheme := runtime.NewScheme()
 	if err := corev1.AddToScheme(scheme); err != nil {

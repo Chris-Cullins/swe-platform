@@ -99,6 +99,14 @@ kind-up: ## Create the kind dev cluster
 kind-down: ## Delete the kind dev cluster
 	kind delete cluster --name $(KIND_CLUSTER)
 
+.PHONY: argocd-up
+argocd-up: ## Create the Argo CD cluster tracking origin/main
+	./hack/argocd-up.sh
+
+.PHONY: argocd-down
+argocd-down: ## Delete the Argo CD cluster
+	kind delete cluster --name swe-argo
+
 .PHONY: install-crds
 install-crds: manifests ## Install CRDs into the current cluster
 	kubectl apply -f config/crd/bases
