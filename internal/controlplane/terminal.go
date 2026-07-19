@@ -73,6 +73,9 @@ func (d KubernetesTerminalDialer) DialTerminal(ctx context.Context, namespace, n
 			return nil, nil, err
 		}
 	}
+	if !platformv1alpha1.IsEnvironmentReady(&environment) {
+		return nil, nil, fmt.Errorf("environment is not ready for its current generation")
+	}
 	if environment.Status.PodName == "" {
 		return nil, nil, fmt.Errorf("environment has no active pod")
 	}
@@ -84,8 +87,9 @@ func (d KubernetesTerminalDialer) DialTerminal(ctx context.Context, namespace, n
 	if !metav1.IsControlledBy(&pod, &environment) {
 		return nil, nil, fmt.Errorf("environment pod is not owned by the current environment")
 	}
-	if pod.Status.PodIP == "" {
-		return nil, nil, fmt.Errorf("environment pod has no IP address")
+	if !pod.DeletionTimestamp.IsZero() || !terminalPodReady(&pod) || pod.Status.PodIP == "" ||
+		environment.Status.Endpoints.Sandboxd != net.JoinHostPort(pod.Status.PodIP, sandboxdPort) {
+		return nil, nil, fmt.Errorf("environment pod is not the current ready sandboxd endpoint")
 	}
 	dialOptions, err := sandboxclient.DialOptions(&pod)
 	if err != nil {
@@ -106,6 +110,15 @@ func (d KubernetesTerminalDialer) DialTerminal(ctx context.Context, namespace, n
 	go d.heartbeatActivity(heartbeatContext, types.NamespacedName{Namespace: namespace, Name: name}, heartbeatInterval)
 	closer := &activeTerminalConnection{Closer: connection, cancel: cancelHeartbeat}
 	return sandboxdv1.NewTerminalServiceClient(connection), closer, nil
+}
+
+func terminalPodReady(pod *corev1.Pod) bool {
+	for _, condition := range pod.Status.Conditions {
+		if condition.Type == corev1.PodReady {
+			return condition.Status == corev1.ConditionTrue
+		}
+	}
+	return false
 }
 
 func (d KubernetesTerminalDialer) activityHeartbeatInterval(ctx context.Context, environment *platformv1alpha1.Environment) (time.Duration, error) {
@@ -168,7 +181,7 @@ func (d KubernetesTerminalDialer) waitUntilReady(ctx context.Context, namespace,
 		if err := d.Client.Get(wakeContext, key, environment); err != nil {
 			return fmt.Errorf("wait for environment wake: %w", err)
 		}
-		if environment.Status.Phase == platformv1alpha1.EnvironmentPhaseReady && environment.Status.PodName != "" {
+		if platformv1alpha1.IsEnvironmentReady(environment) && environment.Status.PodName != "" {
 			return nil
 		}
 		select {

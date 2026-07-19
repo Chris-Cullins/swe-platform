@@ -3,13 +3,17 @@ package main
 import (
 	"context"
 	"crypto/tls"
+	"crypto/x509"
+	"encoding/pem"
 	"flag"
 	"fmt"
 	"log"
 	"net"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
+	"time"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
@@ -23,8 +27,14 @@ import (
 var Version = "dev"
 
 func main() {
+	if len(os.Args) >= 2 && os.Args[1] == "healthcheck" {
+		if err := healthcheck(os.Args[2:]); err != nil {
+			log.Fatal(err)
+		}
+		return
+	}
 	if len(os.Args) < 2 || os.Args[1] != "serve" {
-		fmt.Fprintln(os.Stderr, "usage: sandboxd serve [-addr :50051] [-workspace /workspace] -tls-cert FILE -tls-key FILE -capabilities FILE")
+		fmt.Fprintln(os.Stderr, "usage: sandboxd serve ... | sandboxd healthcheck -ca FILE -token FILE")
 		os.Exit(2)
 	}
 
@@ -83,4 +93,56 @@ func main() {
 	if err := grpcServer.Serve(lis); err != nil {
 		log.Fatalf("serve: %v", err)
 	}
+}
+
+func healthcheck(args []string) error {
+	fs := flag.NewFlagSet("healthcheck", flag.ContinueOnError)
+	addr := fs.String("addr", "127.0.0.1:50051", "sandboxd gRPC address")
+	caPath := fs.String("ca", "", "sandboxd TLS certificate")
+	tokenPath := fs.String("token", "", "health capability token")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if *caPath == "" || *tokenPath == "" {
+		return fmt.Errorf("-ca and -token are required")
+	}
+	certificatePEM, err := os.ReadFile(*caPath)
+	if err != nil {
+		return fmt.Errorf("read health trust certificate: %w", err)
+	}
+	block, _ := pem.Decode(certificatePEM)
+	if block == nil {
+		return fmt.Errorf("decode health trust certificate: no PEM certificate")
+	}
+	certificate, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		return fmt.Errorf("parse health trust certificate: %w", err)
+	}
+	if len(certificate.DNSNames) == 0 {
+		return fmt.Errorf("health trust certificate has no DNS identity")
+	}
+	roots := x509.NewCertPool()
+	roots.AddCert(certificate)
+	token, err := os.ReadFile(*tokenPath)
+	if err != nil {
+		return fmt.Errorf("read health capability: %w", err)
+	}
+	connection, err := grpc.NewClient(*addr,
+		grpc.WithTransportCredentials(credentials.NewTLS(&tls.Config{RootCAs: roots, ServerName: certificate.DNSNames[0], MinVersion: tls.VersionTLS13})),
+		grpc.WithPerRPCCredentials(auth.BearerCredentials{Token: strings.TrimSpace(string(token))}),
+	)
+	if err != nil {
+		return fmt.Errorf("create health client: %w", err)
+	}
+	defer connection.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 1500*time.Millisecond)
+	defer cancel()
+	response, err := sandboxdv1.NewHealthServiceClient(connection).Check(ctx, &sandboxdv1.HealthCheckRequest{})
+	if err != nil {
+		return fmt.Errorf("check sandboxd health: %w", err)
+	}
+	if !response.Ok {
+		return fmt.Errorf("sandboxd reported unhealthy")
+	}
+	return nil
 }

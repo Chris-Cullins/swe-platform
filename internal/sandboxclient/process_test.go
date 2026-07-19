@@ -29,10 +29,13 @@ func TestDialProcessValidatesCurrentEnvironmentPodAndCredentialIncarnation(t *te
 	certificate := processTestCertificate(t, identity)
 	env := &platformv1alpha1.Environment{ObjectMeta: metav1.ObjectMeta{Name: "environment", Namespace: "ns", UID: "env-uid"}, Status: platformv1alpha1.EnvironmentStatus{
 		Phase: platformv1alpha1.EnvironmentPhaseReady, PodName: "env-environment", Endpoints: platformv1alpha1.EnvironmentEndpoints{Sandboxd: "10.0.0.1:50051"},
+		Conditions: []metav1.Condition{{Type: platformv1alpha1.EnvironmentConditionReady, Status: metav1.ConditionTrue, Reason: "SandboxdReady", Message: "sandboxd is ready"}},
 	}}
 	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: env.Status.PodName, Namespace: env.Namespace, UID: "pod-uid", Annotations: map[string]string{
-		sandboxdauth.IdentityAnnotation: identity, sandboxdauth.SecretUIDAnnotation: "secret-uid",
-	}, OwnerReferences: []metav1.OwnerReference{{APIVersion: platformv1alpha1.GroupVersion.String(), Kind: "Environment", Name: env.Name, UID: env.UID, Controller: processTestPtr(true)}}}, Status: corev1.PodStatus{PodIP: "10.0.0.1"}}
+		sandboxdauth.IdentityAnnotation: identity, sandboxdauth.SecretUIDAnnotation: "secret-uid", sandboxdauth.SecretNameAnnotation: "env-environment-sandboxd",
+	}, OwnerReferences: []metav1.OwnerReference{{APIVersion: platformv1alpha1.GroupVersion.String(), Kind: "Environment", Name: env.Name, UID: env.UID, Controller: processTestPtr(true)}}}, Status: corev1.PodStatus{
+		PodIP: "10.0.0.1", Conditions: []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}},
+	}}
 	secret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "env-environment-sandboxd", Namespace: env.Namespace, UID: "secret-uid", Annotations: map[string]string{
 		sandboxdauth.IdentityAnnotation: identity, sandboxdauth.PodUIDAnnotation: string(pod.UID),
 	}, OwnerReferences: []metav1.OwnerReference{{APIVersion: platformv1alpha1.GroupVersion.String(), Kind: "Environment", Name: env.Name, UID: env.UID, Controller: processTestPtr(true)}}}, Data: map[string][]byte{
@@ -55,6 +58,21 @@ func TestDialProcessValidatesCurrentEnvironmentPodAndCredentialIncarnation(t *te
 		t.Fatalf("valid process dial handle: process nil=%t, close nil=%t, error=%v", process == nil, closeConnection == nil, err)
 	}
 	if err := closeConnection(); err != nil {
+		t.Fatal(err)
+	}
+	longNameEnv := env.DeepCopy()
+	longNameEnv.Name = strings.Repeat("long-environment-", 5)
+	longNamePod := pod.DeepCopy()
+	longNamePod.OwnerReferences[0].Name = longNameEnv.Name
+	longNamePod.Annotations[sandboxdauth.SecretNameAnnotation] = "bounded-credential-name"
+	longNameSecret := secret.DeepCopy()
+	longNameSecret.Name = "bounded-credential-name"
+	longNameSecret.OwnerReferences[0].Name = longNameEnv.Name
+	_, closeLongName, err := DialProcess(context.Background(), newClient(longNameEnv, longNamePod, longNameSecret), longNameEnv.Namespace, longNameEnv.Name, longNameEnv.UID)
+	if err != nil {
+		t.Fatalf("long-name Environment credential lookup: %v", err)
+	}
+	if err := closeLongName(); err != nil {
 		t.Fatal(err)
 	}
 

@@ -49,7 +49,7 @@ func (r *WarmPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 
 	ready := int32(0)
 	for i := range environments.Items {
-		if environments.Items[i].Status.Phase == platformv1alpha1.EnvironmentPhaseReady && environments.Items[i].Status.ClaimedBy == nil {
+		if platformv1alpha1.IsEnvironmentReady(&environments.Items[i]) && environments.Items[i].Status.ClaimedBy == nil {
 			ready++
 		}
 	}
@@ -67,7 +67,8 @@ func (r *WarmPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 		if env.Status.ClaimedBy != nil || !env.DeletionTimestamp.IsZero() {
 			continue
 		}
-		if env.Spec.Paused || env.Status.Phase == platformv1alpha1.EnvironmentPhaseFailed || env.Status.Phase == platformv1alpha1.EnvironmentPhaseTerminated {
+		statusCurrent := env.Status.ObservedGeneration == env.Generation
+		if env.Spec.Paused || statusCurrent && (env.Status.Phase == platformv1alpha1.EnvironmentPhaseFailed || env.Status.Phase == platformv1alpha1.EnvironmentPhaseTerminated) {
 			resourceVersion := env.ResourceVersion
 			if err := r.Delete(ctx, env, client.Preconditions{ResourceVersion: &resourceVersion}); errors.IsConflict(err) || errors.IsNotFound(err) {
 				return ctrl.Result{Requeue: true}, nil

@@ -175,12 +175,19 @@ func (r *RunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.R
 		}
 		return ctrl.Result{}, r.setRunState(ctx, &run, platformv1alpha1.RunStateCancelled, "Cancelled", "cancellation completed", environmentReachable(env))
 	}
+	if env.Status.ObservedGeneration != env.Generation {
+		return ctrl.Result{}, r.setRunState(ctx, &run, platformv1alpha1.RunStateAllocating, "EnvironmentStatusStale", "environment status has not observed the current generation", false)
+	}
 
 	switch env.Status.Phase {
 	case platformv1alpha1.EnvironmentPhasePaused, platformv1alpha1.EnvironmentPhaseResuming:
 		return ctrl.Result{}, r.setRunState(ctx, &run, platformv1alpha1.RunStatePaused, "EnvironmentPaused", "managed processes stop; workspace and transcript are retained", false)
 	case platformv1alpha1.EnvironmentPhaseFailed, platformv1alpha1.EnvironmentPhaseTerminated:
-		return ctrl.Result{}, r.setRunState(ctx, &run, platformv1alpha1.RunStateFailed, "EnvironmentFailed", fmt.Sprintf("environment phase is %s", env.Status.Phase), false)
+		message := fmt.Sprintf("environment phase is %s", env.Status.Phase)
+		if condition := apiMeta.FindStatusCondition(env.Status.Conditions, platformv1alpha1.EnvironmentConditionReady); condition != nil && condition.Message != "" {
+			message = condition.Reason + ": " + condition.Message
+		}
+		return ctrl.Result{}, r.setRunState(ctx, &run, platformv1alpha1.RunStateFailed, "EnvironmentFailed", message, false)
 	case platformv1alpha1.EnvironmentPhaseReady, platformv1alpha1.EnvironmentPhaseRunning:
 		// Continue below.
 	default:
@@ -392,7 +399,7 @@ func (r *RunReconciler) claimWarmEnvironment(ctx context.Context, run *platformv
 	for i := range environments.Items {
 		env := &environments.Items[i]
 		owner := metav1.GetControllerOf(env)
-		if env.Spec.TemplateRef != template || env.Spec.Paused || env.Status.Phase != platformv1alpha1.EnvironmentPhaseReady || env.Status.ClaimedBy != nil || owner == nil || owner.Kind != "EnvironmentTemplate" || owner.Name != template {
+		if env.Spec.TemplateRef != template || env.Spec.Paused || !platformv1alpha1.IsEnvironmentReady(env) || env.Status.ClaimedBy != nil || owner == nil || owner.Kind != "EnvironmentTemplate" || owner.Name != template {
 			continue
 		}
 		now := metav1.Now()
@@ -435,10 +442,8 @@ func (r *RunReconciler) promoteWarmEnvironment(ctx context.Context, run *platfor
 	// adapter cannot start until Environment reconciliation has applied the
 	// project and republished the current sandboxd endpoint. Do this on recovery
 	// too, closing a crash between promotion and the Run status write.
-	if env.Status.Phase == platformv1alpha1.EnvironmentPhaseReady {
-		env.Status.Phase = platformv1alpha1.EnvironmentPhaseSetup
-		env.Status.PodName = ""
-		env.Status.Endpoints = platformv1alpha1.EnvironmentEndpoints{}
+	if env.Status.Phase == platformv1alpha1.EnvironmentPhaseReady || env.Status.Phase == platformv1alpha1.EnvironmentPhaseRunning {
+		applyEnvironmentStatus(env, platformv1alpha1.EnvironmentPhaseSetup, "", "", "SetupInProgress", "warm environment is being configured for its project", env.Status.LastActiveAt)
 		if err := r.Status().Update(ctx, env); err != nil {
 			return fmt.Errorf("withdraw warm environment %q readiness: %w", env.Name, err)
 		}
@@ -462,8 +467,7 @@ func (r *RunReconciler) wakeExplicitClaim(ctx context.Context, env *platformv1al
 }
 
 func environmentReachable(env *platformv1alpha1.Environment) bool {
-	return (env.Status.Phase == platformv1alpha1.EnvironmentPhaseReady || env.Status.Phase == platformv1alpha1.EnvironmentPhaseRunning) &&
-		env.Status.PodName != "" && env.Status.Endpoints.Sandboxd != ""
+	return platformv1alpha1.IsEnvironmentReady(env) && env.Status.PodName != "" && env.Status.Endpoints.Sandboxd != ""
 }
 
 func exactControllerOwner(object metav1.Object, apiVersion, kind, name string, uid types.UID) bool {

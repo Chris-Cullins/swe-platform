@@ -109,6 +109,12 @@ func runScheme(t *testing.T) *runtime.Scheme {
 func reconciler(t *testing.T, adapter AdapterLifecycle, objects ...client.Object) *RunReconciler {
 	t.Helper()
 	s := runScheme(t)
+	for _, object := range objects {
+		env, ok := object.(*platformv1alpha1.Environment)
+		if ok && (env.Status.Phase == platformv1alpha1.EnvironmentPhaseReady || env.Status.Phase == platformv1alpha1.EnvironmentPhaseRunning) {
+			applyEnvironmentStatus(env, env.Status.Phase, env.Status.PodName, env.Status.Endpoints.Sandboxd, "SandboxdReady", "sandboxd is ready", env.Status.LastActiveAt)
+		}
+	}
 	// Most lifecycle tests predate the ownership/endpoint security fences. Give
 	// their intentionally valid fixtures the exact current Run owner and a
 	// reachable endpoint; mismatch tests construct their reconciler directly.
@@ -475,6 +481,41 @@ func TestNonterminalAdapterObservationSchedulesPolling(t *testing.T) {
 	}
 	if result.RequeueAfter != adapterPollInterval {
 		t.Fatalf("RequeueAfter = %s, want %s", result.RequeueAfter, adapterPollInterval)
+	}
+}
+
+func TestEnvironmentReachableRequiresCurrentGenerationReady(t *testing.T) {
+	env := &platformv1alpha1.Environment{ObjectMeta: metav1.ObjectMeta{Generation: 2}, Status: platformv1alpha1.EnvironmentStatus{
+		ObservedGeneration: 1,
+		Phase:              platformv1alpha1.EnvironmentPhaseReady,
+		PodName:            "env-test",
+		Endpoints:          platformv1alpha1.EnvironmentEndpoints{Sandboxd: "10.0.0.1:50051"},
+		Conditions: []metav1.Condition{{
+			Type: platformv1alpha1.EnvironmentConditionReady, Status: metav1.ConditionTrue,
+			ObservedGeneration: 1, Reason: "SandboxdReady", Message: "stale readiness",
+		}},
+	}}
+	if environmentReachable(env) {
+		t.Fatal("stale-generation Ready condition was accepted")
+	}
+	applyEnvironmentStatus(env, platformv1alpha1.EnvironmentPhaseReady, env.Status.PodName, env.Status.Endpoints.Sandboxd, "SandboxdReady", "current readiness", nil)
+	if !environmentReachable(env) {
+		t.Fatal("current-generation Ready condition was rejected")
+	}
+}
+
+func TestRunDoesNotFailOnStaleEnvironmentFailure(t *testing.T) {
+	run := &platformv1alpha1.Run{ObjectMeta: metav1.ObjectMeta{Name: "r", Namespace: "ns", UID: "run-uid", Finalizers: []string{runFinalizer}}, Spec: platformv1alpha1.RunSpec{Agent: "test"}, Status: platformv1alpha1.RunStatus{
+		State:          platformv1alpha1.RunStateAllocating,
+		EnvironmentRef: &platformv1alpha1.RunEnvironmentReference{Name: "e", UID: "env-uid", Ownership: platformv1alpha1.EnvironmentOwnershipOwned},
+	}}
+	env := &platformv1alpha1.Environment{ObjectMeta: metav1.ObjectMeta{Name: "e", Namespace: "ns", UID: "env-uid", Generation: 2}, Status: platformv1alpha1.EnvironmentStatus{
+		ObservedGeneration: 1, Phase: platformv1alpha1.EnvironmentPhaseFailed,
+	}}
+	r := reconciler(t, &scriptedAdapter{}, run, env)
+	got := reconcileRun(t, r, run.Name)
+	if got.Status.State != platformv1alpha1.RunStateAllocating {
+		t.Fatalf("Run state = %s, stale Environment failure became terminal", got.Status.State)
 	}
 }
 

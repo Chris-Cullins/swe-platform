@@ -6,6 +6,9 @@ import (
 	"encoding/json"
 	"encoding/pem"
 	stderrors "errors"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -78,14 +81,60 @@ func TestEnsurePodInjectsProjectSecret(t *testing.T) {
 	if setup.Name != "project-setup" {
 		t.Errorf("init container name = %q, want project-setup", setup.Name)
 	}
-	if len(setup.Env) != 1 || setup.Env[0].Name != "SWE_REPOSITORY" || setup.Env[0].Value != project.Spec.Repositories[0] {
-		t.Errorf("init container Env = %#v, want SWE_REPOSITORY=%s", setup.Env, project.Spec.Repositories[0])
+	if len(setup.Env) != 3 || setup.Env[0].Name != "SWE_REPOSITORY" || setup.Env[0].Value != project.Spec.Repositories[0] ||
+		setup.Env[1].Name != "SWE_HOOK_TIMEOUT" || setup.Env[1].Value != projectHookTimeout ||
+		setup.Env[2].Name != "SWE_HOOK_KILL_AFTER" || setup.Env[2].Value != hookKillAfter {
+		t.Errorf("init container Env = %#v, want repository and bounded hook timeout", setup.Env)
 	}
 	if len(setup.EnvFrom) != 1 || setup.EnvFrom[0].SecretRef == nil || setup.EnvFrom[0].SecretRef.Name != "project-config" {
 		t.Errorf("init container EnvFrom = %#v, want project-config Secret", setup.EnvFrom)
 	}
 	if len(setup.VolumeMounts) != 1 || setup.VolumeMounts[0].MountPath != "/workspace" {
 		t.Errorf("init container VolumeMounts = %#v, want /workspace", setup.VolumeMounts)
+	}
+}
+
+func TestHookRunnerBoundsAndPropagatesExecution(t *testing.T) {
+	directory := t.TempDir()
+	run := func(name, contents, timeout, killAfter string) (int, time.Duration) {
+		t.Helper()
+		hook := filepath.Join(directory, name)
+		if err := os.WriteFile(hook, []byte(contents), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		command := exec.Command("/bin/sh", "-c", hookRunnerScript+"\nrun_hook \"$HOOK\"\n")
+		command.Env = append(os.Environ(), "HOOK="+hook, "SWE_HOOK_TIMEOUT="+timeout, "SWE_HOOK_KILL_AFTER="+killAfter)
+		started := time.Now()
+		err := command.Run()
+		elapsed := time.Since(started)
+		if err == nil {
+			return 0, elapsed
+		}
+		var exitError *exec.ExitError
+		if !stderrors.As(err, &exitError) {
+			t.Fatalf("run hook: %v", err)
+		}
+		return exitError.ExitCode(), elapsed
+	}
+
+	output := filepath.Join(directory, "ran")
+	hook := filepath.Join(directory, "success")
+	if err := os.WriteFile(hook, []byte("echo ran > \"$OUTPUT\"\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	command := exec.Command("/bin/sh", "-c", hookRunnerScript+"\nrun_hook \"$HOOK\"\n")
+	command.Env = append(os.Environ(), "HOOK="+hook, "OUTPUT="+output, "SWE_HOOK_TIMEOUT=1s", "SWE_HOOK_KILL_AFTER=1s")
+	if err := command.Run(); err != nil {
+		t.Fatalf("successful hook: %v", err)
+	}
+	if _, err := os.Stat(output); err != nil {
+		t.Fatal("successful hook did not run")
+	}
+	if code, _ := run("failure", "exit 7\n", "1s", "1s"); code != 7 {
+		t.Fatalf("failing hook exit = %d, want 7", code)
+	}
+	if code, elapsed := run("timeout", "trap '' TERM\nwhile :; do sleep 1; done\n", "0.1s", "0.1s"); code != 124 || elapsed > 2*time.Second {
+		t.Fatalf("timed-out hook = exit %d after %s, want exit 124 within bound", code, elapsed)
 	}
 }
 
@@ -119,6 +168,12 @@ func TestEnsurePodCreatesAndRotatesEphemeralSandboxdCredentials(t *testing.T) {
 	if pod.Spec.AutomountServiceAccountToken == nil || *pod.Spec.AutomountServiceAccountToken {
 		t.Fatal("environment pod must not mount a Kubernetes service account token")
 	}
+	container := pod.Spec.Containers[0]
+	for name, probe := range map[string]*corev1.Probe{"startup": container.StartupProbe, "readiness": container.ReadinessProbe, "liveness": container.LivenessProbe} {
+		if probe == nil || probe.Exec == nil || len(probe.Exec.Command) < 2 || probe.Exec.Command[1] != "healthcheck" {
+			t.Errorf("%s probe = %#v, want authenticated sandboxd health RPC", name, probe)
+		}
+	}
 	credentialMount := pod.Spec.Containers[0].VolumeMounts[1]
 	if credentialMount.MountPath != sandboxdCredentialMount || !credentialMount.ReadOnly {
 		t.Fatalf("credential mount = %#v, want read-only non-workspace mount", credentialMount)
@@ -146,8 +201,10 @@ func TestEnsurePodCreatesAndRotatesEphemeralSandboxdCredentials(t *testing.T) {
 	if err := json.Unmarshal(first.Data[sandboxdauth.CapabilitiesKey], &capabilityConfig); err != nil {
 		t.Fatal(err)
 	}
-	if len(capabilityConfig.Grants) != 2 || len(capabilityConfig.Grants[0].Capabilities) != 2 || len(capabilityConfig.Grants[1].Capabilities) != 1 || capabilityConfig.Grants[1].Capabilities[0] != sandboxdauth.CapabilityProcess {
-		t.Fatalf("capability grants = %#v, want terminal/health and distinct process grants", capabilityConfig.Grants)
+	if len(capabilityConfig.Grants) != 3 || len(capabilityConfig.Grants[0].Capabilities) != 2 ||
+		len(capabilityConfig.Grants[1].Capabilities) != 1 || capabilityConfig.Grants[1].Capabilities[0] != sandboxdauth.CapabilityHealth ||
+		len(capabilityConfig.Grants[2].Capabilities) != 1 || capabilityConfig.Grants[2].Capabilities[0] != sandboxdauth.CapabilityProcess {
+		t.Fatalf("capability grants = %#v, want terminal, probe health, and distinct process grants", capabilityConfig.Grants)
 	}
 	if _, published := pod.Annotations[sandboxdauth.ProcessTokenKey]; published {
 		t.Fatal("process token was published on pod")
@@ -287,10 +344,11 @@ func TestEnsurePodRetainsCurrentPodWhenSecretReadFails(t *testing.T) {
 	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
 		Name: envPodName(env), Namespace: env.Namespace,
 		Annotations: map[string]string{
-			sandboxdRevisionAnnotation:      sandboxdSecurityRevision,
-			sandboxdauth.IdentityAnnotation: "current.sandboxd.swe.dev",
-			sandboxdauth.TrustAnnotation:    "public trust bundle",
-			sandboxdauth.TokenAnnotation:    "terminal token",
+			sandboxdRevisionAnnotation:        sandboxdSecurityRevision,
+			sandboxdauth.IdentityAnnotation:   "current.sandboxd.swe.dev",
+			sandboxdauth.TrustAnnotation:      "public trust bundle",
+			sandboxdauth.TokenAnnotation:      "terminal token",
+			sandboxdauth.SecretNameAnnotation: envCredentialName(env),
 		},
 	}}
 	if err := controllerutil.SetControllerReference(env, pod, scheme); err != nil {
@@ -326,10 +384,11 @@ func TestEnsurePodRetainsCurrentPodAndForeignSecretOnCollision(t *testing.T) {
 	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
 		Name: envPodName(env), Namespace: env.Namespace,
 		Annotations: map[string]string{
-			sandboxdRevisionAnnotation:      sandboxdSecurityRevision,
-			sandboxdauth.IdentityAnnotation: "current.sandboxd.swe.dev",
-			sandboxdauth.TrustAnnotation:    "public trust bundle",
-			sandboxdauth.TokenAnnotation:    "terminal token",
+			sandboxdRevisionAnnotation:        sandboxdSecurityRevision,
+			sandboxdauth.IdentityAnnotation:   "current.sandboxd.swe.dev",
+			sandboxdauth.TrustAnnotation:      "public trust bundle",
+			sandboxdauth.TokenAnnotation:      "terminal token",
+			sandboxdauth.SecretNameAnnotation: envCredentialName(env),
 		},
 	}}
 	if err := controllerutil.SetControllerReference(env, pod, scheme); err != nil {
@@ -483,6 +542,82 @@ func TestDeleteObservedChildUsesUIDPrecondition(t *testing.T) {
 	}
 }
 
+func TestPodReplacementWithdrawsReadinessBeforeDeletion(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	if err := platformv1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	env := &platformv1alpha1.Environment{ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default", UID: "env-uid", Generation: 3}, Status: platformv1alpha1.EnvironmentStatus{
+		ObservedGeneration: 3, Phase: platformv1alpha1.EnvironmentPhaseReady, PodName: "env-test",
+		Endpoints: platformv1alpha1.EnvironmentEndpoints{Sandboxd: "10.0.0.1:50051"},
+		Conditions: []metav1.Condition{{Type: platformv1alpha1.EnvironmentConditionReady, Status: metav1.ConditionTrue,
+			ObservedGeneration: 3, Reason: "SandboxdReady", Message: "sandboxd is ready"}},
+	}}
+	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: envPodName(env), Namespace: env.Namespace, UID: "old-pod",
+		Annotations: map[string]string{sandboxdRevisionAnnotation: "1"}}}
+	if err := controllerutil.SetControllerReference(env, pod, scheme); err != nil {
+		t.Fatal(err)
+	}
+	baseClient := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(env).WithObjects(env, pod).Build()
+	readinessWithdrawn := false
+	interceptedClient := interceptor.NewClient(baseClient, interceptor.Funcs{
+		Delete: func(ctx context.Context, underlying client.WithWatch, object client.Object, options ...client.DeleteOption) error {
+			var current platformv1alpha1.Environment
+			if err := underlying.Get(ctx, client.ObjectKeyFromObject(env), &current); err != nil {
+				return err
+			}
+			readinessWithdrawn = !platformv1alpha1.IsEnvironmentReady(&current) && current.Status.PodName == "" && current.Status.Endpoints.Sandboxd == ""
+			return underlying.Delete(ctx, object, options...)
+		},
+	})
+	reconciler := &EnvironmentReconciler{Client: interceptedClient, Scheme: scheme}
+
+	if _, err := reconciler.ensurePod(context.Background(), env, &platformv1alpha1.EnvironmentTemplate{}); err != nil {
+		t.Fatal(err)
+	}
+	if !readinessWithdrawn {
+		t.Fatal("pod replacement deleted the old incarnation before withdrawing readiness")
+	}
+}
+
+func TestTerminatingPodCannotRemainReady(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	if err := platformv1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	deletedAt := metav1.Now()
+	env := &platformv1alpha1.Environment{ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default", UID: "env-uid", Generation: 2}, Status: platformv1alpha1.EnvironmentStatus{
+		ObservedGeneration: 2, Phase: platformv1alpha1.EnvironmentPhaseReady, PodName: "env-test",
+		Endpoints: platformv1alpha1.EnvironmentEndpoints{Sandboxd: "10.0.0.1:50051"},
+		Conditions: []metav1.Condition{{Type: platformv1alpha1.EnvironmentConditionReady, Status: metav1.ConditionTrue,
+			ObservedGeneration: 2, Reason: "SandboxdReady", Message: "sandboxd is ready"}},
+	}}
+	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: envPodName(env), Namespace: env.Namespace, UID: "pod-uid",
+		DeletionTimestamp: &deletedAt, Finalizers: []string{"test/hold"}}}
+	if err := controllerutil.SetControllerReference(env, pod, scheme); err != nil {
+		t.Fatal(err)
+	}
+	reconciler := &EnvironmentReconciler{Client: fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(env).WithObjects(env, pod).Build(), Scheme: scheme}
+	got, err := reconciler.ensurePod(context.Background(), env, &platformv1alpha1.EnvironmentTemplate{})
+	if err != nil || got != nil {
+		t.Fatalf("ensurePod() = (%#v, %v), want wait for terminating pod", got, err)
+	}
+	var updated platformv1alpha1.Environment
+	if err := reconciler.Get(context.Background(), client.ObjectKeyFromObject(env), &updated); err != nil {
+		t.Fatal(err)
+	}
+	ready := apimeta.FindStatusCondition(updated.Status.Conditions, platformv1alpha1.EnvironmentConditionReady)
+	if platformv1alpha1.IsEnvironmentReady(&updated) || updated.Status.PodName != "" || updated.Status.Endpoints.Sandboxd != "" || ready == nil || ready.Reason != "PodTerminating" {
+		t.Fatalf("terminating pod status = %#v", updated.Status)
+	}
+}
+
 func TestNewEnvironmentRefusesTerminatingPriorIncarnationPVC(t *testing.T) {
 	scheme := runtime.NewScheme()
 	if err := corev1.AddToScheme(scheme); err != nil {
@@ -586,9 +721,28 @@ func TestEnvironmentDeletionStopsPodBeforeRevokingCredentials(t *testing.T) {
 	if err := platformv1alpha1.AddToScheme(scheme); err != nil {
 		t.Fatal(err)
 	}
-	env := &platformv1alpha1.Environment{ObjectMeta: metav1.ObjectMeta{
-		Name: "test", Namespace: "default", UID: "environment-uid", Finalizers: []string{environmentFinalizer},
-	}}
+	env := &platformv1alpha1.Environment{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "test", Namespace: "default", UID: "environment-uid", Generation: 1,
+			Finalizers: []string{environmentFinalizer},
+		},
+		Status: platformv1alpha1.EnvironmentStatus{
+			ObservedGeneration: 1,
+			Phase:              platformv1alpha1.EnvironmentPhaseReady,
+			PodName:            "env-test",
+			Endpoints:          platformv1alpha1.EnvironmentEndpoints{Sandboxd: "10.0.0.1:50051"},
+			Conditions: []metav1.Condition{{
+				Type: platformv1alpha1.EnvironmentConditionReady, Status: metav1.ConditionTrue, ObservedGeneration: 1,
+				Reason: "SandboxdReady", LastTransitionTime: metav1.Now(),
+			}},
+		},
+	}
+	deletingEnv := env.DeepCopy()
+	deletedAt := metav1.Now()
+	deletingEnv.DeletionTimestamp = &deletedAt
+	if platformv1alpha1.IsEnvironmentReady(deletingEnv) {
+		t.Fatal("deleting Environment reported ready")
+	}
 	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: envPodName(env), Namespace: env.Namespace, UID: "pod-uid"}}
 	secret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: envCredentialName(env), Namespace: env.Namespace, UID: "secret-uid"}}
 	policy := &networkingv1.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{Name: envNetworkPolicyName(env), Namespace: env.Namespace, UID: "policy-uid"}}
@@ -598,28 +752,36 @@ func TestEnvironmentDeletionStopsPodBeforeRevokingCredentials(t *testing.T) {
 		}
 	}
 	reconciler := &EnvironmentReconciler{
-		Client: fake.NewClientBuilder().WithScheme(scheme).WithObjects(env, pod, secret, policy).Build(), Scheme: scheme,
+		Client: fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(env).WithObjects(env, pod, secret, policy).Build(), Scheme: scheme,
 	}
 
 	result, err := reconciler.reconcileDeleting(context.Background(), env)
 	if err != nil || !result.Requeue {
 		t.Fatalf("delete pod step = (%#v, %v)", result, err)
 	}
+	var deleting platformv1alpha1.Environment
+	if err := reconciler.Get(context.Background(), client.ObjectKeyFromObject(env), &deleting); err != nil {
+		t.Fatal(err)
+	}
+	ready := apimeta.FindStatusCondition(deleting.Status.Conditions, platformv1alpha1.EnvironmentConditionReady)
+	if ready == nil || ready.Status != metav1.ConditionFalse || ready.Reason != "Deleting" || deleting.Status.PodName != "" || deleting.Status.Endpoints.Sandboxd != "" {
+		t.Fatalf("status before pod deletion = %#v, want readiness and endpoint withdrawn", deleting.Status)
+	}
 	if err := reconciler.Get(context.Background(), client.ObjectKeyFromObject(secret), &corev1.Secret{}); err != nil {
 		t.Fatal("credentials were revoked before sandboxd stopped")
 	}
-	result, err = reconciler.reconcileDeleting(context.Background(), env)
+	result, err = reconciler.reconcileDeleting(context.Background(), &deleting)
 	if err != nil || !result.Requeue {
 		t.Fatalf("revoke credentials step = (%#v, %v)", result, err)
 	}
 	if err := reconciler.Get(context.Background(), client.ObjectKeyFromObject(policy), &networkingv1.NetworkPolicy{}); err != nil {
 		t.Fatal("network policy was removed before credentials were revoked")
 	}
-	result, err = reconciler.reconcileDeleting(context.Background(), env)
+	result, err = reconciler.reconcileDeleting(context.Background(), &deleting)
 	if err != nil || !result.Requeue {
 		t.Fatalf("remove network policy step = (%#v, %v)", result, err)
 	}
-	if _, err := reconciler.reconcileDeleting(context.Background(), env); err != nil {
+	if _, err := reconciler.reconcileDeleting(context.Background(), &deleting); err != nil {
 		t.Fatal(err)
 	}
 	var updated platformv1alpha1.Environment
@@ -674,7 +836,7 @@ func TestSyncStatusPublishesSandboxdEndpoint(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	env := &platformv1alpha1.Environment{ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default"}}
+	env := &platformv1alpha1.Environment{ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default", Generation: 4}}
 	reconciler := &EnvironmentReconciler{
 		Client: fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(env).WithObjects(env).Build(),
 		Scheme: scheme,
@@ -697,6 +859,135 @@ func TestSyncStatusPublishesSandboxdEndpoint(t *testing.T) {
 	}
 	if updated.Status.Phase != platformv1alpha1.EnvironmentPhaseReady || updated.Status.Endpoints.Sandboxd != "10.0.0.7:50051" {
 		t.Fatalf("Status = %#v, want Ready with sandboxd endpoint", updated.Status)
+	}
+	ready := apimeta.FindStatusCondition(updated.Status.Conditions, platformv1alpha1.EnvironmentConditionReady)
+	if updated.Status.ObservedGeneration != updated.Generation || ready == nil || ready.Status != metav1.ConditionTrue || ready.ObservedGeneration != updated.Generation || ready.Reason != "SandboxdReady" {
+		t.Fatalf("generation-aware Ready condition = %#v, status generation = %d", ready, updated.Status.ObservedGeneration)
+	}
+}
+
+func TestEnvironmentPodStateSurfacesReadinessFailures(t *testing.T) {
+	waiting := func(reason, message string) corev1.ContainerState {
+		return corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{Reason: reason, Message: message}}
+	}
+	terminated := func(exitCode int32, message string) corev1.ContainerState {
+		return corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: exitCode, Message: message}}
+	}
+	for _, tc := range []struct {
+		name       string
+		env        platformv1alpha1.Environment
+		pod        corev1.Pod
+		wantPhase  platformv1alpha1.EnvironmentPhase
+		wantReason string
+	}{
+		{
+			name: "unschedulable",
+			pod: corev1.Pod{Status: corev1.PodStatus{
+				Phase: corev1.PodPending,
+				Conditions: []corev1.PodCondition{{Type: corev1.PodScheduled, Status: corev1.ConditionFalse,
+					Reason: corev1.PodReasonUnschedulable, Message: "insufficient cpu"}},
+			}},
+			wantPhase: platformv1alpha1.EnvironmentPhaseCreating, wantReason: "Unschedulable",
+		},
+		{
+			name: "setup failed",
+			pod: corev1.Pod{Status: corev1.PodStatus{Phase: corev1.PodPending,
+				InitContainerStatuses: []corev1.ContainerStatus{{Name: "project-setup", State: terminated(1, "setup error")}}}},
+			wantPhase: platformv1alpha1.EnvironmentPhaseFailed, wantReason: "SetupFailed",
+		},
+		{
+			name: "setup hook timeout",
+			pod: corev1.Pod{Status: corev1.PodStatus{Phase: corev1.PodPending,
+				InitContainerStatuses: []corev1.ContainerStatus{{Name: "project-setup", State: terminated(124, "")}}}},
+			wantPhase: platformv1alpha1.EnvironmentPhaseFailed, wantReason: "SetupHookTimedOut",
+		},
+		{
+			name: "resume hook timeout",
+			env:  platformv1alpha1.Environment{Status: platformv1alpha1.EnvironmentStatus{Phase: platformv1alpha1.EnvironmentPhaseFailed}},
+			pod: corev1.Pod{
+				Spec: corev1.PodSpec{InitContainers: []corev1.Container{{Env: []corev1.EnvVar{{Name: "SWE_RESUMING", Value: "true"}}}}},
+				Status: corev1.PodStatus{Phase: corev1.PodPending, InitContainerStatuses: []corev1.ContainerStatus{{
+					Name: "project-setup", State: waiting("CrashLoopBackOff", "retrying"), LastTerminationState: terminated(124, ""),
+				}}},
+			},
+			wantPhase: platformv1alpha1.EnvironmentPhaseFailed, wantReason: "ResumeHookTimedOut",
+		},
+		{
+			name: "image pull",
+			pod: corev1.Pod{Status: corev1.PodStatus{Phase: corev1.PodPending,
+				ContainerStatuses: []corev1.ContainerStatus{{Name: "environment", State: waiting("ImagePullBackOff", "image not found")}}}},
+			wantPhase: platformv1alpha1.EnvironmentPhaseFailed, wantReason: "ImagePullFailed",
+		},
+		{
+			name: "sandboxd crash loop",
+			pod: corev1.Pod{Status: corev1.PodStatus{Phase: corev1.PodRunning,
+				ContainerStatuses: []corev1.ContainerStatus{{Name: "environment", State: waiting("CrashLoopBackOff", "back-off restarting")}}}},
+			wantPhase: platformv1alpha1.EnvironmentPhaseFailed, wantReason: "SandboxdCrashLoopBackOff",
+		},
+		{
+			name:      "sandboxd not ready",
+			pod:       corev1.Pod{Status: corev1.PodStatus{Phase: corev1.PodRunning, PodIP: "10.0.0.1"}},
+			wantPhase: platformv1alpha1.EnvironmentPhaseCreating, wantReason: "SandboxdNotReady",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			phase, reason, message := environmentPodState(&tc.env, &tc.pod)
+			if phase != tc.wantPhase || reason != tc.wantReason || message == "" {
+				t.Fatalf("state = (%s, %s, %q), want (%s, %s, actionable message)", phase, reason, message, tc.wantPhase, tc.wantReason)
+			}
+		})
+	}
+}
+
+func TestEnvironmentPodStateIgnoresFailureBeforeSuccessfulInitRetry(t *testing.T) {
+	pod := &corev1.Pod{
+		Spec: corev1.PodSpec{InitContainers: []corev1.Container{{Name: "project-setup"}}},
+		Status: corev1.PodStatus{
+			Phase: corev1.PodRunning, PodIP: "10.0.0.1",
+			Conditions: []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}},
+			InitContainerStatuses: []corev1.ContainerStatus{{
+				Name:                 "project-setup",
+				State:                corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 0}},
+				LastTerminationState: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 124}},
+			}},
+		},
+	}
+	phase, reason, _ := environmentPodState(&platformv1alpha1.Environment{}, pod)
+	if phase != platformv1alpha1.EnvironmentPhaseReady || reason != "SandboxdReady" {
+		t.Fatalf("state after successful init retry = (%s, %s), want Ready", phase, reason)
+	}
+}
+
+func TestEnvironmentStatusRetriesConflictAndPreservesConditions(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := platformv1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	env := &platformv1alpha1.Environment{ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default", Generation: 2}, Status: platformv1alpha1.EnvironmentStatus{
+		Conditions: []metav1.Condition{{Type: "Audit", Status: metav1.ConditionTrue, Reason: "Recorded", Message: "preserve me"}},
+	}}
+	baseClient := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(env).WithObjects(env).Build()
+	conflicts := 0
+	interceptedClient := interceptor.NewClient(baseClient, interceptor.Funcs{
+		SubResourceUpdate: func(ctx context.Context, underlying client.Client, subresource string, object client.Object, options ...client.SubResourceUpdateOption) error {
+			if subresource == "status" && conflicts == 0 {
+				conflicts++
+				return apierrors.NewConflict(schema.GroupResource{Group: platformv1alpha1.GroupVersion.Group, Resource: "environments"}, object.GetName(), stderrors.New("simulated conflict"))
+			}
+			return underlying.SubResource(subresource).Update(ctx, object, options...)
+		},
+	})
+	reconciler := &EnvironmentReconciler{Client: interceptedClient, Scheme: scheme}
+
+	if err := reconciler.setEnvironmentStatus(context.Background(), env, platformv1alpha1.EnvironmentPhaseReady, "env-test", "10.0.0.1:50051", "SandboxdReady", "sandboxd is ready"); err != nil {
+		t.Fatal(err)
+	}
+	var updated platformv1alpha1.Environment
+	if err := reconciler.Get(context.Background(), client.ObjectKeyFromObject(env), &updated); err != nil {
+		t.Fatal(err)
+	}
+	if conflicts != 1 || !platformv1alpha1.IsEnvironmentReady(&updated) || apimeta.FindStatusCondition(updated.Status.Conditions, "Audit") == nil {
+		t.Fatalf("status after conflict = %#v, conflicts = %d", updated.Status, conflicts)
 	}
 }
 
@@ -736,7 +1027,7 @@ func TestEnsurePodMarksProjectInitializationAsResume(t *testing.T) {
 		t.Fatalf("ensurePod() error = %v", err)
 	}
 	setup := pod.Spec.InitContainers[0]
-	if len(setup.Env) != 2 || setup.Env[1].Name != "SWE_RESUMING" || setup.Env[1].Value != "true" {
+	if len(setup.Env) != 4 || setup.Env[3].Name != "SWE_RESUMING" || setup.Env[3].Value != "true" {
 		t.Fatalf("init container Env = %#v, want SWE_RESUMING=true", setup.Env)
 	}
 }
@@ -773,6 +1064,10 @@ func TestSyncStatusPreservesResumingWhilePodStarts(t *testing.T) {
 	}
 	if updated.Status.Phase != platformv1alpha1.EnvironmentPhaseResuming {
 		t.Fatalf("Phase = %q, want Resuming", updated.Status.Phase)
+	}
+	ready := apimeta.FindStatusCondition(updated.Status.Conditions, platformv1alpha1.EnvironmentConditionReady)
+	if ready == nil || ready.Status != metav1.ConditionFalse || ready.Reason != "ResumeInProgress" {
+		t.Fatalf("Ready during resume = %#v, want false ResumeInProgress", ready)
 	}
 }
 
@@ -824,6 +1119,10 @@ func TestReconcilePausedWaitsForPodDeletion(t *testing.T) {
 	}
 	if updated.Status.Phase != platformv1alpha1.EnvironmentPhasePaused || updated.Status.PodName != "" {
 		t.Fatalf("Status = %#v, want Paused with no pod name", updated.Status)
+	}
+	ready := apimeta.FindStatusCondition(updated.Status.Conditions, platformv1alpha1.EnvironmentConditionReady)
+	if ready == nil || ready.Status != metav1.ConditionFalse || ready.Reason != "Paused" {
+		t.Fatalf("Ready while paused = %#v, want false Paused", ready)
 	}
 }
 

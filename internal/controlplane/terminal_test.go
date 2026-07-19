@@ -23,8 +23,10 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/test/bufconn"
 	corev1 "k8s.io/api/core/v1"
+	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
@@ -160,7 +162,7 @@ func TestKubernetesTerminalDialerUsesRecreatedPodCredentialsAfterWake(t *testing
 				sandboxdauth.TokenAnnotation:    "new-terminal-token",
 			},
 		},
-		Status: corev1.PodStatus{PodIP: "192.0.2.10"},
+		Status: corev1.PodStatus{PodIP: "192.0.2.10", Conditions: []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}}},
 	}
 	if err := controllerutil.SetControllerReference(environment, newPod, scheme); err != nil {
 		t.Fatal(err)
@@ -196,6 +198,16 @@ func (c wakeReadyClient) Patch(ctx context.Context, object client.Object, patch 
 	}
 	current.Status.Phase = platformv1alpha1.EnvironmentPhaseReady
 	current.Status.PodName = c.podName
+	var pod corev1.Pod
+	if err := c.Client.Get(ctx, types.NamespacedName{Namespace: current.Namespace, Name: c.podName}, &pod); err != nil {
+		return err
+	}
+	current.Status.Endpoints.Sandboxd = net.JoinHostPort(pod.Status.PodIP, sandboxdPort)
+	current.Status.ObservedGeneration = current.Generation
+	apimeta.SetStatusCondition(&current.Status.Conditions, metav1.Condition{
+		Type: platformv1alpha1.EnvironmentConditionReady, Status: metav1.ConditionTrue,
+		ObservedGeneration: current.Generation, Reason: "SandboxdReady", Message: "sandboxd is ready",
+	})
 	return c.Client.Status().Update(ctx, &current)
 }
 
@@ -319,7 +331,10 @@ func TestKubernetesTerminalDialerRejectsPodOwnedByAnotherEnvironmentIncarnation(
 	}
 	environment := &platformv1alpha1.Environment{
 		ObjectMeta: metav1.ObjectMeta{Name: "env-1", Namespace: "project-1", UID: "current-environment"},
-		Status:     platformv1alpha1.EnvironmentStatus{PodName: "env-env-1"},
+		Status: platformv1alpha1.EnvironmentStatus{
+			Phase: platformv1alpha1.EnvironmentPhaseReady, PodName: "env-env-1",
+			Conditions: []metav1.Condition{{Type: platformv1alpha1.EnvironmentConditionReady, Status: metav1.ConditionTrue, Reason: "SandboxdReady", Message: "sandboxd is ready"}},
+		},
 	}
 	pod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{

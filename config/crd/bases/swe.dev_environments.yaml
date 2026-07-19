@@ -168,6 +168,11 @@ spec:
                   The idle reaper uses it to decide when to pause.
                 format: date-time
                 type: string
+              observedGeneration:
+                description: ObservedGeneration is the Environment generation reflected
+                  by this status.
+                format: int64
+                type: integer
               phase:
                 description: EnvironmentPhase describes where an Environment is in
                   its lifecycle.

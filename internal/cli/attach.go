@@ -47,6 +47,9 @@ func attachTerminal(cmd *cobra.Command, namespace, envName string) error {
 	if err := clients.Get(cmd.Context(), types.NamespacedName{Namespace: namespace, Name: envName}, env); err != nil {
 		return fmt.Errorf("get environment %s: %w", envName, err)
 	}
+	if !platformv1alpha1.IsEnvironmentReady(env) {
+		return fmt.Errorf("environment %s is not ready for its current generation", envName)
+	}
 	if env.Status.PodName == "" {
 		return fmt.Errorf("environment %s has no backing pod", envName)
 	}
@@ -56,6 +59,9 @@ func attachTerminal(cmd *cobra.Command, namespace, envName string) error {
 	}
 	if !metav1.IsControlledBy(pod, env) {
 		return fmt.Errorf("environment pod %s is not owned by the current environment", env.Status.PodName)
+	}
+	if !pod.DeletionTimestamp.IsZero() || !podReadyForAttach(pod) {
+		return fmt.Errorf("environment pod %s is not ready", env.Status.PodName)
 	}
 	dialOptions, err := sandboxclient.DialOptions(pod)
 	if err != nil {
@@ -85,6 +91,15 @@ func attachTerminal(cmd *cobra.Command, namespace, envName string) error {
 		return err
 	}
 	return nil
+}
+
+func podReadyForAttach(pod *corev1.Pod) bool {
+	for _, condition := range pod.Status.Conditions {
+		if condition.Type == corev1.PodReady {
+			return condition.Status == corev1.ConditionTrue
+		}
+	}
+	return false
 }
 
 func forwardSandboxd(ctx context.Context, clients *kubeClients, namespace, podName string, errOut io.Writer) (uint16, func(), <-chan error, error) {

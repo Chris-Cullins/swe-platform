@@ -1,8 +1,11 @@
 package v1alpha1
 
 import (
+	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
+
+const EnvironmentConditionReady = "Ready"
 
 // EnvironmentPhase describes where an Environment is in its lifecycle.
 // +kubebuilder:validation:Enum=Creating;Setup;Ready;Running;Idle;Paused;Resuming;Failed;Terminated
@@ -61,6 +64,10 @@ type EnvironmentEndpoints struct {
 
 // EnvironmentStatus defines the observed state of Environment.
 type EnvironmentStatus struct {
+	// ObservedGeneration is the Environment generation reflected by this status.
+	// +optional
+	ObservedGeneration int64 `json:"observedGeneration,omitempty"`
+
 	// +optional
 	Phase EnvironmentPhase `json:"phase,omitempty"`
 
@@ -85,6 +92,17 @@ type EnvironmentStatus struct {
 	// +listType=map
 	// +listMapKey=type
 	Conditions []metav1.Condition `json:"conditions,omitempty"`
+}
+
+// IsEnvironmentReady reports whether readiness is true for the current spec
+// generation. Phase remains a human-readable summary, not the readiness contract.
+func IsEnvironmentReady(environment *Environment) bool {
+	if !environment.DeletionTimestamp.IsZero() {
+		return false
+	}
+	condition := apimeta.FindStatusCondition(environment.Status.Conditions, EnvironmentConditionReady)
+	return environment.Status.ObservedGeneration == environment.Generation && condition != nil &&
+		condition.ObservedGeneration == environment.Generation && condition.Status == metav1.ConditionTrue
 }
 
 // +kubebuilder:object:root=true

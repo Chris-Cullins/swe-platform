@@ -29,6 +29,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
+	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
@@ -51,6 +52,8 @@ var sizePresets = map[string]corev1.ResourceList{
 const (
 	defaultDiskSize    = "40Gi"
 	defaultIdleTimeout = 15 * time.Minute
+	projectHookTimeout = "30m"
+	hookKillAfter      = "5s"
 	templateRefField   = "spec.templateRef"
 	warmPoolLabel      = "swe.dev/warm-pool"
 	projectAnnotation  = "swe.dev/project"
@@ -69,23 +72,38 @@ func (e *childOwnershipCollisionError) Error() string {
 
 const (
 	sandboxdCredentialMount    = "/var/run/swe-platform/sandboxd"
-	sandboxdSecurityRevision   = "1"
+	sandboxdSecurityRevision   = "2"
 	sandboxdRevisionAnnotation = "swe.dev/sandboxd-security-revision"
 	environmentFinalizer       = "swe.dev/environment-security"
 )
 
-const projectSetupScript = `set -eu
+const hookRunnerScript = `set -eu
+run_hook() {
+	hook="$1"
+	timeout --kill-after="$SWE_HOOK_KILL_AFTER" "$SWE_HOOK_TIMEOUT" /bin/sh "$hook" || {
+		status="$?"
+		if [ "$status" -eq 124 ] || [ "$status" -eq 137 ]; then
+			echo "$hook timed out after $SWE_HOOK_TIMEOUT" >&2
+			exit 124
+		fi
+		echo "$hook failed with exit code $status" >&2
+		exit "$status"
+	}
+}
+`
+
+const projectSetupScript = hookRunnerScript + `
 if [ ! -d /workspace/.git ]; then
 	git clone -- "$SWE_REPOSITORY" /workspace
 fi
 if ! git -c safe.directory=/workspace -C /workspace config --local --get swe.setup-complete >/dev/null 2>&1; then
 	if [ -f /workspace/.agents/setup ]; then
-		/bin/sh /workspace/.agents/setup
+		run_hook /workspace/.agents/setup
 	fi
 	git -c safe.directory=/workspace -C /workspace config --local swe.setup-complete true
 fi
 if [ "${SWE_RESUMING:-false}" = true ] && [ -f /workspace/.agents/resume ]; then
-	/bin/sh /workspace/.agents/resume
+	run_hook /workspace/.agents/resume
 fi
 `
 
@@ -216,6 +234,9 @@ func (r *EnvironmentReconciler) reconcileIdle(ctx context.Context, env *platform
 func (r *EnvironmentReconciler) reconcileDeleting(ctx context.Context, env *platformv1alpha1.Environment) (ctrl.Result, error) {
 	if !controllerutil.ContainsFinalizer(env, environmentFinalizer) {
 		return ctrl.Result{}, nil
+	}
+	if err := r.setEnvironmentStatus(ctx, env, platformv1alpha1.EnvironmentPhaseCreating, "", "", "Deleting", "environment deletion is in progress"); err != nil {
+		return ctrl.Result{}, fmt.Errorf("withdraw readiness during environment deletion: %w", err)
 	}
 	var pod corev1.Pod
 	if err := r.Get(ctx, types.NamespacedName{Namespace: env.Namespace, Name: envPodName(env)}, &pod); err == nil {
@@ -348,6 +369,15 @@ func (r *EnvironmentReconciler) ensurePod(ctx context.Context, env *platformv1al
 	var pod corev1.Pod
 	err := r.Get(ctx, types.NamespacedName{Namespace: env.Namespace, Name: podName}, &pod)
 	if err == nil {
+		if metav1.IsControlledBy(&pod, env) && !pod.DeletionTimestamp.IsZero() {
+			if err := r.setEnvironmentStatus(ctx, env, platformv1alpha1.EnvironmentPhaseCreating, "", "", "PodTerminating", "the previous environment pod is terminating"); err != nil {
+				return nil, err
+			}
+			if env.Status.PodName != "" || env.Status.Endpoints.Sandboxd != "" {
+				return nil, errPodReplacing
+			}
+			return nil, nil
+		}
 		if metav1.IsControlledBy(&pod, env) {
 			secure, err := r.currentSandboxdPod(ctx, env, &pod)
 			if err != nil {
@@ -356,6 +386,9 @@ func (r *EnvironmentReconciler) ensurePod(ctx context.Context, env *platformv1al
 			if pod.Annotations[projectAnnotation] != env.Spec.ProjectRef {
 				if err := r.setPhase(ctx, env, platformv1alpha1.EnvironmentPhaseSetup, "", ""); err != nil {
 					return nil, err
+				}
+				if env.Status.PodName != "" || env.Status.Endpoints.Sandboxd != "" {
+					return nil, errPodReplacing
 				}
 				if err := r.deleteObservedChild(ctx, &pod); err != nil && !errors.IsNotFound(err) {
 					return nil, fmt.Errorf("replace pod for project change: %w", err)
@@ -368,6 +401,12 @@ func (r *EnvironmentReconciler) ensurePod(ctx context.Context, env *platformv1al
 		}
 		if !metav1.IsControlledBy(&pod, env) {
 			return nil, &childOwnershipCollisionError{kind: "Pod", name: podName}
+		}
+		if err := r.setEnvironmentStatus(ctx, env, platformv1alpha1.EnvironmentPhaseCreating, "", "", "PodReplacing", "the environment pod is being replaced before readiness can be restored"); err != nil {
+			return nil, err
+		}
+		if env.Status.PodName != "" || env.Status.Endpoints.Sandboxd != "" {
+			return nil, errPodReplacing
 		}
 		if err := r.deleteObservedChild(ctx, &pod); err != nil && !errors.IsNotFound(err) {
 			return nil, err
@@ -408,12 +447,13 @@ func (r *EnvironmentReconciler) ensurePod(ctx context.Context, env *platformv1al
 			Name:      podName,
 			Labels:    envLabels(env),
 			Annotations: map[string]string{
-				projectAnnotation:                env.Spec.ProjectRef,
-				sandboxdauth.IdentityAnnotation:  identity,
-				sandboxdauth.TrustAnnotation:     string(trust),
-				sandboxdauth.TokenAnnotation:     terminalToken,
-				sandboxdauth.SecretUIDAnnotation: string(credentials.UID),
-				sandboxdRevisionAnnotation:       sandboxdSecurityRevision,
+				projectAnnotation:                 env.Spec.ProjectRef,
+				sandboxdauth.IdentityAnnotation:   identity,
+				sandboxdauth.TrustAnnotation:      string(trust),
+				sandboxdauth.TokenAnnotation:      terminalToken,
+				sandboxdauth.SecretUIDAnnotation:  string(credentials.UID),
+				sandboxdauth.SecretNameAnnotation: credentials.Name,
+				sandboxdRevisionAnnotation:        sandboxdSecurityRevision,
 			},
 		},
 		Spec: corev1.PodSpec{
@@ -437,7 +477,21 @@ func (r *EnvironmentReconciler) ensurePod(ctx context.Context, env *platformv1al
 					ContainerPort: 50051,
 				}},
 				ReadinessProbe: &corev1.Probe{
-					ProbeHandler: corev1.ProbeHandler{TCPSocket: &corev1.TCPSocketAction{Port: intstr.FromString("sandboxd")}},
+					ProbeHandler:   corev1.ProbeHandler{Exec: &corev1.ExecAction{Command: sandboxdHealthcheckCommand()}},
+					PeriodSeconds:  2,
+					TimeoutSeconds: 2,
+				},
+				StartupProbe: &corev1.Probe{
+					ProbeHandler:     corev1.ProbeHandler{Exec: &corev1.ExecAction{Command: sandboxdHealthcheckCommand()}},
+					PeriodSeconds:    2,
+					FailureThreshold: 30,
+					TimeoutSeconds:   2,
+				},
+				LivenessProbe: &corev1.Probe{
+					ProbeHandler:     corev1.ProbeHandler{Exec: &corev1.ExecAction{Command: sandboxdHealthcheckCommand()}},
+					PeriodSeconds:    10,
+					FailureThreshold: 3,
+					TimeoutSeconds:   2,
 				},
 				Resources: corev1.ResourceRequirements{
 					Requests: resources,
@@ -468,6 +522,7 @@ func (r *EnvironmentReconciler) ensurePod(ctx context.Context, env *platformv1al
 							{Key: sandboxdauth.TLSCertKey, Path: sandboxdauth.TLSCertKey},
 							{Key: sandboxdauth.TLSKeyKey, Path: sandboxdauth.TLSKeyKey},
 							{Key: sandboxdauth.CapabilitiesKey, Path: sandboxdauth.CapabilitiesKey},
+							{Key: sandboxdauth.HealthTokenKey, Path: sandboxdauth.HealthTokenKey},
 						},
 					}},
 				},
@@ -485,16 +540,21 @@ func (r *EnvironmentReconciler) ensurePod(ctx context.Context, env *platformv1al
 		if len(project.Spec.Repositories) == 0 {
 			return nil, fmt.Errorf("project %q has no repositories", env.Spec.ProjectRef)
 		}
-		projectEnv := []corev1.EnvVar{{Name: "SWE_REPOSITORY", Value: project.Spec.Repositories[0]}}
+		projectEnv := []corev1.EnvVar{
+			{Name: "SWE_REPOSITORY", Value: project.Spec.Repositories[0]},
+			{Name: "SWE_HOOK_TIMEOUT", Value: projectHookTimeout},
+			{Name: "SWE_HOOK_KILL_AFTER", Value: hookKillAfter},
+		}
 		if env.Status.Phase == platformv1alpha1.EnvironmentPhaseResuming {
 			projectEnv = append(projectEnv, corev1.EnvVar{Name: "SWE_RESUMING", Value: "true"})
 		}
 		pod.Spec.InitContainers = []corev1.Container{{
-			Name:            "project-setup",
-			Image:           tmpl.Spec.Image,
-			ImagePullPolicy: corev1.PullIfNotPresent,
-			Command:         []string{"/bin/sh", "-c", projectSetupScript},
-			Env:             projectEnv,
+			Name:                     "project-setup",
+			Image:                    tmpl.Spec.Image,
+			ImagePullPolicy:          corev1.PullIfNotPresent,
+			Command:                  []string{"/bin/sh", "-c", projectSetupScript},
+			Env:                      projectEnv,
+			TerminationMessagePolicy: corev1.TerminationMessageFallbackToLogsOnError,
 			Resources: corev1.ResourceRequirements{
 				Requests: resources,
 				Limits:   resources,
@@ -535,7 +595,7 @@ func (r *EnvironmentReconciler) ensurePod(ctx context.Context, env *platformv1al
 func (r *EnvironmentReconciler) currentSandboxdPod(ctx context.Context, env *platformv1alpha1.Environment, pod *corev1.Pod) (bool, error) {
 	if !metav1.IsControlledBy(pod, env) || pod.Annotations[sandboxdRevisionAnnotation] != sandboxdSecurityRevision ||
 		pod.Annotations[sandboxdauth.IdentityAnnotation] == "" || pod.Annotations[sandboxdauth.TrustAnnotation] == "" ||
-		pod.Annotations[sandboxdauth.TokenAnnotation] == "" {
+		pod.Annotations[sandboxdauth.TokenAnnotation] == "" || pod.Annotations[sandboxdauth.SecretNameAnnotation] != envCredentialName(env) {
 		return false, nil
 	}
 	var secret corev1.Secret
@@ -552,7 +612,8 @@ func (r *EnvironmentReconciler) currentSandboxdPod(ctx context.Context, env *pla
 		secret.Annotations[sandboxdauth.IdentityAnnotation] == pod.Annotations[sandboxdauth.IdentityAnnotation] &&
 		pod.UID != "" && secret.Annotations[sandboxdauth.PodUIDAnnotation] == string(pod.UID) &&
 		len(secret.Data[sandboxdauth.TLSCertKey]) > 0 && len(secret.Data[sandboxdauth.TLSKeyKey]) > 0 &&
-		len(secret.Data[sandboxdauth.CapabilitiesKey]) > 0 && len(secret.Data[sandboxdauth.ProcessTokenKey]) > 0, nil
+		len(secret.Data[sandboxdauth.CapabilitiesKey]) > 0 && len(secret.Data[sandboxdauth.HealthTokenKey]) > 0 &&
+		len(secret.Data[sandboxdauth.ProcessTokenKey]) > 0, nil
 }
 
 func (r *EnvironmentReconciler) rotateSandboxdCredentials(ctx context.Context, env *platformv1alpha1.Environment) (string, []byte, string, error) {
@@ -569,12 +630,17 @@ func (r *EnvironmentReconciler) rotateSandboxdCredentials(ctx context.Context, e
 	if err != nil {
 		return "", nil, "", err
 	}
+	healthToken, err := randomCredential(32)
+	if err != nil {
+		return "", nil, "", err
+	}
 	processToken, err := randomCredential(32)
 	if err != nil {
 		return "", nil, "", err
 	}
 	capabilities, err := json.Marshal(sandboxdauth.Config{Grants: []sandboxdauth.Grant{
 		{TokenHash: sandboxdauth.TokenVerifier(terminalToken), Capabilities: []sandboxdauth.Capability{sandboxdauth.CapabilityHealth, sandboxdauth.CapabilityTerminal}},
+		{TokenHash: sandboxdauth.TokenVerifier(healthToken), Capabilities: []sandboxdauth.Capability{sandboxdauth.CapabilityHealth}},
 		{TokenHash: sandboxdauth.TokenVerifier(processToken), Capabilities: []sandboxdauth.Capability{sandboxdauth.CapabilityProcess}},
 	}})
 	if err != nil {
@@ -589,7 +655,7 @@ func (r *EnvironmentReconciler) rotateSandboxdCredentials(ctx context.Context, e
 		if err := controllerutil.SetControllerReference(env, &secret, r.Scheme); err != nil {
 			return "", nil, "", err
 		}
-		secret.Data = sandboxdCredentialData(certificate, privateKey, capabilities, processToken)
+		secret.Data = sandboxdCredentialData(certificate, privateKey, capabilities, healthToken, processToken)
 		secret.Annotations = map[string]string{sandboxdauth.IdentityAnnotation: serverName}
 		if err := r.Create(ctx, &secret); err != nil {
 			return "", nil, "", collisionOnAlreadyExists(err, "Secret", key.Name)
@@ -600,7 +666,7 @@ func (r *EnvironmentReconciler) rotateSandboxdCredentials(ctx context.Context, e
 		if !exactControllerOwner(&secret, platformv1alpha1.GroupVersion.String(), "Environment", env.Name, env.UID) {
 			return "", nil, "", &childOwnershipCollisionError{kind: "Secret", name: secret.Name}
 		}
-		secret.Data = sandboxdCredentialData(certificate, privateKey, capabilities, processToken)
+		secret.Data = sandboxdCredentialData(certificate, privateKey, capabilities, healthToken, processToken)
 		if secret.Annotations == nil {
 			secret.Annotations = map[string]string{}
 		}
@@ -612,12 +678,21 @@ func (r *EnvironmentReconciler) rotateSandboxdCredentials(ctx context.Context, e
 	return serverName, certificate, terminalToken, nil
 }
 
-func sandboxdCredentialData(certificate, privateKey, capabilities []byte, processToken string) map[string][]byte {
+func sandboxdCredentialData(certificate, privateKey, capabilities []byte, healthToken, processToken string) map[string][]byte {
 	return map[string][]byte{
 		sandboxdauth.TLSCertKey:      certificate,
 		sandboxdauth.TLSKeyKey:       privateKey,
 		sandboxdauth.CapabilitiesKey: capabilities,
+		sandboxdauth.HealthTokenKey:  []byte(healthToken),
 		sandboxdauth.ProcessTokenKey: []byte(processToken),
+	}
+}
+
+func sandboxdHealthcheckCommand() []string {
+	return []string{
+		"sandboxd", "healthcheck",
+		"-ca=" + sandboxdCredentialMount + "/" + sandboxdauth.TLSCertKey,
+		"-token=" + sandboxdCredentialMount + "/" + sandboxdauth.HealthTokenKey,
 	}
 }
 
@@ -736,35 +811,126 @@ func (r *EnvironmentReconciler) ensureSandboxdNetworkPolicy(ctx context.Context,
 	return true, nil
 }
 
-// syncStatus maps pod state onto the Environment phase.
+// syncStatus maps Kubernetes-native pod readiness and container failure state
+// onto the Environment's generation-aware readiness contract.
 func (r *EnvironmentReconciler) syncStatus(ctx context.Context, env *platformv1alpha1.Environment, pod *corev1.Pod) error {
-	phase := platformv1alpha1.EnvironmentPhaseCreating
+	phase, reason, message := environmentPodState(env, pod)
 	sandboxdEndpoint := ""
-	refreshActivity := false
+	if phase == platformv1alpha1.EnvironmentPhaseReady {
+		sandboxdEndpoint = net.JoinHostPort(pod.Status.PodIP, "50051")
+		if env.Status.LastActiveAt == nil || (env.Status.Phase != platformv1alpha1.EnvironmentPhaseReady && env.Status.Phase != platformv1alpha1.EnvironmentPhaseRunning) {
+			now := metav1.Now()
+			env.Status.LastActiveAt = &now
+		}
+	}
+	return r.setEnvironmentStatus(ctx, env, phase, pod.Name, sandboxdEndpoint, reason, message)
+}
+
+func environmentPodState(env *platformv1alpha1.Environment, pod *corev1.Pod) (platformv1alpha1.EnvironmentPhase, string, string) {
+	resuming := podIsResume(pod) || env.Status.Phase == platformv1alpha1.EnvironmentPhaseResuming
+	for _, condition := range pod.Status.Conditions {
+		if condition.Type == corev1.PodScheduled && condition.Status == corev1.ConditionFalse && condition.Reason == corev1.PodReasonUnschedulable {
+			return platformv1alpha1.EnvironmentPhaseCreating, "Unschedulable", messageOr(condition.Message, "the scheduler cannot currently place the environment pod")
+		}
+	}
+	for _, status := range pod.Status.InitContainerStatuses {
+		if terminated := status.State.Terminated; terminated != nil && terminated.ExitCode != 0 {
+			return initContainerFailure(status.Name, terminated, resuming)
+		}
+		if status.State.Waiting != nil {
+			waiting := status.State.Waiting
+			if terminated := status.LastTerminationState.Terminated; terminated != nil && terminated.ExitCode != 0 {
+				return initContainerFailure(status.Name, terminated, resuming)
+			}
+			if imagePullFailure(waiting.Reason) {
+				return platformv1alpha1.EnvironmentPhaseFailed, "ImagePullFailed", containerStatusMessage(status.Name, waiting.Reason, waiting.Message)
+			}
+			if waiting.Reason == "CrashLoopBackOff" {
+				return platformv1alpha1.EnvironmentPhaseFailed, setupReason(resuming, "Failed"), containerStatusMessage(status.Name, waiting.Reason, waiting.Message)
+			}
+		}
+	}
+	for _, status := range pod.Status.ContainerStatuses {
+		if status.State.Waiting != nil {
+			waiting := status.State.Waiting
+			if imagePullFailure(waiting.Reason) {
+				return platformv1alpha1.EnvironmentPhaseFailed, "ImagePullFailed", containerStatusMessage(status.Name, waiting.Reason, waiting.Message)
+			}
+			if waiting.Reason == "CrashLoopBackOff" {
+				return platformv1alpha1.EnvironmentPhaseFailed, "SandboxdCrashLoopBackOff", containerStatusMessage(status.Name, waiting.Reason, waiting.Message)
+			}
+		}
+	}
+
 	switch pod.Status.Phase {
 	case corev1.PodPending:
-		if env.Status.Phase == platformv1alpha1.EnvironmentPhaseResuming {
-			phase = platformv1alpha1.EnvironmentPhaseResuming
-		} else if len(pod.Spec.InitContainers) > 0 {
-			phase = platformv1alpha1.EnvironmentPhaseSetup
+		if resuming {
+			return platformv1alpha1.EnvironmentPhaseResuming, "ResumeInProgress", "repository resume and sandboxd startup are in progress"
 		}
+		if len(pod.Spec.InitContainers) > 0 {
+			return platformv1alpha1.EnvironmentPhaseSetup, "SetupInProgress", "repository setup and sandboxd startup are in progress"
+		}
+		return platformv1alpha1.EnvironmentPhaseCreating, "Provisioning", "environment pod is provisioning"
 	case corev1.PodRunning:
 		if podReady(pod) && pod.Status.PodIP != "" {
-			phase = platformv1alpha1.EnvironmentPhaseReady
-			sandboxdEndpoint = net.JoinHostPort(pod.Status.PodIP, "50051")
-			refreshActivity = env.Status.LastActiveAt == nil || (env.Status.Phase != platformv1alpha1.EnvironmentPhaseReady && env.Status.Phase != platformv1alpha1.EnvironmentPhaseRunning)
+			return platformv1alpha1.EnvironmentPhaseReady, "SandboxdReady", "setup is complete and sandboxd is ready"
 		}
-		// TODO(P2): phase = Running while a Run is attached, Idle after activity stops.
+		return platformv1alpha1.EnvironmentPhaseCreating, "SandboxdNotReady", "sandboxd has not passed its readiness probe"
 	case corev1.PodFailed:
-		phase = platformv1alpha1.EnvironmentPhaseFailed
+		return platformv1alpha1.EnvironmentPhaseFailed, "PodFailed", messageOr(pod.Status.Message, "environment pod failed")
 	case corev1.PodSucceeded:
-		phase = platformv1alpha1.EnvironmentPhaseTerminated
+		return platformv1alpha1.EnvironmentPhaseTerminated, "PodTerminated", "environment pod terminated"
+	default:
+		return platformv1alpha1.EnvironmentPhaseCreating, "Provisioning", "environment pod is provisioning"
 	}
-	if refreshActivity {
-		now := metav1.Now()
-		env.Status.LastActiveAt = &now
+}
+
+func initContainerFailure(name string, terminated *corev1.ContainerStateTerminated, resuming bool) (platformv1alpha1.EnvironmentPhase, string, string) {
+	reason := setupReason(resuming, "Failed")
+	if terminated.ExitCode == 124 || terminated.ExitCode == 137 {
+		reason = setupReason(resuming, "HookTimedOut")
 	}
-	return r.setPhase(ctx, env, phase, pod.Name, sandboxdEndpoint)
+	message := fmt.Sprintf("init container %s exited with code %d", name, terminated.ExitCode)
+	if terminated.Message != "" {
+		message += ": " + terminated.Message
+	}
+	return platformv1alpha1.EnvironmentPhaseFailed, reason, message
+}
+
+func messageOr(message, fallback string) string {
+	if message != "" {
+		return message
+	}
+	return fallback
+}
+
+func podIsResume(pod *corev1.Pod) bool {
+	for _, container := range pod.Spec.InitContainers {
+		for _, variable := range container.Env {
+			if variable.Name == "SWE_RESUMING" && variable.Value == "true" {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func imagePullFailure(reason string) bool {
+	return reason == "ErrImagePull" || reason == "ImagePullBackOff" || reason == "InvalidImageName"
+}
+
+func setupReason(resuming bool, suffix string) string {
+	if resuming {
+		return "Resume" + suffix
+	}
+	return "Setup" + suffix
+}
+
+func containerStatusMessage(name, reason, message string) string {
+	if message == "" {
+		return fmt.Sprintf("container %s: %s", name, reason)
+	}
+	return fmt.Sprintf("container %s: %s: %s", name, reason, message)
 }
 
 func podReady(pod *corev1.Pod) bool {
@@ -777,38 +943,110 @@ func podReady(pod *corev1.Pod) bool {
 }
 
 func (r *EnvironmentReconciler) setPhase(ctx context.Context, env *platformv1alpha1.Environment, phase platformv1alpha1.EnvironmentPhase, podName, sandboxdEndpoint string) error {
-	conditionChanged := clearChildOwnershipCollision(env)
-	if env.Status.Phase == phase && env.Status.PodName == podName && env.Status.Endpoints.Sandboxd == sandboxdEndpoint && !conditionChanged {
-		return nil
-	}
-	env.Status.Phase = phase
-	env.Status.PodName = podName
-	env.Status.Endpoints.Sandboxd = sandboxdEndpoint
-	return r.Status().Update(ctx, env)
+	reason, message := phaseReadiness(phase)
+	return r.setEnvironmentStatus(ctx, env, phase, podName, sandboxdEndpoint, reason, message)
 }
 
 func (r *EnvironmentReconciler) fail(ctx context.Context, env *platformv1alpha1.Environment, err error) error {
 	log.FromContext(ctx).Error(err, "reconcile failed", "environment", env.Name)
 	var collision *childOwnershipCollisionError
-	if stderrors.As(err, &collision) {
-		env.Status.Phase = platformv1alpha1.EnvironmentPhaseFailed
-		changed := apimeta.SetStatusCondition(&env.Status.Conditions, metav1.Condition{
-			Type:               "ChildOwnershipConflict",
-			Status:             metav1.ConditionTrue,
-			ObservedGeneration: env.Generation,
-			Reason:             "ResourceCollision",
-			Message:            collision.Error(),
-		})
-		if !changed {
-			return nil
-		}
-		return r.Status().Update(ctx, env)
+	reason := "ReconcileFailed"
+	if invalidEnvironmentConfiguration(err) {
+		reason = "InvalidConfiguration"
 	}
-	env.Status.Phase = platformv1alpha1.EnvironmentPhaseFailed
-	if statusErr := r.Status().Update(ctx, env); statusErr != nil {
+	statusErr := r.updateEnvironmentStatus(ctx, env, func(current *platformv1alpha1.Environment) {
+		applyEnvironmentStatus(current, platformv1alpha1.EnvironmentPhaseFailed, "", "", reason, err.Error(), env.Status.LastActiveAt)
+		if stderrors.As(err, &collision) {
+			apimeta.SetStatusCondition(&current.Status.Conditions, metav1.Condition{
+				Type:               "ChildOwnershipConflict",
+				Status:             metav1.ConditionTrue,
+				ObservedGeneration: current.Generation,
+				Reason:             "ResourceCollision",
+				Message:            collision.Error(),
+			})
+		}
+	})
+	if statusErr != nil {
 		return statusErr
 	}
+	if collision != nil {
+		return nil
+	}
 	return err
+}
+
+func (r *EnvironmentReconciler) setEnvironmentStatus(ctx context.Context, env *platformv1alpha1.Environment, phase platformv1alpha1.EnvironmentPhase, podName, sandboxdEndpoint, reason, message string) error {
+	return r.updateEnvironmentStatus(ctx, env, func(current *platformv1alpha1.Environment) {
+		applyEnvironmentStatus(current, phase, podName, sandboxdEndpoint, reason, message, env.Status.LastActiveAt)
+		clearChildOwnershipCollision(current)
+	})
+}
+
+func (r *EnvironmentReconciler) updateEnvironmentStatus(ctx context.Context, env *platformv1alpha1.Environment, mutate func(*platformv1alpha1.Environment)) error {
+	key := client.ObjectKeyFromObject(env)
+	expectedGeneration := env.Generation
+	var updated platformv1alpha1.Environment
+	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		if err := r.Get(ctx, key, &updated); err != nil {
+			return err
+		}
+		if updated.Generation != expectedGeneration {
+			return nil
+		}
+		before := updated.DeepCopy()
+		mutate(&updated)
+		if apiequality.Semantic.DeepEqual(before.Status, updated.Status) {
+			return nil
+		}
+		return r.Status().Update(ctx, &updated)
+	})
+	if err == nil {
+		env.Status = updated.Status
+	}
+	return err
+}
+
+func applyEnvironmentStatus(env *platformv1alpha1.Environment, phase platformv1alpha1.EnvironmentPhase, podName, sandboxdEndpoint, reason, message string, lastActiveAt *metav1.Time) {
+	env.Status.ObservedGeneration = env.Generation
+	env.Status.Phase = phase
+	env.Status.PodName = podName
+	env.Status.Endpoints.Sandboxd = sandboxdEndpoint
+	if lastActiveAt != nil && (env.Status.LastActiveAt == nil || lastActiveAt.After(env.Status.LastActiveAt.Time)) {
+		env.Status.LastActiveAt = lastActiveAt.DeepCopy()
+	}
+	apimeta.SetStatusCondition(&env.Status.Conditions, metav1.Condition{
+		Type:               platformv1alpha1.EnvironmentConditionReady,
+		Status:             boolConditionStatus(phase == platformv1alpha1.EnvironmentPhaseReady || phase == platformv1alpha1.EnvironmentPhaseRunning),
+		ObservedGeneration: env.Generation,
+		Reason:             reason,
+		Message:            message,
+	})
+}
+
+func phaseReadiness(phase platformv1alpha1.EnvironmentPhase) (string, string) {
+	switch phase {
+	case platformv1alpha1.EnvironmentPhaseSetup:
+		return "SetupInProgress", "repository setup is in progress"
+	case platformv1alpha1.EnvironmentPhaseResuming:
+		return "ResumeInProgress", "repository resume is in progress"
+	case platformv1alpha1.EnvironmentPhaseReady, platformv1alpha1.EnvironmentPhaseRunning:
+		return "SandboxdReady", "setup is complete and sandboxd is ready"
+	case platformv1alpha1.EnvironmentPhaseIdle:
+		return "PauseRequested", "environment is idle and pause was requested"
+	case platformv1alpha1.EnvironmentPhasePaused:
+		return "Paused", "environment is paused; workspace and transcript are retained"
+	case platformv1alpha1.EnvironmentPhaseFailed:
+		return "ReconcileFailed", "environment reconciliation failed"
+	case platformv1alpha1.EnvironmentPhaseTerminated:
+		return "PodTerminated", "environment pod terminated"
+	default:
+		return "Provisioning", "environment infrastructure is provisioning"
+	}
+}
+
+func invalidEnvironmentConfiguration(err error) bool {
+	message := err.Error()
+	return strings.Contains(message, "get template ") || strings.Contains(message, "get project ") || strings.Contains(message, " has no repositories")
 }
 
 func clearChildOwnershipCollision(env *platformv1alpha1.Environment) bool {

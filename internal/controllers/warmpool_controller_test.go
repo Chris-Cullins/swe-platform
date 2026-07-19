@@ -77,6 +77,10 @@ func TestWarmPoolReconcileReportsReadyAndRemovesExcess(t *testing.T) {
 			Status:     platformv1alpha1.EnvironmentStatus{Phase: platformv1alpha1.EnvironmentPhaseReady},
 		},
 	}
+	for _, object := range environments {
+		env := object.(*platformv1alpha1.Environment)
+		applyEnvironmentStatus(env, platformv1alpha1.EnvironmentPhaseReady, "env-"+env.Name, "10.0.0.1:50051", "SandboxdReady", "sandboxd is ready", nil)
+	}
 	objects := append([]client.Object{tmpl}, environments...)
 	reconciler := &WarmPoolReconciler{
 		Client: fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(tmpl).WithObjects(objects...).Build(),
@@ -132,6 +136,26 @@ func TestWarmPoolReconcileExcludesClaimedEnvironment(t *testing.T) {
 	var retained platformv1alpha1.Environment
 	if err := reconciler.Get(context.Background(), client.ObjectKeyFromObject(claimed), &retained); err != nil || retained.Status.ClaimedBy == nil {
 		t.Fatalf("claimed environment was removed or altered: %#v, %v", retained, err)
+	}
+}
+
+func TestWarmPoolKeepsStaleGenerationFailure(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := platformv1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	tmpl := &platformv1alpha1.EnvironmentTemplate{ObjectMeta: metav1.ObjectMeta{Name: "small", Namespace: "default"}, Spec: platformv1alpha1.EnvironmentTemplateSpec{
+		WarmPool: &platformv1alpha1.WarmPoolSpec{Min: 1},
+	}}
+	env := &platformv1alpha1.Environment{ObjectMeta: metav1.ObjectMeta{Name: "warm-stale", Namespace: "default", Generation: 2, Labels: map[string]string{warmPoolLabel: "small"}}, Spec: platformv1alpha1.EnvironmentSpec{TemplateRef: "small"}, Status: platformv1alpha1.EnvironmentStatus{
+		ObservedGeneration: 1, Phase: platformv1alpha1.EnvironmentPhaseFailed,
+	}}
+	reconciler := &WarmPoolReconciler{Client: fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(tmpl).WithObjects(tmpl, env).Build(), Scheme: scheme}
+	if _, err := reconciler.Reconcile(context.Background(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(tmpl)}); err != nil {
+		t.Fatal(err)
+	}
+	if err := reconciler.Get(context.Background(), client.ObjectKeyFromObject(env), &platformv1alpha1.Environment{}); err != nil {
+		t.Fatalf("stale-generation failed Environment was deleted: %v", err)
 	}
 }
 

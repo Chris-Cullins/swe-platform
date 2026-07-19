@@ -33,15 +33,17 @@ const (
 
 // Credential bundle keys and identity annotation shared by provisioners and clients.
 const (
-	TLSCertKey          = "tls.crt"
-	TLSKeyKey           = "tls.key"
-	CapabilitiesKey     = "capabilities.json"
-	ProcessTokenKey     = "process-token"
-	IdentityAnnotation  = "swe.dev/sandboxd-identity"
-	TrustAnnotation     = "swe.dev/sandboxd-trust"
-	TokenAnnotation     = "swe.dev/sandboxd-terminal-token"
-	PodUIDAnnotation    = "swe.dev/sandboxd-pod-uid"
-	SecretUIDAnnotation = "swe.dev/sandboxd-secret-uid"
+	TLSCertKey           = "tls.crt"
+	TLSKeyKey            = "tls.key"
+	CapabilitiesKey      = "capabilities.json"
+	HealthTokenKey       = "health-token"
+	ProcessTokenKey      = "process-token"
+	IdentityAnnotation   = "swe.dev/sandboxd-identity"
+	TrustAnnotation      = "swe.dev/sandboxd-trust"
+	TokenAnnotation      = "swe.dev/sandboxd-terminal-token"
+	PodUIDAnnotation     = "swe.dev/sandboxd-pod-uid"
+	SecretUIDAnnotation  = "swe.dev/sandboxd-secret-uid"
+	SecretNameAnnotation = "swe.dev/sandboxd-secret-name"
 )
 
 // Grant binds a bearer token to the services it may call.
