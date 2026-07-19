@@ -13,6 +13,10 @@ environmentTemplates:
   - name: small
     spec:
       image: ghcr.io/chris-cullins/swe-platform/env-base:dev
-      size: small
+      # Leave room for the claimed environment and its immediate pool replacement
+      # on kind's single control-plane node.
+      size: tiny
       idleTimeout: 15m
       diskSize: 5Gi
+      warmPool:
+        min: 1

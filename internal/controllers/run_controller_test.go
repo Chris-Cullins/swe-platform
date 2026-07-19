@@ -140,6 +140,69 @@ func TestRepeatedAllocationCreatesOneOwnedEnvironment(t *testing.T) {
 	}
 }
 
+func TestRunClaimsAndRecoversWarmEnvironment(t *testing.T) {
+	run := &platformv1alpha1.Run{ObjectMeta: metav1.ObjectMeta{Name: "r", Namespace: "ns", UID: "run-uid"}, Spec: platformv1alpha1.RunSpec{TemplateRef: "small", ProjectRef: "project", Agent: "test"}}
+	warm := &platformv1alpha1.Environment{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "warm-small-1",
+			Namespace: "ns",
+			UID:       "warm-uid",
+			Labels:    map[string]string{warmPoolLabel: "small"},
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: platformv1alpha1.GroupVersion.String(), Kind: "EnvironmentTemplate", Name: "small", UID: "template-uid", Controller: ptr(true),
+			}},
+		},
+		Spec:   platformv1alpha1.EnvironmentSpec{TemplateRef: "small"},
+		Status: platformv1alpha1.EnvironmentStatus{Phase: platformv1alpha1.EnvironmentPhaseReady},
+	}
+	r := reconciler(t, &scriptedAdapter{}, run, warm)
+	ref, err := r.allocateEnvironment(context.Background(), run)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ref.Name != warm.Name || ref.UID != warm.UID || ref.Ownership != platformv1alpha1.EnvironmentOwnershipClaimed {
+		t.Fatalf("reference = %#v", ref)
+	}
+	var claimed platformv1alpha1.Environment
+	if err := r.Get(context.Background(), client.ObjectKeyFromObject(warm), &claimed); err != nil {
+		t.Fatal(err)
+	}
+	if claimed.Status.ClaimedBy == nil || claimed.Status.ClaimedBy.UID != run.UID || claimed.Status.LastActiveAt == nil || claimed.Status.Phase != platformv1alpha1.EnvironmentPhaseSetup || claimed.Status.PodName != "" || claimed.Status.Endpoints.Sandboxd != "" {
+		t.Fatalf("claim status = %#v", claimed.Status)
+	}
+	if claimed.Spec.ProjectRef != run.Spec.ProjectRef || claimed.Labels[warmPoolLabel] != "" || metav1.GetControllerOf(&claimed) != nil {
+		t.Fatalf("promoted environment = %#v", claimed)
+	}
+	recovered, err := r.recoverEnvironmentReference(context.Background(), run)
+	if err != nil || recovered == nil || recovered.UID != warm.UID || recovered.Ownership != platformv1alpha1.EnvironmentOwnershipClaimed {
+		t.Fatalf("recovered = %#v, error = %v", recovered, err)
+	}
+}
+
+func TestWarmPromotionWithdrawsReadinessBeforeAdapterAcceptance(t *testing.T) {
+	run := &platformv1alpha1.Run{ObjectMeta: metav1.ObjectMeta{Name: "r", Namespace: "ns", UID: "run-uid", Finalizers: []string{runFinalizer}}, Spec: platformv1alpha1.RunSpec{TemplateRef: "small", ProjectRef: "project", Agent: "test"}}
+	warm := &platformv1alpha1.Environment{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "warm-small-1", Namespace: "ns", UID: "warm-uid", Labels: map[string]string{warmPoolLabel: "small"},
+			OwnerReferences: []metav1.OwnerReference{{APIVersion: platformv1alpha1.GroupVersion.String(), Kind: "EnvironmentTemplate", Name: "small", UID: "template-uid", Controller: ptr(true)}},
+		},
+		Spec: platformv1alpha1.EnvironmentSpec{TemplateRef: "small"},
+		Status: platformv1alpha1.EnvironmentStatus{
+			Phase: platformv1alpha1.EnvironmentPhaseReady, PodName: "env-warm-small-1", Endpoints: platformv1alpha1.EnvironmentEndpoints{Sandboxd: "10.0.0.1:50051"},
+		},
+	}
+	adapter := &scriptedAdapter{}
+	r := reconciler(t, adapter, run, warm)
+	got := reconcileRun(t, r, run.Name)
+	if got.Status.State != platformv1alpha1.RunStateAllocating || got.Status.EnvironmentRef == nil {
+		t.Fatalf("Run status = %#v, want allocated but not ready", got.Status)
+	}
+	got = reconcileRun(t, r, run.Name)
+	if got.Status.State != platformv1alpha1.RunStateAllocating || adapter.accepted != 0 {
+		t.Fatalf("state = %s, adapter accepts = %d", got.Status.State, adapter.accepted)
+	}
+}
+
 func TestClaimsAreExclusiveUIDFencedAndReleasedSafely(t *testing.T) {
 	run := &platformv1alpha1.Run{ObjectMeta: metav1.ObjectMeta{Name: "r", Namespace: "ns", UID: "new"}, Spec: platformv1alpha1.RunSpec{EnvironmentRef: "shared", Agent: "test"}}
 	env := &platformv1alpha1.Environment{ObjectMeta: metav1.ObjectMeta{Name: "shared", Namespace: "ns", UID: "env"}, Status: platformv1alpha1.EnvironmentStatus{ClaimedBy: &platformv1alpha1.RunReference{Name: "r", UID: "old"}}}

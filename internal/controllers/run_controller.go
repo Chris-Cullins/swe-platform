@@ -112,7 +112,13 @@ func (r *RunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.R
 	}
 
 	if run.Status.EnvironmentRef == nil {
-		ref, err := r.allocateEnvironment(ctx, &run)
+		ref, err := r.recoverEnvironmentReference(ctx, &run)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+		if ref == nil {
+			ref, err = r.allocateEnvironment(ctx, &run)
+		}
 		if err != nil {
 			return ctrl.Result{}, err
 		}
@@ -170,6 +176,9 @@ func (r *RunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.R
 	case AdapterObservationAccepted:
 	case AdapterObservationRunning:
 		state = platformv1alpha1.RunStateRunning
+		if err := r.touchEnvironmentActivity(ctx, env); err != nil {
+			return ctrl.Result{}, err
+		}
 	case AdapterObservationNeedsInput:
 		state = platformv1alpha1.RunStateNeedsInput
 	case AdapterObservationSucceeded:
@@ -209,21 +218,20 @@ func (r *RunReconciler) allocateEnvironment(ctx context.Context, run *platformv1
 		return &platformv1alpha1.RunEnvironmentReference{Name: env.Name, UID: env.UID, Ownership: platformv1alpha1.EnvironmentOwnershipClaimed}, nil
 	}
 
-	template := run.Spec.TemplateRef
-	if run.Spec.ProjectRef != "" && template == "" {
-		var project platformv1alpha1.Project
-		if err := r.Get(ctx, types.NamespacedName{Namespace: run.Namespace, Name: run.Spec.ProjectRef}, &project); err != nil {
-			return nil, fmt.Errorf("get project %q: %w", run.Spec.ProjectRef, err)
-		}
-		template = project.Spec.TemplateRef
+	template, err := r.resolveTemplate(ctx, run)
+	if err != nil {
+		return nil, err
 	}
 	if template == "" {
 		return nil, fmt.Errorf("run has no environment template")
 	}
+	if ref, err := r.claimWarmEnvironment(ctx, run, template); err != nil || ref != nil {
+		return ref, err
+	}
 	name := "run-" + string(run.UID)
 	key := types.NamespacedName{Namespace: run.Namespace, Name: name}
 	var env platformv1alpha1.Environment
-	err := r.Get(ctx, key, &env)
+	err = r.Get(ctx, key, &env)
 	if apierrors.IsNotFound(err) {
 		env = platformv1alpha1.Environment{
 			ObjectMeta: metav1.ObjectMeta{Namespace: run.Namespace, Name: name},
@@ -280,6 +288,19 @@ func (r *RunReconciler) recoverEnvironmentReference(ctx context.Context, run *pl
 		}
 		return nil, nil
 	}
+	var environments platformv1alpha1.EnvironmentList
+	if err := r.List(ctx, &environments, client.InNamespace(run.Namespace)); err != nil {
+		return nil, err
+	}
+	for i := range environments.Items {
+		env := &environments.Items[i]
+		if env.Status.ClaimedBy != nil && env.Status.ClaimedBy.Name == run.Name && env.Status.ClaimedBy.UID == run.UID {
+			if err := r.promoteWarmEnvironment(ctx, run, env); err != nil {
+				return nil, err
+			}
+			return &platformv1alpha1.RunEnvironmentReference{Name: env.Name, UID: env.UID, Ownership: platformv1alpha1.EnvironmentOwnershipClaimed}, nil
+		}
+	}
 	var env platformv1alpha1.Environment
 	if err := r.Get(ctx, types.NamespacedName{Namespace: run.Namespace, Name: "run-" + string(run.UID)}, &env); err != nil {
 		if apierrors.IsNotFound(err) {
@@ -291,6 +312,88 @@ func (r *RunReconciler) recoverEnvironmentReference(ctx context.Context, run *pl
 		return nil, nil
 	}
 	return &platformv1alpha1.RunEnvironmentReference{Name: env.Name, UID: env.UID, Ownership: platformv1alpha1.EnvironmentOwnershipOwned}, nil
+}
+
+func (r *RunReconciler) resolveTemplate(ctx context.Context, run *platformv1alpha1.Run) (string, error) {
+	if run.Spec.TemplateRef != "" {
+		return run.Spec.TemplateRef, nil
+	}
+	if run.Spec.ProjectRef == "" {
+		return "", nil
+	}
+	var project platformv1alpha1.Project
+	if err := r.Get(ctx, types.NamespacedName{Namespace: run.Namespace, Name: run.Spec.ProjectRef}, &project); err != nil {
+		return "", fmt.Errorf("get project %q: %w", run.Spec.ProjectRef, err)
+	}
+	return project.Spec.TemplateRef, nil
+}
+
+func (r *RunReconciler) claimWarmEnvironment(ctx context.Context, run *platformv1alpha1.Run, template string) (*platformv1alpha1.RunEnvironmentReference, error) {
+	var environments platformv1alpha1.EnvironmentList
+	if err := r.List(ctx, &environments, client.InNamespace(run.Namespace), client.MatchingLabels{warmPoolLabel: template}); err != nil {
+		return nil, fmt.Errorf("list warm environments: %w", err)
+	}
+	for i := range environments.Items {
+		env := &environments.Items[i]
+		owner := metav1.GetControllerOf(env)
+		if env.Spec.TemplateRef != template || env.Spec.Paused || env.Status.Phase != platformv1alpha1.EnvironmentPhaseReady || env.Status.ClaimedBy != nil || owner == nil || owner.Kind != "EnvironmentTemplate" || owner.Name != template {
+			continue
+		}
+		now := metav1.Now()
+		env.Status.ClaimedBy = &platformv1alpha1.RunReference{Name: run.Name, UID: run.UID}
+		env.Status.LastActiveAt = &now
+		if err := r.Status().Update(ctx, env); err != nil {
+			if apierrors.IsConflict(err) || apierrors.IsNotFound(err) {
+				continue
+			}
+			return nil, fmt.Errorf("claim warm environment %q: %w", env.Name, err)
+		}
+		if err := r.promoteWarmEnvironment(ctx, run, env); err != nil {
+			return nil, err
+		}
+		return &platformv1alpha1.RunEnvironmentReference{Name: env.Name, UID: env.UID, Ownership: platformv1alpha1.EnvironmentOwnershipClaimed}, nil
+	}
+	return nil, nil
+}
+
+func (r *RunReconciler) promoteWarmEnvironment(ctx context.Context, run *platformv1alpha1.Run, env *platformv1alpha1.Environment) error {
+	before := env.DeepCopy()
+	delete(env.Labels, warmPoolLabel)
+	owners := env.OwnerReferences[:0]
+	for _, owner := range env.OwnerReferences {
+		if owner.Controller != nil && *owner.Controller && owner.Kind == "EnvironmentTemplate" && owner.Name == env.Spec.TemplateRef {
+			continue
+		}
+		owners = append(owners, owner)
+	}
+	env.OwnerReferences = owners
+	env.Spec.ProjectRef = run.Spec.ProjectRef
+	env.Spec.Paused = false
+	if !reflect.DeepEqual(before.ObjectMeta, env.ObjectMeta) || !reflect.DeepEqual(before.Spec, env.Spec) {
+		if err := r.Patch(ctx, env, client.MergeFromWithOptions(before, client.MergeFromWithOptimisticLock{})); err != nil {
+			return fmt.Errorf("promote warm environment %q: %w", env.Name, err)
+		}
+	}
+	// A warm pod may still represent the generic, project-less environment.
+	// Withdraw readiness before recording the allocation on the Run so the
+	// adapter cannot start until Environment reconciliation has applied the
+	// project and republished the current sandboxd endpoint. Do this on recovery
+	// too, closing a crash between promotion and the Run status write.
+	if env.Status.Phase == platformv1alpha1.EnvironmentPhaseReady {
+		env.Status.Phase = platformv1alpha1.EnvironmentPhaseSetup
+		env.Status.PodName = ""
+		env.Status.Endpoints = platformv1alpha1.EnvironmentEndpoints{}
+		if err := r.Status().Update(ctx, env); err != nil {
+			return fmt.Errorf("withdraw warm environment %q readiness: %w", env.Name, err)
+		}
+	}
+	return nil
+}
+
+func (r *RunReconciler) touchEnvironmentActivity(ctx context.Context, env *platformv1alpha1.Environment) error {
+	now := metav1.Now()
+	env.Status.LastActiveAt = &now
+	return r.Status().Update(ctx, env)
 }
 
 func (r *RunReconciler) cleanupTerminal(ctx context.Context, run *platformv1alpha1.Run) error {

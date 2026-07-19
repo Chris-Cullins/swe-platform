@@ -15,7 +15,7 @@ rules:
     resources: ["environments", "runs"]
     verbs: ["create", "delete", "get", "list", "patch", "update", "watch"]
   - apiGroups: ["swe.dev"]
-    resources: ["environments/status", "runs/status"]
+    resources: ["environments/status", "environmenttemplates/status", "runs/status"]
     verbs: ["get", "patch", "update"]
   - apiGroups: ["swe.dev"]
     resources: ["environmenttemplates"]
@@ -62,6 +62,12 @@ rules:
     verbs: ["get"]
   - apiGroups: ["swe.dev"]
     resources: ["environments"]
+    verbs: ["get", "patch"]
+  - apiGroups: ["swe.dev"]
+    resources: ["environments/status"]
+    verbs: ["get", "update"]
+  - apiGroups: ["swe.dev"]
+    resources: ["environmenttemplates"]
     verbs: ["get"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1

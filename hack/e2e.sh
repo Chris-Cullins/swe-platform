@@ -57,6 +57,15 @@ echo "==> installing operator, CRDs, and kind template through Helm"
 helm upgrade --install swe-platform charts/swe-platform \
 	--namespace default --values charts/swe-platform/values-kind.yaml --wait --timeout 2m
 
+echo "==> waiting for warm environment"
+kubectl wait --for=jsonpath='{.status.warmPoolReady}'=1 environmenttemplate/small --timeout=2m
+WARM_ENV_NAME=$(kubectl get environments -l swe.dev/warm-pool=small -o jsonpath='{.items[0].metadata.name}')
+if [[ -z "$WARM_ENV_NAME" ]]; then
+	echo "FAIL: warm pool did not create an environment"
+	exit 1
+fi
+WARM_POD_UID=$(kubectl get pod "env-${WARM_ENV_NAME}" -o jsonpath='{.metadata.uid}')
+
 echo "==> creating project configuration"
 kubectl create secret generic e2e-project-config --from-literal=SWE_E2E_PROJECT_CONFIG=project-config-ok
 PROJECT_REPO="$(mktemp -d /tmp/swe-e2e-project-XXXXXX)"
@@ -139,27 +148,47 @@ bin/swe run "end-to-end smoke test" --project e2e --wait=false
 RUN_NAME=$(kubectl get runs -o jsonpath='{.items[0].metadata.name}')
 kubectl wait --for=jsonpath='{.status.state}'=Failed run/"$RUN_NAME" --timeout=3m
 RUN_ENV_NAME=$(kubectl get run "$RUN_NAME" -o jsonpath='{.status.environmentRef.name}')
-kubectl wait --for=jsonpath='{.status.phase}'=Paused environment/"$RUN_ENV_NAME" --timeout=3m
-if [[ $(kubectl get environments -o name | wc -l) -ne 1 ]]; then
-	echo "FAIL: Run allocation created duplicate environments"
+RUN_ENV_OWNERSHIP=$(kubectl get run "$RUN_NAME" -o jsonpath='{.status.environmentRef.ownership}')
+if [[ "$RUN_ENV_NAME" != "$WARM_ENV_NAME" || "$RUN_ENV_OWNERSHIP" != "Claimed" ]]; then
+	echo "FAIL: Run allocated $RUN_ENV_NAME ($RUN_ENV_OWNERSHIP), expected claimed warm environment $WARM_ENV_NAME"
 	exit 1
 fi
-
-# No production agent adapter exists yet, so the unknown adapter fails and its
-# owned Environment is correctly paused. Use a standalone Environment for the
-# remaining environment/sandboxd acceptance checks.
+RUN_POD_UID=$(kubectl get pod "env-${RUN_ENV_NAME}" -o jsonpath='{.metadata.uid}')
+RUN_POD_PROJECT=$(kubectl get pod "env-${RUN_ENV_NAME}" -o jsonpath='{.metadata.annotations.swe\.dev/project}')
+if [[ "$RUN_POD_UID" == "$WARM_POD_UID" || "$RUN_POD_PROJECT" != "e2e" ]]; then
+	echo "FAIL: Run reached a terminal state before its claimed warm pod was replaced and configured for the Project"
+	exit 1
+fi
+for _ in $(seq 1 60); do
+	CLAIM_UID=$(kubectl get environment "$RUN_ENV_NAME" -o jsonpath='{.status.claimedBy.uid}' 2>/dev/null || true)
+	if [[ -z "$CLAIM_UID" ]]; then
+		break
+	fi
+	sleep 1
+done
+if [[ -n "${CLAIM_UID:-}" ]]; then
+	echo "FAIL: terminal Run did not release its warm Environment claim"
+	exit 1
+fi
+kubectl wait --for=jsonpath='{.status.phase}'=Ready environment/"$RUN_ENV_NAME" --timeout=3m
 kubectl delete run "$RUN_NAME" --wait=true >/dev/null
-kubectl wait --for=delete environment/"$RUN_ENV_NAME" --timeout=2m
-cat <<'EOF' | kubectl apply -f -
-apiVersion: swe.dev/v1alpha1
-kind: Environment
-metadata:
-  name: e2e-environment
-spec:
-  projectRef: e2e
-  templateRef: small
-EOF
-kubectl wait --for=jsonpath='{.status.phase}'=Ready environment/e2e-environment --timeout=3m
+if ! kubectl get environment "$RUN_ENV_NAME" >/dev/null 2>&1; then
+	echo "FAIL: deleting Run removed its claimed Environment"
+	exit 1
+fi
+ENV_NAME=$RUN_ENV_NAME
+for _ in $(seq 1 60); do
+	REPLACEMENT_NAME=$(kubectl get environments -l swe.dev/warm-pool=small -o jsonpath='{range .items[*]}{.metadata.name}{end}' 2>/dev/null || true)
+	REPLACEMENT_PHASE=$(kubectl get environments -l swe.dev/warm-pool=small -o jsonpath='{range .items[*]}{.status.phase}{end}' 2>/dev/null || true)
+	if [[ -n "$REPLACEMENT_NAME" && "$REPLACEMENT_NAME" != "$ENV_NAME" && "$REPLACEMENT_PHASE" == "Ready" ]]; then
+		break
+	fi
+	sleep 1
+done
+if [[ -z "${REPLACEMENT_NAME:-}" || "$REPLACEMENT_NAME" == "$ENV_NAME" || "${REPLACEMENT_PHASE:-}" != "Ready" ]]; then
+	echo "FAIL: warm pool was not replenished after claim"
+	exit 1
+fi
 
 echo "==> verifying state"
 kubectl get environments
@@ -196,7 +225,6 @@ if ! grep -q 'e2e transcript event' /tmp/swe-platform-transcript.out; then
 	exit 1
 fi
 
-ENV_NAME=e2e-environment
 echo "==> verifying shared terminal through swe attach"
 printf 'printf terminal-e2e-ok; printf "\\n%%s\\n" "$SWE_E2E_PROJECT_CONFIG"; exit\n' | bin/swe attach "$ENV_NAME" > /tmp/swe-platform-terminal.out
 if ! grep -q 'terminal-e2e-ok' /tmp/swe-platform-terminal.out; then
@@ -257,7 +285,20 @@ if ! kubectl exec "env-${ENV_NAME}" -- sh -c 'test "$(wc -l < /workspace/setup-r
 	exit 1
 fi
 
-echo "==> verifying web terminal through the control plane"
+echo "==> verifying idle pause and terminal wake through the control plane"
+PRE_IDLE_POD_UID=$(kubectl get pod "env-${ENV_NAME}" -o jsonpath='{.metadata.uid}')
+kubectl patch environmenttemplate small --type=merge -p '{"spec":{"idleTimeout":"5s"}}' >/dev/null
+for _ in $(seq 1 30); do
+	PHASE=$(kubectl get environment "$ENV_NAME" -o jsonpath='{.status.phase}')
+	if [[ "$PHASE" == "Paused" ]] && ! kubectl get pod "env-${ENV_NAME}" >/dev/null 2>&1; then
+		break
+	fi
+	sleep 1
+done
+if [[ "${PHASE:-}" != "Paused" ]] || kubectl get pod "env-${ENV_NAME}" >/dev/null 2>&1; then
+	echo "FAIL: idle environment did not pause and remove its pod"
+	exit 1
+fi
 WEB_TERMINAL_CLIENT=$(mktemp /tmp/swe-web-terminal-XXXXXX.go)
 cat > "$WEB_TERMINAL_CLIENT" <<'EOF'
 package main
@@ -291,6 +332,19 @@ go run "$WEB_TERMINAL_CLIENT" "ws://127.0.0.1:18080/api/v1/environments/${ENV_NA
 if ! grep -q 'web-terminal-e2e-ok' /tmp/swe-platform-web-terminal.out; then
 	echo "FAIL: terminal output was not received through the control-plane websocket"
 	cat /tmp/swe-platform-web-terminal.out
+	exit 1
+fi
+if [[ "$(kubectl get environment "$ENV_NAME" -o jsonpath='{.spec.paused}')" == "true" ]]; then
+	echo "FAIL: terminal request did not wake the idle environment"
+	exit 1
+fi
+if [[ "$(kubectl get environment "$ENV_NAME" -o jsonpath='{.status.phase}')" != "Ready" ]]; then
+	echo "FAIL: woken environment did not become ready"
+	exit 1
+fi
+POST_WAKE_POD_UID=$(kubectl get pod "env-${ENV_NAME}" -o jsonpath='{.metadata.uid}')
+if [[ "$POST_WAKE_POD_UID" == "$PRE_IDLE_POD_UID" ]]; then
+	echo "FAIL: terminal request connected without recreating the paused pod"
 	exit 1
 fi
 

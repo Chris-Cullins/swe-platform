@@ -8,12 +8,15 @@ import (
 	"net"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/gorilla/websocket"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/util/retry"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	platformv1alpha1 "github.com/Chris-Cullins/swe-platform/api/v1alpha1"
@@ -23,6 +26,8 @@ import (
 const (
 	defaultNamespace = "default"
 	sandboxdPort     = "50051"
+	wakeTimeout      = 2 * time.Minute
+	wakePollInterval = 250 * time.Millisecond
 )
 
 // TerminalDialer resolves an Environment and connects to its sandboxd API.
@@ -35,11 +40,38 @@ type KubernetesTerminalDialer struct {
 	Client client.Client
 }
 
-// DialTerminal connects directly to sandboxd in an active environment pod.
+type activeTerminalConnection struct {
+	io.Closer
+	cancel context.CancelFunc
+}
+
+func (c *activeTerminalConnection) Close() error {
+	c.cancel()
+	return c.Closer.Close()
+}
+
+// DialTerminal records terminal activity, wakes a paused environment, and then
+// connects directly to sandboxd in its active pod.
 func (d KubernetesTerminalDialer) DialTerminal(ctx context.Context, namespace, name string) (sandboxdv1.TerminalServiceClient, io.Closer, error) {
 	var environment platformv1alpha1.Environment
 	if err := d.Client.Get(ctx, types.NamespacedName{Namespace: namespace, Name: name}, &environment); err != nil {
 		return nil, nil, fmt.Errorf("get environment: %w", err)
+	}
+	if err := d.markActive(ctx, &environment); err != nil {
+		return nil, nil, err
+	}
+	if environment.Spec.Paused {
+		before := environment.DeepCopy()
+		environment.Spec.Paused = false
+		if err := d.Client.Patch(ctx, &environment, client.MergeFrom(before)); err != nil {
+			return nil, nil, fmt.Errorf("wake environment: %w", err)
+		}
+		if err := d.waitUntilReady(ctx, namespace, name, &environment); err != nil {
+			return nil, nil, err
+		}
+		if err := d.markActive(ctx, &environment); err != nil {
+			return nil, nil, err
+		}
 	}
 	if environment.Status.PodName == "" {
 		return nil, nil, fmt.Errorf("environment has no active pod")
@@ -57,7 +89,87 @@ func (d KubernetesTerminalDialer) DialTerminal(ctx context.Context, namespace, n
 	if err != nil {
 		return nil, nil, fmt.Errorf("connect to sandboxd: %w", err)
 	}
-	return sandboxdv1.NewTerminalServiceClient(connection), connection, nil
+	heartbeatContext, cancelHeartbeat := context.WithCancel(ctx)
+	heartbeatInterval, err := d.activityHeartbeatInterval(ctx, &environment)
+	if err != nil {
+		cancelHeartbeat()
+		_ = connection.Close()
+		return nil, nil, err
+	}
+	go d.heartbeatActivity(heartbeatContext, types.NamespacedName{Namespace: namespace, Name: name}, heartbeatInterval)
+	closer := &activeTerminalConnection{Closer: connection, cancel: cancelHeartbeat}
+	return sandboxdv1.NewTerminalServiceClient(connection), closer, nil
+}
+
+func (d KubernetesTerminalDialer) activityHeartbeatInterval(ctx context.Context, environment *platformv1alpha1.Environment) (time.Duration, error) {
+	timeout := 15 * time.Minute
+	var template platformv1alpha1.EnvironmentTemplate
+	key := types.NamespacedName{Namespace: environment.Namespace, Name: environment.Spec.TemplateRef}
+	if err := d.Client.Get(ctx, key, &template); err != nil {
+		return 0, fmt.Errorf("get environment template: %w", err)
+	}
+	if template.Spec.IdleTimeout != nil {
+		timeout = template.Spec.IdleTimeout.Duration
+	}
+	if timeout <= 0 {
+		return 0, fmt.Errorf("environment template idle timeout must be positive")
+	}
+	return timeout / 2, nil
+}
+
+func (d KubernetesTerminalDialer) heartbeatActivity(ctx context.Context, key types.NamespacedName, interval time.Duration) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			var environment platformv1alpha1.Environment
+			if err := d.Client.Get(ctx, key, &environment); err != nil {
+				return
+			}
+			if err := d.markActive(ctx, &environment); err != nil {
+				return
+			}
+		}
+	}
+}
+
+func (d KubernetesTerminalDialer) markActive(ctx context.Context, environment *platformv1alpha1.Environment) error {
+	key := client.ObjectKeyFromObject(environment)
+	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		if err := d.Client.Get(ctx, key, environment); err != nil {
+			return err
+		}
+		now := metav1.Now()
+		environment.Status.LastActiveAt = &now
+		return d.Client.Status().Update(ctx, environment)
+	}); err != nil {
+		return fmt.Errorf("record environment activity: %w", err)
+	}
+	return nil
+}
+
+func (d KubernetesTerminalDialer) waitUntilReady(ctx context.Context, namespace, name string, environment *platformv1alpha1.Environment) error {
+	wakeContext, cancel := context.WithTimeout(ctx, wakeTimeout)
+	defer cancel()
+	ticker := time.NewTicker(wakePollInterval)
+	defer ticker.Stop()
+	key := types.NamespacedName{Namespace: namespace, Name: name}
+	for {
+		if err := d.Client.Get(wakeContext, key, environment); err != nil {
+			return fmt.Errorf("wait for environment wake: %w", err)
+		}
+		if environment.Status.Phase == platformv1alpha1.EnvironmentPhaseReady && environment.Status.PodName != "" {
+			return nil
+		}
+		select {
+		case <-wakeContext.Done():
+			return fmt.Errorf("wait for environment wake: %w", wakeContext.Err())
+		case <-ticker.C:
+		}
+	}
 }
 
 type terminalControl struct {

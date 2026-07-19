@@ -8,12 +8,18 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/gorilla/websocket"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/test/bufconn"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
+	platformv1alpha1 "github.com/Chris-Cullins/swe-platform/api/v1alpha1"
 	sandboxdv1 "github.com/Chris-Cullins/swe-platform/sandboxd/gen/proto/sandboxd/v1"
 )
 
@@ -81,6 +87,31 @@ func TestWebTerminalRequiresDialer(t *testing.T) {
 	NewServer(nil).Handler().ServeHTTP(response, request)
 	if response.Code != 503 {
 		t.Fatalf("status = %d, want 503", response.Code)
+	}
+}
+
+func TestKubernetesTerminalDialerMarksEnvironmentActive(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := platformv1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	oldActivity := metav1.NewTime(time.Now().Add(-time.Hour))
+	environment := &platformv1alpha1.Environment{
+		ObjectMeta: metav1.ObjectMeta{Name: "env-1", Namespace: "project-1"},
+		Status:     platformv1alpha1.EnvironmentStatus{LastActiveAt: &oldActivity},
+	}
+	kubeClient := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(environment).WithObjects(environment).Build()
+	dialer := KubernetesTerminalDialer{Client: kubeClient}
+
+	if err := dialer.markActive(context.Background(), environment); err != nil {
+		t.Fatalf("markActive() error = %v", err)
+	}
+	var updated platformv1alpha1.Environment
+	if err := kubeClient.Get(context.Background(), client.ObjectKeyFromObject(environment), &updated); err != nil {
+		t.Fatal(err)
+	}
+	if updated.Status.LastActiveAt == nil || !updated.Status.LastActiveAt.After(oldActivity.Time) {
+		t.Fatalf("LastActiveAt = %v, want after %s", updated.Status.LastActiveAt, oldActivity.Time)
 	}
 }
 
