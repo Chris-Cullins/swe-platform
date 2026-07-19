@@ -99,14 +99,14 @@ type EnvironmentStatus struct {
 	LastActiveAt *metav1.Time `json:"lastActiveAt,omitempty"`
 
 	// PodRecoveryAttempts is the number of terminal Pod replacements attempted
-	// for PodRecoveryObservedGeneration.
+	// since the current Pod recovery sequence last became ready.
 	// +optional
 	PodRecoveryAttempts int32 `json:"podRecoveryAttempts,omitempty"`
 
-	// PodRecoveryObservedGeneration is the Environment generation for which the
-	// Pod recovery budget is being tracked.
+	// PodRecoveryExhausted reports that automatic terminal Pod replacement has
+	// consumed its retry budget. It remains set until sandboxd becomes ready.
 	// +optional
-	PodRecoveryObservedGeneration int64 `json:"podRecoveryObservedGeneration,omitempty"`
+	PodRecoveryExhausted bool `json:"podRecoveryExhausted,omitempty"`
 
 	// PodRecoveryUID identifies the exact terminal Pod covered by the pending or
 	// in-progress recovery attempt.

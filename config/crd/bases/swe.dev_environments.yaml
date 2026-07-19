@@ -198,21 +198,20 @@ spec:
               podRecoveryAttempts:
                 description: |-
                   PodRecoveryAttempts is the number of terminal Pod replacements attempted
-                  for PodRecoveryObservedGeneration.
+                  since the current Pod recovery sequence last became ready.
                 format: int32
                 type: integer
+              podRecoveryExhausted:
+                description: |-
+                  PodRecoveryExhausted reports that automatic terminal Pod replacement has
+                  consumed its retry budget. It remains set until sandboxd becomes ready.
+                type: boolean
               podRecoveryNextAttemptAt:
                 description: |-
                   PodRecoveryNextAttemptAt is when the controller may next replace a
                   terminal Pod.
                 format: date-time
                 type: string
-              podRecoveryObservedGeneration:
-                description: |-
-                  PodRecoveryObservedGeneration is the Environment generation for which the
-                  Pod recovery budget is being tracked.
-                format: int64
-                type: integer
               podRecoveryUID:
                 description: |-
                   PodRecoveryUID identifies the exact terminal Pod covered by the pending or
