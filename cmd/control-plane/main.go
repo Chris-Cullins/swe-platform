@@ -23,6 +23,7 @@ import (
 
 	platformv1alpha1 "github.com/Chris-Cullins/swe-platform/api/v1alpha1"
 	"github.com/Chris-Cullins/swe-platform/internal/controlplane"
+	consoleui "github.com/Chris-Cullins/swe-platform/ui"
 )
 
 const shutdownTimeout = 10 * time.Second
@@ -77,6 +78,7 @@ func main() {
 			Runs:                  controlplane.KubernetesRunResolver{Client: kubeClient},
 			TranscriptStore:       transcripts,
 			TerminalDialer:        controlplane.KubernetesTerminalDialer{Client: kubeClient},
+			ConsoleAssets:         consoleui.Assets(),
 			TrustProxy:            strings.EqualFold(os.Getenv("SWE_TRUST_PROXY_HEADERS"), "true"),
 			AllowInsecureSessions: strings.EqualFold(os.Getenv("SWE_ALLOW_INSECURE_SESSIONS"), "true"),
 			StreamLifecycle:       streamLifecycle,

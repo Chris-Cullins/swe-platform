@@ -163,6 +163,22 @@ subjects:
 Create the ServiceAccount, then mint a short-lived credential with
 `kubectl create token run-123-adapter -n project-a --audience=swe-platform`.
 
+## Operations console
+
+The production control-plane binary and image embed the React operations console and serve it
+from `/` on the same origin as the resource API, transcript SSE stream, and terminal WebSocket.
+There is no separate UI workload or Service. For local access, forward the existing Service and
+open `http://127.0.0.1:8080/`:
+
+```sh
+kubectl port-forward service/swe-platform-swe-platform-control-plane 8080:80
+```
+
+The kind preset permits HTTP browser sessions for this local flow. Production browser sessions
+still require HTTPS. To build the embedded binary outside the image build, run `make ui-build`
+followed by `make build-control-plane-production`; ordinary Go builds intentionally omit the UI
+and do not require generated Vite assets.
+
 ## Run and Environment resource API
 
 The console-facing resource API exposes explicit DTOs rather than Kubernetes objects:
