@@ -171,10 +171,12 @@ after checkout. Set `Environment.spec.paused` to `true` to delete the pod while 
 its workspace PVC, then set it to `false` to create a fresh pod; `.agents/resume` runs
 after the volume is reattached. Both hooks can use values from the Project Secret, which
 also remains available to the running environment. Setup and resume hooks are limited to
-30 minutes each. Environment readiness is reported by the current-generation `Ready`
-condition only after initialization completes and the sandboxd startup/readiness probes
-pass; `status.phase` is a display summary rather than the scheduling contract. GitHub App
-token minting is not implemented yet.
+30 minutes each. Failed or completed environment pods are replaced with bounded exponential
+backoff while retaining the workspace PVC; recovery progress and exhaustion are reported by
+the `Ready` condition and pod-recovery status fields. Environment readiness is reported by
+the current-generation `Ready` condition only after initialization completes and the sandboxd
+startup/readiness probes pass; `status.phase` is a display summary rather than the scheduling
+contract. GitHub App token minting is not implemented yet.
 
 Active environments are automatically paused after their template's `idleTimeout`
 (15 minutes by default). Opening the control-plane web terminal records activity and
