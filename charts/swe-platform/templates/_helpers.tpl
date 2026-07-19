@@ -29,3 +29,7 @@ app.kubernetes.io/managed-by: {{ .Release.Service }}
 {{- default "default" .Values.serviceAccount.name }}
 {{- end }}
 {{- end }}
+
+{{- define "swe-platform.environmentImage" -}}
+{{- printf "%s:%s" .Values.environmentImage.repository (.Values.environmentImage.tag | default .Chart.AppVersion) -}}
+{{- end }}

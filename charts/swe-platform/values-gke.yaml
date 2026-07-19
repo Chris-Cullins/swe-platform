@@ -1,9 +1,7 @@
-# Production baseline for GKE clusters whose environment node pools have
-# GKE Sandbox enabled. The gvisor RuntimeClass must exist before environments run.
+# Production baseline for GKE clusters whose environment node pools have GKE
+# Sandbox enabled. Images inherit the chart appVersion as one coordinated
+# release. The gvisor RuntimeClass must exist before environments run.
 replicaCount: 2
-
-image:
-  tag: latest
 
 resources:
   requests:
@@ -26,7 +24,6 @@ affinity:
 environmentTemplates:
   - name: medium
     spec:
-      image: ghcr.io/chris-cullins/swe-platform/env-base:latest
       size: medium
       runtimeClass: gvisor
       idleTimeout: 15m

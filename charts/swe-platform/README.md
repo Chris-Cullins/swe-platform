@@ -22,8 +22,14 @@ helm upgrade --install swe-platform ./charts/swe-platform \
 ```
 
 The production presets create a `medium` `EnvironmentTemplate` using the published
-`env-base` image. Override image tags with immutable release or SHA tags for controlled
-rollouts.
+`env-base` image. Operator, control-plane, and env-base tags default to the chart
+`appVersion`, keeping a released chart on one tested version set and making Helm rollback
+restore that set. Override all three tags with immutable release or SHA tags when testing
+a different coordinated set; `latest` and `dev` are development-only choices.
+
+Each image publish run emits a `swe-platform-release-*` artifact containing the chart
+version, app version, and the registry digest of every image for incident diagnosis and
+digest-pinned installation overrides.
 
 | Preset | Assumptions |
 |---|---|

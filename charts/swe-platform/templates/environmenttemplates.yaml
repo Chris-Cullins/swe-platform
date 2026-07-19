@@ -1,4 +1,8 @@
 {{- range .Values.environmentTemplates }}
+{{- $spec := deepCopy .spec }}
+{{- if not $spec.image }}
+{{- $_ := set $spec "image" (include "swe-platform.environmentImage" $) }}
+{{- end }}
 ---
 apiVersion: swe.dev/v1alpha1
 kind: EnvironmentTemplate
@@ -8,5 +12,5 @@ metadata:
   labels:
     {{- include "swe-platform.labels" $ | nindent 4 }}
 spec:
-  {{- toYaml .spec | nindent 2 }}
+  {{- toYaml $spec | nindent 2 }}
 {{- end }}

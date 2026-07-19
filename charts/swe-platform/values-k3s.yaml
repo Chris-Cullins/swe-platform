@@ -1,7 +1,6 @@
-# Production baseline for k3s. k3s does not include gVisor, so this preset uses
-# the cluster's default OCI runtime for environment pods.
-image:
-  tag: latest
+# Production baseline for k3s. Images inherit the chart appVersion as one
+# coordinated release. k3s does not include gVisor, so this preset uses the
+# cluster's default OCI runtime for environment pods.
 
 resources:
   requests:
@@ -14,7 +13,6 @@ resources:
 environmentTemplates:
   - name: medium
     spec:
-      image: ghcr.io/chris-cullins/swe-platform/env-base:latest
       size: medium
       idleTimeout: 15m
       diskSize: 40Gi

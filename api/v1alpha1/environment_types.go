@@ -87,6 +87,11 @@ type EnvironmentStatus struct {
 	// +optional
 	PodName string `json:"podName,omitempty"`
 
+	// ImageID is the immutable runtime image identity reported for the current
+	// environment container. It is cleared when no backing pod exists.
+	// +optional
+	ImageID string `json:"imageID,omitempty"`
+
 	// LastActiveAt records the last time the environment saw user or agent activity.
 	// The idle reaper uses it to decide when to pause.
 	// +optional

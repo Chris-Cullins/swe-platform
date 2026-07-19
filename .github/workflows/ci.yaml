@@ -55,3 +55,23 @@ jobs:
             helm template swe-platform charts/swe-platform \
               --namespace swe-platform-system --values "$values" >/dev/null
           done
+
+      - name: Production images are immutable and coordinated
+        run: |
+          app_version=$(awk '$1 == "appVersion:" {gsub(/"/, "", $2); print $2}' charts/swe-platform/Chart.yaml)
+          if [[ ! "$app_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([+-][0-9A-Za-z.-]+)?$ ]]; then
+            echo "Chart.appVersion must be an immutable release version, got: ${app_version:-<empty>}" >&2
+            exit 1
+          fi
+          for preset in k3s gke eks; do
+            images=$(helm template swe-platform charts/swe-platform \
+              --namespace swe-platform-system \
+              --values "charts/swe-platform/values-${preset}.yaml" |
+              awk '$1 == "image:" {gsub(/"/, "", $2); print $2}')
+            test "$(printf '%s\n' "$images" | wc -l)" -eq 3
+            test "$(printf '%s\n' "$images" | sort -u | sed -n "s/.*:\([^:@]*\)$/\1/p" | uniq)" = "$app_version"
+            if printf '%s\n' "$images" | grep -Eq ':(latest|dev)$'; then
+              echo "mutable production image in values-${preset}.yaml" >&2
+              exit 1
+            fi
+          done

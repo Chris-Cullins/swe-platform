@@ -162,6 +162,11 @@ spec:
                     description: Terminal is the websocket address of the shared terminal.
                     type: string
                 type: object
+              imageID:
+                description: |-
+                  ImageID is the immutable runtime image identity reported for the current
+                  environment container. It is cleared when no backing pod exists.
+                type: string
               lastActiveAt:
                 description: |-
                   LastActiveAt records the last time the environment saw user or agent activity.

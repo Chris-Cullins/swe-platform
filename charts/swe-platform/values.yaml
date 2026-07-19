@@ -2,7 +2,8 @@ replicaCount: 1
 
 image:
   repository: ghcr.io/chris-cullins/swe-platform/operator
-  tag: latest
+  # Defaults to Chart.appVersion so released charts select their coordinated release.
+  tag: ""
   pullPolicy: IfNotPresent
 
 controlPlane:
@@ -10,7 +11,8 @@ controlPlane:
   replicaCount: 1
   image:
     repository: ghcr.io/chris-cullins/swe-platform/control-plane
-    tag: latest
+    # Defaults to Chart.appVersion.
+    tag: ""
     pullPolicy: IfNotPresent
   auth:
     tokenAudience: swe-platform
@@ -53,6 +55,12 @@ resources: {}
 nodeSelector: {}
 tolerations: []
 affinity: {}
+
+# Default image for EnvironmentTemplate entries that omit spec.image. Its tag
+# defaults to Chart.appVersion alongside the operator and control plane.
+environmentImage:
+  repository: ghcr.io/chris-cullins/swe-platform/env-base
+  tag: ""
 
 # EnvironmentTemplate resources to create. Each entry may set `namespace` and
 # otherwise uses the release namespace. Empty by default because no stable

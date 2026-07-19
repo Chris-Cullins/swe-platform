@@ -70,7 +70,10 @@ runs both via `make` targets:
 - **Dev cluster:** `make kind-up`, build/load the images, then install
   `charts/swe-platform` with `values-kind.yaml` as printed by the script.
 - **Production Helm presets:** `charts/swe-platform/values-{k3s,gke,eks}.yaml`; CI lints
-  and renders every preset. Provider assumptions are documented in the chart README.
+  and renders every preset, verifies all rendered production images use the coordinated
+  chart `appVersion`, and rejects `latest`/`dev`. Provider assumptions are documented in
+  the chart README. Image publish runs attach a release manifest with the chart version
+  and all three image digests.
 - **E2E acceptance:** `./hack/e2e.sh` — full kind + operator + `swe run` pass with the
   env-base image built and loaded locally (no registry credentials needed). Runs in CI
   as the `e2e` workflow on relevant PRs and via `workflow_dispatch`.

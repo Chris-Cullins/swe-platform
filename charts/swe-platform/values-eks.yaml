@@ -1,9 +1,7 @@
 # Production baseline for EKS with the EBS CSI driver and a default StorageClass.
-# EKS has no standard gVisor RuntimeClass; configure one explicitly if installed.
+# Images inherit the chart appVersion as one coordinated release. EKS has no
+# standard gVisor RuntimeClass; configure one explicitly if installed.
 replicaCount: 2
-
-image:
-  tag: latest
 
 resources:
   requests:
@@ -26,7 +24,6 @@ affinity:
 environmentTemplates:
   - name: medium
     spec:
-      image: ghcr.io/chris-cullins/swe-platform/env-base:latest
       size: medium
       idleTimeout: 15m
       diskSize: 40Gi

@@ -972,6 +972,9 @@ func TestSyncStatusPublishesSandboxdEndpoint(t *testing.T) {
 			Phase:      corev1.PodRunning,
 			PodIP:      "10.0.0.7",
 			Conditions: []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}},
+			ContainerStatuses: []corev1.ContainerStatus{{
+				Name: "environment", ImageID: "ghcr.io/example/env@sha256:0123456789abcdef",
+			}},
 		},
 	}
 
@@ -982,8 +985,8 @@ func TestSyncStatusPublishesSandboxdEndpoint(t *testing.T) {
 	if err := reconciler.Get(context.Background(), client.ObjectKeyFromObject(env), &updated); err != nil {
 		t.Fatal(err)
 	}
-	if updated.Status.Phase != platformv1alpha1.EnvironmentPhaseReady || updated.Status.Endpoints.Sandboxd != "10.0.0.7:50051" {
-		t.Fatalf("Status = %#v, want Ready with sandboxd endpoint", updated.Status)
+	if updated.Status.Phase != platformv1alpha1.EnvironmentPhaseReady || updated.Status.Endpoints.Sandboxd != "10.0.0.7:50051" || updated.Status.ImageID != "ghcr.io/example/env@sha256:0123456789abcdef" {
+		t.Fatalf("Status = %#v, want Ready with sandboxd endpoint and immutable image ID", updated.Status)
 	}
 	ready := apimeta.FindStatusCondition(updated.Status.Conditions, platformv1alpha1.EnvironmentConditionReady)
 	if updated.Status.ObservedGeneration != updated.Generation || ready == nil || ready.Status != metav1.ConditionTrue || ready.ObservedGeneration != updated.Generation || ready.Reason != "SandboxdReady" {

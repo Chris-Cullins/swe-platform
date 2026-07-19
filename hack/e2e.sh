@@ -192,6 +192,13 @@ fi
 echo "==> verifying state"
 kubectl get environments
 kubectl get pods -l app.kubernetes.io/managed-by=swe-platform
+STATUS_POD_NAME=$(kubectl get environment "$ENV_NAME" -o jsonpath='{.status.podName}')
+ENV_IMAGE_ID=$(kubectl get environment "$ENV_NAME" -o jsonpath='{.status.imageID}')
+POD_IMAGE_ID=$(kubectl get pod "$STATUS_POD_NAME" -o jsonpath='{.status.containerStatuses[?(@.name=="environment")].imageID}')
+if [[ -z "$ENV_IMAGE_ID" || "$ENV_IMAGE_ID" != "$POD_IMAGE_ID" ]]; then
+	echo "FAIL: environment image ID '${ENV_IMAGE_ID:-<empty>}' does not match pod image ID '${POD_IMAGE_ID:-<empty>}'"
+	exit 1
+fi
 
 echo "==> configuring a run-scoped transcript producer"
 cat <<EOF | kubectl apply -f -
@@ -347,6 +354,10 @@ if [[ "${PHASE:-}" != "Paused" ]] || kubectl get pod "$POD_NAME" >/dev/null 2>&1
 	echo "FAIL: environment did not pause and remove its pod"
 	exit 1
 fi
+if [[ -n "$(kubectl get environment "$ENV_NAME" -o jsonpath='{.status.imageID}')" ]]; then
+	echo "FAIL: paused environment retained a stale image ID"
+	exit 1
+fi
 if ! kubectl get pvc "$PVC_NAME" >/dev/null 2>&1; then
 	echo "FAIL: pause removed the workspace PVC"
 	exit 1
@@ -354,6 +365,12 @@ fi
 kubectl patch environment "$ENV_NAME" --type=merge -p '{"spec":{"paused":false}}' >/dev/null
 kubectl wait --for=jsonpath='{.status.phase}'=Ready environment/"$ENV_NAME" --timeout=2m
 kubectl wait --for=condition=Ready pod/"$POD_NAME" --timeout=2m
+RESUMED_IMAGE_ID=$(kubectl get environment "$ENV_NAME" -o jsonpath='{.status.imageID}')
+RESUMED_POD_IMAGE_ID=$(kubectl get pod "$POD_NAME" -o jsonpath='{.status.containerStatuses[?(@.name=="environment")].imageID}')
+if [[ -z "$RESUMED_IMAGE_ID" || "$RESUMED_IMAGE_ID" != "$RESUMED_POD_IMAGE_ID" ]]; then
+	echo "FAIL: resumed environment image ID '${RESUMED_IMAGE_ID:-<empty>}' does not match pod image ID '${RESUMED_POD_IMAGE_ID:-<empty>}'"
+	exit 1
+fi
 if ! kubectl exec "$POD_NAME" -- sh -c 'test "$(cat /workspace/resume-result)" = project-config-ok'; then
 	echo "FAIL: .agents/resume did not run with the project Secret"
 	exit 1

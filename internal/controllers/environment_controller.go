@@ -868,7 +868,20 @@ func (r *EnvironmentReconciler) syncStatus(ctx context.Context, env *platformv1a
 			env.Status.LastActiveAt = &now
 		}
 	}
-	return r.setEnvironmentStatus(ctx, env, phase, pod.Name, sandboxdEndpoint, reason, message)
+	return r.updateEnvironmentStatus(ctx, env, func(current *platformv1alpha1.Environment) {
+		applyEnvironmentStatus(current, phase, pod.Name, sandboxdEndpoint, reason, message, env.Status.LastActiveAt)
+		current.Status.ImageID = environmentImageID(pod)
+		clearChildOwnershipCollision(current)
+	})
+}
+
+func environmentImageID(pod *corev1.Pod) string {
+	for _, status := range pod.Status.ContainerStatuses {
+		if status.Name == "environment" {
+			return status.ImageID
+		}
+	}
+	return ""
 }
 
 func environmentPodState(env *platformv1alpha1.Environment, pod *corev1.Pod) (platformv1alpha1.EnvironmentPhase, string, string) {
@@ -1055,6 +1068,7 @@ func applyEnvironmentStatus(env *platformv1alpha1.Environment, phase platformv1a
 	env.Status.ObservedGeneration = env.Generation
 	env.Status.Phase = phase
 	env.Status.PodName = podName
+	env.Status.ImageID = ""
 	env.Status.Endpoints.Sandboxd = sandboxdEndpoint
 	if lastActiveAt != nil && (env.Status.LastActiveAt == nil || lastActiveAt.After(env.Status.LastActiveAt.Time)) {
 		env.Status.LastActiveAt = lastActiveAt.DeepCopy()

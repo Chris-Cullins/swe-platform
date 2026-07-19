@@ -30,6 +30,15 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      - name: Validate release version
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          app_version=$(awk '$1 == "appVersion:" {gsub(/"/, "", $2); print $2}' charts/swe-platform/Chart.yaml)
+          if [[ "$GITHUB_REF_NAME" != "v${app_version}" ]]; then
+            echo "release tag ${GITHUB_REF_NAME} does not match Chart.appVersion ${app_version}" >&2
+            exit 1
+          fi
+
       - uses: docker/setup-qemu-action@v4
 
       - uses: docker/setup-buildx-action@v4
@@ -57,6 +66,7 @@ jobs:
             type=sha,prefix=sha-
 
       - name: Build and push
+        id: build
         uses: docker/build-push-action@v7
         with:
           context: .
@@ -67,3 +77,50 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha,scope=${{ matrix.image.name }}
           cache-to: type=gha,mode=max,scope=${{ matrix.image.name }}
+
+      - name: Record published digest
+        env:
+          IMAGE_NAME: ${{ matrix.image.name }}
+          IMAGE_REPOSITORY: ${{ steps.image.outputs.prefix }}/${{ matrix.image.name }}
+          IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          mkdir -p image-digest
+          jq -n \
+            --arg name "$IMAGE_NAME" \
+            --arg repository "$IMAGE_REPOSITORY" \
+            --arg digest "$IMAGE_DIGEST" \
+            '{name: $name, repository: $repository, digest: $digest}' \
+            > "image-digest/${IMAGE_NAME}.json"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: image-digest-${{ matrix.image.name }}
+          path: image-digest/${{ matrix.image.name }}.json
+
+  release-manifest:
+    needs: publish
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: image-digest-*
+          path: image-digests
+          merge-multiple: true
+
+      - name: Create release manifest
+        run: |
+          chart_version=$(awk '$1 == "version:" {print $2}' charts/swe-platform/Chart.yaml)
+          app_version=$(awk '$1 == "appVersion:" {gsub(/"/, "", $2); print $2}' charts/swe-platform/Chart.yaml)
+          jq -s \
+            --arg chartVersion "$chart_version" \
+            --arg appVersion "$app_version" \
+            '{chartVersion: $chartVersion, appVersion: $appVersion, images: (map({key: .name, value: {repository: .repository, digest: .digest}}) | from_entries)}' \
+            image-digests/*.json > release-manifest.json
+          cat release-manifest.json >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: swe-platform-release-${{ github.ref_name }}-${{ github.sha }}
+          path: release-manifest.json
