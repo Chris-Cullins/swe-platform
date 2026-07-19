@@ -43,6 +43,7 @@ type EnvironmentSpec struct {
 	ProjectRef string `json:"projectRef,omitempty"`
 
 	// TemplateRef is the name of the EnvironmentTemplate to build from.
+	// +kubebuilder:validation:MinLength=1
 	TemplateRef string `json:"templateRef"`
 
 	// Backend overrides the template's backend when set. Only pod is currently

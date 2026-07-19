@@ -15,6 +15,7 @@ type WarmPoolSpec struct {
 // EnvironmentTemplateSpec defines a class of environments.
 type EnvironmentTemplateSpec struct {
 	// Image is the container image for the environment.
+	// +kubebuilder:validation:MinLength=1
 	Image string `json:"image"`
 
 	// Size names a resource preset (tiny | small | medium | large).
