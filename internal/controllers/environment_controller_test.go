@@ -1062,6 +1062,76 @@ func TestTerminalPodRecoveryPersistsAcrossConcurrentGenerationChange(t *testing.
 	}
 }
 
+func TestTerminalPodRecoveryRejectsSameNameReplacementEnvironment(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	if err := platformv1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	stored := &platformv1alpha1.Environment{ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default", UID: "environment-u2", Generation: 1}}
+	stale := stored.DeepCopy()
+	stale.UID = "environment-u1"
+	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "env-test", Namespace: "default", UID: "u1-terminal-pod"}, Status: corev1.PodStatus{Phase: corev1.PodFailed}}
+	reconciler := &EnvironmentReconciler{
+		Client: fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(stored).WithObjects(stored).Build(),
+		Scheme: scheme,
+	}
+
+	result, err := reconciler.reconcileTerminalPod(context.Background(), stale, pod)
+	if !stderrors.Is(err, errEnvironmentIncarnationChanged) || result.Requeue || result.RequeueAfter != 0 {
+		t.Fatalf("stale terminal recovery = (%#v, %v), want incarnation rejection", result, err)
+	}
+	var replacement platformv1alpha1.Environment
+	if err := reconciler.Get(context.Background(), client.ObjectKeyFromObject(stored), &replacement); err != nil {
+		t.Fatal(err)
+	}
+	if replacement.Status.PodRecoveryAttempts != 0 || replacement.Status.PodRecoveryExhausted || replacement.Status.PodRecoveryUID != "" || replacement.Status.PodRecoveryNextAttemptAt != nil || len(replacement.Status.Conditions) != 0 {
+		t.Fatalf("U1 terminal marker was written into U2: %#v", replacement.Status)
+	}
+}
+
+func TestHealthReadyResetRejectsSameNameReplacementEnvironment(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	if err := platformv1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	next := metav1.Now()
+	stored := &platformv1alpha1.Environment{ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default", UID: "environment-u2", Generation: 2}, Status: platformv1alpha1.EnvironmentStatus{
+		ObservedGeneration: 2, Phase: platformv1alpha1.EnvironmentPhaseCreating,
+		PodRecoveryAttempts: 2, PodRecoveryUID: "u2-terminal-pod", PodRecoveryNextAttemptAt: &next,
+		Conditions: []metav1.Condition{{Type: platformv1alpha1.EnvironmentConditionReady, Status: metav1.ConditionFalse,
+			ObservedGeneration: 2, Reason: "PodRecoveryPending", Message: "U2 recovery is pending"}},
+	}}
+	stale := stored.DeepCopy()
+	stale.UID = "environment-u1"
+	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "env-test", Namespace: "default"}, Status: corev1.PodStatus{
+		Phase: corev1.PodRunning, PodIP: "10.0.0.1",
+		Conditions: []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}},
+	}}
+	reconciler := &EnvironmentReconciler{
+		Client: fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(stored).WithObjects(stored).Build(),
+		Scheme: scheme,
+	}
+
+	if err := reconciler.syncStatus(context.Background(), stale, pod); !stderrors.Is(err, errEnvironmentIncarnationChanged) {
+		t.Fatalf("stale health-ready reset error = %v, want incarnation rejection", err)
+	}
+	var replacement platformv1alpha1.Environment
+	if err := reconciler.Get(context.Background(), client.ObjectKeyFromObject(stored), &replacement); err != nil {
+		t.Fatal(err)
+	}
+	ready := apimeta.FindStatusCondition(replacement.Status.Conditions, platformv1alpha1.EnvironmentConditionReady)
+	if replacement.Status.PodRecoveryAttempts != 2 || replacement.Status.PodRecoveryUID != "u2-terminal-pod" || replacement.Status.PodRecoveryNextAttemptAt == nil ||
+		replacement.Status.Endpoints.Sandboxd != "" || ready == nil || ready.Status != metav1.ConditionFalse || ready.Reason != "PodRecoveryPending" {
+		t.Fatalf("U1 health readiness reset U2 recovery: %#v", replacement.Status)
+	}
+}
+
 func TestNewEnvironmentRefusesTerminatingPriorIncarnationPVC(t *testing.T) {
 	scheme := runtime.NewScheme()
 	if err := corev1.AddToScheme(scheme); err != nil {

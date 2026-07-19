@@ -62,8 +62,9 @@ const (
 )
 
 var (
-	errPodReplacing       = stderrors.New("environment pod is being replaced")
-	errPodRecoveryChanged = stderrors.New("environment pod recovery state changed")
+	errPodReplacing                  = stderrors.New("environment pod is being replaced")
+	errPodRecoveryChanged            = stderrors.New("environment pod recovery state changed")
+	errEnvironmentIncarnationChanged = stderrors.New("environment incarnation changed")
 )
 
 type childOwnershipCollisionError struct {
@@ -1187,11 +1188,15 @@ func (r *EnvironmentReconciler) setEnvironmentStatus(ctx context.Context, env *p
 
 func (r *EnvironmentReconciler) updateEnvironmentStatus(ctx context.Context, env *platformv1alpha1.Environment, mutate func(*platformv1alpha1.Environment)) error {
 	key := client.ObjectKeyFromObject(env)
+	expectedUID := env.UID
 	expectedGeneration := env.Generation
 	var updated platformv1alpha1.Environment
 	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		if err := r.Get(ctx, key, &updated); err != nil {
 			return err
+		}
+		if updated.UID != expectedUID {
+			return errEnvironmentIncarnationChanged
 		}
 		if updated.Generation != expectedGeneration {
 			return nil
@@ -1214,11 +1219,15 @@ func (r *EnvironmentReconciler) updateEnvironmentStatus(ctx context.Context, env
 // only sandboxd readiness, not an ordinary spec edit, resets it.
 func (r *EnvironmentReconciler) updatePodRecoveryStatus(ctx context.Context, env *platformv1alpha1.Environment, mutate func(*platformv1alpha1.Environment)) error {
 	key := client.ObjectKeyFromObject(env)
+	expectedUID := env.UID
 	expected := env.Status
 	var updated platformv1alpha1.Environment
 	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		if err := r.Get(ctx, key, &updated); err != nil {
 			return err
+		}
+		if updated.UID != expectedUID {
+			return errEnvironmentIncarnationChanged
 		}
 		if !samePodRecoveryState(&expected, &updated.Status) {
 			return errPodRecoveryChanged
