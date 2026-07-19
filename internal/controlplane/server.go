@@ -34,14 +34,17 @@ type appendTranscriptRequest struct {
 
 // Server serves the control-plane API and live transcript streams.
 type Server struct {
-	log            *slog.Logger
-	store          TranscriptStore
-	access         AccessController
-	runs           RunResolver
-	terminalDialer TerminalDialer
-	trustProxy     bool
-	heartbeat      time.Duration
-	streams        context.Context
+	log                   *slog.Logger
+	store                 TranscriptStore
+	access                AccessController
+	sessions              SessionAuthenticator
+	resources             ResourceService
+	runs                  RunResolver
+	terminalDialer        TerminalDialer
+	trustProxy            bool
+	allowInsecureSessions bool
+	heartbeat             time.Duration
+	streams               context.Context
 }
 
 // RunResolver verifies that a namespaced Run exists before transcript state is used.
@@ -65,11 +68,14 @@ func (r KubernetesRunResolver) ResolveRun(ctx context.Context, namespace, name s
 
 // ServerOptions supplies the control plane's resource and authorization dependencies.
 type ServerOptions struct {
-	Access          AccessController
-	Runs            RunResolver
-	TranscriptStore TranscriptStore
-	TerminalDialer  TerminalDialer
-	TrustProxy      bool
+	Access                AccessController
+	Sessions              SessionAuthenticator
+	Resources             ResourceService
+	Runs                  RunResolver
+	TranscriptStore       TranscriptStore
+	TerminalDialer        TerminalDialer
+	TrustProxy            bool
+	AllowInsecureSessions bool
 	// StreamLifecycle is canceled when long-lived SSE and terminal handlers
 	// must exit during process shutdown. Ordinary requests do not use it.
 	StreamLifecycle context.Context
@@ -92,14 +98,17 @@ func NewServer(log *slog.Logger, options ServerOptions) *Server {
 		streams = context.Background()
 	}
 	return &Server{
-		log:            log,
-		store:          options.TranscriptStore,
-		access:         options.Access,
-		runs:           options.Runs,
-		terminalDialer: options.TerminalDialer,
-		trustProxy:     options.TrustProxy,
-		heartbeat:      heartbeat,
-		streams:        streams,
+		log:                   log,
+		store:                 options.TranscriptStore,
+		access:                options.Access,
+		sessions:              options.Sessions,
+		resources:             options.Resources,
+		runs:                  options.Runs,
+		terminalDialer:        options.TerminalDialer,
+		trustProxy:            options.TrustProxy,
+		allowInsecureSessions: options.AllowInsecureSessions,
+		heartbeat:             heartbeat,
+		streams:               streams,
 	}
 }
 
@@ -121,6 +130,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
 	})
+	mux.HandleFunc("/api/v1/session", s.handleSession)
 	mux.HandleFunc(namespacedPathPrefix, s.handleNamespacedAPI)
 	return mux
 }
@@ -129,6 +139,34 @@ func (s *Server) handleNamespacedAPI(w http.ResponseWriter, r *http.Request) {
 	namespace, resource, name, subresource, ok := namespacedResource(r.URL.Path)
 	if !ok {
 		http.NotFound(w, r)
+		return
+	}
+	if resource == "runs" && name == "" && subresource == "" {
+		s.handleRunCollection(w, r, namespace)
+		return
+	}
+	if resource == "runs" && name != "" && subresource == "" {
+		if r.Method == http.MethodGet {
+			s.handleGetRun(w, r, namespace, name)
+		} else {
+			writeResourceMethodError(w, "GET")
+		}
+		return
+	}
+	if resource == "runs" && name != "" && subresource == "cancel" {
+		if r.Method == http.MethodPost {
+			s.handleCancelRun(w, r, namespace, name)
+		} else {
+			writeResourceMethodError(w, "POST")
+		}
+		return
+	}
+	if resource == "environments" && name != "" && subresource == "" {
+		if r.Method == http.MethodGet {
+			s.handleGetEnvironment(w, r, namespace, name)
+		} else {
+			writeResourceMethodError(w, "GET")
+		}
 		return
 	}
 	if resource == "runs" && subresource == "transcript" {
@@ -142,13 +180,18 @@ func (s *Server) handleNamespacedAPI(w http.ResponseWriter, r *http.Request) {
 	http.NotFound(w, r)
 }
 
+func writeResourceMethodError(w http.ResponseWriter, allow string) {
+	w.Header().Set("Allow", allow)
+	writeProblem(w, http.StatusMethodNotAllowed, "method-not-allowed", "Method not allowed", "this resource supports "+allow)
+}
+
 func namespacedResource(path string) (namespace, resource, name, subresource string, ok bool) {
 	remainder := strings.TrimPrefix(path, namespacedPathPrefix)
 	if remainder == path {
 		return "", "", "", "", false
 	}
 	parts := strings.Split(remainder, "/")
-	if len(parts) != 4 {
+	if len(parts) < 2 || len(parts) > 4 {
 		return "", "", "", "", false
 	}
 	for _, part := range parts {
@@ -156,7 +199,14 @@ func namespacedResource(path string) (namespace, resource, name, subresource str
 			return "", "", "", "", false
 		}
 	}
-	return parts[0], parts[1], parts[2], parts[3], true
+	namespace, resource = parts[0], parts[1]
+	if len(parts) >= 3 {
+		name = parts[2]
+	}
+	if len(parts) == 4 {
+		subresource = parts[3]
+	}
+	return namespace, resource, name, subresource, true
 }
 
 func (s *Server) handleTranscript(w http.ResponseWriter, r *http.Request, namespace, run string) {

@@ -44,6 +44,13 @@ type AccessController interface {
 	Authorize(*http.Request, ResourceAccess, bool) error
 }
 
+// SessionAuthenticator validates Kubernetes credentials for browser session
+// exchange without issuing or retaining a platform credential.
+type SessionAuthenticator interface {
+	CreateSession(*http.Request) (Session, string, error)
+	CurrentSession(*http.Request) (Session, error)
+}
+
 // KubernetesAccessController uses TokenReview and SubjectAccessReview. BootstrapToken,
 // when non-empty, is an all-access credential intended only for initial self-hosted setup.
 type KubernetesAccessController struct {
@@ -96,6 +103,37 @@ func (a KubernetesAccessController) Authorize(r *http.Request, access ResourceAc
 		return errForbidden
 	}
 	return nil
+}
+
+// CreateSession validates an explicit bearer credential and returns that same
+// credential for placement in the browser's HttpOnly cookie. Bootstrap access
+// can never be exchanged for a browser session.
+func (a KubernetesAccessController) CreateSession(r *http.Request) (Session, string, error) {
+	token, bearer, err := requestToken(r, false)
+	if err != nil {
+		return Session{}, "", err
+	}
+	user, err := a.authenticate(r.Context(), token, bearer)
+	if err != nil {
+		return Session{}, "", err
+	}
+	if user.bootstrap {
+		return Session{}, "", errForbidden
+	}
+	return Session{Authenticated: true, Username: user.name}, token, nil
+}
+
+// CurrentSession validates the current cookie credential through TokenReview.
+func (a KubernetesAccessController) CurrentSession(r *http.Request) (Session, error) {
+	cookie, err := r.Cookie(sessionCookieName)
+	if err != nil || cookie.Value == "" {
+		return Session{}, errUnauthenticated
+	}
+	user, err := a.authenticate(r.Context(), cookie.Value, false)
+	if err != nil {
+		return Session{}, err
+	}
+	return Session{Authenticated: true, Username: user.name}, nil
 }
 
 func (a KubernetesAccessController) authenticate(ctx context.Context, token string, bearer bool) (principal, error) {
@@ -175,4 +213,17 @@ func writeAccessError(w http.ResponseWriter, err error) {
 		return
 	}
 	http.Error(w, "authorization service unavailable", http.StatusServiceUnavailable)
+}
+
+func writeRESTAccessError(w http.ResponseWriter, err error) {
+	if errors.Is(err, errUnauthenticated) {
+		w.Header().Set("WWW-Authenticate", "Bearer")
+		writeProblem(w, http.StatusUnauthorized, "authentication-required", "Authentication required", "provide a valid Kubernetes credential")
+		return
+	}
+	if errors.Is(err, errForbidden) {
+		writeProblem(w, http.StatusForbidden, "access-denied", "Access denied", "Kubernetes authorization denied this operation")
+		return
+	}
+	writeProblem(w, http.StatusServiceUnavailable, "authorization-unavailable", "Authorization unavailable", "Kubernetes authentication or authorization is unavailable")
 }

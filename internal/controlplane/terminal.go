@@ -7,8 +7,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"net/url"
-	"strings"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -252,35 +250,12 @@ func (s *Server) handleTerminal(w http.ResponseWriter, r *http.Request, namespac
 }
 
 func (s *Server) checkWebSocketOrigin(r *http.Request) bool {
-	origin := r.Header.Get("Origin")
-	if origin == "" {
+	origins := r.Header.Values("Origin")
+	if len(origins) == 0 || (len(origins) == 1 && origins[0] == "") {
 		_, _, err := requestToken(r, false)
 		return err == nil
 	}
-	parsed, err := url.Parse(origin)
-	if err != nil || parsed.Host == "" || (parsed.Scheme != "http" && parsed.Scheme != "https") {
-		return false
-	}
-	host := r.Host
-	scheme := "http"
-	if r.TLS != nil {
-		scheme = "https"
-	}
-	if s.trustProxy {
-		forwardedHost := r.Header.Get("X-Forwarded-Host")
-		forwardedProto := r.Header.Get("X-Forwarded-Proto")
-		if forwardedHost != "" || forwardedProto != "" {
-			if forwardedHost == "" || forwardedProto == "" || strings.Contains(forwardedHost, ",") || strings.Contains(forwardedProto, ",") {
-				return false
-			}
-			host = strings.TrimSpace(forwardedHost)
-			scheme = strings.ToLower(strings.TrimSpace(forwardedProto))
-			if scheme != "http" && scheme != "https" {
-				return false
-			}
-		}
-	}
-	return parsed.Scheme == scheme && strings.EqualFold(parsed.Host, host)
+	return s.sameOrigin(r)
 }
 
 func bridgeWebTerminal(ctx context.Context, connection *websocket.Conn, client sandboxdv1.TerminalServiceClient) error {

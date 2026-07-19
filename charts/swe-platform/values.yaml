@@ -19,6 +19,9 @@ controlPlane:
     # Honor X-Forwarded-Host/Proto for WebSocket origin checks only when a trusted
     # reverse proxy overwrites both headers.
     trustProxyHeaders: false
+    # Development-only escape hatch for direct HTTP access. Production browser
+    # sessions require HTTPS and always set Secure cookies.
+    allowInsecureSessions: false
     # Optional all-access bootstrap credential for initial self-hosted setup.
     # Create this Secret out of band and disable/remove it after configuring RBAC.
     bootstrapTokenSecret:

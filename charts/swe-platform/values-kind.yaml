@@ -6,6 +6,8 @@ image:
 controlPlane:
   image:
     tag: dev
+  auth:
+    allowInsecureSessions: true
 
 leaderElection: false
 
