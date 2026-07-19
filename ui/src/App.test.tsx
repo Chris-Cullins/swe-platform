@@ -28,17 +28,83 @@ function show(path: string, state?: unknown) {
 
 afterEach(() => { vi.useRealTimers(); vi.restoreAllMocks() })
 describe('App frozen API integration', () => {
+  it('lands on the default namespace Run feed from the root route', async () => {
+    const fetch = vi.spyOn(globalThis, 'fetch').mockImplementation(async path => path === '/api/v1/session' ? response({ authenticated: true, username: 'alex' }) : response({ items: [] }))
+    show('/')
+    expect(await screen.findByText('No runs found.')).toBeInTheDocument()
+    expect(screen.getByLabelText('Namespace')).toHaveValue('default')
+    expect(screen.getByTestId('location')).toHaveTextContent('/namespaces/default/runs')
+    expect(fetch).toHaveBeenCalledWith('/api/v1/namespaces/default/runs?limit=200', expect.anything())
+  })
+
   it('redirects a session 401 to login', async () => {
     vi.spyOn(globalThis, 'fetch').mockResolvedValue(response({ type: 'auth', title: 'Unauthorized', status: 401 }, 401))
     show('/namespaces/default/runs')
     expect(await screen.findByRole('heading', { name: 'SWE Operations' })).toBeInTheDocument()
   })
 
-  it('uses the exact encoded namespace list API and renders accessible empty state', async () => {
+  it('switches to a valid namespace without leaking the previous namespace cache', async () => {
+    const otherRun = { ...run, name: 'argo-run', uid: 'argo-uid', intent: { ...run.intent, prompt: 'Argo namespace task' } }
+    const lateRun = { ...run, name: 'late-default-run', uid: 'late-default-uid' }
+    let defaultRequests = 0
+    let resolveLateDefault!: (value: Response) => void
+    let resolveOther!: (value: Response) => void
+    const fetch = vi.spyOn(globalThis, 'fetch').mockImplementation(async path => {
+      if (path === '/api/v1/session') return response({ authenticated: true, username: 'alex' })
+      if (path === '/api/v1/namespaces/default/runs?limit=200') {
+        defaultRequests += 1
+        if (defaultRequests === 1) return response({ items: [run] })
+        return new Promise<Response>(resolve => { resolveLateDefault = resolve })
+      }
+      if (path === '/api/v1/namespaces/swe-platform-system/runs?limit=200') return new Promise<Response>(resolve => { resolveOther = resolve })
+      throw new Error(`Unexpected request: ${path}`)
+    })
+    const { client } = show('/namespaces/default/runs')
+    expect(await screen.findByText('repair-ui')).toBeInTheDocument()
+    act(() => { void client.invalidateQueries({ queryKey: queryKeys.runs('default') }) })
+    await waitFor(() => expect(defaultRequests).toBe(2))
+    await userEvent.clear(screen.getByLabelText('Namespace'))
+    await userEvent.type(screen.getByLabelText('Namespace'), 'swe-platform-system')
+    await userEvent.click(screen.getByRole('button', { name: 'Switch' }))
+    expect(await screen.findByText('Loading runs…')).toBeInTheDocument()
+    expect(screen.queryByText('repair-ui')).not.toBeInTheDocument()
+    resolveOther(response({ items: [otherRun] }))
+    expect(await screen.findByText('argo-run')).toBeInTheDocument()
+    expect(screen.queryByText('repair-ui')).not.toBeInTheDocument()
+    expect(screen.getByTestId('location')).toHaveTextContent('/namespaces/swe-platform-system/runs')
+    expect(client.getQueryData(queryKeys.runs('swe-platform-system'))).toEqual({ items: [otherRun] })
+    resolveLateDefault(response({ items: [lateRun] }))
+    await waitFor(() => expect(client.getQueryData(queryKeys.runs('default'))).toEqual({ items: [lateRun] }))
+    expect(screen.getByText('argo-run')).toBeInTheDocument()
+    expect(screen.queryByText('late-default-run')).not.toBeInTheDocument()
+    expect(fetch).toHaveBeenCalledWith('/api/v1/namespaces/swe-platform-system/runs?limit=200', expect.anything())
+  })
+
+  it.each(['', 'Default', 'team/a', 'https://evil.example', 'team?next=evil', 'team#fragment', '-team', `${'a'.repeat(64)}`])('rejects invalid namespace input %j without navigating or fetching', async invalid => {
+    const fetch = vi.spyOn(globalThis, 'fetch').mockImplementation(async path => path === '/api/v1/session' ? response({ authenticated: true, username: 'alex' }) : response({ items: [] }))
+    show('/namespaces/default/runs')
+    await screen.findByText('No runs found.')
+    await userEvent.clear(screen.getByLabelText('Namespace'))
+    if (invalid) await userEvent.type(screen.getByLabelText('Namespace'), invalid)
+    await userEvent.click(screen.getByRole('button', { name: 'Switch' }))
+    expect(screen.getByRole('alert')).toHaveTextContent(invalid ? 'valid Kubernetes DNS label' : 'Namespace is required')
+    expect(screen.getByTestId('location')).toHaveTextContent('/namespaces/default/runs')
+    expect(fetch).toHaveBeenCalledTimes(2)
+  })
+
+  it('rejects an invalid namespace deep link before issuing a namespace API request', async () => {
     const fetch = vi.spyOn(globalThis, 'fetch').mockImplementation(async path => path === '/api/v1/session' ? response({ authenticated: true, username: 'alex' }) : response({ items: [] }))
     show('/namespaces/team%2Fa/runs')
-    expect(await screen.findByText('No runs found.')).toHaveAttribute('role', 'status')
-    expect(fetch).toHaveBeenCalledWith('/api/v1/namespaces/team%2Fa/runs?limit=200', expect.anything())
+    expect(await screen.findByRole('alert')).toHaveTextContent('valid Kubernetes DNS label')
+    expect(fetch).toHaveBeenCalledOnce()
+  })
+
+  it('rejects malformed namespace encoding without issuing a namespace API request', async () => {
+    vi.spyOn(console, 'warn').mockImplementation(() => undefined)
+    const fetch = vi.spyOn(globalThis, 'fetch').mockImplementation(async path => path === '/api/v1/session' ? response({ authenticated: true, username: 'alex' }) : response({ items: [] }))
+    show('/namespaces/team%ZZ/runs')
+    expect(await screen.findByRole('alert')).toHaveTextContent('valid Kubernetes DNS label')
+    expect(fetch).toHaveBeenCalledOnce()
   })
 
   it('keeps polling an empty feed and discovers a run created elsewhere', async () => {
@@ -74,7 +140,7 @@ describe('App frozen API integration', () => {
       if (!loggedIn) return response({ type: 'https://swe-platform.dev/problems/unauthenticated', title: 'Session expired', status: 401 }, 401)
       return response(run)
     })
-    const deepLink = '/namespaces/default/runs/repair-ui/overview?panel=usage#tokens'
+    const deepLink = '/namespaces/swe-platform-system/runs/repair-ui/overview?panel=usage#tokens'
     const { client } = show(deepLink)
     client.setQueryData(['prior-user-data'], { prompt: 'secret task' })
     const token = await screen.findByLabelText('Access token')
@@ -93,7 +159,7 @@ describe('App frozen API integration', () => {
       if (path === '/api/v1/session') return response({ authenticated: true, username: 'alex' })
       return response(run)
     })
-    const deepLink = '/namespaces/default/runs/repair-ui/overview?panel=usage#tokens'
+    const deepLink = '/namespaces/swe-platform-system/runs/repair-ui/overview?panel=usage#tokens'
     const firstView = show(deepLink)
     const token = await screen.findByLabelText('Access token')
     await userEvent.type(token, 'token')
@@ -103,7 +169,7 @@ describe('App frozen API integration', () => {
 
     firstView.unmount()
     authenticated = false
-    show('/login', { from: { pathname: '/\\evil.example', search: '?steal=1' } })
+    show('/login', { from: { pathname: '/\t/evil.example', search: '?steal=1' } })
     const externalToken = screen.getAllByLabelText('Access token').at(-1)!
     await userEvent.type(externalToken, 'token')
     await userEvent.click(screen.getAllByRole('button', { name: 'Sign in' }).at(-1)!)

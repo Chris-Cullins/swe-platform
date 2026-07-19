@@ -15,6 +15,16 @@ const Terminal = lazy(() => import('./Terminal'))
 const DNS_SUBDOMAIN = /^[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?$/
 const DNS_LABEL = /^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/
 const MAX_CREATE_BODY_BYTES = 1024 * 1024
+const hasASCIIControl = (value: string) => [...value].some(character => character.charCodeAt(0) <= 31 || character.charCodeAt(0) === 127)
+
+// Exported for focused URL-boundary tests.
+// eslint-disable-next-line react-refresh/only-export-components
+export function validateNamespace(value: string): string | undefined {
+  if (!value) return 'Namespace is required.'
+  if (value.length > 63 || !DNS_LABEL.test(value)) {
+    return 'Namespace must be a valid Kubernetes DNS label (lowercase letters, digits, and hyphens; maximum 63 characters).'
+  }
+}
 
 // Exported for contract-level validation tests.
 // eslint-disable-next-line react-refresh/only-export-components
@@ -51,10 +61,14 @@ function loginDestination(state: unknown) {
   const from = (state as { from?: unknown }).from
   if (!from || typeof from !== 'object') return '/'
   const candidate = from as { pathname?: unknown; search?: unknown; hash?: unknown }
-  if (typeof candidate.pathname !== 'string' || !candidate.pathname.startsWith('/') || candidate.pathname.startsWith('//') || candidate.pathname.includes('\\')) return '/'
+  if (typeof candidate.pathname !== 'string' || !candidate.pathname.startsWith('/') || candidate.pathname.startsWith('//') || candidate.pathname.includes('\\') || candidate.pathname.includes('?') || candidate.pathname.includes('#') || hasASCIIControl(candidate.pathname)) return '/'
   const search = typeof candidate.search === 'string' && (candidate.search === '' || candidate.search.startsWith('?')) ? candidate.search : ''
   const hash = typeof candidate.hash === 'string' && (candidate.hash === '' || candidate.hash.startsWith('#')) ? candidate.hash : ''
-  return `${candidate.pathname}${search}${hash}`
+  if (hasASCIIControl(search) || hasASCIIControl(hash) || search.includes('#')) return '/'
+  try {
+    if (new URL(`${candidate.pathname}${search}${hash}`, window.location.origin).origin !== window.location.origin) return '/'
+  } catch { return '/' }
+  return { pathname: candidate.pathname, search, hash }
 }
 
 function Login() {
@@ -97,12 +111,26 @@ function Shell() {
   const { namespace = 'default' } = useParams()
   const navigate = useNavigate()
   const queryClient = useQueryClient()
+  const [nextNamespace, setNextNamespace] = React.useState(namespace)
+  const [validation, setValidation] = React.useState('')
+  React.useEffect(() => { setNextNamespace(namespace); setValidation('') }, [namespace])
   const logout = useMutation({ mutationFn: api.logout, onSuccess: () => { queryClient.clear(); navigate('/login', { replace: true }) } })
+  const routeError = validateNamespace(namespace)
   return <><header>
     <Link to={`/namespaces/${encodeURIComponent(namespace)}/runs`} className="brand">SWE Operations</Link>
-    <span>Namespace: <strong>{namespace}</strong></span>
+    <form className="namespace-switcher" onSubmit={event => {
+      event.preventDefault()
+      const error = validateNamespace(nextNamespace)
+      setValidation(error || '')
+      if (!error) navigate(`/namespaces/${encodeURIComponent(nextNamespace)}/runs`)
+    }}>
+      <label htmlFor="namespace">Namespace</label>
+      <input id="namespace" value={nextNamespace} onChange={event => setNextNamespace(event.target.value)} aria-invalid={!!validation} aria-describedby={validation ? 'namespace-error' : undefined} />
+      <button>Switch</button>
+      {validation && <span id="namespace-error" role="alert">{validation}</span>}
+    </form>
     <button onClick={() => logout.mutate()}>Log out</button>
-  </header><Outlet /></>
+  </header>{routeError ? <main><Failure error={new Error(routeError)} /></main> : <Outlet />}</>
 }
 
 function RunList() {
