@@ -169,6 +169,32 @@ func TestTmuxSessionEncodesBinaryInputAndResize(t *testing.T) {
 	}
 }
 
+func TestTmuxSessionCloseUnblocksWrite(t *testing.T) {
+	stdin := &blockingWriteCloser{
+		started: make(chan struct{}),
+		closed:  make(chan struct{}),
+	}
+	session := &tmuxTerminalSession{stdin: stdin}
+	writeDone := make(chan error, 1)
+	go func() { writeDone <- session.Write([]byte("blocked")) }()
+	receive(t, stdin.started)
+
+	closeDone := make(chan error, 1)
+	go func() { closeDone <- session.Close() }()
+	if err := receive(t, closeDone); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	if err := receive(t, writeDone); !errors.Is(err, io.ErrClosedPipe) {
+		t.Fatalf("write error = %v, want closed pipe", err)
+	}
+	if err := session.Close(); err != nil {
+		t.Fatalf("second close: %v", err)
+	}
+	if err := session.Resize(120, 40); !errors.Is(err, io.ErrClosedPipe) {
+		t.Fatalf("resize after close = %v, want closed pipe", err)
+	}
+}
+
 func TestTmuxOutputDecodesBinaryData(t *testing.T) {
 	got, ok := tmuxOutput("%output %0 A\\000\\134" + string([]byte{0xff}) + "Z")
 	if !ok {
@@ -298,6 +324,24 @@ type nopWriteCloser struct {
 }
 
 func (nopWriteCloser) Close() error { return nil }
+
+type blockingWriteCloser struct {
+	started   chan struct{}
+	closed    chan struct{}
+	startOnce sync.Once
+	closeOnce sync.Once
+}
+
+func (w *blockingWriteCloser) Write([]byte) (int, error) {
+	w.startOnce.Do(func() { close(w.started) })
+	<-w.closed
+	return 0, io.ErrClosedPipe
+}
+
+func (w *blockingWriteCloser) Close() error {
+	w.closeOnce.Do(func() { close(w.closed) })
+	return nil
+}
 
 type failingTerminalStream struct {
 	grpc.ServerStream

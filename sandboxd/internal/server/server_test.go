@@ -259,7 +259,7 @@ func TestTerminalStreamsSharedTmuxSession(t *testing.T) {
 	}
 
 	if err := first.Send(&sandboxdv1.TerminalMessage{Kind: &sandboxdv1.TerminalMessage_Data{
-		Data: []byte("printf first-survived; exit\n"),
+		Data: []byte("printf first-survived\n"),
 	}}); err != nil {
 		t.Fatalf("send after second detach: %v", err)
 	}

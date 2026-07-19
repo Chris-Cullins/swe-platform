@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -213,7 +214,7 @@ type tmuxTerminalSession struct {
 	stderr  *strings.Builder
 
 	writeMu  sync.Mutex
-	closed   bool
+	closed   atomic.Bool
 	waitOnce sync.Once
 	waitErr  error
 }
@@ -253,19 +254,16 @@ func (s *tmuxTerminalSession) Resize(cols, rows uint32) error {
 }
 
 func (s *tmuxTerminalSession) Close() error {
-	s.writeMu.Lock()
-	defer s.writeMu.Unlock()
-	if s.closed {
+	if !s.closed.CompareAndSwap(false, true) {
 		return nil
 	}
-	s.closed = true
 	return s.stdin.Close()
 }
 
 func (s *tmuxTerminalSession) writeCommand(command string) error {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
-	if s.closed {
+	if s.closed.Load() {
 		return io.ErrClosedPipe
 	}
 	_, err := io.WriteString(s.stdin, command+"\n")
