@@ -312,6 +312,18 @@ func hashFile(ctx context.Context, file *os.File) (string, error) {
 	}
 }
 
+func readChunk(reader io.Reader, size uint64) ([]byte, error) {
+	data := make([]byte, int(size))
+	n, err := io.ReadFull(reader, data)
+	if err != nil {
+		if errors.Is(err, io.EOF) {
+			err = io.ErrUnexpectedEOF
+		}
+		return nil, err
+	}
+	return data[:n], nil
+}
+
 func (s *FilesystemServer) Read(ctx context.Context, req *sandboxdv1.ReadRequest) (*sandboxdv1.ReadResponse, error) {
 	if err := s.initialize(); err != nil {
 		return nil, status.Error(codes.Internal, "initialize filesystem")
@@ -367,15 +379,13 @@ func (s *FilesystemServer) Read(ctx context.Context, req *sandboxdv1.ReadRequest
 		return nil, filesystemError("seek workspace file", err)
 	}
 	want := min(uint64(maxBytes), size-req.GetOffset())
-	data := make([]byte, int(want))
-	n, err := io.ReadFull(file, data)
+	data, err := readChunk(file, want)
 	if errors.Is(err, io.ErrUnexpectedEOF) {
 		return nil, status.Error(codes.Aborted, "workspace file changed during read")
 	}
 	if err != nil && !errors.Is(err, io.EOF) {
 		return nil, filesystemError("read workspace file", err)
 	}
-	data = data[:n]
 	next := req.GetOffset() + uint64(len(data))
 	return &sandboxdv1.ReadResponse{Data: data, Offset: req.GetOffset(), NextOffset: next, Size: size, Eof: next == size, Version: version}, nil
 }
