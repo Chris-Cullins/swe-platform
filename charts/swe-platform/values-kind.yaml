@@ -8,6 +8,11 @@ controlPlane:
     tag: dev
   auth:
     allowInsecureSessions: true
+  # Keep CPU headroom for the claimed environment and its immediate warm-pool
+  # replacement on kind's single control-plane node.
+  resources:
+    requests:
+      cpu: 10m
 
 leaderElection: false
 
