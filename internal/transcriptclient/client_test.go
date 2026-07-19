@@ -61,7 +61,10 @@ func TestAppendClassifiesControlPlaneFailures(t *testing.T) {
 		{http.StatusUnauthorized, false},
 		{http.StatusRequestTimeout, false},
 		{http.StatusTooManyRequests, false},
+		{http.StatusMisdirectedRequest, false},
+		{http.StatusTooEarly, false},
 		{http.StatusInternalServerError, false},
+		{http.StatusFound, false},
 	}
 	for _, test := range tests {
 		t.Run(http.StatusText(test.status), func(t *testing.T) {

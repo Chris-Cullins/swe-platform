@@ -72,11 +72,14 @@ func (c Client) Append(ctx context.Context, namespace, run string, event control
 }
 
 func permanentRejection(statusCode int) bool {
-	if statusCode == http.StatusUnauthorized || statusCode == http.StatusRequestTimeout || statusCode == http.StatusTooManyRequests {
+	switch statusCode {
+	case http.StatusBadRequest,
+		http.StatusForbidden,
+		http.StatusConflict,
+		http.StatusRequestEntityTooLarge,
+		http.StatusInsufficientStorage:
+		return true
+	default:
 		return false
 	}
-	if statusCode >= 500 && statusCode != http.StatusInsufficientStorage {
-		return false
-	}
-	return true
 }
