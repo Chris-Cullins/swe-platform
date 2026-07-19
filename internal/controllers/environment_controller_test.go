@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"encoding/pem"
 	stderrors "errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -13,6 +14,7 @@ import (
 	networkingv1 "k8s.io/api/networking/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
@@ -121,6 +123,11 @@ func TestEnsurePodCreatesAndRotatesEphemeralSandboxdCredentials(t *testing.T) {
 	if pod.Spec.Volumes[1].Secret.DefaultMode == nil || *pod.Spec.Volumes[1].Secret.DefaultMode != 0o444 {
 		t.Fatalf("credential mode = %v, want readable by non-root sandboxd", pod.Spec.Volumes[1].Secret.DefaultMode)
 	}
+	for _, item := range pod.Spec.Volumes[1].Secret.Items {
+		if item.Key == sandboxdauth.ProcessTokenKey {
+			t.Fatal("private adapter process token was mounted into the environment pod")
+		}
+	}
 
 	var first corev1.Secret
 	if err := reconciler.Get(context.Background(), client.ObjectKey{Namespace: env.Namespace, Name: envCredentialName(env)}, &first); err != nil {
@@ -133,8 +140,11 @@ func TestEnsurePodCreatesAndRotatesEphemeralSandboxdCredentials(t *testing.T) {
 	if err := json.Unmarshal(first.Data[sandboxdauth.CapabilitiesKey], &capabilityConfig); err != nil {
 		t.Fatal(err)
 	}
-	if len(capabilityConfig.Grants) != 1 || len(capabilityConfig.Grants[0].Capabilities) != 2 {
-		t.Fatalf("capability grants = %#v, want one terminal/health grant", capabilityConfig.Grants)
+	if len(capabilityConfig.Grants) != 2 || len(capabilityConfig.Grants[0].Capabilities) != 2 || len(capabilityConfig.Grants[1].Capabilities) != 1 || capabilityConfig.Grants[1].Capabilities[0] != sandboxdauth.CapabilityProcess {
+		t.Fatalf("capability grants = %#v, want terminal/health and distinct process grants", capabilityConfig.Grants)
+	}
+	if _, published := pod.Annotations[sandboxdauth.ProcessTokenKey]; published {
+		t.Fatal("process token was published on pod")
 	}
 	block, _ := pem.Decode(first.Data[sandboxdauth.TLSCertKey])
 	if block == nil {
@@ -153,6 +163,13 @@ func TestEnsurePodCreatesAndRotatesEphemeralSandboxdCredentials(t *testing.T) {
 		t.Fatalf("certificate cannot be used as the pinned TLS identity: %v", err)
 	}
 	firstToken := pod.Annotations[sandboxdauth.TokenAnnotation]
+	if string(first.Data[sandboxdauth.ProcessTokenKey]) == "" || string(first.Data[sandboxdauth.ProcessTokenKey]) == firstToken {
+		t.Fatal("Secret must contain a distinct private process token")
+	}
+	if string(first.Data[sandboxdauth.CapabilitiesKey]) == string(first.Data[sandboxdauth.ProcessTokenKey]) ||
+		strings.Contains(string(first.Data[sandboxdauth.CapabilitiesKey]), string(first.Data[sandboxdauth.ProcessTokenKey])) {
+		t.Fatal("mounted capability data exposes the raw process token")
+	}
 
 	if err := reconciler.Delete(context.Background(), pod); err != nil {
 		t.Fatal(err)
@@ -197,7 +214,7 @@ func TestSandboxdNetworkPolicyOnlyAllowsControlPlaneIngress(t *testing.T) {
 	if err := reconciler.Get(context.Background(), client.ObjectKey{Namespace: env.Namespace, Name: envNetworkPolicyName(env)}, &policy); err != nil {
 		t.Fatal(err)
 	}
-	if len(policy.Spec.Ingress) != 1 || len(policy.Spec.Ingress[0].From) != 1 {
+	if len(policy.Spec.Ingress) != 1 || len(policy.Spec.Ingress[0].From) != 2 {
 		t.Fatalf("unexpected ingress policy: %#v", policy.Spec.Ingress)
 	}
 	peer := policy.Spec.Ingress[0].From[0]
@@ -211,6 +228,9 @@ func TestSandboxdNetworkPolicyOnlyAllowsControlPlaneIngress(t *testing.T) {
 	}
 	if len(policy.Spec.Ingress[0].Ports) != 1 || policy.Spec.Ingress[0].Ports[0].Port.IntVal != 50051 {
 		t.Fatalf("ingress ports = %#v, want sandboxd only", policy.Spec.Ingress[0].Ports)
+	}
+	if got := policy.Spec.Ingress[0].From[1].PodSelector.MatchLabels["app.kubernetes.io/component"]; got != "operator" {
+		t.Fatalf("second ingress peer component = %q, want operator", got)
 	}
 }
 
@@ -433,6 +453,41 @@ func TestSyncStatusReportsSetupForProjectInitialization(t *testing.T) {
 	}
 }
 
+func TestSyncStatusPublishesSandboxdEndpoint(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	if err := platformv1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+
+	env := &platformv1alpha1.Environment{ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default"}}
+	reconciler := &EnvironmentReconciler{
+		Client: fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(env).WithObjects(env).Build(),
+		Scheme: scheme,
+	}
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "env-test", Namespace: "default"},
+		Status: corev1.PodStatus{
+			Phase:      corev1.PodRunning,
+			PodIP:      "10.0.0.7",
+			Conditions: []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}},
+		},
+	}
+
+	if err := reconciler.syncStatus(context.Background(), env, pod); err != nil {
+		t.Fatalf("syncStatus() error = %v", err)
+	}
+	var updated platformv1alpha1.Environment
+	if err := reconciler.Get(context.Background(), client.ObjectKeyFromObject(env), &updated); err != nil {
+		t.Fatal(err)
+	}
+	if updated.Status.Phase != platformv1alpha1.EnvironmentPhaseReady || updated.Status.Endpoints.Sandboxd != "10.0.0.7:50051" {
+		t.Fatalf("Status = %#v, want Ready with sandboxd endpoint", updated.Status)
+	}
+}
+
 func TestEnsurePodMarksProjectInitializationAsResume(t *testing.T) {
 	scheme := runtime.NewScheme()
 	if err := corev1.AddToScheme(scheme); err != nil {
@@ -617,36 +672,64 @@ func TestReconcileIdleSchedulesRemainingTimeout(t *testing.T) {
 	}
 }
 
-func TestConsumeClaimRefreshesActivity(t *testing.T) {
+func TestSyncStatusRefreshesActivityWhenSetupBecomesReady(t *testing.T) {
 	scheme := runtime.NewScheme()
 	if err := platformv1alpha1.AddToScheme(scheme); err != nil {
 		t.Fatal(err)
 	}
 	oldActivity := metav1.NewTime(time.Now().Add(-time.Hour))
 	env := &platformv1alpha1.Environment{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:        "test",
-			Namespace:   "default",
-			Annotations: map[string]string{claimedAnnotation: "claim-id"},
+		ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default"},
+		Status:     platformv1alpha1.EnvironmentStatus{Phase: platformv1alpha1.EnvironmentPhaseSetup, LastActiveAt: &oldActivity},
+	}
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "env-test", Namespace: "default"},
+		Status: corev1.PodStatus{
+			Phase: corev1.PodRunning, PodIP: "10.0.0.1",
+			Conditions: []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}},
 		},
-		Status: platformv1alpha1.EnvironmentStatus{LastActiveAt: &oldActivity},
 	}
 	reconciler := &EnvironmentReconciler{
 		Client: fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(env).WithObjects(env).Build(),
 		Scheme: scheme,
 	}
-
-	if err := reconciler.consumeClaim(context.Background(), env); err != nil {
-		t.Fatalf("consumeClaim() error = %v", err)
+	if err := reconciler.syncStatus(context.Background(), env, pod); err != nil {
+		t.Fatal(err)
 	}
 	var updated platformv1alpha1.Environment
 	if err := reconciler.Get(context.Background(), client.ObjectKeyFromObject(env), &updated); err != nil {
 		t.Fatal(err)
 	}
-	if updated.Annotations[claimedAnnotation] != "" {
-		t.Fatalf("claim annotation was not consumed: %#v", updated.Annotations)
+	if updated.Status.Phase != platformv1alpha1.EnvironmentPhaseReady || updated.Status.LastActiveAt == nil || !updated.Status.LastActiveAt.After(oldActivity.Time) {
+		t.Fatalf("status = %#v, want newly ready with refreshed activity", updated.Status)
 	}
-	if updated.Status.LastActiveAt == nil || time.Since(updated.Status.LastActiveAt.Time) > time.Minute {
-		t.Fatalf("LastActiveAt = %v, want recently refreshed", updated.Status.LastActiveAt)
+}
+
+func TestPauseFencesEnvironmentWithoutReadableTemplate(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	if err := platformv1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	env := &platformv1alpha1.Environment{
+		ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default", UID: "env-uid", Finalizers: []string{environmentFinalizer}},
+		Spec:       platformv1alpha1.EnvironmentSpec{TemplateRef: "deleted-template", Paused: true},
+		Status:     platformv1alpha1.EnvironmentStatus{Phase: platformv1alpha1.EnvironmentPhaseFailed, PodName: "missing-pod"},
+	}
+	reconciler := &EnvironmentReconciler{
+		Client: fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(env).WithObjects(env).Build(),
+		Scheme: scheme,
+	}
+	if _, err := reconciler.Reconcile(context.Background(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(env)}); err != nil {
+		t.Fatalf("paused reconcile depended on deleted template: %v", err)
+	}
+	var fenced platformv1alpha1.Environment
+	if err := reconciler.Get(context.Background(), client.ObjectKeyFromObject(env), &fenced); err != nil {
+		t.Fatal(err)
+	}
+	if fenced.Status.Phase != platformv1alpha1.EnvironmentPhasePaused || fenced.Status.PodName != "" || fenced.Status.Endpoints.Sandboxd != "" {
+		t.Fatalf("fenced status = %#v", fenced.Status)
 	}
 }

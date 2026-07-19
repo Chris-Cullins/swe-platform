@@ -2,9 +2,9 @@ package cli
 
 import (
 	"context"
+	"errors"
 	"testing"
 
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
@@ -12,36 +12,69 @@ import (
 	platformv1alpha1 "github.com/Chris-Cullins/swe-platform/api/v1alpha1"
 )
 
-func TestClaimWarmEnvironment(t *testing.T) {
-	scheme := runtime.NewScheme()
-	if err := platformv1alpha1.AddToScheme(scheme); err != nil {
-		t.Fatal(err)
-	}
-	env := &platformv1alpha1.Environment{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:            "warm-small-test",
-			Namespace:       "default",
-			ResourceVersion: "1",
-			Labels:          map[string]string{warmPoolLabel: "small"},
-			OwnerReferences: []metav1.OwnerReference{{Name: "small"}},
-		},
-		Spec:   platformv1alpha1.EnvironmentSpec{TemplateRef: "small"},
-		Status: platformv1alpha1.EnvironmentStatus{Phase: platformv1alpha1.EnvironmentPhaseReady},
-	}
-	clients := &kubeClients{Client: fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(env).WithObjects(env).Build()}
+type uncertainCreateClient struct {
+	client.Client
+	lostResponse bool
+}
 
-	claimed, ok, err := claimWarmEnvironment(context.Background(), clients, "default", "small", "example")
-	if err != nil {
-		t.Fatalf("claimWarmEnvironment() error = %v", err)
+func (c *uncertainCreateClient) Create(ctx context.Context, object client.Object, opts ...client.CreateOption) error {
+	if err := c.Client.Create(ctx, object, opts...); err != nil {
+		return err
 	}
-	if !ok || claimed.Name != env.Name {
-		t.Fatalf("claimWarmEnvironment() = (%#v, %v), want %q", claimed, ok, env.Name)
+	if !c.lostResponse {
+		c.lostResponse = true
+		return errors.New("API response lost after persistence")
 	}
-	var updated platformv1alpha1.Environment
-	if err := clients.Get(context.Background(), client.ObjectKeyFromObject(env), &updated); err != nil {
+	return nil
+}
+
+func TestCreateRunIsDeclarativeAndIdempotent(t *testing.T) {
+	s := runtime.NewScheme()
+	if err := platformv1alpha1.AddToScheme(s); err != nil {
 		t.Fatal(err)
 	}
-	if updated.Spec.ProjectRef != "example" || updated.Labels[warmPoolLabel] != "" || len(updated.OwnerReferences) != 0 || updated.Annotations[claimedAnnotation] == "" {
-		t.Fatalf("claimed environment = %#v", updated)
+	c := fake.NewClientBuilder().WithScheme(s).Build()
+	clients := &kubeClients{Client: c}
+	call := func(prompt string) error {
+		return createRun(context.Background(), clients, "ns", "stable", "small", "", "", "test", prompt, false, 0)
+	}
+	if err := call("do it"); err != nil {
+		t.Fatal(err)
+	}
+	if err := call("do it"); err != nil {
+		t.Fatalf("same intent: %v", err)
+	}
+	if err := call("different"); err == nil {
+		t.Fatal("mismatched intent succeeded")
+	}
+	var runs platformv1alpha1.RunList
+	if err := c.List(context.Background(), &runs); err != nil {
+		t.Fatal(err)
+	}
+	var envs platformv1alpha1.EnvironmentList
+	if err := c.List(context.Background(), &envs); err != nil {
+		t.Fatal(err)
+	}
+	if len(runs.Items) != 1 || len(envs.Items) != 0 {
+		t.Fatalf("runs=%d environments=%d", len(runs.Items), len(envs.Items))
+	}
+}
+
+func TestCreateRunRecoversUncertainCreateResponse(t *testing.T) {
+	s := runtime.NewScheme()
+	if err := platformv1alpha1.AddToScheme(s); err != nil {
+		t.Fatal(err)
+	}
+	base := fake.NewClientBuilder().WithScheme(s).Build()
+	clients := &kubeClients{Client: &uncertainCreateClient{Client: base}}
+	if err := createRun(context.Background(), clients, "ns", "stable-timeout", "small", "", "", "test", "do it", false, 0); err != nil {
+		t.Fatalf("uncertain create was not recovered: %v", err)
+	}
+	var runs platformv1alpha1.RunList
+	if err := base.List(context.Background(), &runs); err != nil {
+		t.Fatal(err)
+	}
+	if len(runs.Items) != 1 || runs.Items[0].Name != "stable-timeout" {
+		t.Fatalf("runs = %#v", runs.Items)
 	}
 }

@@ -97,3 +97,80 @@ func TestWarmPoolReconcileReportsReadyAndRemovesExcess(t *testing.T) {
 		t.Fatal("newest excess warm environment was not deleted")
 	}
 }
+
+func TestWarmPoolReconcileExcludesClaimedEnvironment(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := platformv1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	tmpl := &platformv1alpha1.EnvironmentTemplate{
+		ObjectMeta: metav1.ObjectMeta{Name: "small", Namespace: "default", UID: "template-uid"},
+		Spec:       platformv1alpha1.EnvironmentTemplateSpec{WarmPool: &platformv1alpha1.WarmPoolSpec{Min: 1}},
+	}
+	claimed := &platformv1alpha1.Environment{
+		ObjectMeta: metav1.ObjectMeta{Name: "warm-claimed", Namespace: "default", Labels: map[string]string{warmPoolLabel: "small"}},
+		Spec:       platformv1alpha1.EnvironmentSpec{TemplateRef: "small"},
+		Status: platformv1alpha1.EnvironmentStatus{
+			Phase:     platformv1alpha1.EnvironmentPhaseReady,
+			ClaimedBy: &platformv1alpha1.RunReference{Name: "run", UID: "run-uid"},
+		},
+	}
+	reconciler := &WarmPoolReconciler{
+		Client: fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(tmpl, claimed).WithObjects(tmpl, claimed).Build(),
+		Scheme: scheme,
+	}
+	if _, err := reconciler.Reconcile(context.Background(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(tmpl)}); err != nil {
+		t.Fatal(err)
+	}
+	var environments platformv1alpha1.EnvironmentList
+	if err := reconciler.List(context.Background(), &environments, client.InNamespace("default")); err != nil {
+		t.Fatal(err)
+	}
+	if len(environments.Items) != 2 {
+		t.Fatalf("environments = %d, want claimed plus replacement", len(environments.Items))
+	}
+	var retained platformv1alpha1.Environment
+	if err := reconciler.Get(context.Background(), client.ObjectKeyFromObject(claimed), &retained); err != nil || retained.Status.ClaimedBy == nil {
+		t.Fatalf("claimed environment was removed or altered: %#v, %v", retained, err)
+	}
+}
+
+func TestWarmPoolReconcileDeletesOnlyUnclaimedUnusableEnvironment(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := platformv1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	tmpl := &platformv1alpha1.EnvironmentTemplate{
+		ObjectMeta: metav1.ObjectMeta{Name: "small", Namespace: "default", UID: "template-uid"},
+		Spec:       platformv1alpha1.EnvironmentTemplateSpec{WarmPool: &platformv1alpha1.WarmPoolSpec{Min: 1}},
+	}
+	failed := func(name string, claim *platformv1alpha1.RunReference) *platformv1alpha1.Environment {
+		return &platformv1alpha1.Environment{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "default", Labels: map[string]string{warmPoolLabel: "small"}},
+			Spec:       platformv1alpha1.EnvironmentSpec{TemplateRef: "small"},
+			Status:     platformv1alpha1.EnvironmentStatus{Phase: platformv1alpha1.EnvironmentPhaseFailed, ClaimedBy: claim},
+		}
+	}
+	unclaimed := failed("warm-unclaimed", nil)
+	claimed := failed("warm-claimed", &platformv1alpha1.RunReference{Name: "run", UID: "run-uid"})
+	reconciler := &WarmPoolReconciler{
+		Client: fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(tmpl, unclaimed, claimed).WithObjects(tmpl, unclaimed, claimed).Build(),
+		Scheme: scheme,
+	}
+	if _, err := reconciler.Reconcile(context.Background(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(tmpl)}); err != nil {
+		t.Fatal(err)
+	}
+	if err := reconciler.Get(context.Background(), client.ObjectKeyFromObject(unclaimed), &platformv1alpha1.Environment{}); err == nil {
+		t.Fatal("unclaimed failed environment was retained")
+	}
+	if err := reconciler.Get(context.Background(), client.ObjectKeyFromObject(claimed), &platformv1alpha1.Environment{}); err != nil {
+		t.Fatalf("claimed failed environment was deleted: %v", err)
+	}
+	var environments platformv1alpha1.EnvironmentList
+	if err := reconciler.List(context.Background(), &environments, client.InNamespace("default"), client.MatchingLabels{warmPoolLabel: "small"}); err != nil {
+		t.Fatal(err)
+	}
+	if len(environments.Items) != 2 {
+		t.Fatalf("pool environments = %d, want claimed plus replacement", len(environments.Items))
+	}
+}

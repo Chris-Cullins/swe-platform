@@ -68,6 +68,7 @@ if [[ -z "$WARM_ENV_NAME" ]]; then
 	echo "FAIL: warm pool did not create an environment"
 	exit 1
 fi
+WARM_POD_UID=$(kubectl get pod "env-${WARM_ENV_NAME}" -o jsonpath='{.metadata.uid}')
 
 echo "==> creating project configuration"
 kubectl create secret generic e2e-project-config --from-literal=SWE_E2E_PROJECT_CONFIG=project-config-ok
@@ -146,15 +147,35 @@ spec:
     name: e2e-project-config
 EOF
 
-echo "==> creating project environment + run via swe"
-bin/swe run "end-to-end smoke test" --project e2e --timeout 3m
-
+echo "==> creating project environment + run intent via swe"
+bin/swe run "end-to-end smoke test" --project e2e --wait=false
 RUN_NAME=$(kubectl get runs -o jsonpath='{.items[0].metadata.name}')
-ENV_NAME=$(kubectl get run "$RUN_NAME" -o jsonpath='{.spec.environmentRef}')
-if [[ "$ENV_NAME" != "$WARM_ENV_NAME" ]]; then
-	echo "FAIL: swe run created $ENV_NAME instead of claiming warm environment $WARM_ENV_NAME"
+kubectl wait --for=jsonpath='{.status.state}'=Failed run/"$RUN_NAME" --timeout=3m
+RUN_ENV_NAME=$(kubectl get run "$RUN_NAME" -o jsonpath='{.status.environmentRef.name}')
+RUN_ENV_OWNERSHIP=$(kubectl get run "$RUN_NAME" -o jsonpath='{.status.environmentRef.ownership}')
+if [[ "$RUN_ENV_NAME" != "$WARM_ENV_NAME" || "$RUN_ENV_OWNERSHIP" != "Claimed" ]]; then
+	echo "FAIL: Run allocated $RUN_ENV_NAME ($RUN_ENV_OWNERSHIP), expected claimed warm environment $WARM_ENV_NAME"
 	exit 1
 fi
+RUN_POD_UID=$(kubectl get pod "env-${RUN_ENV_NAME}" -o jsonpath='{.metadata.uid}')
+RUN_POD_PROJECT=$(kubectl get pod "env-${RUN_ENV_NAME}" -o jsonpath='{.metadata.annotations.swe\.dev/project}')
+if [[ "$RUN_POD_UID" == "$WARM_POD_UID" || "$RUN_POD_PROJECT" != "e2e" ]]; then
+	echo "FAIL: Run reached a terminal state before its claimed warm pod was replaced and configured for the Project"
+	exit 1
+fi
+for _ in $(seq 1 60); do
+	CLAIM_UID=$(kubectl get environment "$RUN_ENV_NAME" -o jsonpath='{.status.claimedBy.uid}' 2>/dev/null || true)
+	if [[ -z "$CLAIM_UID" ]]; then
+		break
+	fi
+	sleep 1
+done
+if [[ -n "${CLAIM_UID:-}" ]]; then
+	echo "FAIL: terminal Run did not release its warm Environment claim"
+	exit 1
+fi
+kubectl wait --for=jsonpath='{.status.phase}'=Ready environment/"$RUN_ENV_NAME" --timeout=3m
+ENV_NAME=$RUN_ENV_NAME
 for _ in $(seq 1 60); do
 	REPLACEMENT_NAME=$(kubectl get environments -l swe.dev/warm-pool=small -o jsonpath='{range .items[*]}{.metadata.name}{end}' 2>/dev/null || true)
 	REPLACEMENT_PHASE=$(kubectl get environments -l swe.dev/warm-pool=small -o jsonpath='{range .items[*]}{.status.phase}{end}' 2>/dev/null || true)
@@ -269,6 +290,12 @@ wait "$STREAM_PID" >/dev/null 2>&1 || true
 if ! grep -q 'e2e transcript event' /tmp/swe-platform-transcript.out; then
 	echo "FAIL: transcript event was not received from the SSE stream"
 	cat /tmp/swe-platform-transcript.out
+	exit 1
+fi
+
+kubectl delete run "$RUN_NAME" --wait=true >/dev/null
+if ! kubectl get environment "$RUN_ENV_NAME" >/dev/null 2>&1; then
+	echo "FAIL: deleting Run removed its claimed Environment"
 	exit 1
 fi
 

@@ -74,6 +74,23 @@ spec:
           status:
             description: EnvironmentStatus defines the observed state of Environment.
             properties:
+              claimedBy:
+                description: |-
+                  ClaimedBy is the Run currently using a reusable Environment. Controller-
+                  owned Environments do not use claims. Name and UID fence stale Runs.
+                properties:
+                  name:
+                    type: string
+                  uid:
+                    description: |-
+                      UID is a type that holds unique ID values, including UUIDs.  Because we
+                      don't ONLY use UUIDs, this is an alias to string.  Being a type captures
+                      intent and helps make sure that UIDs and names do not get conflated.
+                    type: string
+                required:
+                - name
+                - uid
+                type: object
               conditions:
                 items:
                   description: Condition contains details for one aspect of the current

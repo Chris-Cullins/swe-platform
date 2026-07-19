@@ -13,6 +13,7 @@ import (
 	stderrors "errors"
 	"fmt"
 	"math/big"
+	"net"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -49,7 +50,6 @@ const (
 	templateRefField   = "spec.templateRef"
 	warmPoolLabel      = "swe.dev/warm-pool"
 	projectAnnotation  = "swe.dev/project"
-	claimedAnnotation  = "swe.dev/claimed"
 )
 
 var errPodReplacing = stderrors.New("environment pod is being replaced")
@@ -112,12 +112,12 @@ func (r *EnvironmentReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		}
 		return ctrl.Result{Requeue: true}, nil
 	}
-	if env.Annotations[claimedAnnotation] != "" {
-		if err := r.consumeClaim(ctx, &env); err != nil {
-			return ctrl.Result{}, err
-		}
+	// Fencing must not depend on a still-readable template or successful setup.
+	// Cancellation/finalization can therefore stop an execution domain even
+	// after its template was deleted or provisioning became permanently broken.
+	if env.Spec.Paused {
+		return r.reconcilePaused(ctx, &env)
 	}
-
 	var tmpl platformv1alpha1.EnvironmentTemplate
 	if err := r.Get(ctx, types.NamespacedName{Namespace: env.Namespace, Name: env.Spec.TemplateRef}, &tmpl); err != nil {
 		return ctrl.Result{}, r.fail(ctx, &env, fmt.Errorf("get template %q: %w", env.Spec.TemplateRef, err))
@@ -138,13 +138,10 @@ func (r *EnvironmentReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		return ctrl.Result{Requeue: true}, nil
 	}
 
-	if env.Spec.Paused {
-		return r.reconcilePaused(ctx, &env)
-	}
 	if env.Status.Phase == platformv1alpha1.EnvironmentPhasePaused {
 		now := metav1.Now()
 		env.Status.LastActiveAt = &now
-		return ctrl.Result{Requeue: true}, r.setPhase(ctx, &env, platformv1alpha1.EnvironmentPhaseResuming, "")
+		return ctrl.Result{Requeue: true}, r.setPhase(ctx, &env, platformv1alpha1.EnvironmentPhaseResuming, "", "")
 	}
 
 	pod, err := r.ensurePod(ctx, &env, &tmpl)
@@ -165,20 +162,6 @@ func (r *EnvironmentReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		return ctrl.Result{}, nil
 	}
 	return r.reconcileIdle(ctx, &env, &tmpl)
-}
-
-func (r *EnvironmentReconciler) consumeClaim(ctx context.Context, env *platformv1alpha1.Environment) error {
-	now := metav1.Now()
-	env.Status.LastActiveAt = &now
-	if err := r.Status().Update(ctx, env); err != nil {
-		return fmt.Errorf("record warm environment claim activity: %w", err)
-	}
-	before := env.DeepCopy()
-	delete(env.Annotations, claimedAnnotation)
-	if err := r.Patch(ctx, env, client.MergeFrom(before)); err != nil {
-		return fmt.Errorf("consume warm environment claim: %w", err)
-	}
-	return nil
 }
 
 // reconcileIdle schedules the next activity check or requests a pause once the
@@ -205,7 +188,7 @@ func (r *EnvironmentReconciler) reconcileIdle(ctx context.Context, env *platform
 	if err := r.Patch(ctx, env, patch); err != nil {
 		return ctrl.Result{}, fmt.Errorf("request idle pause: %w", err)
 	}
-	if err := r.setPhase(ctx, env, platformv1alpha1.EnvironmentPhaseIdle, env.Status.PodName); err != nil {
+	if err := r.setPhase(ctx, env, platformv1alpha1.EnvironmentPhaseIdle, env.Status.PodName, env.Status.Endpoints.Sandboxd); err != nil {
 		return ctrl.Result{}, err
 	}
 	return ctrl.Result{Requeue: true}, nil
@@ -300,7 +283,7 @@ func (r *EnvironmentReconciler) reconcilePaused(ctx context.Context, env *platfo
 		return ctrl.Result{}, err
 	}
 
-	return ctrl.Result{}, r.setPhase(ctx, env, platformv1alpha1.EnvironmentPhasePaused, "")
+	return ctrl.Result{}, r.setPhase(ctx, env, platformv1alpha1.EnvironmentPhasePaused, "", "")
 }
 
 func (r *EnvironmentReconciler) ensureWorkspacePVC(ctx context.Context, env *platformv1alpha1.Environment, tmpl *platformv1alpha1.EnvironmentTemplate) (bool, error) {
@@ -364,7 +347,7 @@ func (r *EnvironmentReconciler) ensurePod(ctx context.Context, env *platformv1al
 				return nil, err
 			}
 			if pod.Annotations[projectAnnotation] != env.Spec.ProjectRef {
-				if err := r.setPhase(ctx, env, platformv1alpha1.EnvironmentPhaseSetup, ""); err != nil {
+				if err := r.setPhase(ctx, env, platformv1alpha1.EnvironmentPhaseSetup, "", ""); err != nil {
 					return nil, err
 				}
 				if err := r.Delete(ctx, &pod); err != nil {
@@ -409,6 +392,10 @@ func (r *EnvironmentReconciler) ensurePod(ctx context.Context, env *platformv1al
 	if err != nil {
 		return nil, fmt.Errorf("rotate sandboxd credentials: %w", err)
 	}
+	var credentials corev1.Secret
+	if err := r.Get(ctx, types.NamespacedName{Namespace: env.Namespace, Name: envCredentialName(env)}, &credentials); err != nil {
+		return nil, fmt.Errorf("get rotated sandboxd credentials: %w", err)
+	}
 
 	resources, ok := sizePresets[tmpl.Spec.Size]
 	if !ok {
@@ -421,11 +408,12 @@ func (r *EnvironmentReconciler) ensurePod(ctx context.Context, env *platformv1al
 			Name:      podName,
 			Labels:    envLabels(env),
 			Annotations: map[string]string{
-				projectAnnotation:               env.Spec.ProjectRef,
-				sandboxdauth.IdentityAnnotation: identity,
-				sandboxdauth.TrustAnnotation:    string(trust),
-				sandboxdauth.TokenAnnotation:    terminalToken,
-				sandboxdRevisionAnnotation:      sandboxdSecurityRevision,
+				projectAnnotation:                env.Spec.ProjectRef,
+				sandboxdauth.IdentityAnnotation:  identity,
+				sandboxdauth.TrustAnnotation:     string(trust),
+				sandboxdauth.TokenAnnotation:     terminalToken,
+				sandboxdauth.SecretUIDAnnotation: string(credentials.UID),
+				sandboxdRevisionAnnotation:       sandboxdSecurityRevision,
 			},
 		},
 		Spec: corev1.PodSpec{
@@ -443,6 +431,13 @@ func (r *EnvironmentReconciler) ensurePod(ctx context.Context, env *platformv1al
 					"-tls-cert=" + sandboxdCredentialMount + "/" + sandboxdauth.TLSCertKey,
 					"-tls-key=" + sandboxdCredentialMount + "/" + sandboxdauth.TLSKeyKey,
 					"-capabilities=" + sandboxdCredentialMount + "/" + sandboxdauth.CapabilitiesKey,
+				},
+				Ports: []corev1.ContainerPort{{
+					Name:          "sandboxd",
+					ContainerPort: 50051,
+				}},
+				ReadinessProbe: &corev1.Probe{
+					ProbeHandler: corev1.ProbeHandler{TCPSocket: &corev1.TCPSocketAction{Port: intstr.FromString("sandboxd")}},
 				},
 				Resources: corev1.ResourceRequirements{
 					Requests: resources,
@@ -469,6 +464,11 @@ func (r *EnvironmentReconciler) ensurePod(ctx context.Context, env *platformv1al
 					VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{
 						SecretName:  envCredentialName(env),
 						DefaultMode: ptr(int32(0o444)),
+						Items: []corev1.KeyToPath{
+							{Key: sandboxdauth.TLSCertKey, Path: sandboxdauth.TLSCertKey},
+							{Key: sandboxdauth.TLSKeyKey, Path: sandboxdauth.TLSKeyKey},
+							{Key: sandboxdauth.CapabilitiesKey, Path: sandboxdauth.CapabilitiesKey},
+						},
 					}},
 				},
 			},
@@ -519,6 +519,16 @@ func (r *EnvironmentReconciler) ensurePod(ctx context.Context, env *platformv1al
 	if err := r.Create(ctx, &pod); err != nil {
 		return nil, err
 	}
+	// Bind the private adapter credential to the exact execution incarnation.
+	// Real API servers always assign a Pod UID. Fake clients do not, so an empty
+	// UID remains unusable rather than weakening the live check.
+	if err := r.Get(ctx, types.NamespacedName{Namespace: env.Namespace, Name: envCredentialName(env)}, &credentials); err != nil {
+		return nil, err
+	}
+	credentials.Annotations[sandboxdauth.PodUIDAnnotation] = string(pod.UID)
+	if err := r.Update(ctx, &credentials); err != nil {
+		return nil, fmt.Errorf("bind sandboxd credentials to pod: %w", err)
+	}
 	return &pod, nil
 }
 
@@ -535,10 +545,12 @@ func (r *EnvironmentReconciler) currentSandboxdPod(ctx context.Context, env *pla
 		}
 		return false, fmt.Errorf("get sandboxd credentials: %w", err)
 	}
-	return metav1.IsControlledBy(&secret, env) &&
+	return exactControllerOwner(&secret, platformv1alpha1.GroupVersion.String(), "Environment", env.Name, env.UID) &&
+		secret.UID != "" && pod.Annotations[sandboxdauth.SecretUIDAnnotation] == string(secret.UID) &&
 		secret.Annotations[sandboxdauth.IdentityAnnotation] == pod.Annotations[sandboxdauth.IdentityAnnotation] &&
+		pod.UID != "" && secret.Annotations[sandboxdauth.PodUIDAnnotation] == string(pod.UID) &&
 		len(secret.Data[sandboxdauth.TLSCertKey]) > 0 && len(secret.Data[sandboxdauth.TLSKeyKey]) > 0 &&
-		len(secret.Data[sandboxdauth.CapabilitiesKey]) > 0, nil
+		len(secret.Data[sandboxdauth.CapabilitiesKey]) > 0 && len(secret.Data[sandboxdauth.ProcessTokenKey]) > 0, nil
 }
 
 func (r *EnvironmentReconciler) rotateSandboxdCredentials(ctx context.Context, env *platformv1alpha1.Environment) (string, []byte, string, error) {
@@ -555,8 +567,13 @@ func (r *EnvironmentReconciler) rotateSandboxdCredentials(ctx context.Context, e
 	if err != nil {
 		return "", nil, "", err
 	}
+	processToken, err := randomCredential(32)
+	if err != nil {
+		return "", nil, "", err
+	}
 	capabilities, err := json.Marshal(sandboxdauth.Config{Grants: []sandboxdauth.Grant{
-		{Token: terminalToken, Capabilities: []sandboxdauth.Capability{sandboxdauth.CapabilityHealth, sandboxdauth.CapabilityTerminal}},
+		{TokenHash: sandboxdauth.TokenVerifier(terminalToken), Capabilities: []sandboxdauth.Capability{sandboxdauth.CapabilityHealth, sandboxdauth.CapabilityTerminal}},
+		{TokenHash: sandboxdauth.TokenVerifier(processToken), Capabilities: []sandboxdauth.Capability{sandboxdauth.CapabilityProcess}},
 	}})
 	if err != nil {
 		return "", nil, "", err
@@ -570,7 +587,7 @@ func (r *EnvironmentReconciler) rotateSandboxdCredentials(ctx context.Context, e
 		if err := controllerutil.SetControllerReference(env, &secret, r.Scheme); err != nil {
 			return "", nil, "", err
 		}
-		secret.Data = sandboxdCredentialData(certificate, privateKey, capabilities)
+		secret.Data = sandboxdCredentialData(certificate, privateKey, capabilities, processToken)
 		secret.Annotations = map[string]string{sandboxdauth.IdentityAnnotation: serverName}
 		if err := r.Create(ctx, &secret); err != nil {
 			return "", nil, "", err
@@ -578,7 +595,7 @@ func (r *EnvironmentReconciler) rotateSandboxdCredentials(ctx context.Context, e
 	} else if err != nil {
 		return "", nil, "", err
 	} else {
-		secret.Data = sandboxdCredentialData(certificate, privateKey, capabilities)
+		secret.Data = sandboxdCredentialData(certificate, privateKey, capabilities, processToken)
 		if secret.Annotations == nil {
 			secret.Annotations = map[string]string{}
 		}
@@ -590,11 +607,12 @@ func (r *EnvironmentReconciler) rotateSandboxdCredentials(ctx context.Context, e
 	return serverName, certificate, terminalToken, nil
 }
 
-func sandboxdCredentialData(certificate, privateKey, capabilities []byte) map[string][]byte {
+func sandboxdCredentialData(certificate, privateKey, capabilities []byte, processToken string) map[string][]byte {
 	return map[string][]byte{
 		sandboxdauth.TLSCertKey:      certificate,
 		sandboxdauth.TLSKeyKey:       privateKey,
 		sandboxdauth.CapabilitiesKey: capabilities,
+		sandboxdauth.ProcessTokenKey: []byte(processToken),
 	}
 }
 
@@ -690,6 +708,12 @@ func (r *EnvironmentReconciler) ensureSandboxdNetworkPolicy(ctx context.Context,
 					"app.kubernetes.io/instance":  controlPlaneInstance,
 					"app.kubernetes.io/component": "control-plane",
 				}},
+			}, {
+				NamespaceSelector: &metav1.LabelSelector{MatchLabels: map[string]string{"kubernetes.io/metadata.name": controlPlaneNamespace}},
+				PodSelector: &metav1.LabelSelector{MatchLabels: map[string]string{
+					"app.kubernetes.io/name": controlPlaneName, "app.kubernetes.io/instance": controlPlaneInstance,
+					"app.kubernetes.io/component": "operator",
+				}},
 			}},
 			Ports: []networkingv1.NetworkPolicyPort{{Protocol: &protocol, Port: ptr(intstr.FromInt32(50051))}},
 		}},
@@ -718,7 +742,7 @@ func (r *EnvironmentReconciler) ensureSandboxdNetworkPolicy(ctx context.Context,
 // with the same Environment name. Unowned and differently owned objects are
 // foreign collisions and must never be adopted or deleted.
 func dependentOwnership(object metav1.Object, env *platformv1alpha1.Environment) (current, stale bool) {
-	if metav1.IsControlledBy(object, env) {
+	if exactControllerOwner(object, platformv1alpha1.GroupVersion.String(), "Environment", env.Name, env.UID) {
 		return true, false
 	}
 	owner := metav1.GetControllerOf(object)
@@ -732,7 +756,8 @@ func dependentOwnership(object metav1.Object, env *platformv1alpha1.Environment)
 // syncStatus maps pod state onto the Environment phase.
 func (r *EnvironmentReconciler) syncStatus(ctx context.Context, env *platformv1alpha1.Environment, pod *corev1.Pod) error {
 	phase := platformv1alpha1.EnvironmentPhaseCreating
-	initializeActivity := false
+	sandboxdEndpoint := ""
+	refreshActivity := false
 	switch pod.Status.Phase {
 	case corev1.PodPending:
 		if env.Status.Phase == platformv1alpha1.EnvironmentPhaseResuming {
@@ -741,31 +766,40 @@ func (r *EnvironmentReconciler) syncStatus(ctx context.Context, env *platformv1a
 			phase = platformv1alpha1.EnvironmentPhaseSetup
 		}
 	case corev1.PodRunning:
-		phase = platformv1alpha1.EnvironmentPhaseReady
-		initializeActivity = env.Status.LastActiveAt == nil
+		if podReady(pod) && pod.Status.PodIP != "" {
+			phase = platformv1alpha1.EnvironmentPhaseReady
+			sandboxdEndpoint = net.JoinHostPort(pod.Status.PodIP, "50051")
+			refreshActivity = env.Status.LastActiveAt == nil || (env.Status.Phase != platformv1alpha1.EnvironmentPhaseReady && env.Status.Phase != platformv1alpha1.EnvironmentPhaseRunning)
+		}
+		// TODO(P2): phase = Running while a Run is attached, Idle after activity stops.
 	case corev1.PodFailed:
 		phase = platformv1alpha1.EnvironmentPhaseFailed
 	case corev1.PodSucceeded:
 		phase = platformv1alpha1.EnvironmentPhaseTerminated
 	}
-	if initializeActivity {
+	if refreshActivity {
 		now := metav1.Now()
 		env.Status.LastActiveAt = &now
 	}
-	if env.Status.Phase == phase && env.Status.PodName == pod.Name && !initializeActivity {
-		return nil
-	}
-	env.Status.Phase = phase
-	env.Status.PodName = pod.Name
-	return r.Status().Update(ctx, env)
+	return r.setPhase(ctx, env, phase, pod.Name, sandboxdEndpoint)
 }
 
-func (r *EnvironmentReconciler) setPhase(ctx context.Context, env *platformv1alpha1.Environment, phase platformv1alpha1.EnvironmentPhase, podName string) error {
-	if env.Status.Phase == phase && env.Status.PodName == podName {
+func podReady(pod *corev1.Pod) bool {
+	for _, condition := range pod.Status.Conditions {
+		if condition.Type == corev1.PodReady {
+			return condition.Status == corev1.ConditionTrue
+		}
+	}
+	return false
+}
+
+func (r *EnvironmentReconciler) setPhase(ctx context.Context, env *platformv1alpha1.Environment, phase platformv1alpha1.EnvironmentPhase, podName, sandboxdEndpoint string) error {
+	if env.Status.Phase == phase && env.Status.PodName == podName && env.Status.Endpoints.Sandboxd == sandboxdEndpoint {
 		return nil
 	}
 	env.Status.Phase = phase
 	env.Status.PodName = podName
+	env.Status.Endpoints.Sandboxd = sandboxdEndpoint
 	return r.Status().Update(ctx, env)
 }
 

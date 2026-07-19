@@ -4,31 +4,26 @@ import (
 	"context"
 	"crypto/rand"
 	"fmt"
+	"reflect"
 	"time"
 
 	"github.com/spf13/cobra"
-	corev1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/api/errors"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
-	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	platformv1alpha1 "github.com/Chris-Cullins/swe-platform/api/v1alpha1"
 )
 
-const (
-	warmPoolLabel     = "swe.dev/warm-pool"
-	projectAnnotation = "swe.dev/project"
-	claimedAnnotation = "swe.dev/claimed"
-)
-
 func newRunCommand() *cobra.Command {
 	var (
-		template string
-		project  string
-		agent    string
-		wait     bool
-		timeout  time.Duration
+		template    string
+		project     string
+		environment string
+		agent       string
+		name        string
+		wait        bool
+		timeout     time.Duration
 	)
 
 	cmd := &cobra.Command{
@@ -37,142 +32,103 @@ func newRunCommand() *cobra.Command {
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			namespace, _ := cmd.Flags().GetString("namespace")
-			return runEnvironment(cmd.Context(), namespace, template, project, agent, args[0], wait, timeout)
+			return runEnvironment(cmd.Context(), namespace, name, template, project, environment, agent, args[0], wait, timeout)
 		},
 	}
 
+	cmd.Flags().StringVar(&name, "name", "", "Stable Run name/idempotency key (reuse to retry an uncertain create)")
 	cmd.Flags().StringVarP(&template, "template", "t", "", "EnvironmentTemplate to use (defaults to the project's template)")
 	cmd.Flags().StringVarP(&project, "project", "p", "", "Project providing the default template and environment configuration")
+	cmd.Flags().StringVarP(&environment, "environment", "e", "", "Existing unclaimed Environment to reuse (exclusive with --template/--project)")
 	cmd.Flags().StringVar(&agent, "agent", "claude-code", "Agent adapter to run")
-	cmd.Flags().BoolVar(&wait, "wait", true, "Wait for the environment to become Ready")
-	cmd.Flags().DurationVar(&timeout, "timeout", 5*time.Minute, "How long to wait for readiness")
+	cmd.Flags().BoolVar(&wait, "wait", true, "Wait for the adapter to start or the Run to finish")
+	cmd.Flags().DurationVar(&timeout, "timeout", 5*time.Minute, "How long to wait for the Run")
 	return cmd
 }
 
-func runEnvironment(ctx context.Context, namespace, template, project, agent, prompt string, wait bool, timeout time.Duration) error {
+func runEnvironment(ctx context.Context, namespace, name, template, project, environment, agent, prompt string, wait bool, timeout time.Duration) error {
 	clients, err := newKubeClients()
 	if err != nil {
 		return err
 	}
-	if project != "" {
-		var configuredProject platformv1alpha1.Project
-		if err := clients.Get(ctx, types.NamespacedName{Namespace: namespace, Name: project}, &configuredProject); err != nil {
-			return fmt.Errorf("get project %q: %w", project, err)
-		}
-		if template == "" {
-			template = configuredProject.Spec.TemplateRef
-		}
-	}
-	if template == "" {
-		return fmt.Errorf("an environment template is required: set --template or use a project with spec.templateRef")
-	}
+	return createRun(ctx, clients, namespace, name, template, project, environment, agent, prompt, wait, timeout)
+}
 
-	env, claimed, err := claimWarmEnvironment(ctx, clients, namespace, template, project)
-	if err != nil {
-		return err
+func createRun(ctx context.Context, clients *kubeClients, namespace, name, template, project, environment, agent, prompt string, wait bool, timeout time.Duration) error {
+	if environment == "" && template == "" && project == "" {
+		return fmt.Errorf("an environment, template, or project is required")
 	}
-	if !claimed {
-		env = &platformv1alpha1.Environment{
-			ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: "env-" + randSuffix(6)},
-			Spec: platformv1alpha1.EnvironmentSpec{
-				ProjectRef:  project,
-				TemplateRef: template,
-			},
-		}
-		if err := clients.Create(ctx, env); err != nil {
-			return fmt.Errorf("create environment: %w", err)
-		}
+	if environment != "" && (template != "" || project != "") {
+		return fmt.Errorf("--environment cannot be combined with --template or --project")
 	}
-	envName := env.Name
-	if claimed {
-		fmt.Printf("environment %s claimed from warm pool (template %s)\n", envName, template)
-	} else {
-		fmt.Printf("environment %s created (template %s)\n", envName, template)
+	if name == "" {
+		name = "run-" + randSuffix(10)
 	}
 
 	run := &platformv1alpha1.Run{
-		ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: "run-" + randSuffix(6)},
+		ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: name},
 		Spec: platformv1alpha1.RunSpec{
-			EnvironmentRef: envName,
+			EnvironmentRef: environment,
+			ProjectRef:     project,
+			TemplateRef:    template,
 			Agent:          agent,
 			Prompt:         prompt,
 		},
 	}
 	if err := clients.Create(ctx, run); err != nil {
-		return fmt.Errorf("create run: %w", err)
+		// A timeout may mean the API server persisted the object but its response
+		// was lost. Read the same name and accept only the same immutable intent.
+		var existing platformv1alpha1.Run
+		getErr := clients.Get(ctx, types.NamespacedName{Namespace: namespace, Name: name}, &existing)
+		if getErr != nil {
+			return fmt.Errorf("create run %q: %w (retry with --name %s)", name, err, name)
+		}
+		if !sameRunIntent(existing.Spec, run.Spec) {
+			return fmt.Errorf("run %q already exists with different task intent", name)
+		}
+		run = &existing
+		fmt.Printf("run %s already exists with the same intent; reusing it\n", run.Name)
+	} else {
+		fmt.Printf("run %s created (agent %s)\n", run.Name, agent)
 	}
-	fmt.Printf("run %s created (agent %s)\n", run.Name, agent)
 
 	if !wait {
 		return nil
 	}
-	return waitForReady(ctx, clients, namespace, envName, timeout)
+	return waitForRun(ctx, clients, namespace, name, timeout)
 }
 
-func claimWarmEnvironment(ctx context.Context, clients *kubeClients, namespace, template, project string) (*platformv1alpha1.Environment, bool, error) {
-	var environments platformv1alpha1.EnvironmentList
-	if err := clients.List(ctx, &environments,
-		client.InNamespace(namespace),
-		client.MatchingLabels{warmPoolLabel: template},
-	); err != nil {
-		return nil, false, fmt.Errorf("list warm environments: %w", err)
-	}
-	for i := range environments.Items {
-		env := &environments.Items[i]
-		if env.Status.Phase != platformv1alpha1.EnvironmentPhaseReady {
-			continue
-		}
-		before := env.DeepCopy()
-		delete(env.Labels, warmPoolLabel)
-		env.OwnerReferences = nil
-		if env.Annotations == nil {
-			env.Annotations = make(map[string]string)
-		}
-		env.Annotations[claimedAnnotation] = time.Now().UTC().Format(time.RFC3339Nano)
-		env.Spec.ProjectRef = project
-		patch := client.MergeFromWithOptions(before, client.MergeFromWithOptimisticLock{})
-		if err := clients.Patch(ctx, env, patch); err != nil {
-			if errors.IsConflict(err) || errors.IsNotFound(err) {
-				continue
-			}
-			return nil, false, fmt.Errorf("claim warm environment %q: %w", env.Name, err)
-		}
-		return env, true, nil
-	}
-	return nil, false, nil
+func sameRunIntent(a, b platformv1alpha1.RunSpec) bool {
+	a.Cancel, b.Cancel = false, false
+	return reflect.DeepEqual(a, b)
 }
 
-// waitForReady polls the Environment until it reports Ready or the timeout expires.
+// waitForRun polls until the adapter accepts and starts work or the Run ends.
 // TODO(P1): replace polling with a watch once the control plane exists.
-func waitForReady(ctx context.Context, clients *kubeClients, namespace, name string, timeout time.Duration) error {
+func waitForRun(ctx context.Context, clients *kubeClients, namespace, name string, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
-	lastPhase := platformv1alpha1.EnvironmentPhase("")
-	fmt.Println("waiting for environment to become ready...")
+	lastState := platformv1alpha1.RunState("")
+	fmt.Println("waiting for the run to start...")
 
 	for time.Now().Before(deadline) {
-		var env platformv1alpha1.Environment
-		if err := clients.Get(ctx, types.NamespacedName{Namespace: namespace, Name: name}, &env); err != nil {
-			return fmt.Errorf("get environment: %w", err)
+		var run platformv1alpha1.Run
+		if err := clients.Get(ctx, types.NamespacedName{Namespace: namespace, Name: name}, &run); err != nil {
+			return fmt.Errorf("get run: %w", err)
 		}
-		if env.Status.Phase != lastPhase {
-			fmt.Printf("  phase: %s\n", env.Status.Phase)
-			lastPhase = env.Status.Phase
+		if run.Status.State != lastState {
+			fmt.Printf("  state: %s\n", run.Status.State)
+			lastState = run.Status.State
 		}
-		switch env.Status.Phase {
-		case platformv1alpha1.EnvironmentPhaseReady, platformv1alpha1.EnvironmentPhaseRunning:
-			var pod corev1.Pod
-			if err := clients.Get(ctx, types.NamespacedName{Namespace: namespace, Name: "env-" + name}, &pod); err != nil {
-				if !errors.IsNotFound(err) {
-					return fmt.Errorf("get environment pod: %w", err)
-				}
-				break
+		switch run.Status.State {
+		case platformv1alpha1.RunStateRunning, platformv1alpha1.RunStateNeedsInput, platformv1alpha1.RunStateSucceeded:
+			if run.Status.EnvironmentRef != nil {
+				fmt.Printf("run %s is %s — attach with: swe attach %s\n", name, run.Status.State, run.Status.EnvironmentRef.Name)
 			}
-			if pod.Status.Phase == corev1.PodRunning && pod.Annotations[projectAnnotation] == env.Spec.ProjectRef {
-				fmt.Printf("environment %s is ready — attach with: swe attach %s\n", name, name)
-				return nil
-			}
-		case platformv1alpha1.EnvironmentPhaseFailed:
-			return fmt.Errorf("environment failed")
+			return nil
+		case platformv1alpha1.RunStateFailed:
+			return fmt.Errorf("run failed")
+		case platformv1alpha1.RunStateCancelled:
+			return fmt.Errorf("run was cancelled")
 		}
 		select {
 		case <-ctx.Done():
@@ -180,7 +136,39 @@ func waitForReady(ctx context.Context, clients *kubeClients, namespace, name str
 		case <-time.After(2 * time.Second):
 		}
 	}
-	return fmt.Errorf("timed out after %s waiting for readiness", timeout)
+	return fmt.Errorf("timed out after %s waiting for run %s", timeout, name)
+}
+
+func newCancelCommand() *cobra.Command {
+	return &cobra.Command{
+		Use:   "cancel RUN",
+		Short: "Request idempotent cancellation of a run",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			clients, err := newKubeClients()
+			if err != nil {
+				return err
+			}
+			namespace, _ := cmd.Flags().GetString("namespace")
+			var run platformv1alpha1.Run
+			if err := clients.Get(cmd.Context(), types.NamespacedName{Namespace: namespace, Name: args[0]}, &run); err != nil {
+				if apierrors.IsNotFound(err) {
+					return fmt.Errorf("run %q not found", args[0])
+				}
+				return err
+			}
+			if run.Spec.Cancel {
+				fmt.Printf("run %s cancellation already requested\n", run.Name)
+				return nil
+			}
+			run.Spec.Cancel = true
+			if err := clients.Update(cmd.Context(), &run); err != nil {
+				return fmt.Errorf("cancel run: %w", err)
+			}
+			fmt.Printf("run %s cancellation requested\n", run.Name)
+			return nil
+		},
+	}
 }
 
 // randSuffix returns n random lowercase alphanumeric characters.

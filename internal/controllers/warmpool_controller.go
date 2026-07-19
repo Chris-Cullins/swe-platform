@@ -49,7 +49,7 @@ func (r *WarmPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 
 	ready := int32(0)
 	for i := range environments.Items {
-		if environments.Items[i].Status.Phase == platformv1alpha1.EnvironmentPhaseReady {
+		if environments.Items[i].Status.Phase == platformv1alpha1.EnvironmentPhaseReady && environments.Items[i].Status.ClaimedBy == nil {
 			ready++
 		}
 	}
@@ -64,9 +64,19 @@ func (r *WarmPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 	active := make([]*platformv1alpha1.Environment, 0, len(environments.Items))
 	for i := range environments.Items {
 		env := &environments.Items[i]
-		if env.Status.Phase != platformv1alpha1.EnvironmentPhaseFailed && !env.Spec.Paused {
-			active = append(active, env)
+		if env.Status.ClaimedBy != nil || !env.DeletionTimestamp.IsZero() {
+			continue
 		}
+		if env.Spec.Paused || env.Status.Phase == platformv1alpha1.EnvironmentPhaseFailed || env.Status.Phase == platformv1alpha1.EnvironmentPhaseTerminated {
+			resourceVersion := env.ResourceVersion
+			if err := r.Delete(ctx, env, client.Preconditions{ResourceVersion: &resourceVersion}); errors.IsConflict(err) || errors.IsNotFound(err) {
+				return ctrl.Result{Requeue: true}, nil
+			} else if err != nil {
+				return ctrl.Result{}, fmt.Errorf("delete unusable warm environment %q: %w", env.Name, err)
+			}
+			continue
+		}
+		active = append(active, env)
 	}
 	for int32(len(active)) < minimum {
 		env := &platformv1alpha1.Environment{

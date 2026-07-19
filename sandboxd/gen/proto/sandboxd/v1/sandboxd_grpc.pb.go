@@ -123,6 +123,200 @@ var ExecService_ServiceDesc = grpc.ServiceDesc{
 }
 
 const (
+	ProcessService_Start_FullMethodName = "/sandboxd.v1.ProcessService/Start"
+	ProcessService_Get_FullMethodName   = "/sandboxd.v1.ProcessService/Get"
+	ProcessService_Stop_FullMethodName  = "/sandboxd.v1.ProcessService/Stop"
+)
+
+// ProcessServiceClient is the client API for ProcessService service.
+//
+// For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
+//
+// ProcessService manages background processes for the lifetime of one
+// sandboxd daemon epoch. Processes are addressed by their logical owner and
+// role, never by an operating-system process identifier.
+type ProcessServiceClient interface {
+	// Start is detached from the RPC context. Repeating the same key and spec
+	// returns the existing process; the same key with a different spec fails.
+	Start(ctx context.Context, in *StartProcessRequest, opts ...grpc.CallOption) (*Process, error)
+	// Get returns running and retained terminal state in this sandboxd epoch.
+	Get(ctx context.Context, in *GetProcessRequest, opts ...grpc.CallOption) (*Process, error)
+	// Stop is idempotent, including when the key is absent or already terminal.
+	Stop(ctx context.Context, in *StopProcessRequest, opts ...grpc.CallOption) (*Process, error)
+}
+
+type processServiceClient struct {
+	cc grpc.ClientConnInterface
+}
+
+func NewProcessServiceClient(cc grpc.ClientConnInterface) ProcessServiceClient {
+	return &processServiceClient{cc}
+}
+
+func (c *processServiceClient) Start(ctx context.Context, in *StartProcessRequest, opts ...grpc.CallOption) (*Process, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(Process)
+	err := c.cc.Invoke(ctx, ProcessService_Start_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *processServiceClient) Get(ctx context.Context, in *GetProcessRequest, opts ...grpc.CallOption) (*Process, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(Process)
+	err := c.cc.Invoke(ctx, ProcessService_Get_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *processServiceClient) Stop(ctx context.Context, in *StopProcessRequest, opts ...grpc.CallOption) (*Process, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(Process)
+	err := c.cc.Invoke(ctx, ProcessService_Stop_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// ProcessServiceServer is the server API for ProcessService service.
+// All implementations must embed UnimplementedProcessServiceServer
+// for forward compatibility.
+//
+// ProcessService manages background processes for the lifetime of one
+// sandboxd daemon epoch. Processes are addressed by their logical owner and
+// role, never by an operating-system process identifier.
+type ProcessServiceServer interface {
+	// Start is detached from the RPC context. Repeating the same key and spec
+	// returns the existing process; the same key with a different spec fails.
+	Start(context.Context, *StartProcessRequest) (*Process, error)
+	// Get returns running and retained terminal state in this sandboxd epoch.
+	Get(context.Context, *GetProcessRequest) (*Process, error)
+	// Stop is idempotent, including when the key is absent or already terminal.
+	Stop(context.Context, *StopProcessRequest) (*Process, error)
+	mustEmbedUnimplementedProcessServiceServer()
+}
+
+// UnimplementedProcessServiceServer must be embedded to have
+// forward compatible implementations.
+//
+// NOTE: this should be embedded by value instead of pointer to avoid a nil
+// pointer dereference when methods are called.
+type UnimplementedProcessServiceServer struct{}
+
+func (UnimplementedProcessServiceServer) Start(context.Context, *StartProcessRequest) (*Process, error) {
+	return nil, status.Error(codes.Unimplemented, "method Start not implemented")
+}
+func (UnimplementedProcessServiceServer) Get(context.Context, *GetProcessRequest) (*Process, error) {
+	return nil, status.Error(codes.Unimplemented, "method Get not implemented")
+}
+func (UnimplementedProcessServiceServer) Stop(context.Context, *StopProcessRequest) (*Process, error) {
+	return nil, status.Error(codes.Unimplemented, "method Stop not implemented")
+}
+func (UnimplementedProcessServiceServer) mustEmbedUnimplementedProcessServiceServer() {}
+func (UnimplementedProcessServiceServer) testEmbeddedByValue()                        {}
+
+// UnsafeProcessServiceServer may be embedded to opt out of forward compatibility for this service.
+// Use of this interface is not recommended, as added methods to ProcessServiceServer will
+// result in compilation errors.
+type UnsafeProcessServiceServer interface {
+	mustEmbedUnimplementedProcessServiceServer()
+}
+
+func RegisterProcessServiceServer(s grpc.ServiceRegistrar, srv ProcessServiceServer) {
+	// If the following call panics, it indicates UnimplementedProcessServiceServer was
+	// embedded by pointer and is nil.  This will cause panics if an
+	// unimplemented method is ever invoked, so we test this at initialization
+	// time to prevent it from happening at runtime later due to I/O.
+	if t, ok := srv.(interface{ testEmbeddedByValue() }); ok {
+		t.testEmbeddedByValue()
+	}
+	s.RegisterService(&ProcessService_ServiceDesc, srv)
+}
+
+func _ProcessService_Start_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(StartProcessRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ProcessServiceServer).Start(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: ProcessService_Start_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ProcessServiceServer).Start(ctx, req.(*StartProcessRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _ProcessService_Get_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetProcessRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ProcessServiceServer).Get(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: ProcessService_Get_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ProcessServiceServer).Get(ctx, req.(*GetProcessRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _ProcessService_Stop_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(StopProcessRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ProcessServiceServer).Stop(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: ProcessService_Stop_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ProcessServiceServer).Stop(ctx, req.(*StopProcessRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+// ProcessService_ServiceDesc is the grpc.ServiceDesc for ProcessService service.
+// It's only intended for direct use with grpc.RegisterService,
+// and not to be introspected or modified (even as a copy)
+var ProcessService_ServiceDesc = grpc.ServiceDesc{
+	ServiceName: "sandboxd.v1.ProcessService",
+	HandlerType: (*ProcessServiceServer)(nil),
+	Methods: []grpc.MethodDesc{
+		{
+			MethodName: "Start",
+			Handler:    _ProcessService_Start_Handler,
+		},
+		{
+			MethodName: "Get",
+			Handler:    _ProcessService_Get_Handler,
+		},
+		{
+			MethodName: "Stop",
+			Handler:    _ProcessService_Stop_Handler,
+		},
+	},
+	Streams:  []grpc.StreamDesc{},
+	Metadata: "proto/sandboxd/v1/sandboxd.proto",
+}
+
+const (
 	FilesystemService_Read_FullMethodName  = "/sandboxd.v1.FilesystemService/Read"
 	FilesystemService_Write_FullMethodName = "/sandboxd.v1.FilesystemService/Write"
 	FilesystemService_List_FullMethodName  = "/sandboxd.v1.FilesystemService/List"

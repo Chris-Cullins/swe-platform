@@ -62,6 +62,64 @@ with a reviewable diff, branch, or PR.
    Gateway (stream/terminal/portals) ◄─────────┘  workspace volume
 ```
 
+### Run and process lifecycle
+
+`Run` is the durable, server-side task intent. Clients create one Run; the Run
+controller allocates an Environment or exclusively claims the existing Environment in
+`spec.environmentRef`. The Run UID is the idempotency key for allocation, adapter task
+acceptance, and managed processes. Reconciliation therefore converges after a timeout or
+partial failure instead of starting a second task.
+
+The ownership boundary is independent of Kubernetes container layout:
+
+| Concern | Lifecycle owner |
+|---|---|
+| Task intent, allocation/claim, cancellation, and normalized status | Run controller |
+| Pod, VM, Windows host, or external-runner infrastructure | Environment controller/backend |
+| Agent-specific command/protocol and transcript interpretation | Adapter |
+| Agent and declared-service process start, observation, and stop | `sandboxd` managed-process API |
+
+Adapters receive only an immutable Run UID/task and a backend-neutral, securely pinned
+sandboxd process dial handle.
+Every adapter lifecycle operation is idempotent. A foreground CLI adapter can map one
+managed agent process's state to Run status; a long-lived service adapter can keep an
+Environment-scoped service process and map its task-acknowledgement/events instead. The
+platform does not assume that agent-process exit means task completion. The same contract
+maps to pod, KubeVirt, Windows, and external-runner backends because it exposes no Pod,
+container, PID, tmux, or OS-signal semantics.
+
+Run states are observable milestones: `Allocating`, `EnvironmentReady`,
+`AdapterAccepted`, `Running`, `NeedsInput`, `Paused`, and terminal `Succeeded`, `Failed`,
+or `Cancelled`. Conditions additionally report environment readiness, a durable adapter
+acceptance-attempt marker written before the acceptance RPC, and confirmed adapter acceptance.
+The EnvironmentReady condition tracks the allocation independently from terminal task outcome;
+it remains true for an adapter failure while sandboxd is reachable and becomes false after the
+allocation is released, lost, paused, or fenced. The attempt marker makes cancellation
+conservative after an uncertain response. An unavailable adapter fails explicitly rather than
+pretending work started.
+
+Environment ownership and cleanup are explicit:
+
+| Allocation | While running | Completion/cancellation | Run deletion |
+|---|---|---|---|
+| Controller-created (`Owned`) | Environment has a Run controller owner reference | Stop Run-scoped work and pause the Environment; retain workspace and transcript for review | Finalizer stops work, then Kubernetes garbage-collects the Environment, pod, and PVC |
+| Existing (`Claimed`) | `Environment.status.claimedBy` stores Run name + UID; optimistic concurrency permits one claimant | Stop Run-scoped work, clear only the matching UID claim, and leave the Environment active and reusable | Finalizer stops work and releases only the matching claim; it never deletes the Environment |
+
+An explicit `--environment` request fails terminally if another Run already holds the claim; it
+does not wait and unexpectedly start later after that claim is released.
+
+Pause is not process checkpointing. Pausing fences the current execution domain and stops
+**every** agent and declared-service process by removing the environment pod (or the
+backend equivalent), while retaining the workspace disk and adapter-owned transcript.
+Accepted work is cancelled only while that exact execution incarnation is securely
+reachable, or cleanup proceeds without an RPC after pause has removed its pod and
+endpoint. For unreachable or unavailable-adapter cleanup, the Run controller requests backend
+pause and retains the claim/finalizer until the Environment reports the pod and endpoint gone.
+Resume creates a fresh sandboxd epoch, runs the repository resume hook, and calls the
+adapter's idempotent acceptance path again with the same Run UID. Adapters reconstruct or
+restart their processes from workspace/transcript state; no old process incarnation is
+allowed to overlap the new one.
+
 ## Roadmap
 
 - **P0 — skeleton:** `sandboxd`, CRDs, operator, CLI, kind quickstart
@@ -86,7 +144,14 @@ template and inject the environment variables from `spec.secretRef` into the env
 ```sh
 swe run --template small "Fix the flaky test"
 swe run --project org-repo "Fix the flaky test"
+swe run --name fix-flaky-42 --project org-repo "Fix the flaky test"
+swe run --environment warm-env-1 "Fix the flaky test"
+swe cancel fix-flaky-42
 ```
+
+`--name` is the create idempotency key: retry an uncertain request with the same name and
+immutable task arguments. The CLI returns the existing Run only when its intent matches;
+the controller creates or claims the Environment server-side.
 
 The first repository configured on a Project is cloned into `/workspace` when its
 environment is created. If the repository contains `.agents/setup`, the hook runs once

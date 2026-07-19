@@ -53,6 +53,7 @@ func main() {
 		log.Fatalf("listen %s: %v", *addr, err)
 	}
 
+	processServer := server.NewProcessServer(*workspace)
 	grpcServer := grpc.NewServer(
 		grpc.Creds(credentials.NewTLS(&tls.Config{
 			Certificates: []tls.Certificate{certificate},
@@ -63,6 +64,7 @@ func main() {
 	)
 	sandboxdv1.RegisterHealthServiceServer(grpcServer, &server.HealthServer{Version: Version})
 	sandboxdv1.RegisterExecServiceServer(grpcServer, &server.ExecServer{Workspace: *workspace})
+	sandboxdv1.RegisterProcessServiceServer(grpcServer, processServer)
 	sandboxdv1.RegisterFilesystemServiceServer(grpcServer, &server.FilesystemServer{Workspace: *workspace})
 	sandboxdv1.RegisterTerminalServiceServer(grpcServer, &server.TerminalServer{Workspace: *workspace})
 	sandboxdv1.RegisterPortServiceServer(grpcServer, server.NewPortServer())
@@ -73,6 +75,7 @@ func main() {
 	go func() {
 		<-ctx.Done()
 		log.Println("shutting down")
+		processServer.Close()
 		grpcServer.GracefulStop()
 	}()
 
