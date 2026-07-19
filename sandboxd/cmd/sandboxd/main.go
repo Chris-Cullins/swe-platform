@@ -81,7 +81,7 @@ func main() {
 	sandboxdv1.RegisterExecServiceServer(grpcServer, server.NewExecServer(*workspace, supervisor))
 	sandboxdv1.RegisterProcessServiceServer(grpcServer, processServer)
 	sandboxdv1.RegisterFilesystemServiceServer(grpcServer, filesystemServer)
-	sandboxdv1.RegisterTerminalServiceServer(grpcServer, &server.TerminalServer{Workspace: *workspace})
+	sandboxdv1.RegisterTerminalServiceServer(grpcServer, server.NewTerminalServer(*workspace))
 	sandboxdv1.RegisterPortServiceServer(grpcServer, server.NewPortServer())
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)

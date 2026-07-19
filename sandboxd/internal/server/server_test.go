@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"net"
 	"os"
@@ -10,6 +11,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -23,11 +25,13 @@ import (
 	sandboxdv1 "github.com/Chris-Cullins/swe-platform/sandboxd/gen/proto/sandboxd/v1"
 )
 
+var testSocketCounter atomic.Uint64
+
 // newConn spins up an in-process gRPC server with all services registered
 // and returns a client connection to it.
 func newConn(t *testing.T, workspace string) *grpc.ClientConn {
 	t.Helper()
-	socketName := "swe-test-" + filepath.Base(workspace)
+	socketName := fmt.Sprintf("swe-test-%d", testSocketCounter.Add(1))
 	t.Cleanup(func() {
 		_ = exec.Command("tmux", "-L", socketName, "kill-server").Run()
 	})
@@ -40,9 +44,7 @@ func newConn(t *testing.T, workspace string) *grpc.ClientConn {
 	sandboxdv1.RegisterProcessServiceServer(grpcServer, processServer)
 	sandboxdv1.RegisterFilesystemServiceServer(grpcServer, newTestFilesystemServer(t, workspace))
 	sandboxdv1.RegisterTerminalServiceServer(grpcServer, &TerminalServer{
-		Workspace:  workspace,
-		SocketName: socketName,
-		Shell:      []string{"sh"},
+		backend: newTmuxTerminalBackend(workspace, socketName, []string{"sh"}),
 	})
 	sandboxdv1.RegisterPortServiceServer(grpcServer, NewPortServer())
 	go func() { _ = grpcServer.Serve(lis) }()
@@ -214,33 +216,67 @@ func TestTerminalStreamsSharedTmuxSession(t *testing.T) {
 	conn := newConn(t, t.TempDir())
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	stream, err := sandboxdv1.NewTerminalServiceClient(conn).Terminal(ctx)
+	first, err := sandboxdv1.NewTerminalServiceClient(conn).Terminal(ctx)
 	if err != nil {
 		t.Fatalf("terminal: %v", err)
 	}
-	if err := stream.Send(&sandboxdv1.TerminalMessage{Kind: &sandboxdv1.TerminalMessage_Open{
+	if err := first.Send(&sandboxdv1.TerminalMessage{Kind: &sandboxdv1.TerminalMessage_Open{
 		Open: &sandboxdv1.TerminalOpen{Cols: 80, Rows: 24},
 	}}); err != nil {
 		t.Fatalf("send open: %v", err)
 	}
-	if err := stream.Send(&sandboxdv1.TerminalMessage{Kind: &sandboxdv1.TerminalMessage_Data{
-		Data: []byte("printf terminal-ok; exit\n"),
+	if err := first.Send(&sandboxdv1.TerminalMessage{Kind: &sandboxdv1.TerminalMessage_Data{
+		Data: []byte("printf first-ready\n"),
 	}}); err != nil {
 		t.Fatalf("send input: %v", err)
 	}
-	var output []byte
+	receiveTerminalMarker(t, first, "first-ready")
+
+	second, err := sandboxdv1.NewTerminalServiceClient(conn).Terminal(ctx)
+	if err != nil {
+		t.Fatalf("second terminal: %v", err)
+	}
+	if err := second.Send(&sandboxdv1.TerminalMessage{Kind: &sandboxdv1.TerminalMessage_Open{
+		Open: &sandboxdv1.TerminalOpen{Cols: 100, Rows: 30},
+	}}); err != nil {
+		t.Fatalf("send second open: %v", err)
+	}
+	if err := second.Send(&sandboxdv1.TerminalMessage{Kind: &sandboxdv1.TerminalMessage_Data{
+		Data: []byte("printf shared-session\n"),
+	}}); err != nil {
+		t.Fatalf("send second input: %v", err)
+	}
+	receiveTerminalMarker(t, first, "shared-session")
+	if err := second.CloseSend(); err != nil {
+		t.Fatalf("detach second terminal: %v", err)
+	}
 	for {
-		message, err := stream.Recv()
-		if err == io.EOF {
+		if _, err := second.Recv(); err == io.EOF {
 			break
+		} else if err != nil {
+			t.Fatalf("receive second detach: %v", err)
 		}
+	}
+
+	if err := first.Send(&sandboxdv1.TerminalMessage{Kind: &sandboxdv1.TerminalMessage_Data{
+		Data: []byte("printf first-survived; exit\n"),
+	}}); err != nil {
+		t.Fatalf("send after second detach: %v", err)
+	}
+	receiveTerminalMarker(t, first, "first-survived")
+}
+
+func receiveTerminalMarker(t *testing.T, stream interface {
+	Recv() (*sandboxdv1.TerminalMessage, error)
+}, marker string) {
+	t.Helper()
+	var output []byte
+	for !strings.Contains(string(output), marker) {
+		message, err := stream.Recv()
 		if err != nil {
-			t.Fatalf("recv: %v", err)
+			t.Fatalf("receive terminal marker %q: %v (output %q)", marker, err, output)
 		}
 		output = append(output, message.GetData()...)
-	}
-	if !strings.Contains(string(output), "terminal-ok") {
-		t.Fatalf("terminal output did not contain marker: %q", output)
 	}
 }
 
