@@ -1924,14 +1924,15 @@ func TestReconcileIdleRequestsPauseAfterTimeout(t *testing.T) {
 }
 
 func TestReconcileIdleSchedulesRemainingTimeout(t *testing.T) {
-	lastActive := metav1.Now()
+	now := time.Date(2026, time.July, 19, 12, 0, 0, 0, time.UTC)
+	lastActive := metav1.NewTime(now)
 	env := &platformv1alpha1.Environment{
 		Status: platformv1alpha1.EnvironmentStatus{LastActiveAt: &lastActive},
 	}
 	tmpl := &platformv1alpha1.EnvironmentTemplate{
 		Spec: platformv1alpha1.EnvironmentTemplateSpec{IdleTimeout: &metav1.Duration{Duration: time.Minute}},
 	}
-	reconciler := &EnvironmentReconciler{}
+	reconciler := &EnvironmentReconciler{Now: func() time.Time { return now }}
 
 	result, err := reconciler.reconcileIdle(context.Background(), env, tmpl)
 	if err != nil {
@@ -1939,6 +1940,178 @@ func TestReconcileIdleSchedulesRemainingTimeout(t *testing.T) {
 	}
 	if result.RequeueAfter <= 0 || result.RequeueAfter > time.Minute {
 		t.Fatalf("RequeueAfter = %s, want remaining one-minute timeout", result.RequeueAfter)
+	}
+}
+
+func TestReconcileIdleProtectsExactActiveRunOwnerAndClaim(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		claimed bool
+	}{
+		{name: "owned"},
+		{name: "claimed", claimed: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			scheme := runtime.NewScheme()
+			if err := platformv1alpha1.AddToScheme(scheme); err != nil {
+				t.Fatal(err)
+			}
+			now := time.Date(2026, time.July, 19, 12, 0, 0, 0, time.UTC)
+			stale := metav1.NewTime(now.Add(-time.Hour))
+			run := &platformv1alpha1.Run{ObjectMeta: metav1.ObjectMeta{Name: "active", Namespace: "default", UID: "run-uid"}, Status: platformv1alpha1.RunStatus{State: platformv1alpha1.RunStateRunning}}
+			env := &platformv1alpha1.Environment{ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default", UID: "env-uid"}, Status: platformv1alpha1.EnvironmentStatus{LastActiveAt: &stale}}
+			if test.claimed {
+				env.Status.ClaimedBy = &platformv1alpha1.RunReference{Name: run.Name, UID: run.UID}
+			} else {
+				env.OwnerReferences = []metav1.OwnerReference{{APIVersion: platformv1alpha1.GroupVersion.String(), Kind: "Run", Name: run.Name, UID: run.UID, Controller: ptr(true)}}
+			}
+			reconciler := &EnvironmentReconciler{Client: fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(env, run).WithObjects(env, run).Build(), Now: func() time.Time { return now }}
+			tmpl := &platformv1alpha1.EnvironmentTemplate{Spec: platformv1alpha1.EnvironmentTemplateSpec{IdleTimeout: &metav1.Duration{Duration: time.Minute}}}
+
+			result, err := reconciler.reconcileIdle(context.Background(), env, tmpl)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var retained platformv1alpha1.Environment
+			if err := reconciler.Get(context.Background(), client.ObjectKeyFromObject(env), &retained); err != nil {
+				t.Fatal(err)
+			}
+			if retained.Spec.Paused || result.RequeueAfter != time.Minute {
+				t.Fatalf("active Run protection = (%#v, %#v), want unpaused one-minute recheck", retained.Spec, result)
+			}
+		})
+	}
+}
+
+func TestReconcileIdleRestartUsesPersistedActivityDeadline(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := platformv1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	started := time.Date(2026, time.July, 19, 12, 0, 0, 0, time.UTC)
+	lastActive := metav1.NewTime(started)
+	env := &platformv1alpha1.Environment{ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default"}, Status: platformv1alpha1.EnvironmentStatus{LastActiveAt: &lastActive}}
+	clientAfterRestart := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(env).WithObjects(env).Build()
+	tmpl := &platformv1alpha1.EnvironmentTemplate{Spec: platformv1alpha1.EnvironmentTemplateSpec{IdleTimeout: &metav1.Duration{Duration: time.Minute}}}
+
+	first := &EnvironmentReconciler{Client: clientAfterRestart, Now: func() time.Time { return started.Add(30 * time.Second) }}
+	result, err := first.reconcileIdle(context.Background(), env.DeepCopy(), tmpl)
+	if err != nil || result.RequeueAfter != 30*time.Second {
+		t.Fatalf("first restarted reconcile = (%#v, %v), want persisted 30-second remainder", result, err)
+	}
+	second := &EnvironmentReconciler{Client: clientAfterRestart, Now: func() time.Time { return started.Add(61 * time.Second) }}
+	if _, err := second.reconcileIdle(context.Background(), env.DeepCopy(), tmpl); err != nil {
+		t.Fatal(err)
+	}
+	var paused platformv1alpha1.Environment
+	if err := clientAfterRestart.Get(context.Background(), client.ObjectKeyFromObject(env), &paused); err != nil {
+		t.Fatal(err)
+	}
+	if !paused.Spec.Paused {
+		t.Fatal("fresh reconciler forgot the persisted idle deadline")
+	}
+}
+
+func TestReconcileIdleDoesNotTreatTerminalRunClaimAsActive(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := platformv1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, time.July, 19, 12, 0, 0, 0, time.UTC)
+	stale := metav1.NewTime(now.Add(-time.Hour))
+	run := &platformv1alpha1.Run{ObjectMeta: metav1.ObjectMeta{Name: "done", Namespace: "default", UID: "run-uid"}, Status: platformv1alpha1.RunStatus{State: platformv1alpha1.RunStateSucceeded}}
+	env := &platformv1alpha1.Environment{ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default"}, Status: platformv1alpha1.EnvironmentStatus{LastActiveAt: &stale, ClaimedBy: &platformv1alpha1.RunReference{Name: run.Name, UID: run.UID}}}
+	reconciler := &EnvironmentReconciler{Client: fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(env, run).WithObjects(env, run).Build(), Now: func() time.Time { return now }}
+	tmpl := &platformv1alpha1.EnvironmentTemplate{Spec: platformv1alpha1.EnvironmentTemplateSpec{IdleTimeout: &metav1.Duration{Duration: time.Minute}}}
+
+	if _, err := reconciler.reconcileIdle(context.Background(), env, tmpl); err != nil {
+		t.Fatal(err)
+	}
+	var paused platformv1alpha1.Environment
+	if err := reconciler.Get(context.Background(), client.ObjectKeyFromObject(env), &paused); err != nil {
+		t.Fatal(err)
+	}
+	if !paused.Spec.Paused {
+		t.Fatal("terminal Run claim incorrectly retained active-Run protection")
+	}
+}
+
+func TestReconcileIdleClaimRaceCannotCommitPause(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := platformv1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, time.July, 19, 12, 0, 0, 0, time.UTC)
+	stale := metav1.NewTime(now.Add(-time.Hour))
+	run := &platformv1alpha1.Run{ObjectMeta: metav1.ObjectMeta{Name: "claiming", Namespace: "default", UID: "run-uid"}, Status: platformv1alpha1.RunStatus{State: platformv1alpha1.RunStateAllocating}}
+	env := &platformv1alpha1.Environment{ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default", UID: "env-uid"}, Status: platformv1alpha1.EnvironmentStatus{LastActiveAt: &stale}}
+	baseClient := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(env, run).WithObjects(env, run).Build()
+	claimed := false
+	interceptedClient := interceptor.NewClient(baseClient, interceptor.Funcs{
+		Patch: func(ctx context.Context, underlying client.WithWatch, object client.Object, patch client.Patch, options ...client.PatchOption) error {
+			if !claimed {
+				claimed = true
+				var current platformv1alpha1.Environment
+				if err := underlying.Get(ctx, client.ObjectKeyFromObject(env), &current); err != nil {
+					return err
+				}
+				current.Status.ClaimedBy = &platformv1alpha1.RunReference{Name: run.Name, UID: run.UID}
+				if err := underlying.Status().Update(ctx, &current); err != nil {
+					return err
+				}
+			}
+			return underlying.Patch(ctx, object, patch, options...)
+		},
+	})
+	reconciler := &EnvironmentReconciler{Client: interceptedClient, Now: func() time.Time { return now }}
+	tmpl := &platformv1alpha1.EnvironmentTemplate{Spec: platformv1alpha1.EnvironmentTemplateSpec{IdleTimeout: &metav1.Duration{Duration: time.Minute}}}
+
+	if _, err := reconciler.reconcileIdle(context.Background(), env, tmpl); !apierrors.IsConflict(err) {
+		t.Fatalf("claim race error = %v, want optimistic-lock conflict", err)
+	}
+	var current platformv1alpha1.Environment
+	if err := baseClient.Get(context.Background(), client.ObjectKeyFromObject(env), &current); err != nil {
+		t.Fatal(err)
+	}
+	if current.Spec.Paused || current.Status.ClaimedBy == nil {
+		t.Fatalf("claim race committed automatic pause: %#v", current)
+	}
+	if _, err := reconciler.reconcileIdle(context.Background(), &current, tmpl); err != nil {
+		t.Fatal(err)
+	}
+	if err := baseClient.Get(context.Background(), client.ObjectKeyFromObject(env), &current); err != nil {
+		t.Fatal(err)
+	}
+	if current.Spec.Paused {
+		t.Fatal("active claim was not protected after the race retry")
+	}
+}
+
+func TestExplicitPauseRemainsAuthoritativeWithActiveRun(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	if err := platformv1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	run := &platformv1alpha1.Run{ObjectMeta: metav1.ObjectMeta{Name: "active", Namespace: "default", UID: "run-uid"}, Status: platformv1alpha1.RunStatus{State: platformv1alpha1.RunStateRunning}}
+	env := &platformv1alpha1.Environment{
+		ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default", UID: "env-uid", Finalizers: []string{environmentFinalizer}, OwnerReferences: []metav1.OwnerReference{{APIVersion: platformv1alpha1.GroupVersion.String(), Kind: "Run", Name: run.Name, UID: run.UID, Controller: ptr(true)}}},
+		Spec:       platformv1alpha1.EnvironmentSpec{Paused: true, TemplateRef: "deleted-template"},
+		Status:     platformv1alpha1.EnvironmentStatus{Phase: platformv1alpha1.EnvironmentPhaseReady},
+	}
+	reconciler := &EnvironmentReconciler{Client: fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(env, run).WithObjects(env, run).Build(), Scheme: scheme}
+
+	if _, err := reconciler.Reconcile(context.Background(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(env)}); err != nil {
+		t.Fatal(err)
+	}
+	var paused platformv1alpha1.Environment
+	if err := reconciler.Get(context.Background(), client.ObjectKeyFromObject(env), &paused); err != nil {
+		t.Fatal(err)
+	}
+	if !paused.Spec.Paused || paused.Status.Phase != platformv1alpha1.EnvironmentPhasePaused {
+		t.Fatalf("explicit pause was overridden by active Run protection: %#v", paused)
 	}
 }
 

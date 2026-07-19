@@ -5,15 +5,18 @@ import (
 	"errors"
 	"sync"
 	"testing"
+	"time"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	apiMeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
 	platformv1alpha1 "github.com/Chris-Cullins/swe-platform/api/v1alpha1"
@@ -320,6 +323,70 @@ func TestConcurrentClaimHasOneWinner(t *testing.T) {
 	}
 	if stored.Status.ClaimedBy == nil || (stored.Status.ClaimedBy.UID != runA.UID && stored.Status.ClaimedBy.UID != runB.UID) {
 		t.Fatalf("claim = %#v", stored.Status.ClaimedBy)
+	}
+}
+
+func TestRunActivityRetryPreservesConcurrentEnvironmentStatus(t *testing.T) {
+	s := runScheme(t)
+	oldActivity := metav1.NewTime(time.Now().Add(-time.Hour))
+	env := &platformv1alpha1.Environment{ObjectMeta: metav1.ObjectMeta{Name: "shared", Namespace: "ns", UID: "env-uid"}, Status: platformv1alpha1.EnvironmentStatus{LastActiveAt: &oldActivity}}
+	baseClient := fake.NewClientBuilder().WithScheme(s).WithStatusSubresource(env).WithObjects(env).Build()
+	conflicts := 0
+	interceptedClient := interceptor.NewClient(baseClient, interceptor.Funcs{
+		SubResourceUpdate: func(ctx context.Context, underlying client.Client, subresource string, object client.Object, options ...client.SubResourceUpdateOption) error {
+			if subresource == "status" && conflicts == 0 {
+				conflicts++
+				var concurrent platformv1alpha1.Environment
+				if err := underlying.Get(ctx, client.ObjectKeyFromObject(env), &concurrent); err != nil {
+					return err
+				}
+				concurrent.Status.ClaimedBy = &platformv1alpha1.RunReference{Name: "r", UID: "run-uid"}
+				concurrent.Status.PodRecoveryAttempts = 2
+				if err := underlying.Status().Update(ctx, &concurrent); err != nil {
+					return err
+				}
+				return apierrors.NewConflict(schema.GroupResource{Group: platformv1alpha1.GroupVersion.Group, Resource: "environments"}, object.GetName(), errors.New("simulated concurrent writer"))
+			}
+			return underlying.SubResource(subresource).Update(ctx, object, options...)
+		},
+	})
+	r := &RunReconciler{Client: interceptedClient}
+
+	if err := r.touchEnvironmentActivity(context.Background(), env); err != nil {
+		t.Fatal(err)
+	}
+	var updated platformv1alpha1.Environment
+	if err := baseClient.Get(context.Background(), client.ObjectKeyFromObject(env), &updated); err != nil {
+		t.Fatal(err)
+	}
+	if conflicts != 1 || updated.Status.LastActiveAt == nil || !updated.Status.LastActiveAt.After(oldActivity.Time) || updated.Status.ClaimedBy == nil || updated.Status.PodRecoveryAttempts != 2 {
+		t.Fatalf("concurrent status was lost: %#v (conflicts=%d)", updated.Status, conflicts)
+	}
+}
+
+func TestRunEnvironmentWatchIgnoresOnlyActivityUpdates(t *testing.T) {
+	oldEnvironment := &platformv1alpha1.Environment{ObjectMeta: metav1.ObjectMeta{Name: "e", Namespace: "ns", UID: "env-uid"}, Status: platformv1alpha1.EnvironmentStatus{Phase: platformv1alpha1.EnvironmentPhaseReady}}
+	activity := oldEnvironment.DeepCopy()
+	now := metav1.Now()
+	activity.Status.LastActiveAt = &now
+	if runRelevantEnvironmentUpdate(oldEnvironment, activity) {
+		t.Fatal("lastActiveAt-only update would feed back into Run reconciliation")
+	}
+	claim := activity.DeepCopy()
+	claim.Status.ClaimedBy = &platformv1alpha1.RunReference{Name: "r", UID: "run-uid"}
+	if !runRelevantEnvironmentUpdate(activity, claim) {
+		t.Fatal("claim update was filtered from Run reconciliation")
+	}
+	recovery := activity.DeepCopy()
+	recovery.Status.PodRecoveryAttempts = 1
+	if !runRelevantEnvironmentUpdate(activity, recovery) {
+		t.Fatal("pod recovery update was filtered from Run reconciliation")
+	}
+	spec := activity.DeepCopy()
+	spec.Generation++
+	spec.Spec.Paused = true
+	if !runRelevantEnvironmentUpdate(activity, spec) {
+		t.Fatal("spec update was filtered from Run reconciliation")
 	}
 }
 

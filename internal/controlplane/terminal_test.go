@@ -9,6 +9,7 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
+	"errors"
 	"io"
 	"math/big"
 	"net"
@@ -238,6 +239,70 @@ func TestKubernetesTerminalDialerDoesNotMarkReplacementEnvironmentActive(t *test
 	if updated.Status.LastActiveAt != nil {
 		t.Fatal("replacement Environment was marked active")
 	}
+}
+
+func TestTerminalHeartbeatRecoversAfterTransientGetFailure(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := platformv1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	oldActivity := metav1.NewTime(time.Now().Add(-time.Hour))
+	environment := &platformv1alpha1.Environment{ObjectMeta: metav1.ObjectMeta{Name: "env-1", Namespace: "project-1", UID: "env-uid"}, Status: platformv1alpha1.EnvironmentStatus{LastActiveAt: &oldActivity}}
+	baseClient := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(environment).WithObjects(environment).Build()
+	transient := &transientTerminalGetClient{Client: baseClient, getFailures: 1, updateFailures: 1}
+	dialer := KubernetesTerminalDialer{Client: transient}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go dialer.heartbeatActivity(ctx, client.ObjectKeyFromObject(environment), environment.UID, 5*time.Millisecond)
+
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		var updated platformv1alpha1.Environment
+		if err := baseClient.Get(context.Background(), client.ObjectKeyFromObject(environment), &updated); err != nil {
+			t.Fatal(err)
+		}
+		if updated.Status.LastActiveAt != nil && updated.Status.LastActiveAt.After(oldActivity.Time) {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatal("terminal heartbeat stopped after a transient Get failure")
+}
+
+type transientTerminalGetClient struct {
+	client.Client
+	mu             sync.Mutex
+	getFailures    int
+	updateFailures int
+}
+
+func (c *transientTerminalGetClient) Get(ctx context.Context, key client.ObjectKey, object client.Object, options ...client.GetOption) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.getFailures > 0 {
+		c.getFailures--
+		return errors.New("transient API failure")
+	}
+	return c.Client.Get(ctx, key, object, options...)
+}
+
+func (c *transientTerminalGetClient) Status() client.SubResourceWriter {
+	return &transientTerminalStatusWriter{SubResourceWriter: c.Client.Status(), client: c}
+}
+
+type transientTerminalStatusWriter struct {
+	client.SubResourceWriter
+	client *transientTerminalGetClient
+}
+
+func (w *transientTerminalStatusWriter) Update(ctx context.Context, object client.Object, options ...client.SubResourceUpdateOption) error {
+	w.client.mu.Lock()
+	defer w.client.mu.Unlock()
+	if w.client.updateFailures > 0 {
+		w.client.updateFailures--
+		return errors.New("transient status failure")
+	}
+	return w.SubResourceWriter.Update(ctx, object, options...)
 }
 
 func TestKubernetesTerminalDialerUsesRecreatedPodCredentialsAfterWake(t *testing.T) {

@@ -178,9 +178,12 @@ the current-generation `Ready` condition only after initialization completes and
 startup/readiness probes pass; `status.phase` is a display summary rather than the scheduling
 contract. GitHub App token minting is not implemented yet.
 
-Active environments are automatically paused after their template's `idleTimeout`
-(15 minutes by default). Opening the control-plane web terminal records activity and
-wakes a paused environment before connecting.
+Environments without an active Run are automatically paused after their template's
+`idleTimeout` (15 minutes by default). An exact non-terminal Run owner or claim always
+prevents an automatic idle pause, while explicit pause requests remain authoritative.
+Run reconciliation and attached control-plane terminals refresh activity; terminal
+heartbeats retry transient Kubernetes API failures. Opening the web terminal records
+activity and wakes a paused environment before connecting.
 
 Set `EnvironmentTemplate.spec.warmPool.min` to keep that many unclaimed environments
 ready. `swe run` claims a ready environment before creating a cold one, and the operator
