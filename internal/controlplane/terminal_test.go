@@ -17,6 +17,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -39,7 +40,7 @@ import (
 )
 
 func TestWebTerminalBridgesSandboxd(t *testing.T) {
-	backend := &terminalTestServer{}
+	backend := &terminalTestServer{requireHealth: true}
 	listener := bufconn.Listen(1024 * 1024)
 	grpcServer := grpc.NewServer()
 	sandboxdv1.RegisterTerminalServiceServer(grpcServer, backend)
@@ -852,16 +853,22 @@ func (d *terminalTestDialer) DialTerminal(_ context.Context, namespace, environm
 type terminalTestServer struct {
 	sandboxdv1.UnimplementedTerminalServiceServer
 	sandboxdv1.UnimplementedHealthServiceServer
-	open   *sandboxdv1.TerminalOpen
-	resize *sandboxdv1.TerminalResize
-	input  []byte
+	requireHealth bool
+	healthChecked atomic.Bool
+	open          *sandboxdv1.TerminalOpen
+	resize        *sandboxdv1.TerminalResize
+	input         []byte
 }
 
-func (*terminalTestServer) Check(context.Context, *sandboxdv1.HealthCheckRequest) (*sandboxdv1.HealthCheckResponse, error) {
+func (s *terminalTestServer) Check(context.Context, *sandboxdv1.HealthCheckRequest) (*sandboxdv1.HealthCheckResponse, error) {
+	s.healthChecked.Store(true)
 	return &sandboxdv1.HealthCheckResponse{Ok: true}, nil
 }
 
 func (s *terminalTestServer) Terminal(stream sandboxdv1.TerminalService_TerminalServer) error {
+	if s.requireHealth && !s.healthChecked.Load() {
+		return errors.New("terminal opened before health check")
+	}
 	message, err := stream.Recv()
 	if err != nil {
 		return err
