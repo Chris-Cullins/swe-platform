@@ -15,7 +15,6 @@ import (
 	"net"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -363,64 +362,6 @@ func (s *ExecServer) Exec(stream sandboxdv1.ExecService_ExecServer) error {
 			Exit: &sandboxdv1.ExecExit{Code: code, Error: errStr, Reason: terminalReason},
 		},
 	})
-}
-
-// FilesystemServer implements FilesystemService.
-type FilesystemServer struct {
-	sandboxdv1.UnimplementedFilesystemServiceServer
-	Workspace string
-}
-
-// resolve maps a request path onto the filesystem. Relative paths resolve
-// against the workspace.
-// TODO(P1): jail paths to the workspace root.
-func (s *FilesystemServer) resolve(path string) string {
-	if path == "" {
-		return s.Workspace
-	}
-	if filepath.IsAbs(path) {
-		return filepath.Clean(path)
-	}
-	return filepath.Join(s.Workspace, path)
-}
-
-func (s *FilesystemServer) Read(_ context.Context, req *sandboxdv1.ReadRequest) (*sandboxdv1.ReadResponse, error) {
-	content, err := os.ReadFile(s.resolve(req.Path))
-	if err != nil {
-		return nil, status.Errorf(codes.NotFound, "read %s: %v", req.Path, err)
-	}
-	return &sandboxdv1.ReadResponse{Content: content}, nil
-}
-
-func (s *FilesystemServer) Write(_ context.Context, req *sandboxdv1.WriteRequest) (*sandboxdv1.WriteResponse, error) {
-	path := s.resolve(req.Path)
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return nil, status.Errorf(codes.Internal, "mkdir for %s: %v", req.Path, err)
-	}
-	mode := os.FileMode(req.Mode)
-	if req.Mode == 0 {
-		mode = 0o644
-	}
-	if err := os.WriteFile(path, req.Content, mode); err != nil {
-		return nil, status.Errorf(codes.Internal, "write %s: %v", req.Path, err)
-	}
-	return &sandboxdv1.WriteResponse{}, nil
-}
-
-func (s *FilesystemServer) List(_ context.Context, req *sandboxdv1.ListRequest) (*sandboxdv1.ListResponse, error) {
-	entries, err := os.ReadDir(s.resolve(req.Path))
-	if err != nil {
-		return nil, status.Errorf(codes.NotFound, "list %s: %v", req.Path, err)
-	}
-	resp := &sandboxdv1.ListResponse{Entries: make([]*sandboxdv1.Entry, 0, len(entries))}
-	for _, e := range entries {
-		entry := &sandboxdv1.Entry{Name: e.Name(), IsDir: e.IsDir()}
-		if info, err := e.Info(); err == nil {
-			entry.Size = info.Size()
-		}
-		resp.Entries = append(resp.Entries, entry)
-	}
-	return resp, nil
 }
 
 // PortServer implements PortService.

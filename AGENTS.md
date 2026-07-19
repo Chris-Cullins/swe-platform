@@ -63,8 +63,8 @@ runs both via `make` targets:
 
 - **Build all binaries:** `make build` (outputs operator, control plane, CLI, and sandboxd to `bin/`, gitignored)
 - **Unit tests:** `make test` · **Vet:** `make vet`
-- **Windows containment:** CI runs focused sandboxd process and Exec tests on
-  `windows-latest`; keep OS-specific tests behind build tags.
+- **Windows portability:** CI runs focused sandboxd process, Exec, and filesystem tests
+  on `windows-latest`; keep OS-specific tests behind build tags.
 - **Regenerate deepcopy:** `make generate` · **CRDs + RBAC:** `make manifests`
   (`manifests` synchronizes chart CRDs; CI fails on a diff). Use `make check-chart-crds`
   to verify the checked-in Helm CRDs independently.

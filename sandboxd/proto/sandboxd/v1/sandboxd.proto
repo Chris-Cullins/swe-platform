@@ -182,42 +182,87 @@ message ReadOutputResponse {
   uint64 produced_end = 7;
 }
 
-// FilesystemService provides file access inside the environment.
+// FilesystemService provides bounded access to the environment workspace.
+// Paths are slash-separated logical paths, never host filesystem paths. See
+// FILESYSTEM.md for normalization, confinement, limits, and commit semantics.
 service FilesystemService {
   rpc Read(ReadRequest) returns (ReadResponse);
-  rpc Write(WriteRequest) returns (WriteResponse);
+  rpc Write(stream WriteRequest) returns (WriteResponse);
   rpc List(ListRequest) returns (ListResponse);
 }
 
 message ReadRequest {
   string path = 1;
+  uint64 offset = 2;
+  uint32 max_bytes = 3;
+  // include_version requests a complete-file SHA-256 scan. Clients normally
+  // request it once, then page content without repeatedly hashing the file.
+  bool include_version = 4;
 }
 
 message ReadResponse {
-  bytes content = 1;
+  bytes data = 1;
+  uint64 offset = 2;
+  uint64 next_offset = 3;
+  uint64 size = 4;
+  bool eof = 5;
+  // version is the lowercase SHA-256 digest of the complete file when
+  // include_version was requested; otherwise it is empty.
+  string version = 6;
 }
 
 message WriteRequest {
-  string path = 1;
-  bytes content = 2;
-  // mode is the file permission bits (e.g. 0o644); 0 means default.
-  uint32 mode = 3;
+  oneof kind {
+    WriteHeader header = 1;
+    bytes data = 2;
+  }
 }
 
-message WriteResponse {}
+enum WritePrecondition {
+  WRITE_PRECONDITION_UNSPECIFIED = 0;
+  WRITE_PRECONDITION_ANY = 1;
+  WRITE_PRECONDITION_MUST_NOT_EXIST = 2;
+  WRITE_PRECONDITION_MATCH_VERSION = 3;
+}
+
+message WriteHeader {
+  string path = 1;
+  WritePrecondition precondition = 2;
+  // expected_version is required for MATCH_VERSION and is a lowercase
+  // SHA-256 digest returned by Read or a prior Write.
+  string expected_version = 3;
+}
+
+message WriteResponse {
+  uint64 size = 1;
+  string version = 2;
+}
 
 message ListRequest {
   string path = 1;
+  uint32 page_size = 2;
+  string page_token = 3;
 }
 
 message ListResponse {
   repeated Entry entries = 1;
+  string next_page_token = 2;
+}
+
+enum EntryType {
+  ENTRY_TYPE_UNSPECIFIED = 0;
+  ENTRY_TYPE_FILE = 1;
+  ENTRY_TYPE_DIRECTORY = 2;
+  ENTRY_TYPE_SYMLINK = 3;
+  ENTRY_TYPE_OTHER = 4;
 }
 
 message Entry {
   string name = 1;
-  bool is_dir = 2;
-  int64 size = 3;
+  EntryType type = 2;
+  // size is the regular-file byte size and zero for other entry types.
+  uint64 size = 3;
+  int64 modified_unix_ms = 4;
 }
 
 // TerminalService multiplexes the environment's shared terminal session.

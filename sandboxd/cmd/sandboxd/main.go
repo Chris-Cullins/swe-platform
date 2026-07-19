@@ -65,6 +65,11 @@ func main() {
 
 	supervisor := server.NewSupervisor()
 	processServer := server.NewProcessServer(*workspace, supervisor)
+	filesystemServer, err := server.NewFilesystemServer(*workspace)
+	if err != nil {
+		log.Fatalf("open workspace filesystem: %v", err)
+	}
+	defer filesystemServer.Close()
 	grpcServer := grpc.NewServer(
 		grpc.Creds(credentials.NewTLS(&tls.Config{
 			Certificates: []tls.Certificate{certificate},
@@ -76,7 +81,7 @@ func main() {
 	sandboxdv1.RegisterHealthServiceServer(grpcServer, &server.HealthServer{Version: Version})
 	sandboxdv1.RegisterExecServiceServer(grpcServer, server.NewExecServer(*workspace, supervisor))
 	sandboxdv1.RegisterProcessServiceServer(grpcServer, processServer)
-	sandboxdv1.RegisterFilesystemServiceServer(grpcServer, &server.FilesystemServer{Workspace: *workspace})
+	sandboxdv1.RegisterFilesystemServiceServer(grpcServer, filesystemServer)
 	sandboxdv1.RegisterTerminalServiceServer(grpcServer, &server.TerminalServer{Workspace: *workspace})
 	sandboxdv1.RegisterPortServiceServer(grpcServer, server.NewPortServer())
 

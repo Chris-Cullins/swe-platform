@@ -364,10 +364,12 @@ const (
 //
 // For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
 //
-// FilesystemService provides file access inside the environment.
+// FilesystemService provides bounded access to the environment workspace.
+// Paths are slash-separated logical paths, never host filesystem paths. See
+// FILESYSTEM.md for normalization, confinement, limits, and commit semantics.
 type FilesystemServiceClient interface {
 	Read(ctx context.Context, in *ReadRequest, opts ...grpc.CallOption) (*ReadResponse, error)
-	Write(ctx context.Context, in *WriteRequest, opts ...grpc.CallOption) (*WriteResponse, error)
+	Write(ctx context.Context, opts ...grpc.CallOption) (grpc.ClientStreamingClient[WriteRequest, WriteResponse], error)
 	List(ctx context.Context, in *ListRequest, opts ...grpc.CallOption) (*ListResponse, error)
 }
 
@@ -389,15 +391,18 @@ func (c *filesystemServiceClient) Read(ctx context.Context, in *ReadRequest, opt
 	return out, nil
 }
 
-func (c *filesystemServiceClient) Write(ctx context.Context, in *WriteRequest, opts ...grpc.CallOption) (*WriteResponse, error) {
+func (c *filesystemServiceClient) Write(ctx context.Context, opts ...grpc.CallOption) (grpc.ClientStreamingClient[WriteRequest, WriteResponse], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	out := new(WriteResponse)
-	err := c.cc.Invoke(ctx, FilesystemService_Write_FullMethodName, in, out, cOpts...)
+	stream, err := c.cc.NewStream(ctx, &FilesystemService_ServiceDesc.Streams[0], FilesystemService_Write_FullMethodName, cOpts...)
 	if err != nil {
 		return nil, err
 	}
-	return out, nil
+	x := &grpc.GenericClientStream[WriteRequest, WriteResponse]{ClientStream: stream}
+	return x, nil
 }
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type FilesystemService_WriteClient = grpc.ClientStreamingClient[WriteRequest, WriteResponse]
 
 func (c *filesystemServiceClient) List(ctx context.Context, in *ListRequest, opts ...grpc.CallOption) (*ListResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
@@ -413,10 +418,12 @@ func (c *filesystemServiceClient) List(ctx context.Context, in *ListRequest, opt
 // All implementations must embed UnimplementedFilesystemServiceServer
 // for forward compatibility.
 //
-// FilesystemService provides file access inside the environment.
+// FilesystemService provides bounded access to the environment workspace.
+// Paths are slash-separated logical paths, never host filesystem paths. See
+// FILESYSTEM.md for normalization, confinement, limits, and commit semantics.
 type FilesystemServiceServer interface {
 	Read(context.Context, *ReadRequest) (*ReadResponse, error)
-	Write(context.Context, *WriteRequest) (*WriteResponse, error)
+	Write(grpc.ClientStreamingServer[WriteRequest, WriteResponse]) error
 	List(context.Context, *ListRequest) (*ListResponse, error)
 	mustEmbedUnimplementedFilesystemServiceServer()
 }
@@ -431,8 +438,8 @@ type UnimplementedFilesystemServiceServer struct{}
 func (UnimplementedFilesystemServiceServer) Read(context.Context, *ReadRequest) (*ReadResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method Read not implemented")
 }
-func (UnimplementedFilesystemServiceServer) Write(context.Context, *WriteRequest) (*WriteResponse, error) {
-	return nil, status.Error(codes.Unimplemented, "method Write not implemented")
+func (UnimplementedFilesystemServiceServer) Write(grpc.ClientStreamingServer[WriteRequest, WriteResponse]) error {
+	return status.Error(codes.Unimplemented, "method Write not implemented")
 }
 func (UnimplementedFilesystemServiceServer) List(context.Context, *ListRequest) (*ListResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method List not implemented")
@@ -476,23 +483,12 @@ func _FilesystemService_Read_Handler(srv interface{}, ctx context.Context, dec f
 	return interceptor(ctx, in, info, handler)
 }
 
-func _FilesystemService_Write_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
-	in := new(WriteRequest)
-	if err := dec(in); err != nil {
-		return nil, err
-	}
-	if interceptor == nil {
-		return srv.(FilesystemServiceServer).Write(ctx, in)
-	}
-	info := &grpc.UnaryServerInfo{
-		Server:     srv,
-		FullMethod: FilesystemService_Write_FullMethodName,
-	}
-	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(FilesystemServiceServer).Write(ctx, req.(*WriteRequest))
-	}
-	return interceptor(ctx, in, info, handler)
+func _FilesystemService_Write_Handler(srv interface{}, stream grpc.ServerStream) error {
+	return srv.(FilesystemServiceServer).Write(&grpc.GenericServerStream[WriteRequest, WriteResponse]{ServerStream: stream})
 }
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type FilesystemService_WriteServer = grpc.ClientStreamingServer[WriteRequest, WriteResponse]
 
 func _FilesystemService_List_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(ListRequest)
@@ -524,15 +520,17 @@ var FilesystemService_ServiceDesc = grpc.ServiceDesc{
 			Handler:    _FilesystemService_Read_Handler,
 		},
 		{
-			MethodName: "Write",
-			Handler:    _FilesystemService_Write_Handler,
-		},
-		{
 			MethodName: "List",
 			Handler:    _FilesystemService_List_Handler,
 		},
 	},
-	Streams:  []grpc.StreamDesc{},
+	Streams: []grpc.StreamDesc{
+		{
+			StreamName:    "Write",
+			Handler:       _FilesystemService_Write_Handler,
+			ClientStreams: true,
+		},
+	},
 	Metadata: "proto/sandboxd/v1/sandboxd.proto",
 }
 
