@@ -8,6 +8,18 @@ on:
 permissions: {}
 
 jobs:
+  sandboxd-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+          cache-dependency-path: sandboxd/go.sum
+      - name: Test Windows process containment
+        working-directory: sandboxd
+        run: go test ./internal/server -run "^(TestProcessDomainAssignsLeaderToJob|TestProcessServiceForceContainsDescendant|TestExecExplicitAndCloseSendEOFStillPublishOutputAndExit)$" -count=1
+
   build-test:
     runs-on: ubuntu-latest
     steps:

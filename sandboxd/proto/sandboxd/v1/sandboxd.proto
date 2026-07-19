@@ -15,7 +15,52 @@ message ExecRequest {
   oneof kind {
     ExecStart start = 1;
     bytes stdin = 2;
+    ExecStdinEOF stdin_eof = 3;
+    ExecControl control = 4;
   }
+}
+
+message ExecStdinEOF {}
+
+enum ProcessControl {
+  PROCESS_CONTROL_UNSPECIFIED = 0;
+  PROCESS_CONTROL_INTERRUPT = 1;
+  PROCESS_CONTROL_TERMINATE = 2;
+  PROCESS_CONTROL_FORCE = 3;
+}
+
+message ExecControl { ProcessControl control = 1; }
+
+enum EnvironmentMode {
+  ENVIRONMENT_MODE_UNSPECIFIED = 0;
+  ENVIRONMENT_MODE_INHERIT = 1;
+  ENVIRONMENT_MODE_REPLACE = 2;
+}
+
+enum TerminationReason {
+  TERMINATION_REASON_UNSPECIFIED = 0;
+  TERMINATION_REASON_EXITED = 1;
+  TERMINATION_REASON_START_FAILED = 2;
+  TERMINATION_REASON_WAIT_FAILED = 3;
+  TERMINATION_REASON_TIMEOUT = 4;
+  TERMINATION_REASON_INTERRUPTED = 5;
+  TERMINATION_REASON_TERMINATED = 6;
+  TERMINATION_REASON_FORCED = 7;
+  TERMINATION_REASON_DISCONNECTED = 8;
+  TERMINATION_REASON_DAEMON_CLOSED = 9;
+}
+
+enum OutputStream {
+  OUTPUT_STREAM_UNSPECIFIED = 0;
+  OUTPUT_STREAM_STDOUT = 1;
+  OUTPUT_STREAM_STDERR = 2;
+}
+
+message OutputChunk {
+  OutputStream stream = 1;
+  bytes data = 2;
+  uint64 offset = 3;
+  uint64 gap_bytes = 4;
 }
 
 message ExecStart {
@@ -25,12 +70,16 @@ message ExecStart {
   // cwd defaults to the environment workspace.
   string cwd = 2;
   map<string, string> env = 3;
+  EnvironmentMode env_mode = 4;
+  uint64 timeout_ms = 5;
 }
 
 message ExecResponse {
   oneof kind {
-    bytes stdout = 1;
-    bytes stderr = 2;
+    // Field numbers 1 and 2 were bytes before lifecycle v1. Their wire type is
+    // intentionally incompatible; pre-1.0 clients must regenerate.
+    OutputChunk stdout = 1;
+    OutputChunk stderr = 2;
     ExecExit exit = 3;
   }
 }
@@ -39,6 +88,7 @@ message ExecExit {
   int32 code = 1;
   // error is set when the command could not be started or waited on.
   string error = 2;
+  TerminationReason reason = 3;
 }
 
 // ProcessService manages background processes for the lifetime of one
@@ -52,6 +102,7 @@ service ProcessService {
   rpc Get(GetProcessRequest) returns (Process);
   // Stop is idempotent, including when the key is absent or already terminal.
   rpc Stop(StopProcessRequest) returns (Process);
+  rpc ReadOutput(ReadOutputRequest) returns (ReadOutputResponse);
 }
 
 message ProcessKey {
@@ -64,6 +115,8 @@ message ProcessSpec {
   // cwd defaults to the environment workspace.
   string cwd = 2;
   map<string, string> env = 3;
+  EnvironmentMode env_mode = 4;
+  uint64 timeout_ms = 5;
 }
 
 message StartProcessRequest {
@@ -79,6 +132,8 @@ enum StopMode {
   STOP_MODE_UNSPECIFIED = 0;
   STOP_MODE_GRACEFUL = 1;
   STOP_MODE_FORCE = 2;
+  STOP_MODE_INTERRUPT = 3;
+  STOP_MODE_TERMINATE = 4;
 }
 
 message StopProcessRequest {
@@ -101,9 +156,30 @@ message Process {
   ProcessKey key = 1;
   ProcessSpec spec = 2;
   ProcessState state = 3;
-  // exit_code is meaningful in terminal states. A start/wait failure uses -1.
-  int32 exit_code = 4;
+  // Present only after the child was started and reaped.
+  optional int32 exit_code = 4;
   string error = 5;
+  string execution_id = 6;
+  TerminationReason reason = 7;
+}
+
+message ReadOutputRequest {
+  ProcessKey key = 1;
+  string execution_id = 2;
+  OutputStream stream = 3;
+  uint64 offset = 4;
+  uint32 max_bytes = 5;
+}
+
+message ReadOutputResponse {
+  bytes data = 1;
+  uint64 offset = 2;
+  uint64 next_offset = 3;
+  uint64 gap_bytes = 4;
+  bool eof = 5;
+  // Absolute bounds make retention loss independently auditable.
+  uint64 retained_start = 6;
+  uint64 produced_end = 7;
 }
 
 // FilesystemService provides file access inside the environment.

@@ -89,6 +89,13 @@ platform does not assume that agent-process exit means task completion. The same
 maps to pod, KubeVirt, Windows, and external-runner backends because it exposes no Pod,
 container, PID, tmux, or OS-signal semantics.
 
+The committed sandboxd process contract is documented beside its protobuf in
+[`PROCESS_LIFECYCLE.md`](sandboxd/proto/sandboxd/v1/PROCESS_LIFECYCLE.md). In short,
+connection-bound `Exec` supports explicit stdin EOF but is not retry-safe; keyed,
+epoch-scoped `ProcessService` provides duplicate-safe launch, portable tree controls,
+timeouts, opaque execution identity, and bounded cursor output with observable loss.
+It supports both foreground agent processes and reconnectable long-lived services.
+
 Run states are observable milestones: `Allocating`, `EnvironmentReady`,
 `AdapterAccepted`, `Running`, `NeedsInput`, `Paused`, and terminal `Succeeded`, `Failed`,
 or `Cancelled`. Conditions additionally report environment readiness, a durable adapter

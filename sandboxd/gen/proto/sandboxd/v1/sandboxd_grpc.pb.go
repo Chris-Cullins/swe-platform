@@ -123,9 +123,10 @@ var ExecService_ServiceDesc = grpc.ServiceDesc{
 }
 
 const (
-	ProcessService_Start_FullMethodName = "/sandboxd.v1.ProcessService/Start"
-	ProcessService_Get_FullMethodName   = "/sandboxd.v1.ProcessService/Get"
-	ProcessService_Stop_FullMethodName  = "/sandboxd.v1.ProcessService/Stop"
+	ProcessService_Start_FullMethodName      = "/sandboxd.v1.ProcessService/Start"
+	ProcessService_Get_FullMethodName        = "/sandboxd.v1.ProcessService/Get"
+	ProcessService_Stop_FullMethodName       = "/sandboxd.v1.ProcessService/Stop"
+	ProcessService_ReadOutput_FullMethodName = "/sandboxd.v1.ProcessService/ReadOutput"
 )
 
 // ProcessServiceClient is the client API for ProcessService service.
@@ -143,6 +144,7 @@ type ProcessServiceClient interface {
 	Get(ctx context.Context, in *GetProcessRequest, opts ...grpc.CallOption) (*Process, error)
 	// Stop is idempotent, including when the key is absent or already terminal.
 	Stop(ctx context.Context, in *StopProcessRequest, opts ...grpc.CallOption) (*Process, error)
+	ReadOutput(ctx context.Context, in *ReadOutputRequest, opts ...grpc.CallOption) (*ReadOutputResponse, error)
 }
 
 type processServiceClient struct {
@@ -183,6 +185,16 @@ func (c *processServiceClient) Stop(ctx context.Context, in *StopProcessRequest,
 	return out, nil
 }
 
+func (c *processServiceClient) ReadOutput(ctx context.Context, in *ReadOutputRequest, opts ...grpc.CallOption) (*ReadOutputResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ReadOutputResponse)
+	err := c.cc.Invoke(ctx, ProcessService_ReadOutput_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // ProcessServiceServer is the server API for ProcessService service.
 // All implementations must embed UnimplementedProcessServiceServer
 // for forward compatibility.
@@ -198,6 +210,7 @@ type ProcessServiceServer interface {
 	Get(context.Context, *GetProcessRequest) (*Process, error)
 	// Stop is idempotent, including when the key is absent or already terminal.
 	Stop(context.Context, *StopProcessRequest) (*Process, error)
+	ReadOutput(context.Context, *ReadOutputRequest) (*ReadOutputResponse, error)
 	mustEmbedUnimplementedProcessServiceServer()
 }
 
@@ -216,6 +229,9 @@ func (UnimplementedProcessServiceServer) Get(context.Context, *GetProcessRequest
 }
 func (UnimplementedProcessServiceServer) Stop(context.Context, *StopProcessRequest) (*Process, error) {
 	return nil, status.Error(codes.Unimplemented, "method Stop not implemented")
+}
+func (UnimplementedProcessServiceServer) ReadOutput(context.Context, *ReadOutputRequest) (*ReadOutputResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ReadOutput not implemented")
 }
 func (UnimplementedProcessServiceServer) mustEmbedUnimplementedProcessServiceServer() {}
 func (UnimplementedProcessServiceServer) testEmbeddedByValue()                        {}
@@ -292,6 +308,24 @@ func _ProcessService_Stop_Handler(srv interface{}, ctx context.Context, dec func
 	return interceptor(ctx, in, info, handler)
 }
 
+func _ProcessService_ReadOutput_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ReadOutputRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ProcessServiceServer).ReadOutput(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: ProcessService_ReadOutput_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ProcessServiceServer).ReadOutput(ctx, req.(*ReadOutputRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // ProcessService_ServiceDesc is the grpc.ServiceDesc for ProcessService service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -310,6 +344,10 @@ var ProcessService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "Stop",
 			Handler:    _ProcessService_Stop_Handler,
+		},
+		{
+			MethodName: "ReadOutput",
+			Handler:    _ProcessService_ReadOutput_Handler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},

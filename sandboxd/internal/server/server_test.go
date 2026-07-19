@@ -16,6 +16,7 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 	"google.golang.org/grpc/test/bufconn"
 
@@ -32,9 +33,11 @@ func newConn(t *testing.T, workspace string) *grpc.ClientConn {
 	})
 	lis := bufconn.Listen(1024 * 1024)
 	grpcServer := grpc.NewServer()
+	supervisor := NewSupervisor()
+	processServer := NewProcessServer(workspace, supervisor)
 	sandboxdv1.RegisterHealthServiceServer(grpcServer, &HealthServer{Version: "test"})
-	sandboxdv1.RegisterExecServiceServer(grpcServer, &ExecServer{Workspace: workspace})
-	sandboxdv1.RegisterProcessServiceServer(grpcServer, NewProcessServer(workspace))
+	sandboxdv1.RegisterExecServiceServer(grpcServer, NewExecServer(workspace, supervisor))
+	sandboxdv1.RegisterProcessServiceServer(grpcServer, processServer)
 	sandboxdv1.RegisterFilesystemServiceServer(grpcServer, &FilesystemServer{Workspace: workspace})
 	sandboxdv1.RegisterTerminalServiceServer(grpcServer, &TerminalServer{
 		Workspace:  workspace,
@@ -43,7 +46,7 @@ func newConn(t *testing.T, workspace string) *grpc.ClientConn {
 	})
 	sandboxdv1.RegisterPortServiceServer(grpcServer, NewPortServer())
 	go func() { _ = grpcServer.Serve(lis) }()
-	t.Cleanup(grpcServer.Stop)
+	t.Cleanup(func() { grpcServer.Stop(); processServer.Close() })
 
 	conn, err := grpc.NewClient("passthrough://bufnet",
 		grpc.WithContextDialer(func(ctx context.Context, _ string) (net.Conn, error) {
@@ -101,7 +104,7 @@ func TestExecStreamsOutputAndExitCode(t *testing.T) {
 			t.Fatalf("recv: %v", err)
 		}
 		if out := resp.GetStdout(); out != nil {
-			stdout = append(stdout, out...)
+			stdout = append(stdout, out.Data...)
 		}
 		if e := resp.GetExit(); e != nil {
 			exit = e
@@ -116,6 +119,90 @@ func TestExecStreamsOutputAndExitCode(t *testing.T) {
 	}
 	if got := string(stdout); !strings.HasPrefix(strings.TrimSpace(got), "hello-sandboxd") {
 		t.Fatalf("unexpected stdout: %q", got)
+	}
+}
+
+func TestExecExplicitAndCloseSendEOFStillPublishOutputAndExit(t *testing.T) {
+	for _, explicit := range []bool{true, false} {
+		t.Run(map[bool]string{true: "explicit", false: "close-send"}[explicit], func(t *testing.T) {
+			client := sandboxdv1.NewExecServiceClient(newConn(t, t.TempDir()))
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			defer cancel()
+			stream, err := client.Exec(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			argv := []string{"sh", "-c", "cat >/dev/null; printf after-eof"}
+			if runtime.GOOS == "windows" {
+				argv = []string{"cmd", "/c", "more >nul & echo after-eof"}
+			}
+			if err := stream.Send(&sandboxdv1.ExecRequest{Kind: &sandboxdv1.ExecRequest_Start{Start: &sandboxdv1.ExecStart{Argv: argv}}}); err != nil {
+				t.Fatal(err)
+			}
+			if explicit {
+				if err := stream.Send(&sandboxdv1.ExecRequest{Kind: &sandboxdv1.ExecRequest_StdinEof{StdinEof: &sandboxdv1.ExecStdinEOF{}}}); err != nil {
+					t.Fatal(err)
+				}
+			} else if err := stream.CloseSend(); err != nil {
+				t.Fatal(err)
+			}
+			var out []byte
+			var exit *sandboxdv1.ExecExit
+			for {
+				resp, err := stream.Recv()
+				if err == io.EOF {
+					break
+				}
+				if err != nil {
+					t.Fatal(err)
+				}
+				if c := resp.GetStdout(); c != nil {
+					out = append(out, c.Data...)
+				}
+				if e := resp.GetExit(); e != nil {
+					exit = e
+				}
+			}
+			if strings.TrimSpace(string(out)) != "after-eof" || exit == nil || exit.Code != 0 || exit.Reason != sandboxdv1.TerminationReason_TERMINATION_REASON_EXITED {
+				t.Fatalf("output=%q exit=%v", out, exit)
+			}
+		})
+	}
+}
+
+func TestProcessBoundedOutputOffsetsGapEOFAndStaleID(t *testing.T) {
+	s := NewProcessServer(t.TempDir())
+	s.OutputCapacity = 5
+	t.Cleanup(s.Close)
+	key := &sandboxdv1.ProcessKey{OwnerId: "output", Role: "test"}
+	p, err := s.Start(context.Background(), &sandboxdv1.StartProcessRequest{Key: key, Spec: &sandboxdv1.ProcessSpec{Argv: []string{"sh", "-c", "printf 0123456789"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, func() bool {
+		got, _ := s.Get(context.Background(), &sandboxdv1.GetProcessRequest{Key: key})
+		return got != nil && got.State == sandboxdv1.ProcessState_PROCESS_STATE_EXITED
+	})
+	got, err := s.ReadOutput(context.Background(), &sandboxdv1.ReadOutputRequest{Key: key, ExecutionId: p.ExecutionId, Stream: sandboxdv1.OutputStream_OUTPUT_STREAM_STDOUT, MaxBytes: 99})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got.Data) != "56789" || got.Offset != 5 || got.NextOffset != 10 || got.GapBytes != 5 || got.RetainedStart != 5 || got.ProducedEnd != 10 || !got.Eof {
+		t.Fatalf("unexpected retained output: %+v", got)
+	}
+	_, err = s.ReadOutput(context.Background(), &sandboxdv1.ReadOutputRequest{Key: key, ExecutionId: "stale", Stream: sandboxdv1.OutputStream_OUTPUT_STREAM_STDOUT})
+	if status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("stale id: %v", err)
+	}
+}
+
+func TestNormalizeEnvReplaceAndStable(t *testing.T) {
+	env, err := normalizeEnv(sandboxdv1.EnvironmentMode_ENVIRONMENT_MODE_REPLACE, map[string]string{"B": "2", "A": "1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Join(env, ",") != "A=1,B=2" {
+		t.Fatalf("replace env = %v", env)
 	}
 }
 
@@ -282,20 +369,35 @@ func TestProcessDuplicateStartAndConflict(t *testing.T) {
 	const callers = 8
 	var wg sync.WaitGroup
 	errs := make(chan error, callers)
+	ids := make(chan string, callers)
 	for range callers {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			_, err := client.Start(context.Background(), &sandboxdv1.StartProcessRequest{Key: key, Spec: spec})
+			process, err := client.Start(context.Background(), &sandboxdv1.StartProcessRequest{Key: key, Spec: spec})
+			if process != nil {
+				ids <- process.ExecutionId
+			}
 			errs <- err
 		}()
 	}
 	wg.Wait()
 	close(errs)
+	close(ids)
 	for err := range errs {
 		if err != nil {
 			t.Fatalf("duplicate start: %v", err)
 		}
+	}
+	var executionID string
+	for id := range ids {
+		if id == "" {
+			t.Fatal("duplicate Start returned an empty execution ID")
+		}
+		if executionID != "" && id != executionID {
+			t.Fatalf("duplicate Start IDs differ: %q and %q", executionID, id)
+		}
+		executionID = id
 	}
 	waitFor(t, func() bool {
 		content, _ := os.ReadFile(filepath.Join(workspace, "starts"))
@@ -307,6 +409,208 @@ func TestProcessDuplicateStartAndConflict(t *testing.T) {
 		t.Fatalf("conflicting start: expected FailedPrecondition, got %v", err)
 	}
 	_, _ = client.Stop(context.Background(), &sandboxdv1.StopProcessRequest{Key: key, Mode: sandboxdv1.StopMode_STOP_MODE_FORCE})
+	waitFor(t, func() bool {
+		p, _ := client.Get(context.Background(), &sandboxdv1.GetProcessRequest{Key: key})
+		return p != nil && p.State == sandboxdv1.ProcessState_PROCESS_STATE_EXITED
+	})
+	retry, err := client.Start(context.Background(), &sandboxdv1.StartProcessRequest{Key: key, Spec: spec})
+	if err != nil || retry.ExecutionId != executionID {
+		t.Fatalf("terminal retry: process=%v error=%v", retry, err)
+	}
+	content, _ := os.ReadFile(filepath.Join(workspace, "starts"))
+	if strings.Count(string(content), "start\n") != 1 {
+		t.Fatalf("terminal retry relaunched process: %q", content)
+	}
+}
+
+func TestProcessRecordLimitPreservesRetry(t *testing.T) {
+	s := NewProcessServer(t.TempDir())
+	s.MaxRecords = 1
+	t.Cleanup(s.Close)
+	key := &sandboxdv1.ProcessKey{OwnerId: "existing", Role: "agent"}
+	spec := &sandboxdv1.ProcessSpec{Argv: []string{"sh", "-c", "exit 0"}}
+	first, err := s.Start(context.Background(), &sandboxdv1.StartProcessRequest{Key: key, Spec: spec})
+	if err != nil || first.ExecutionId == "" {
+		t.Fatalf("first Start: %v %v", first, err)
+	}
+	_, err = s.Start(context.Background(), &sandboxdv1.StartProcessRequest{Key: &sandboxdv1.ProcessKey{OwnerId: "new", Role: "agent"}, Spec: spec})
+	if status.Code(err) != codes.ResourceExhausted {
+		t.Fatalf("new key: %v", err)
+	}
+	retry, err := s.Start(context.Background(), &sandboxdv1.StartProcessRequest{Key: key, Spec: spec})
+	if err != nil || retry.ExecutionId != first.ExecutionId {
+		t.Fatalf("retry: %v %v", retry, err)
+	}
+}
+
+func TestProcessOutputPaginationAndBothStreams(t *testing.T) {
+	s := NewProcessServer(t.TempDir())
+	t.Cleanup(s.Close)
+	key := &sandboxdv1.ProcessKey{OwnerId: "pages", Role: "agent"}
+	p, err := s.Start(context.Background(), &sandboxdv1.StartProcessRequest{Key: key, Spec: &sandboxdv1.ProcessSpec{Argv: []string{"sh", "-c", "printf abcdef; printf 12345 >&2"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, func() bool {
+		got, _ := s.Get(context.Background(), &sandboxdv1.GetProcessRequest{Key: key})
+		return got != nil && got.State == sandboxdv1.ProcessState_PROCESS_STATE_EXITED
+	})
+	for stream, want := range map[sandboxdv1.OutputStream]string{sandboxdv1.OutputStream_OUTPUT_STREAM_STDOUT: "abcdef", sandboxdv1.OutputStream_OUTPUT_STREAM_STDERR: "12345"} {
+		var got []byte
+		var cursor uint64
+		for {
+			page, err := s.ReadOutput(context.Background(), &sandboxdv1.ReadOutputRequest{Key: key, ExecutionId: p.ExecutionId, Stream: stream, Offset: cursor, MaxBytes: 2})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(page.Data) > 2 || page.Offset != cursor || page.GapBytes != 0 {
+				t.Fatalf("bad page: %+v", page)
+			}
+			got = append(got, page.Data...)
+			cursor = page.NextOffset
+			if page.Eof {
+				break
+			}
+		}
+		if string(got) != want {
+			t.Fatalf("stream %s = %q", stream, got)
+		}
+	}
+}
+
+func TestForegroundAndServiceProcessShapes(t *testing.T) {
+	t.Run("foreground", func(t *testing.T) {
+		s := NewProcessServer(t.TempDir())
+		t.Cleanup(s.Close)
+		key := &sandboxdv1.ProcessKey{OwnerId: "fg", Role: "agent"}
+		p, err := s.Start(context.Background(), &sandboxdv1.StartProcessRequest{Key: key, Spec: &sandboxdv1.ProcessSpec{Argv: []string{"sh", "-c", "printf foreground"}}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		waitFor(t, func() bool {
+			x, _ := s.Get(context.Background(), &sandboxdv1.GetProcessRequest{Key: key})
+			return x != nil && x.State == sandboxdv1.ProcessState_PROCESS_STATE_EXITED
+		})
+		out, err := s.ReadOutput(context.Background(), &sandboxdv1.ReadOutputRequest{Key: key, ExecutionId: p.ExecutionId, Stream: sandboxdv1.OutputStream_OUTPUT_STREAM_STDOUT})
+		if err != nil || string(out.Data) != "foreground" || !out.Eof {
+			t.Fatalf("output=%v err=%v", out, err)
+		}
+	})
+	t.Run("service", func(t *testing.T) {
+		workspace := t.TempDir()
+		s := NewProcessServer(workspace)
+		t.Cleanup(s.Close)
+		key := &sandboxdv1.ProcessKey{OwnerId: "svc", Role: "service"}
+		ctx, cancel := context.WithCancel(context.Background())
+		p, err := s.Start(ctx, &sandboxdv1.StartProcessRequest{Key: key, Spec: processTestSpec(t, workspace, "wait")})
+		if err != nil {
+			t.Fatal(err)
+		}
+		cancel()
+		again, err := s.Get(context.Background(), &sandboxdv1.GetProcessRequest{Key: key})
+		if err != nil || again.ExecutionId != p.ExecutionId || again.State != sandboxdv1.ProcessState_PROCESS_STATE_RUNNING {
+			t.Fatalf("reconnect=%v err=%v", again, err)
+		}
+		_, err = s.Stop(context.Background(), &sandboxdv1.StopProcessRequest{Key: key, Mode: sandboxdv1.StopMode_STOP_MODE_FORCE})
+		if err != nil {
+			t.Fatal(err)
+		}
+	})
+}
+
+func TestTimeoutOverflowValidation(t *testing.T) {
+	overflow := uint64(1<<63-1)/uint64(time.Millisecond) + 1
+	s := NewProcessServer(t.TempDir())
+	t.Cleanup(s.Close)
+	_, err := s.Start(context.Background(), &sandboxdv1.StartProcessRequest{Key: &sandboxdv1.ProcessKey{OwnerId: "x", Role: "x"}, Spec: &sandboxdv1.ProcessSpec{Argv: []string{"sh"}, TimeoutMs: overflow}})
+	if status.Code(err) != codes.InvalidArgument {
+		t.Fatalf("ProcessSpec overflow: %v", err)
+	}
+	client := sandboxdv1.NewExecServiceClient(newConn(t, t.TempDir()))
+	stream, err := client.Exec(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := stream.Send(&sandboxdv1.ExecRequest{Kind: &sandboxdv1.ExecRequest_Start{Start: &sandboxdv1.ExecStart{Argv: []string{"sh"}, TimeoutMs: overflow}}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := stream.Recv(); status.Code(err) != codes.InvalidArgument {
+		t.Fatalf("ExecStart overflow: %v", err)
+	}
+}
+
+func TestExecRejectsUnknownAndUnspecifiedControls(t *testing.T) {
+	for _, control := range []sandboxdv1.ProcessControl{sandboxdv1.ProcessControl_PROCESS_CONTROL_UNSPECIFIED, sandboxdv1.ProcessControl(99)} {
+		client := sandboxdv1.NewExecServiceClient(newConn(t, t.TempDir()))
+		stream, err := client.Exec(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := stream.Send(&sandboxdv1.ExecRequest{Kind: &sandboxdv1.ExecRequest_Start{Start: &sandboxdv1.ExecStart{Argv: []string{"sh", "-c", "sleep 10"}}}}); err != nil {
+			t.Fatal(err)
+		}
+		if err := stream.Send(&sandboxdv1.ExecRequest{Kind: &sandboxdv1.ExecRequest_Control{Control: &sandboxdv1.ExecControl{Control: control}}}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := stream.Recv(); status.Code(err) != codes.InvalidArgument {
+			t.Fatalf("control %d: %v", control, err)
+		}
+	}
+}
+
+type blockedExecStream struct {
+	sandboxdv1.ExecService_ExecServer
+	ctx       context.Context
+	start     *sandboxdv1.ExecRequest
+	once      sync.Once
+	release   chan struct{}
+	mu        sync.Mutex
+	responses []*sandboxdv1.ExecResponse
+}
+
+func (s *blockedExecStream) Context() context.Context     { return s.ctx }
+func (s *blockedExecStream) SetHeader(metadata.MD) error  { return nil }
+func (s *blockedExecStream) SendHeader(metadata.MD) error { return nil }
+func (s *blockedExecStream) SetTrailer(metadata.MD)       {}
+func (s *blockedExecStream) SendMsg(any) error            { return nil }
+func (s *blockedExecStream) RecvMsg(any) error            { return io.EOF }
+func (s *blockedExecStream) Recv() (*sandboxdv1.ExecRequest, error) {
+	var result *sandboxdv1.ExecRequest
+	s.once.Do(func() { result = s.start })
+	if result != nil {
+		return result, nil
+	}
+	return nil, io.EOF
+}
+func (s *blockedExecStream) Send(r *sandboxdv1.ExecResponse) error {
+	if r.GetStdout() != nil || r.GetStderr() != nil {
+		<-s.release
+	}
+	s.mu.Lock()
+	s.responses = append(s.responses, r)
+	s.mu.Unlock()
+	return nil
+}
+
+func TestExecOutputLossIsObservable(t *testing.T) {
+	stream := &blockedExecStream{ctx: context.Background(), release: make(chan struct{}), start: &sandboxdv1.ExecRequest{Kind: &sandboxdv1.ExecRequest_Start{Start: &sandboxdv1.ExecStart{Argv: []string{"sh", "-c", "head -c 4194304 /dev/zero"}}}}}
+	done := make(chan error, 1)
+	go func() { done <- NewExecServer(t.TempDir(), NewSupervisor()).Exec(stream) }()
+	time.Sleep(150 * time.Millisecond)
+	close(stream.release)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	var delivered, gaps uint64
+	for _, r := range stream.responses {
+		if out := r.GetStdout(); out != nil {
+			delivered += uint64(len(out.Data))
+			gaps += out.GapBytes
+		}
+	}
+	if delivered+gaps != 4194304 || gaps == 0 {
+		t.Fatalf("delivered=%d gaps=%d", delivered, gaps)
+	}
 }
 
 func TestProcessRPCancellationDoesNotKillAndStopIsIdempotent(t *testing.T) {
@@ -349,7 +653,7 @@ func TestProcessGetRetainsTerminalState(t *testing.T) {
 	}
 	waitFor(t, func() bool {
 		p, err := client.Get(context.Background(), &sandboxdv1.GetProcessRequest{Key: key})
-		return err == nil && p.State == sandboxdv1.ProcessState_PROCESS_STATE_EXITED && p.ExitCode == 0
+		return err == nil && p.State == sandboxdv1.ProcessState_PROCESS_STATE_EXITED && p.GetExitCode() == 0
 	})
 	p, err := client.Get(context.Background(), &sandboxdv1.GetProcessRequest{Key: key})
 	if err != nil || p.State != sandboxdv1.ProcessState_PROCESS_STATE_EXITED {

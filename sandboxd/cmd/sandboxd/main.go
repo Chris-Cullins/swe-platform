@@ -63,7 +63,8 @@ func main() {
 		log.Fatalf("listen %s: %v", *addr, err)
 	}
 
-	processServer := server.NewProcessServer(*workspace)
+	supervisor := server.NewSupervisor()
+	processServer := server.NewProcessServer(*workspace, supervisor)
 	grpcServer := grpc.NewServer(
 		grpc.Creds(credentials.NewTLS(&tls.Config{
 			Certificates: []tls.Certificate{certificate},
@@ -73,7 +74,7 @@ func main() {
 		grpc.StreamInterceptor(authorizer.StreamServerInterceptor),
 	)
 	sandboxdv1.RegisterHealthServiceServer(grpcServer, &server.HealthServer{Version: Version})
-	sandboxdv1.RegisterExecServiceServer(grpcServer, &server.ExecServer{Workspace: *workspace})
+	sandboxdv1.RegisterExecServiceServer(grpcServer, server.NewExecServer(*workspace, supervisor))
 	sandboxdv1.RegisterProcessServiceServer(grpcServer, processServer)
 	sandboxdv1.RegisterFilesystemServiceServer(grpcServer, &server.FilesystemServer{Workspace: *workspace})
 	sandboxdv1.RegisterTerminalServiceServer(grpcServer, &server.TerminalServer{Workspace: *workspace})
@@ -85,7 +86,13 @@ func main() {
 	go func() {
 		<-ctx.Done()
 		log.Println("shutting down")
-		processServer.Close()
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := processServer.CloseContext(shutdownCtx); err != nil {
+			log.Printf("sandboxd shutdown fencing failed: %v", err)
+			grpcServer.Stop()
+			return
+		}
 		grpcServer.GracefulStop()
 	}()
 

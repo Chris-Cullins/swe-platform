@@ -20,6 +20,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -28,6 +29,13 @@ import (
 )
 
 const execChunkSize = 32 * 1024
+const execQueueSize = 32
+
+type execOutput struct {
+	stream sandboxdv1.OutputStream
+	data   []byte
+	offset uint64
+}
 
 // HealthServer implements HealthService.
 type HealthServer struct {
@@ -42,7 +50,15 @@ func (s *HealthServer) Check(context.Context, *sandboxdv1.HealthCheckRequest) (*
 // ExecServer implements ExecService.
 type ExecServer struct {
 	sandboxdv1.UnimplementedExecServiceServer
-	Workspace string
+	Workspace  string
+	supervisor *Supervisor
+}
+
+func NewExecServer(workspace string, supervisor *Supervisor) *ExecServer {
+	if supervisor == nil {
+		supervisor = NewSupervisor()
+	}
+	return &ExecServer{Workspace: workspace, supervisor: supervisor}
 }
 
 // Exec runs a command and streams its output. The first client message must
@@ -59,79 +75,220 @@ func (s *ExecServer) Exec(stream sandboxdv1.ExecService_ExecServer) error {
 	if len(start.Argv) == 0 {
 		return status.Error(codes.InvalidArgument, "argv must not be empty")
 	}
+	if !validTimeout(start.TimeoutMs) {
+		return status.Error(codes.InvalidArgument, "timeout_ms overflows duration")
+	}
 
 	cwd := start.Cwd
 	if cwd == "" {
 		cwd = s.Workspace
 	}
 
-	cmd := exec.CommandContext(stream.Context(), start.Argv[0], start.Argv[1:]...)
+	cmd := exec.Command(start.Argv[0], start.Argv[1:]...)
 	cmd.Dir = cwd
-	cmd.Env = os.Environ()
-	for k, v := range start.Env {
-		cmd.Env = append(cmd.Env, k+"="+v)
+	cmd.Env, err = normalizeEnv(start.EnvMode, start.Env)
+	if err != nil {
+		return err
+	}
+	domain := newProcessDomain(cmd)
+	if s.supervisor == nil {
+		s.supervisor = NewSupervisor()
+	}
+	var causeMu sync.Mutex
+	reason := sandboxdv1.TerminationReason_TERMINATION_REASON_UNSPECIFIED
+	setCause := func(r sandboxdv1.TerminationReason) bool {
+		causeMu.Lock()
+		defer causeMu.Unlock()
+		if reason != sandboxdv1.TerminationReason_TERMINATION_REASON_UNSPECIFIED {
+			return false
+		}
+		reason = r
+		return true
+	}
+	deliverCause := func(r sandboxdv1.TerminationReason, deliver func() error) error {
+		causeMu.Lock()
+		defer causeMu.Unlock()
+		if reason != sandboxdv1.TerminationReason_TERMINATION_REASON_UNSPECIFIED {
+			return nil
+		}
+		if err := deliver(); err != nil {
+			return err
+		}
+		reason = r
+		return nil
 	}
 
-	stdin, err := cmd.StdinPipe()
+	stdinR, stdin, err := os.Pipe()
 	if err != nil {
 		return status.Errorf(codes.Internal, "stdin pipe: %v", err)
 	}
-	stdout, err := cmd.StdoutPipe()
+	defer stdin.Close()
+	cmd.Stdin = stdinR
+	stdout, stdoutW, err := os.Pipe()
 	if err != nil {
+		_ = stdinR.Close()
+		_ = stdin.Close()
 		return status.Errorf(codes.Internal, "stdout pipe: %v", err)
 	}
-	stderr, err := cmd.StderrPipe()
+	stderr, stderrW, err := os.Pipe()
 	if err != nil {
+		_ = stdinR.Close()
+		_ = stdin.Close()
+		_ = stdout.Close()
+		_ = stdoutW.Close()
 		return status.Errorf(codes.Internal, "stderr pipe: %v", err)
 	}
+	cmd.Stdout, cmd.Stderr = stdoutW, stderrW
 
-	if err := cmd.Start(); err != nil {
+	if err := s.supervisor.start(domain, func() { setCause(sandboxdv1.TerminationReason_TERMINATION_REASON_DAEMON_CLOSED) }); err != nil {
+		_ = stdinR.Close()
+		_ = stdin.Close()
+		_ = stdout.Close()
+		_ = stdoutW.Close()
+		_ = stderr.Close()
+		_ = stderrW.Close()
+		if errors.Is(err, context.Canceled) {
+			return status.Error(codes.Unavailable, "process supervisor epoch is closed")
+		}
+		_ = stdinR.Close()
+		_ = stdin.Close()
+		_ = stdout.Close()
+		_ = stdoutW.Close()
+		_ = stderr.Close()
+		_ = stderrW.Close()
 		return stream.Send(&sandboxdv1.ExecResponse{
 			Kind: &sandboxdv1.ExecResponse_Exit{
-				Exit: &sandboxdv1.ExecExit{Code: -1, Error: fmt.Sprintf("start: %v", err)},
+				Exit: &sandboxdv1.ExecExit{Code: -1, Error: fmt.Sprintf("start: %v", err), Reason: sandboxdv1.TerminationReason_TERMINATION_REASON_START_FAILED},
 			},
 		})
 	}
+	defer s.supervisor.done(domain)
+
+	killFor := func(r sandboxdv1.TerminationReason) {
+		_ = deliverCause(r, domain.force)
+	}
+	_ = stdinR.Close()
+	_ = stdoutW.Close()
+	_ = stderrW.Close()
+	controlErr := make(chan error, 1)
 
 	// Feed stdin from the client.
+	recvDone := make(chan error, 1)
 	go func() {
-		defer stdin.Close()
 		for {
 			req, err := stream.Recv()
 			if err != nil {
+				_ = stdin.Close()
+				recvDone <- err
 				return
 			}
 			if data := req.GetStdin(); data != nil {
 				if _, err := stdin.Write(data); err != nil {
+					select {
+					case recvDone <- err:
+					default:
+					}
+					return
+				}
+			}
+			if req.GetStdinEof() != nil {
+				_ = stdin.Close()
+			}
+			if control := req.GetControl(); control != nil {
+				var controlReason sandboxdv1.TerminationReason
+				var deliveryErr error
+				switch control.Control {
+				case sandboxdv1.ProcessControl_PROCESS_CONTROL_INTERRUPT:
+					controlReason = sandboxdv1.TerminationReason_TERMINATION_REASON_INTERRUPTED
+					deliveryErr = deliverCause(controlReason, domain.interrupt)
+				case sandboxdv1.ProcessControl_PROCESS_CONTROL_TERMINATE:
+					controlReason = sandboxdv1.TerminationReason_TERMINATION_REASON_TERMINATED
+					deliveryErr = deliverCause(controlReason, domain.terminate)
+				case sandboxdv1.ProcessControl_PROCESS_CONTROL_FORCE:
+					controlReason = sandboxdv1.TerminationReason_TERMINATION_REASON_FORCED
+					deliveryErr = deliverCause(controlReason, domain.force)
+				default:
+					deliveryErr = status.Error(codes.InvalidArgument, "unknown or unspecified process control")
+				}
+				if deliveryErr != nil {
+					_ = domain.force()
+					if errors.Is(deliveryErr, errInterruptUnsupported) {
+						deliveryErr = status.Error(codes.Unimplemented, deliveryErr.Error())
+					} else if status.Code(deliveryErr) == codes.OK {
+						deliveryErr = status.Errorf(codes.Internal, "deliver process control: %v", deliveryErr)
+					}
+					select {
+					case controlErr <- deliveryErr:
+					default:
+					}
 					return
 				}
 			}
 		}
 	}()
-
-	var sendMu sync.Mutex
-	send := func(resp *sandboxdv1.ExecResponse) {
-		sendMu.Lock()
-		defer sendMu.Unlock()
-		_ = stream.Send(resp) // client disconnect ends the command via context
+	// A transport cancellation is a full disconnect; half-close (io.EOF) only
+	// closes stdin and output remains readable.
+	go func() {
+		select {
+		case err := <-recvDone:
+			if err != io.EOF {
+				killFor(sandboxdv1.TerminationReason_TERMINATION_REASON_DISCONNECTED)
+			}
+		case <-stream.Context().Done():
+			killFor(sandboxdv1.TerminationReason_TERMINATION_REASON_DISCONNECTED)
+		}
+	}()
+	var timer *time.Timer
+	if start.TimeoutMs > 0 {
+		timer = time.AfterFunc(time.Duration(start.TimeoutMs)*time.Millisecond, func() {
+			killFor(sandboxdv1.TerminationReason_TERMINATION_REASON_TIMEOUT)
+		})
 	}
 
+	q := make(chan execOutput, execQueueSize)
+	dispatched := make(chan [2]uint64, 1)
+	sendErr := make(chan error, 1)
+	go func() {
+		var next [2]uint64
+		for event := range q {
+			i := int(event.stream) - 1
+			chunk := &sandboxdv1.OutputChunk{Stream: event.stream, Data: event.data, Offset: event.offset, GapBytes: event.offset - next[i]}
+			resp := &sandboxdv1.ExecResponse{}
+			if i == 0 {
+				resp.Kind = &sandboxdv1.ExecResponse_Stdout{Stdout: chunk}
+			} else {
+				resp.Kind = &sandboxdv1.ExecResponse_Stderr{Stderr: chunk}
+			}
+			if err := stream.Send(resp); err != nil {
+				killFor(sandboxdv1.TerminationReason_TERMINATION_REASON_DISCONNECTED)
+				sendErr <- err
+				return
+			}
+			next[i] = event.offset + uint64(len(event.data))
+		}
+		dispatched <- next
+	}()
+
 	var wg sync.WaitGroup
-	pump := func(r io.Reader, stdoutStream bool) {
+	var producedMu sync.Mutex
+	var produced [2]uint64
+	pump := func(r *os.File, outputStream sandboxdv1.OutputStream) {
 		defer wg.Done()
+		defer r.Close()
 		buf := make([]byte, execChunkSize)
 		for {
 			n, err := r.Read(buf)
 			if n > 0 {
-				chunk := make([]byte, n)
-				copy(chunk, buf[:n])
-				resp := &sandboxdv1.ExecResponse{}
-				if stdoutStream {
-					resp.Kind = &sandboxdv1.ExecResponse_Stdout{Stdout: chunk}
-				} else {
-					resp.Kind = &sandboxdv1.ExecResponse_Stderr{Stderr: chunk}
+				i := int(outputStream) - 1
+				producedMu.Lock()
+				offset := produced[i]
+				produced[i] += uint64(n)
+				producedMu.Unlock()
+				chunk := append([]byte(nil), buf[:n]...)
+				select {
+				case q <- execOutput{stream: outputStream, data: chunk, offset: offset}:
+				default: // drains never wait for a slow network consumer
 				}
-				send(resp)
 			}
 			if err != nil {
 				return
@@ -139,11 +296,50 @@ func (s *ExecServer) Exec(stream sandboxdv1.ExecService_ExecServer) error {
 		}
 	}
 	wg.Add(2)
-	go pump(stdout, true)
-	go pump(stderr, false)
+	go pump(stdout, sandboxdv1.OutputStream_OUTPUT_STREAM_STDOUT)
+	go pump(stderr, sandboxdv1.OutputStream_OUTPUT_STREAM_STDERR)
 
-	waitErr := cmd.Wait()
+	waitErr := domain.wait()
+	setCause(sandboxdv1.TerminationReason_TERMINATION_REASON_EXITED)
+	if timer != nil {
+		timer.Stop()
+	}
+	_ = domain.force() // fence descendants before terminal publication
+	_ = domain.close()
+	_ = stdoutW.Close()
+	_ = stderrW.Close()
 	wg.Wait()
+	close(q)
+	select {
+	case err := <-controlErr:
+		return err
+	default:
+	}
+	var next [2]uint64
+	select {
+	case next = <-dispatched:
+	case err := <-sendErr:
+		return err
+	}
+	producedMu.Lock()
+	ends := produced
+	producedMu.Unlock()
+	for i := range 2 {
+		if ends[i] <= next[i] {
+			continue
+		}
+		outputStream := sandboxdv1.OutputStream(i + 1)
+		chunk := &sandboxdv1.OutputChunk{Stream: outputStream, Offset: ends[i], GapBytes: ends[i] - next[i]}
+		resp := &sandboxdv1.ExecResponse{}
+		if i == 0 {
+			resp.Kind = &sandboxdv1.ExecResponse_Stdout{Stdout: chunk}
+		} else {
+			resp.Kind = &sandboxdv1.ExecResponse_Stderr{Stderr: chunk}
+		}
+		if err := stream.Send(resp); err != nil {
+			return err
+		}
+	}
 
 	code := int32(0)
 	errStr := ""
@@ -156,12 +352,17 @@ func (s *ExecServer) Exec(stream sandboxdv1.ExecService_ExecServer) error {
 			errStr = waitErr.Error()
 		}
 	}
-	send(&sandboxdv1.ExecResponse{
+	causeMu.Lock()
+	terminalReason := reason
+	causeMu.Unlock()
+	if terminalReason == sandboxdv1.TerminationReason_TERMINATION_REASON_UNSPECIFIED {
+		terminalReason = sandboxdv1.TerminationReason_TERMINATION_REASON_EXITED
+	}
+	return stream.Send(&sandboxdv1.ExecResponse{
 		Kind: &sandboxdv1.ExecResponse_Exit{
-			Exit: &sandboxdv1.ExecExit{Code: code, Error: errStr},
+			Exit: &sandboxdv1.ExecExit{Code: code, Error: errStr, Reason: terminalReason},
 		},
 	})
-	return nil
 }
 
 // FilesystemServer implements FilesystemService.
