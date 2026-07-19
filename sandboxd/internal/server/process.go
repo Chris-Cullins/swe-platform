@@ -23,12 +23,13 @@ type processKey struct {
 }
 
 type managedProcess struct {
-	key      *sandboxdv1.ProcessKey
-	spec     *sandboxdv1.ProcessSpec
-	cmd      *exec.Cmd
-	state    sandboxdv1.ProcessState
-	exitCode int32
-	err      string
+	key           *sandboxdv1.ProcessKey
+	spec          *sandboxdv1.ProcessSpec
+	cmd           *exec.Cmd
+	state         sandboxdv1.ProcessState
+	exitCode      int32
+	err           string
+	stopRequested bool
 }
 
 // ProcessServer manages processes in memory for one sandboxd daemon epoch.
@@ -190,11 +191,13 @@ func (s *ProcessServer) Stop(_ context.Context, req *sandboxdv1.StopProcessReque
 		return processResponse(p), nil
 	}
 	if req.Mode == sandboxdv1.StopMode_STOP_MODE_FORCE {
+		p.stopRequested = true
 		p.state = sandboxdv1.ProcessState_PROCESS_STATE_STOPPING
 		_ = killManagedProcess(p.cmd)
 		return processResponse(p), nil
 	}
 	if p.state == sandboxdv1.ProcessState_PROCESS_STATE_RUNNING {
+		p.stopRequested = true
 		p.state = sandboxdv1.ProcessState_PROCESS_STATE_STOPPING
 		if err := interruptManagedProcess(p.cmd); err != nil {
 			_ = killManagedProcess(p.cmd) // interruption is unsupported on some hosts
@@ -206,7 +209,7 @@ func (s *ProcessServer) Stop(_ context.Context, req *sandboxdv1.StopProcessReque
 			time.AfterFunc(grace, func() {
 				s.mu.Lock()
 				defer s.mu.Unlock()
-				if s.processes[key] == p && p.state == sandboxdv1.ProcessState_PROCESS_STATE_STOPPING {
+				if s.processes[key] == p && p.stopRequested {
 					_ = killManagedProcess(p.cmd)
 				}
 			})
@@ -227,6 +230,7 @@ func (s *ProcessServer) Close() {
 	commands := make([]*exec.Cmd, 0, len(s.processes))
 	for _, p := range s.processes {
 		if p.state == sandboxdv1.ProcessState_PROCESS_STATE_RUNNING || p.state == sandboxdv1.ProcessState_PROCESS_STATE_STOPPING {
+			p.stopRequested = true
 			p.state = sandboxdv1.ProcessState_PROCESS_STATE_STOPPING
 			commands = append(commands, p.cmd)
 		}

@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	apiMeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -316,6 +317,34 @@ func TestConcurrentClaimHasOneWinner(t *testing.T) {
 	}
 }
 
+func TestExplicitClaimContentionFailsPermanently(t *testing.T) {
+	loser := &platformv1alpha1.Run{ObjectMeta: metav1.ObjectMeta{Name: "loser", Namespace: "ns", UID: "loser-uid"}, Spec: platformv1alpha1.RunSpec{EnvironmentRef: "shared", Agent: "test"}}
+	env := &platformv1alpha1.Environment{ObjectMeta: metav1.ObjectMeta{Name: "shared", Namespace: "ns", UID: "env-uid"}, Status: platformv1alpha1.EnvironmentStatus{
+		ClaimedBy: &platformv1alpha1.RunReference{Name: "winner", UID: "winner-uid"},
+	}}
+	r := reconciler(t, &scriptedAdapter{}, loser, env)
+	reconcileRun(t, r, loser.Name) // finalizer
+	failed := reconcileRun(t, r, loser.Name)
+	if failed.Status.State != platformv1alpha1.RunStateFailed || failed.Status.EnvironmentRef != nil {
+		t.Fatalf("contending Run status = %#v", failed.Status)
+	}
+	var released platformv1alpha1.Environment
+	if err := r.Get(context.Background(), client.ObjectKeyFromObject(env), &released); err != nil {
+		t.Fatal(err)
+	}
+	released.Status.ClaimedBy = nil
+	if err := r.Status().Update(context.Background(), &released); err != nil {
+		t.Fatal(err)
+	}
+	reconcileRun(t, r, loser.Name)
+	if err := r.Get(context.Background(), client.ObjectKeyFromObject(env), &released); err != nil {
+		t.Fatal(err)
+	}
+	if released.Status.ClaimedBy != nil {
+		t.Fatalf("failed loser later claimed released Environment: %#v", released.Status.ClaimedBy)
+	}
+}
+
 func TestCancelBeforeAllocationCreatesNothing(t *testing.T) {
 	run := &platformv1alpha1.Run{ObjectMeta: metav1.ObjectMeta{Name: "r", Namespace: "ns", UID: "uid"}, Spec: platformv1alpha1.RunSpec{TemplateRef: "small", Agent: "test", Cancel: true}}
 	r := reconciler(t, &scriptedAdapter{}, run)
@@ -446,6 +475,76 @@ func TestNonterminalAdapterObservationSchedulesPolling(t *testing.T) {
 	}
 	if result.RequeueAfter != adapterPollInterval {
 		t.Fatalf("RequeueAfter = %s, want %s", result.RequeueAfter, adapterPollInterval)
+	}
+}
+
+func TestEnvironmentReadyConditionIsIndependentFromTaskOutcome(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		runState     platformv1alpha1.RunState
+		envPhase     platformv1alpha1.EnvironmentPhase
+		adapter      AdapterLifecycle
+		cancel       bool
+		accepted     bool
+		wantReady    metav1.ConditionStatus
+		wantRunState platformv1alpha1.RunState
+	}{
+		{
+			name: "adapter failure leaves ready Environment", runState: platformv1alpha1.RunStateAdapterAccepted,
+			envPhase: platformv1alpha1.EnvironmentPhaseReady, adapter: &scriptedAdapter{observations: []AdapterObservation{AdapterObservationFailed}},
+			accepted: true, wantReady: metav1.ConditionTrue, wantRunState: platformv1alpha1.RunStateFailed,
+		},
+		{
+			name: "unavailable adapter leaves ready Environment", runState: platformv1alpha1.RunStateEnvironmentReady,
+			envPhase: platformv1alpha1.EnvironmentPhaseReady, wantReady: metav1.ConditionTrue, wantRunState: platformv1alpha1.RunStateFailed,
+		},
+		{
+			name: "Environment failure clears readiness", runState: platformv1alpha1.RunStateAdapterAccepted,
+			envPhase: platformv1alpha1.EnvironmentPhaseFailed, adapter: &scriptedAdapter{}, accepted: true, wantReady: metav1.ConditionFalse, wantRunState: platformv1alpha1.RunStateFailed,
+		},
+		{
+			name: "cancellation leaves reachable Environment ready", runState: platformv1alpha1.RunStateAdapterAccepted,
+			envPhase: platformv1alpha1.EnvironmentPhaseReady, adapter: &scriptedAdapter{}, cancel: true, accepted: true,
+			wantReady: metav1.ConditionTrue, wantRunState: platformv1alpha1.RunStateCancelled,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			run := &platformv1alpha1.Run{ObjectMeta: metav1.ObjectMeta{Name: "r", Namespace: "ns", UID: "run-uid", Finalizers: []string{runFinalizer}}, Spec: platformv1alpha1.RunSpec{Agent: "test", Cancel: tc.cancel}, Status: platformv1alpha1.RunStatus{
+				State:          tc.runState,
+				EnvironmentRef: &platformv1alpha1.RunEnvironmentReference{Name: "shared", UID: "env-uid", Ownership: platformv1alpha1.EnvironmentOwnershipClaimed},
+				Conditions:     []metav1.Condition{{Type: runConditionEnvironmentReady, Status: metav1.ConditionTrue}},
+			}}
+			if tc.accepted {
+				run.Status.Conditions = append(run.Status.Conditions, metav1.Condition{Type: runConditionAdapterAccepted, Status: metav1.ConditionTrue})
+			}
+			env := &platformv1alpha1.Environment{ObjectMeta: metav1.ObjectMeta{Name: "shared", Namespace: "ns", UID: "env-uid"}, Status: platformv1alpha1.EnvironmentStatus{
+				Phase: tc.envPhase, ClaimedBy: &platformv1alpha1.RunReference{Name: run.Name, UID: run.UID},
+			}}
+			if tc.envPhase == platformv1alpha1.EnvironmentPhaseReady {
+				env.Status.PodName = "env-shared"
+				env.Status.Endpoints.Sandboxd = "10.0.0.1:50051"
+			}
+			r := reconciler(t, tc.adapter, run, env)
+			if tc.adapter == nil {
+				r.Adapters = map[string]AdapterLifecycle{}
+			}
+			got := reconcileRun(t, r, run.Name)
+			condition := apiMeta.FindStatusCondition(got.Status.Conditions, runConditionEnvironmentReady)
+			if got.Status.State != tc.wantRunState || condition == nil || condition.Status != tc.wantReady {
+				t.Fatalf("Run status = %#v, EnvironmentReady = %#v", got.Status, condition)
+			}
+			if tc.wantReady == metav1.ConditionTrue {
+				cleaned := reconcileRun(t, r, run.Name)
+				condition = apiMeta.FindStatusCondition(cleaned.Status.Conditions, runConditionEnvironmentReady)
+				if condition == nil || condition.Status != metav1.ConditionFalse {
+					t.Fatalf("EnvironmentReady after terminal claim release = %#v", condition)
+				}
+				var released platformv1alpha1.Environment
+				if err := r.Get(context.Background(), client.ObjectKeyFromObject(env), &released); err != nil || released.Status.ClaimedBy != nil {
+					t.Fatalf("terminal claimed Environment = %#v, error = %v", released, err)
+				}
+			}
+		})
 	}
 }
 

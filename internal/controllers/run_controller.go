@@ -28,6 +28,7 @@ const runFinalizer = "swe.dev/run-cleanup"
 const adapterPollInterval = 2 * time.Second
 
 var errAllocatedEnvironmentGone = errors.New("allocated environment is gone or no longer claimed by this run")
+var errExplicitEnvironmentClaimed = errors.New("explicit environment is already claimed")
 
 const (
 	runConditionEnvironmentReady           = "EnvironmentReady"
@@ -105,7 +106,7 @@ func (r *RunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.R
 			return ctrl.Result{}, err
 		}
 		if ref == nil {
-			return ctrl.Result{}, r.setRunState(ctx, &run, platformv1alpha1.RunStateCancelled, "Cancelled", "cancelled before allocation")
+			return ctrl.Result{}, r.setRunState(ctx, &run, platformv1alpha1.RunStateCancelled, "Cancelled", "cancelled before allocation", false)
 		}
 		if ref.Ownership == platformv1alpha1.EnvironmentOwnershipClaimed {
 			var recovered platformv1alpha1.Environment
@@ -116,11 +117,11 @@ func (r *RunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.R
 				if err := r.releaseClaim(ctx, &run, &recovered); err != nil {
 					return ctrl.Result{}, err
 				}
-				return ctrl.Result{}, r.setRunState(ctx, &run, platformv1alpha1.RunStateCancelled, "Cancelled", "cancelled before warm environment promotion")
+				return ctrl.Result{}, r.setRunState(ctx, &run, platformv1alpha1.RunStateCancelled, "Cancelled", "cancelled before warm environment promotion", false)
 			}
 		}
 		run.Status.EnvironmentRef = ref
-		return ctrl.Result{Requeue: true}, r.setRunState(ctx, &run, platformv1alpha1.RunStateAllocating, "EnvironmentRecovered", fmt.Sprintf("recovered environment %s before cancellation", ref.Name))
+		return ctrl.Result{Requeue: true}, r.setRunState(ctx, &run, platformv1alpha1.RunStateAllocating, "EnvironmentRecovered", fmt.Sprintf("recovered environment %s before cancellation", ref.Name), false)
 	}
 	if !controllerutil.ContainsFinalizer(&run, runFinalizer) {
 		controllerutil.AddFinalizer(&run, runFinalizer)
@@ -146,16 +147,19 @@ func (r *RunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.R
 			}
 		}
 		if err != nil {
+			if errors.Is(err, errExplicitEnvironmentClaimed) {
+				return ctrl.Result{}, r.setRunState(ctx, &run, platformv1alpha1.RunStateFailed, "EnvironmentUnavailable", err.Error(), false)
+			}
 			return ctrl.Result{}, err
 		}
 		run.Status.EnvironmentRef = ref
-		return ctrl.Result{Requeue: true}, r.setRunState(ctx, &run, platformv1alpha1.RunStateAllocating, "EnvironmentAllocated", fmt.Sprintf("environment %s allocated", ref.Name))
+		return ctrl.Result{Requeue: true}, r.setRunState(ctx, &run, platformv1alpha1.RunStateAllocating, "EnvironmentAllocated", fmt.Sprintf("environment %s allocated", ref.Name), false)
 	}
 
 	env, err := r.getAllocatedEnvironment(ctx, &run)
 	if err != nil {
 		if apierrors.IsNotFound(err) || errors.Is(err, errAllocatedEnvironmentGone) {
-			return ctrl.Result{}, r.setRunState(ctx, &run, platformv1alpha1.RunStateFailed, "EnvironmentLost", err.Error())
+			return ctrl.Result{}, r.setRunState(ctx, &run, platformv1alpha1.RunStateFailed, "EnvironmentLost", err.Error(), false)
 		}
 		return ctrl.Result{}, err
 	}
@@ -169,29 +173,29 @@ func (r *RunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.R
 				return ctrl.Result{}, err
 			}
 		}
-		return ctrl.Result{}, r.setRunState(ctx, &run, platformv1alpha1.RunStateCancelled, "Cancelled", "cancellation completed")
+		return ctrl.Result{}, r.setRunState(ctx, &run, platformv1alpha1.RunStateCancelled, "Cancelled", "cancellation completed", environmentReachable(env))
 	}
 
 	switch env.Status.Phase {
 	case platformv1alpha1.EnvironmentPhasePaused, platformv1alpha1.EnvironmentPhaseResuming:
-		return ctrl.Result{}, r.setRunState(ctx, &run, platformv1alpha1.RunStatePaused, "EnvironmentPaused", "managed processes stop; workspace and transcript are retained")
+		return ctrl.Result{}, r.setRunState(ctx, &run, platformv1alpha1.RunStatePaused, "EnvironmentPaused", "managed processes stop; workspace and transcript are retained", false)
 	case platformv1alpha1.EnvironmentPhaseFailed, platformv1alpha1.EnvironmentPhaseTerminated:
-		return ctrl.Result{}, r.setRunState(ctx, &run, platformv1alpha1.RunStateFailed, "EnvironmentFailed", fmt.Sprintf("environment phase is %s", env.Status.Phase))
+		return ctrl.Result{}, r.setRunState(ctx, &run, platformv1alpha1.RunStateFailed, "EnvironmentFailed", fmt.Sprintf("environment phase is %s", env.Status.Phase), false)
 	case platformv1alpha1.EnvironmentPhaseReady, platformv1alpha1.EnvironmentPhaseRunning:
 		// Continue below.
 	default:
-		return ctrl.Result{}, r.setRunState(ctx, &run, platformv1alpha1.RunStateAllocating, "EnvironmentNotReady", fmt.Sprintf("environment phase is %s", env.Status.Phase))
+		return ctrl.Result{}, r.setRunState(ctx, &run, platformv1alpha1.RunStateAllocating, "EnvironmentNotReady", fmt.Sprintf("environment phase is %s", env.Status.Phase), false)
 	}
 	if !environmentReachable(env) {
-		return ctrl.Result{RequeueAfter: adapterPollInterval}, r.setRunState(ctx, &run, platformv1alpha1.RunStateAllocating, "EnvironmentNotReachable", "sandboxd endpoint is not currently reachable")
+		return ctrl.Result{RequeueAfter: adapterPollInterval}, r.setRunState(ctx, &run, platformv1alpha1.RunStateAllocating, "EnvironmentNotReachable", "sandboxd endpoint is not currently reachable", false)
 	}
 
 	if run.Status.State == platformv1alpha1.RunStateAllocating || run.Status.State == platformv1alpha1.RunStatePaused || run.Status.State == "" {
-		return ctrl.Result{Requeue: true}, r.setRunState(ctx, &run, platformv1alpha1.RunStateEnvironmentReady, "EnvironmentReady", "sandboxd is ready")
+		return ctrl.Result{Requeue: true}, r.setRunState(ctx, &run, platformv1alpha1.RunStateEnvironmentReady, "EnvironmentReady", "sandboxd is ready", true)
 	}
 	adapter := r.Adapters[run.Spec.Agent]
 	if adapter == nil {
-		return ctrl.Result{}, r.setRunState(ctx, &run, platformv1alpha1.RunStateFailed, "AdapterUnavailable", fmt.Sprintf("adapter %q is not registered", run.Spec.Agent))
+		return ctrl.Result{}, r.setRunState(ctx, &run, platformv1alpha1.RunStateFailed, "AdapterUnavailable", fmt.Sprintf("adapter %q is not registered", run.Spec.Agent), true)
 	}
 	if run.Status.State == platformv1alpha1.RunStateEnvironmentReady {
 		if !acceptanceAttempted(&run) {
@@ -200,7 +204,7 @@ func (r *RunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.R
 		if err := adapter.EnsureAccepted(ctx, adapterTask(&run), r.adapterSandbox(&run, env)); err != nil {
 			return ctrl.Result{}, err
 		}
-		return ctrl.Result{Requeue: true}, r.setRunState(ctx, &run, platformv1alpha1.RunStateAdapterAccepted, "AdapterAccepted", "adapter accepted the task")
+		return ctrl.Result{Requeue: true}, r.setRunState(ctx, &run, platformv1alpha1.RunStateAdapterAccepted, "AdapterAccepted", "adapter accepted the task", true)
 	}
 
 	observation, message, err := adapter.Observe(ctx, adapterTask(&run), r.adapterSandbox(&run, env))
@@ -224,7 +228,7 @@ func (r *RunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.R
 	default:
 		return ctrl.Result{}, fmt.Errorf("adapter %q returned unknown observation %q", run.Spec.Agent, observation)
 	}
-	err = r.setRunState(ctx, &run, state, string(observation), message)
+	err = r.setRunState(ctx, &run, state, string(observation), message, true)
 	if err != nil || terminalRunState(state) {
 		return ctrl.Result{}, err
 	}
@@ -243,7 +247,7 @@ func (r *RunReconciler) allocateEnvironment(ctx context.Context, run *platformv1
 		}
 		claim := &platformv1alpha1.RunReference{Name: run.Name, UID: run.UID}
 		if env.Status.ClaimedBy != nil && (env.Status.ClaimedBy.Name != claim.Name || env.Status.ClaimedBy.UID != claim.UID) {
-			return nil, fmt.Errorf("environment %q is claimed by run %s", env.Name, env.Status.ClaimedBy.Name)
+			return nil, fmt.Errorf("%w: environment %q is claimed by run %s", errExplicitEnvironmentClaimed, env.Name, env.Status.ClaimedBy.Name)
 		}
 		if env.Status.ClaimedBy == nil {
 			env.Status.ClaimedBy = claim
@@ -518,14 +522,19 @@ func (r *RunReconciler) requestEnvironmentFence(ctx context.Context, env *platfo
 
 func (r *RunReconciler) cleanupTerminal(ctx context.Context, run *platformv1alpha1.Run) (ctrl.Result, error) {
 	if run.Status.EnvironmentRef == nil {
-		return ctrl.Result{}, nil
+		return ctrl.Result{}, r.setEnvironmentReadyCondition(ctx, run, false, "EnvironmentReleased", "Run has no allocated environment")
 	}
 	env, err := r.getAllocatedEnvironment(ctx, run)
 	if apierrors.IsNotFound(err) || errors.Is(err, errAllocatedEnvironmentGone) {
-		return ctrl.Result{}, nil
+		return ctrl.Result{}, r.setEnvironmentReadyCondition(ctx, run, false, "EnvironmentLost", err.Error())
 	}
 	if err != nil {
 		return ctrl.Result{}, err
+	}
+	if !environmentReachable(env) {
+		if err := r.setEnvironmentReadyCondition(ctx, run, false, "EnvironmentNotReady", "allocated environment is not reachable"); err != nil {
+			return ctrl.Result{}, err
+		}
 	}
 	if runMayHaveAccepted(run) && !environmentFenced(env) {
 		adapter := r.Adapters[run.Spec.Agent]
@@ -541,9 +550,15 @@ func (r *RunReconciler) cleanupTerminal(ctx context.Context, run *platformv1alph
 			env.Spec.Paused = true
 			return ctrl.Result{}, r.Update(ctx, env)
 		}
+		if environmentFenced(env) {
+			return ctrl.Result{}, r.setEnvironmentReadyCondition(ctx, run, false, "EnvironmentFenced", "owned environment is paused and fenced")
+		}
 		return ctrl.Result{}, nil
 	}
-	return ctrl.Result{}, r.releaseClaim(ctx, run, env)
+	if err := r.releaseClaim(ctx, run, env); err != nil {
+		return ctrl.Result{}, err
+	}
+	return ctrl.Result{}, r.setEnvironmentReadyCondition(ctx, run, false, "EnvironmentReleased", "claimed environment was released")
 }
 
 func (r *RunReconciler) finalize(ctx context.Context, run *platformv1alpha1.Run) (ctrl.Result, error) {
@@ -603,17 +618,31 @@ func (r *RunReconciler) releaseClaim(ctx context.Context, run *platformv1alpha1.
 	return r.Status().Update(ctx, env)
 }
 
-func (r *RunReconciler) setRunState(ctx context.Context, run *platformv1alpha1.Run, state platformv1alpha1.RunState, reason, message string) error {
+func (r *RunReconciler) setRunState(ctx context.Context, run *platformv1alpha1.Run, state platformv1alpha1.RunState, reason, message string, environmentReady bool) error {
 	before := run.Status.DeepCopy()
 	run.Status.State = state
 	run.Status.ObservedGeneration = run.Generation
-	environmentReady := state == platformv1alpha1.RunStateEnvironmentReady || state == platformv1alpha1.RunStateAdapterAccepted || state == platformv1alpha1.RunStateRunning || state == platformv1alpha1.RunStateNeedsInput || state == platformv1alpha1.RunStateSucceeded
+	environmentReason, environmentMessage := reason, message
+	if environmentReady {
+		environmentReason, environmentMessage = "EnvironmentReady", "sandboxd is ready"
+	}
 	apiMeta.SetStatusCondition(&run.Status.Conditions, metav1.Condition{
-		Type: runConditionEnvironmentReady, Status: boolConditionStatus(environmentReady), Reason: reason, Message: message, ObservedGeneration: run.Generation,
+		Type: runConditionEnvironmentReady, Status: boolConditionStatus(environmentReady), Reason: environmentReason, Message: environmentMessage, ObservedGeneration: run.Generation,
 	})
 	adapterAccepted := runAccepted(run) || state == platformv1alpha1.RunStateAdapterAccepted || state == platformv1alpha1.RunStateRunning || state == platformv1alpha1.RunStateNeedsInput || state == platformv1alpha1.RunStateSucceeded || (state == platformv1alpha1.RunStateFailed && reason == string(AdapterObservationFailed))
 	apiMeta.SetStatusCondition(&run.Status.Conditions, metav1.Condition{
 		Type: runConditionAdapterAccepted, Status: boolConditionStatus(adapterAccepted), Reason: reason, Message: message, ObservedGeneration: run.Generation,
+	})
+	if reflect.DeepEqual(*before, run.Status) {
+		return nil
+	}
+	return r.Status().Update(ctx, run)
+}
+
+func (r *RunReconciler) setEnvironmentReadyCondition(ctx context.Context, run *platformv1alpha1.Run, ready bool, reason, message string) error {
+	before := run.Status.DeepCopy()
+	apiMeta.SetStatusCondition(&run.Status.Conditions, metav1.Condition{
+		Type: runConditionEnvironmentReady, Status: boolConditionStatus(ready), Reason: reason, Message: message, ObservedGeneration: run.Generation,
 	})
 	if reflect.DeepEqual(*before, run.Status) {
 		return nil

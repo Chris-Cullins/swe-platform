@@ -92,8 +92,11 @@ Run states are observable milestones: `Allocating`, `EnvironmentReady`,
 `AdapterAccepted`, `Running`, `NeedsInput`, `Paused`, and terminal `Succeeded`, `Failed`,
 or `Cancelled`. Conditions additionally report environment readiness, a durable adapter
 acceptance-attempt marker written before the acceptance RPC, and confirmed adapter acceptance.
-The attempt marker makes cancellation conservative after an uncertain response. An unavailable
-adapter fails explicitly rather than pretending work started.
+The EnvironmentReady condition tracks the allocation independently from terminal task outcome;
+it remains true for an adapter failure while sandboxd is reachable and becomes false after the
+allocation is released, lost, paused, or fenced. The attempt marker makes cancellation
+conservative after an uncertain response. An unavailable adapter fails explicitly rather than
+pretending work started.
 
 Environment ownership and cleanup are explicit:
 
@@ -101,6 +104,9 @@ Environment ownership and cleanup are explicit:
 |---|---|---|---|
 | Controller-created (`Owned`) | Environment has a Run controller owner reference | Stop Run-scoped work and pause the Environment; retain workspace and transcript for review | Finalizer stops work, then Kubernetes garbage-collects the Environment, pod, and PVC |
 | Existing (`Claimed`) | `Environment.status.claimedBy` stores Run name + UID; optimistic concurrency permits one claimant | Stop Run-scoped work, clear only the matching UID claim, and leave the Environment active and reusable | Finalizer stops work and releases only the matching claim; it never deletes the Environment |
+
+An explicit `--environment` request fails terminally if another Run already holds the claim; it
+does not wait and unexpectedly start later after that claim is released.
 
 Pause is not process checkpointing. Pausing fences the current execution domain and stops
 **every** agent and declared-service process by removing the environment pod (or the
