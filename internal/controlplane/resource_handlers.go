@@ -87,13 +87,13 @@ func (s *Server) createRun(w http.ResponseWriter, r *http.Request, namespace str
 		writeProblem(w, http.StatusConflict, "run-name-unavailable", "Run name unavailable", "the requested Run name cannot be reused")
 		return
 	}
-	existing, getErr := s.resources.GetRun(r.Context(), namespace, request.Name)
+	existing, getErr := s.resources.ResolveRunCreateCollision(r.Context(), namespace, request)
 	if getErr != nil {
+		if errors.Is(getErr, errRunIntentConflict) {
+			writeProblem(w, http.StatusConflict, "run-intent-conflict", "Run intent conflict", "the Run name already exists with different immutable intent")
+			return
+		}
 		s.writeResourceError(w, "resolve Run create collision", namespace, request.Name, getErr)
-		return
-	}
-	if existing.Intent != createRunIntent(request) {
-		writeProblem(w, http.StatusConflict, "run-intent-conflict", "Run intent conflict", "the Run name already exists with different immutable intent")
 		return
 	}
 	writeJSON(w, http.StatusOK, existing)
@@ -244,10 +244,6 @@ func requireEmptyBody(r *http.Request) error {
 		return fmt.Errorf("request body must be empty")
 	}
 	return nil
-}
-
-func createRunIntent(request CreateRunRequest) RunIntent {
-	return RunIntent{Selector: request.Selector, Agent: request.Agent, Prompt: request.Prompt}
 }
 
 func (s *Server) writeResourceError(w http.ResponseWriter, operation, namespace, name string, err error) {

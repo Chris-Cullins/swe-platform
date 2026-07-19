@@ -17,7 +17,9 @@ architectural. If it's missing, ask the maintainer instead of guessing at design
 P0 scaffold is in place: CRD types, environment controller, `sandboxd` (exec/fs/ports/
 health and a shared tmux terminal), CLI (`run`/`logs`/`attach`), kind acceptance, CI,
 and a Helm chart for the operator, control plane, and CRDs. The control plane currently
-provides in-memory transcript ingestion and SSE streaming.
+provides bounded in-memory transcript ingestion and SSE streaming, opaque process-local
+browser sessions backed by repeated Kubernetes TokenReview/SAR authorization, and typed
+Run/Environment resource APIs for the console.
 Remaining gaps are marked `TODO(P0/P1/P2)` in code — most notably secure agent credential
 injection, additional agent adapters, GitHub App–scoped git tokens, and egress/portal
 networking. The first `claude-code` adapter is registered and uses sandboxd managed
@@ -107,8 +109,10 @@ runs both via `make` targets:
   the chart README. Image publish runs attach a release manifest with the chart version
   and all three image digests.
 - **E2E acceptance:** `./hack/e2e.sh` — full kind + operator + `swe run` pass with the
-  env-base image built and loaded locally (no registry credentials needed). Runs in CI
-  as the `e2e` workflow on relevant PRs and via `workflow_dispatch`.
+  env-base image built and loaded locally (no registry credentials needed). It also verifies
+  control-plane TokenReview/SAR scoping, opaque browser session exchange/logout and CSRF,
+  typed Run list/get/create/retry/cancel, Environment get, transcript SSE, and terminal attach.
+  Runs in CI as the `e2e` workflow on relevant PRs and via `workflow_dispatch`.
 - **Images:** `make docker-build` (operator + env-base). The env-base image builds
   its pinned tmux with `images/env-base/tmux-control-output-drain.patch`; keep the
   source checksum and patch synchronized when upgrading tmux. Its `terminal-test`

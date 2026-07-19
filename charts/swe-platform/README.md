@@ -82,10 +82,16 @@ adapter-owned JSON.
 
 Service clients send `Authorization: Bearer <token>`. A browser exchanges an explicit,
 non-bootstrap bearer credential with `POST /api/v1/session`. After a successful TokenReview,
-the control plane places that same short-lived Kubernetes credential in an `HttpOnly`,
-`Secure`, `SameSite=Strict`, `Path=/` cookie named `swe-platform-session`; it does not issue
-or retain a platform refresh token. `GET /api/v1/session` TokenReviews the current cookie and
-`DELETE /api/v1/session` expires it. Production session exchange requires HTTPS. Only the
+the control plane stores that credential in a bounded process-local session and places only a
+random 256-bit opaque identifier in an `HttpOnly`, `Secure`, `SameSite=Strict`, `Path=/`
+cookie named `swe-platform-session`; it does not issue a platform token or refresh token.
+Every cookie-authenticated request resolves the server-side credential and repeats TokenReview
+before SAR, so upstream expiry and revocation still apply. Sessions have a one-hour absolute
+lifetime, credentials are limited to 16 KiB, and one process accepts at most 10,000 active
+sessions. Logout, absolute expiry, or a failed TokenReview deletes the server-side entry.
+Because sessions are process-local, a control-plane restart logs browsers out; the chart's
+single-replica requirement prevents session routing ambiguity. `GET /api/v1/session` validates
+the current session and `DELETE /api/v1/session` revokes it. Production session exchange requires HTTPS. Only the
 kind and Argo development presets set `controlPlane.auth.allowInsecureSessions=true`, which
 allows HTTP and omits the cookie's `Secure` flag.
 

@@ -11,12 +11,14 @@ import (
 type fakeSessions struct {
 	create  func(*http.Request) (Session, string, error)
 	current func(*http.Request) (Session, error)
+	deleted bool
 }
 
 func (f *fakeSessions) CreateSession(r *http.Request) (Session, string, error) {
 	return f.create(r)
 }
 func (f *fakeSessions) CurrentSession(r *http.Request) (Session, error) { return f.current(r) }
+func (f *fakeSessions) DeleteSession(*http.Request)                     { f.deleted = true }
 
 func TestSessionCreateSecurityAndExplicitBearer(t *testing.T) {
 	for _, tc := range []struct {

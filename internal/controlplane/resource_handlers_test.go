@@ -27,22 +27,28 @@ func (a *recordingAccess) Authorize(_ *http.Request, x ResourceAccess, _ bool) e
 }
 
 type fakeResources struct {
-	calls               []string
-	createErr, errorGet error
-	created, existing   Run
-	cancel              Run
-	listLimit           int64
-	listContinue        string
+	calls                             []string
+	createErr, errorGet, collisionErr error
+	created, existing                 Run
+	cancel                            Run
+	listPage                          RunList
+	environment                       Environment
+	listLimit                         int64
+	listContinue                      string
 }
 
 func (f *fakeResources) ListRuns(_ context.Context, n string, l int64, c string) (RunList, error) {
 	f.calls = append(f.calls, "list")
 	f.listLimit, f.listContinue = l, c
-	return RunList{}, nil
+	return f.listPage, nil
 }
 func (f *fakeResources) CreateRun(_ context.Context, n string, r CreateRunRequest) (Run, error) {
 	f.calls = append(f.calls, "create")
 	return f.created, f.createErr
+}
+func (f *fakeResources) ResolveRunCreateCollision(_ context.Context, n string, r CreateRunRequest) (Run, error) {
+	f.calls = append(f.calls, "get")
+	return f.existing, f.collisionErr
 }
 func (f *fakeResources) GetRun(_ context.Context, n, x string) (Run, error) {
 	f.calls = append(f.calls, "get")
@@ -54,7 +60,10 @@ func (f *fakeResources) CancelRun(_ context.Context, n, x string) (Run, error) {
 }
 func (f *fakeResources) GetEnvironment(_ context.Context, n, x string) (Environment, error) {
 	f.calls = append(f.calls, "environment")
-	return Environment{Name: x}, nil
+	if f.environment.Name == "" {
+		return Environment{Name: x}, nil
+	}
+	return f.environment, nil
 }
 
 func resourceRequest(s *Server, method, path, body, origin string) *httptest.ResponseRecorder {
@@ -152,15 +161,16 @@ func TestCreateCollisionAuthorizationAndIntent(t *testing.T) {
 	body := `{"name":"r","selector":{"template":"small"},"agent":"amp","prompt":"go"}`
 	exists := apierrors.NewAlreadyExists(schema.GroupResource{Group: "swe.dev", Resource: "runs"}, "r")
 	for _, tc := range []struct {
-		name     string
-		deny     bool
-		existing Run
-		want     int
-		calls    string
-	}{{"same intent", false, Run{Name: "r", Intent: createRunIntent(req)}, 200, "create,get"}, {"different intent", false, Run{Name: "r", Intent: RunIntent{Agent: "other"}}, 409, "create,get"}, {"denied collision", true, Run{}, 409, "create"}} {
+		name         string
+		deny         bool
+		existing     Run
+		want         int
+		calls        string
+		collisionErr error
+	}{{"same intent", false, Run{Name: "r", Intent: RunIntent{Selector: req.Selector, Agent: req.Agent, Prompt: req.Prompt}}, 200, "create,get", nil}, {"different intent", false, Run{}, 409, "create,get", errRunIntentConflict}, {"denied collision", true, Run{}, 409, "create", nil}} {
 		t.Run(tc.name, func(t *testing.T) {
 			a := &recordingAccess{denyGet: tc.deny}
-			f := &fakeResources{createErr: exists, existing: tc.existing}
+			f := &fakeResources{createErr: exists, existing: tc.existing, collisionErr: tc.collisionErr}
 			w := resourceRequest(NewServer(nil, ServerOptions{Access: a, Resources: f}), "POST", "/api/v1/namespaces/ns/runs", body, "")
 			if w.Code != tc.want || strings.Join(f.calls, ",") != tc.calls {
 				t.Fatalf("status=%d calls=%v", w.Code, f.calls)

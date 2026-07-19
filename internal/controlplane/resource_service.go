@@ -2,6 +2,8 @@ package controlplane
 
 import (
 	"context"
+	"errors"
+	"reflect"
 
 	platformv1alpha1 "github.com/Chris-Cullins/swe-platform/api/v1alpha1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -10,11 +12,14 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
+var errRunIntentConflict = errors.New("run already exists with different immutable intent")
+
 // ResourceService is the Kubernetes-independent resource API used by HTTP
 // handlers. Its representations deliberately contain only the frozen API DTOs.
 type ResourceService interface {
 	ListRuns(ctx context.Context, namespace string, limit int64, continueToken string) (RunList, error)
 	CreateRun(ctx context.Context, namespace string, request CreateRunRequest) (Run, error)
+	ResolveRunCreateCollision(ctx context.Context, namespace string, request CreateRunRequest) (Run, error)
 	GetRun(ctx context.Context, namespace, name string) (Run, error)
 	CancelRun(ctx context.Context, namespace, name string) (Run, error)
 	GetEnvironment(ctx context.Context, namespace, name string) (Environment, error)
@@ -49,13 +54,7 @@ func (s *KubernetesResourceService) CreateRun(ctx context.Context, namespace str
 			Namespace: namespace,
 			Name:      request.Name,
 		},
-		Spec: platformv1alpha1.RunSpec{
-			EnvironmentRef: request.Selector.Environment,
-			ProjectRef:     request.Selector.Project,
-			TemplateRef:    request.Selector.Template,
-			Agent:          request.Agent,
-			Prompt:         request.Prompt,
-		},
+		Spec: desiredRunSpec(request),
 	}
 	if err := s.Client.Create(ctx, run); err != nil {
 		// In particular, do not resolve AlreadyExists here: doing so would read an
@@ -65,12 +64,40 @@ func (s *KubernetesResourceService) CreateRun(ctx context.Context, namespace str
 	return runDTO(run), nil
 }
 
+func (s *KubernetesResourceService) ResolveRunCreateCollision(ctx context.Context, namespace string, request CreateRunRequest) (Run, error) {
+	var run platformv1alpha1.Run
+	if err := s.Client.Get(ctx, types.NamespacedName{Namespace: namespace, Name: request.Name}, &run); err != nil {
+		return Run{}, err
+	}
+	existing := run.Spec
+	existing.Cancel = false
+	if len(existing.Notify) == 0 {
+		existing.Notify = nil
+	}
+	if !reflect.DeepEqual(existing, desiredRunSpec(request)) {
+		return Run{}, errRunIntentConflict
+	}
+	return runDTO(&run), nil
+}
+
 func (s *KubernetesResourceService) GetRun(ctx context.Context, namespace, name string) (Run, error) {
 	var run platformv1alpha1.Run
 	if err := s.Client.Get(ctx, types.NamespacedName{Namespace: namespace, Name: name}, &run); err != nil {
 		return Run{}, err
 	}
 	return runDTO(&run), nil
+}
+
+func desiredRunSpec(request CreateRunRequest) platformv1alpha1.RunSpec {
+	return platformv1alpha1.RunSpec{
+		EnvironmentRef: request.Selector.Environment,
+		ProjectRef:     request.Selector.Project,
+		TemplateRef:    request.Selector.Template,
+		Agent:          request.Agent,
+		Prompt:         request.Prompt,
+		Notify:         nil,
+		ParentRef:      "",
+	}
 }
 
 func (s *KubernetesResourceService) CancelRun(ctx context.Context, namespace, name string) (Run, error) {

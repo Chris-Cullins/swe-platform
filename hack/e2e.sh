@@ -311,6 +311,10 @@ if [[ "$SESSION_STATUS" != "200" ]] || ! grep -q '"authenticated":true' /tmp/swe
 	echo "FAIL: session exchange returned ${SESSION_STATUS}: $(cat /tmp/swe-platform-session.json)"
 	exit 1
 fi
+if grep -Fq "$CONSOLE_TOKEN" "$COOKIE_JAR"; then
+	echo "FAIL: session cookie contains the Kubernetes bearer token"
+	exit 1
+fi
 SESSION_GET_STATUS=$(curl --silent --output /dev/null --write-out '%{http_code}' \
 	--cookie "$COOKIE_JAR" http://127.0.0.1:18080/api/v1/session)
 RUN_LIST_STATUS=$(curl --silent --output /tmp/swe-platform-runs.json --write-out '%{http_code}' \
@@ -342,6 +346,12 @@ SESSION_DELETE_STATUS=$(curl --silent --output /dev/null --write-out '%{http_cod
 	http://127.0.0.1:18080/api/v1/session)
 if [[ "$SESSION_DELETE_STATUS" != "204" ]]; then
 	echo "FAIL: session delete status was ${SESSION_DELETE_STATUS}, expected 204"
+	exit 1
+fi
+LOGOUT_REPLAY_STATUS=$(curl --silent --output /dev/null --write-out '%{http_code}' \
+	--cookie "$COOKIE_JAR" http://127.0.0.1:18080/api/v1/session)
+if [[ "$LOGOUT_REPLAY_STATUS" != "401" ]]; then
+	echo "FAIL: logged-out session replay status was ${LOGOUT_REPLAY_STATUS}, expected 401"
 	exit 1
 fi
 

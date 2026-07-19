@@ -57,10 +57,12 @@ func main() {
 		log.Error("SWE_BOOTSTRAP_TOKEN must contain at least 32 characters")
 		os.Exit(1)
 	}
+	sessions := controlplane.NewMemorySessionStore(controlplane.MemorySessionStoreOptions{})
 	access := controlplane.KubernetesAccessController{
 		Client:         clientset,
 		BootstrapToken: bootstrapToken,
 		Audience:       os.Getenv("SWE_TOKEN_AUDIENCE"),
+		Sessions:       sessions,
 	}
 	resources := &controlplane.KubernetesResourceService{Client: kubeClient}
 	transcripts := controlplane.NewMemoryTranscriptStore(controlplane.DefaultMemoryTranscriptStoreOptions())

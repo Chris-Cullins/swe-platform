@@ -1,16 +1,1 @@
-{
-  "name": "run-fix-flaky-42",
-  "uid": "676d16c3-e625-4c36-a97c-e93065d05121",
-  "createdAt": "2026-07-19T18:04:14Z",
-  "project": "org-repo",
-  "template": "small",
-  "backend": "pod",
-  "paused": false,
-  "phase": "Running",
-  "ready": true,
-  "claim": {
-    "runName": "fix-flaky-42",
-    "runUID": "eb7e3ff7-8117-4caf-912d-167b70eaee21"
-  },
-  "lastActiveAt": "2026-07-19T18:14:13Z"
-}
+{"name":"run-fix-flaky-42","uid":"676d16c3-e625-4c36-a97c-e93065d05121","createdAt":"2026-07-19T18:04:14Z","project":"org-repo","template":"small","backend":"pod","paused":false,"phase":"Running","ready":true,"claim":{"runName":"fix-flaky-42","runUID":"eb7e3ff7-8117-4caf-912d-167b70eaee21"},"lastActiveAt":"2026-07-19T18:14:13Z"}

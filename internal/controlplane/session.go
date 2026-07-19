@@ -35,14 +35,14 @@ func (s *Server) createSession(w http.ResponseWriter, r *http.Request) {
 		writeProblem(w, http.StatusBadRequest, "https-required", "HTTPS required", "browser sessions may only be created over HTTPS")
 		return
 	}
-	session, token, err := s.sessions.CreateSession(r)
+	session, sessionID, err := s.sessions.CreateSession(r)
 	if err != nil {
 		writeRESTAccessError(w, err)
 		return
 	}
 	http.SetCookie(w, &http.Cookie{
 		Name:     sessionCookieName,
-		Value:    token,
+		Value:    sessionID,
 		Path:     "/",
 		HttpOnly: true,
 		Secure:   !s.allowInsecureSessions,
@@ -65,6 +65,7 @@ func (s *Server) deleteSession(w http.ResponseWriter, r *http.Request) {
 		writeProblem(w, http.StatusForbidden, "invalid-origin", "Invalid origin", "cookie-authenticated mutations require an exact same-origin Origin header")
 		return
 	}
+	s.sessions.DeleteSession(r)
 	http.SetCookie(w, &http.Cookie{
 		Name:     sessionCookieName,
 		Value:    "",

@@ -84,6 +84,33 @@ func TestResourceServiceCreateRunIntentOnlyAndAlreadyExistsDoesNotGet(t *testing
 	}
 }
 
+func TestResourceServiceCreateCollisionComparesFullRunSpec(t *testing.T) {
+	request := CreateRunRequest{Name: "same", Selector: RunSelector{Template: "small"}, Agent: "agent", Prompt: "prompt"}
+	for _, test := range []struct {
+		name   string
+		mutate func(*platformv1alpha1.RunSpec)
+		want   error
+	}{
+		{name: "same intent", mutate: func(*platformv1alpha1.RunSpec) {}},
+		{name: "cancel ignored", mutate: func(spec *platformv1alpha1.RunSpec) { spec.Cancel = true }},
+		{name: "empty notify normalized", mutate: func(spec *platformv1alpha1.RunSpec) { spec.Notify = []string{} }},
+		{name: "parent conflicts", mutate: func(spec *platformv1alpha1.RunSpec) { spec.ParentRef = "parent" }, want: errRunIntentConflict},
+		{name: "notify conflicts", mutate: func(spec *platformv1alpha1.RunSpec) { spec.Notify = []string{"parent"} }, want: errRunIntentConflict},
+		{name: "selector conflicts", mutate: func(spec *platformv1alpha1.RunSpec) { spec.TemplateRef = "other" }, want: errRunIntentConflict},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			spec := desiredRunSpec(request)
+			test.mutate(&spec)
+			existing := &platformv1alpha1.Run{ObjectMeta: metav1.ObjectMeta{Name: request.Name, Namespace: "ns"}, Spec: spec}
+			service := &KubernetesResourceService{Client: fake.NewClientBuilder().WithScheme(resourceScheme(t)).WithObjects(existing).Build()}
+			_, err := service.ResolveRunCreateCollision(context.Background(), "ns", request)
+			if !errors.Is(err, test.want) || (test.want == nil && err != nil) {
+				t.Fatalf("error = %v, want %v", err, test.want)
+			}
+		})
+	}
+}
+
 func TestResourceServiceCancelIdempotentRetriesAndErrors(t *testing.T) {
 	scheme := resourceScheme(t)
 	run := &platformv1alpha1.Run{ObjectMeta: metav1.ObjectMeta{Name: "r", Namespace: "ns"}}

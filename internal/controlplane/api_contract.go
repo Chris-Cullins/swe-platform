@@ -10,8 +10,8 @@ type Problem struct {
 	Detail string `json:"detail,omitempty"`
 }
 
-// Session is the authenticated browser identity. The Kubernetes credential is
-// carried only in the HttpOnly session cookie and is never included here.
+// Session is the authenticated browser identity. The HttpOnly cookie carries
+// only an opaque process-local session identifier and is never included here.
 type Session struct {
 	Authenticated bool   `json:"authenticated"`
 	Username      string `json:"username"`

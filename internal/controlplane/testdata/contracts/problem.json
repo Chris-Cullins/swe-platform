@@ -1,6 +1,1 @@
-{
-  "type": "https://swe-platform.dev/problems/invalid-request",
-  "title": "Invalid request",
-  "status": 400,
-  "detail": "name is required"
-}
+{"type":"https://swe-platform.dev/problems/invalid-request","title":"Invalid request","status":400,"detail":"name is required"}

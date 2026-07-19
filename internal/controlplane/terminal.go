@@ -252,7 +252,7 @@ func (s *Server) handleTerminal(w http.ResponseWriter, r *http.Request, namespac
 func (s *Server) checkWebSocketOrigin(r *http.Request) bool {
 	origins := r.Header.Values("Origin")
 	if len(origins) == 0 || (len(origins) == 1 && origins[0] == "") {
-		_, _, err := requestToken(r, false)
+		_, _, err := requestBearerToken(r)
 		return err == nil
 	}
 	return s.sameOrigin(r)
