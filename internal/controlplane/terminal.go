@@ -13,7 +13,6 @@ import (
 
 	"github.com/gorilla/websocket"
 	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials/insecure"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -21,6 +20,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	platformv1alpha1 "github.com/Chris-Cullins/swe-platform/api/v1alpha1"
+	"github.com/Chris-Cullins/swe-platform/internal/sandboxclient"
 	sandboxdv1 "github.com/Chris-Cullins/swe-platform/sandboxd/gen/proto/sandboxd/v1"
 )
 
@@ -81,11 +81,18 @@ func (d KubernetesTerminalDialer) DialTerminal(ctx context.Context, namespace, n
 	if err := d.Client.Get(ctx, types.NamespacedName{Namespace: namespace, Name: environment.Status.PodName}, &pod); err != nil {
 		return nil, nil, fmt.Errorf("get environment pod: %w", err)
 	}
+	if !metav1.IsControlledBy(&pod, &environment) {
+		return nil, nil, fmt.Errorf("environment pod is not owned by the current environment")
+	}
 	if pod.Status.PodIP == "" {
 		return nil, nil, fmt.Errorf("environment pod has no IP address")
 	}
+	dialOptions, err := sandboxclient.DialOptions(&pod)
+	if err != nil {
+		return nil, nil, fmt.Errorf("load sandboxd credentials: %w", err)
+	}
 
-	connection, err := grpc.NewClient(net.JoinHostPort(pod.Status.PodIP, sandboxdPort), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	connection, err := grpc.NewClient(net.JoinHostPort(pod.Status.PodIP, sandboxdPort), dialOptions...)
 	if err != nil {
 		return nil, nil, fmt.Errorf("connect to sandboxd: %w", err)
 	}

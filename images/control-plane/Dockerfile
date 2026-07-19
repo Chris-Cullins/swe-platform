@@ -8,6 +8,8 @@ RUN go mod download
 COPY api/ api/
 COPY cmd/control-plane/ cmd/control-plane/
 COPY internal/controlplane/ internal/controlplane/
+COPY internal/sandboxclient/ internal/sandboxclient/
+COPY sandboxd/auth/ sandboxd/auth/
 COPY sandboxd/gen/ sandboxd/gen/
 ARG TARGETOS
 ARG TARGETARCH
