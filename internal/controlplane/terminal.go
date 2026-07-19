@@ -66,6 +66,18 @@ func (d KubernetesTerminalDialer) DialTerminal(ctx context.Context, namespace, n
 	if err := d.markActive(ctx, &environment, expectedUID); err != nil {
 		return nil, nil, err
 	}
+	heartbeatInterval, err := d.activityHeartbeatInterval(ctx, &environment)
+	if err != nil {
+		return nil, nil, err
+	}
+	heartbeatContext, cancelHeartbeat := context.WithCancel(ctx)
+	heartbeatTransferred := false
+	defer func() {
+		if !heartbeatTransferred {
+			cancelHeartbeat()
+		}
+	}()
+	go d.heartbeatActivity(heartbeatContext, types.NamespacedName{Namespace: namespace, Name: name}, expectedUID, heartbeatInterval)
 	if environment.Spec.Paused {
 		before := environment.DeepCopy()
 		environment.Spec.Paused = false
@@ -86,15 +98,8 @@ func (d KubernetesTerminalDialer) DialTerminal(ctx context.Context, namespace, n
 	if err != nil {
 		return nil, nil, fmt.Errorf("connect to sandboxd: %w", err)
 	}
-	heartbeatContext, cancelHeartbeat := context.WithCancel(ctx)
-	heartbeatInterval, err := d.activityHeartbeatInterval(ctx, &environment)
-	if err != nil {
-		cancelHeartbeat()
-		_ = closeConnection()
-		return nil, nil, err
-	}
-	go d.heartbeatActivity(heartbeatContext, types.NamespacedName{Namespace: namespace, Name: name}, expectedUID, heartbeatInterval)
 	closer := &activeTerminalConnection{Closer: closeFunc(closeConnection), cancel: cancelHeartbeat}
+	heartbeatTransferred = true
 	return terminal, closer, nil
 }
 
