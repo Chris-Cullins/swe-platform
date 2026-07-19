@@ -14,6 +14,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -117,7 +118,7 @@ func TestFilesystemLargeFileRoundTripIsChunked(t *testing.T) {
 
 func TestFilesystemRejectsNonPortableAndEscapingPaths(t *testing.T) {
 	server := newTestFilesystemServer(t, t.TempDir())
-	for _, value := range []string{"/etc/passwd", "../outside", "a/../../outside", `C:\\Windows`, "C:/Windows", `\\\\server\\share`, "a\\b", "a:b", "x\x00y", "a?b", "a<b", "control\x01", "NUL", "com1.txt", "COM¹", "lpt².log", "CONIN$", "conout$.txt", "trailing.", "trailing "} {
+	for _, value := range []string{"/etc/passwd", "../outside", "a/../../outside", `C:\\Windows`, "C:/Windows", `\\\\server\\share`, "a\\b", "a:b", "x\x00y", "a?b", "a<b", "control\x01", "NUL", "com1.txt", "COM¹", "lpt².log", "CONIN$", "conout$.txt", "trailing.", "trailing ", ".SANDBOXD-WRITE-secret"} {
 		t.Run(strings.ReplaceAll(value, "/", "_"), func(t *testing.T) {
 			_, err := server.Read(context.Background(), &sandboxdv1.ReadRequest{Path: value})
 			if status.Code(err) != codes.InvalidArgument {
@@ -171,6 +172,10 @@ func TestFilesystemRejectsNestedAndDanglingSymlinksAndListsTheirType(t *testing.
 	if err != nil || string(read.Data) != "inside" {
 		t.Fatalf("confined internal link: %q, %v", read.GetData(), err)
 	}
+	if _, err := writeWorkspaceFile(context.Background(), client, &sandboxdv1.WriteHeader{Path: "internal/new", Precondition: sandboxdv1.WritePrecondition_WRITE_PRECONDITION_ANY}, []byte("written")); err != nil {
+		t.Fatalf("write through confined internal link: %v", err)
+	}
+	assertFileContent(t, filepath.Join(workspace, "inside", "new"), "written")
 	list, err := client.List(context.Background(), &sandboxdv1.ListRequest{PageSize: 10})
 	if err != nil {
 		t.Fatal(err)
@@ -190,6 +195,9 @@ func TestFilesystemListPaginationAndPortableTypes(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := os.Mkdir(filepath.Join(workspace, "directory"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(workspace, ".SANDBOXD-WRITE-hidden"), []byte("staging"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	client := sandboxdv1.NewFilesystemServiceClient(newFilesystemConn(t, newTestFilesystemServer(t, workspace)))
@@ -271,6 +279,62 @@ func TestFilesystemInterruptedAndLimitedWritesPreserveDestination(t *testing.T) 
 			t.Fatalf("%s limit: %v", name, err)
 		}
 		assertFileContent(t, destination, "original")
+	}
+}
+
+func TestFilesystemCanceledWriteCleansPinnedRenamedDirectory(t *testing.T) {
+	workspace := t.TempDir()
+	parent := filepath.Join(workspace, "parent")
+	if err := os.Mkdir(parent, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	server := newTestFilesystemServer(t, workspace)
+	client := sandboxdv1.NewFilesystemServiceClient(newFilesystemConn(t, server))
+	ctx, cancel := context.WithCancel(context.Background())
+	stream, err := client.Write(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := stream.Send(&sandboxdv1.WriteRequest{Kind: &sandboxdv1.WriteRequest_Header{Header: &sandboxdv1.WriteHeader{Path: "parent/file", Precondition: sandboxdv1.WritePrecondition_WRITE_PRECONDITION_ANY}}}); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, func() bool {
+		matches, _ := filepath.Glob(filepath.Join(parent, ".sandboxd-write-*"))
+		return len(matches) == 1
+	})
+	moved := filepath.Join(workspace, "moved")
+	if err := os.Rename(parent, moved); err != nil {
+		t.Fatal(err)
+	}
+	cancel()
+	if _, err := stream.CloseAndRecv(); status.Code(err) != codes.Canceled {
+		t.Fatalf("cancelled write: %v", err)
+	}
+	waitFor(t, func() bool {
+		matches, _ := filepath.Glob(filepath.Join(moved, ".sandboxd-write-*"))
+		return len(matches) == 0
+	})
+	if _, err := os.Stat(filepath.Join(moved, "file")); !os.IsNotExist(err) {
+		t.Fatalf("canceled destination exists: %v", err)
+	}
+}
+
+func TestFilesystemErrorsDoNotExposeHostPaths(t *testing.T) {
+	workspace := t.TempDir()
+	client := sandboxdv1.NewFilesystemServiceClient(newFilesystemConn(t, newTestFilesystemServer(t, workspace)))
+	_, err := client.Read(context.Background(), &sandboxdv1.ReadRequest{Path: "missing/file"})
+	if status.Code(err) != codes.NotFound || strings.Contains(err.Error(), workspace) || strings.Contains(err.Error(), `\`) || strings.Contains(err.Error(), "missing/file") {
+		t.Fatalf("host path leaked in error: %v", err)
+	}
+	hostErr := &os.PathError{Op: "open", Path: `C:\\private\\workspace\\file`, Err: os.ErrPermission}
+	sanitized := filesystemError("open workspace file", hostErr)
+	if status.Code(sanitized) != codes.PermissionDenied || strings.Contains(sanitized.Error(), "private") || strings.Contains(sanitized.Error(), `\`) {
+		t.Fatalf("synthetic host path leaked in error: %v", sanitized)
+	}
+	uninitialized := &FilesystemServer{Workspace: filepath.Join(workspace, "absent")}
+	_, err = uninitialized.Read(context.Background(), &sandboxdv1.ReadRequest{Path: "file"})
+	if status.Code(err) != codes.Internal || strings.Contains(err.Error(), workspace) {
+		t.Fatalf("initialization host path leaked in error: %v", err)
 	}
 }
 
@@ -453,6 +517,41 @@ func TestFilesystemConcurrentWriteLimit(t *testing.T) {
 	}
 	if err := first.CloseSend(); err != nil && !errors.Is(err, context.Canceled) {
 		t.Fatal(err)
+	}
+}
+
+func TestFilesystemShutdownFencesAndWaitsForWriteCleanup(t *testing.T) {
+	workspace := t.TempDir()
+	server := &FilesystemServer{Workspace: workspace}
+	client := sandboxdv1.NewFilesystemServiceClient(newFilesystemConn(t, server))
+	ctx, cancel := context.WithCancel(context.Background())
+	stream, err := client.Write(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := stream.Send(&sandboxdv1.WriteRequest{Kind: &sandboxdv1.WriteRequest_Header{Header: &sandboxdv1.WriteHeader{Path: "active", Precondition: sandboxdv1.WritePrecondition_WRITE_PRECONDITION_ANY}}}); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, func() bool { return len(server.writeSlots) == 1 })
+	server.BeginShutdown()
+	if _, err := writeWorkspaceFile(context.Background(), client, &sandboxdv1.WriteHeader{Path: "rejected", Precondition: sandboxdv1.WritePrecondition_WRITE_PRECONDITION_ANY}, nil); status.Code(err) != codes.Unavailable {
+		t.Fatalf("write admitted during shutdown: %v", err)
+	}
+	waitCtx, waitCancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer waitCancel()
+	if err := server.CloseContext(waitCtx); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("CloseContext with active write = %v", err)
+	}
+	cancel()
+	if _, err := stream.CloseAndRecv(); status.Code(err) != codes.Canceled {
+		t.Fatalf("cancelled write: %v", err)
+	}
+	if err := server.CloseContext(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	matches, err := filepath.Glob(filepath.Join(workspace, ".sandboxd-write-*"))
+	if err != nil || len(matches) != 0 {
+		t.Fatalf("staging files after shutdown = %v, %v", matches, err)
 	}
 }
 

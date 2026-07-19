@@ -49,6 +49,11 @@ type FilesystemServer struct {
 	initErr    error
 	writeSlots chan struct{}
 	commitMu   sync.RWMutex
+	handlerMu  sync.Mutex
+	closing    bool
+	active     sync.WaitGroup
+	closeOnce  sync.Once
+	closeErr   error
 }
 
 func NewFilesystemServer(workspace string) (*FilesystemServer, error) {
@@ -60,10 +65,46 @@ func NewFilesystemServer(workspace string) (*FilesystemServer, error) {
 }
 
 func (s *FilesystemServer) Close() error {
-	if s.rootHandle == nil {
-		return nil
+	return s.CloseContext(context.Background())
+}
+
+// BeginShutdown fences new writes while the gRPC server drains active RPCs.
+func (s *FilesystemServer) BeginShutdown() {
+	s.handlerMu.Lock()
+	s.closing = true
+	s.handlerMu.Unlock()
+}
+
+// CloseContext waits for active writes to finish cleanup before closing the
+// pinned workspace root.
+func (s *FilesystemServer) CloseContext(ctx context.Context) error {
+	s.BeginShutdown()
+	done := make(chan struct{})
+	go func() {
+		s.active.Wait()
+		close(done)
+	}()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-done:
 	}
-	return s.rootHandle.Close()
+	s.closeOnce.Do(func() {
+		if s.rootHandle != nil {
+			s.closeErr = s.rootHandle.Close()
+		}
+	})
+	return s.closeErr
+}
+
+func (s *FilesystemServer) beginWrite() error {
+	s.handlerMu.Lock()
+	defer s.handlerMu.Unlock()
+	if s.closing {
+		return status.Error(codes.Unavailable, "filesystem is shutting down")
+	}
+	s.active.Add(1)
+	return nil
 }
 
 func (s *FilesystemServer) initialize() error {
@@ -112,7 +153,7 @@ func normalizeWorkspacePath(value string, allowRoot bool) (string, error) {
 		if component == ".." {
 			return "", status.Error(codes.InvalidArgument, "path must not contain upward traversal")
 		}
-		if strings.HasPrefix(component, ".sandboxd-write-") {
+		if isReservedStagingComponent(component) {
 			return "", status.Error(codes.InvalidArgument, "path uses a reserved staging name")
 		}
 		if invalidWindowsComponent(component) {
@@ -127,6 +168,10 @@ func normalizeWorkspacePath(value string, allowRoot bool) (string, error) {
 		return "", status.Error(codes.InvalidArgument, "path must name a workspace entry")
 	}
 	return clean, nil
+}
+
+func isReservedStagingComponent(component string) bool {
+	return strings.HasPrefix(strings.ToLower(component), ".sandboxd-write-")
 }
 
 func invalidWindowsComponent(component string) bool {
@@ -170,25 +215,29 @@ func (s *FilesystemServer) resolveExisting(logical string) (string, os.FileInfo,
 	return current, info, err
 }
 
-// prepareWritePath creates parents through os.Root, which confines any link
-// traversal to the already-open workspace root.
-func (s *FilesystemServer) prepareWritePath(logical string) (string, error) {
+// prepareWriteDirectory creates parents through os.Root, then pins the actual
+// destination directory so renames cannot retarget staging, commit, or cleanup.
+func (s *FilesystemServer) prepareWriteDirectory(logical string) (*os.Root, string, error) {
 	destination := filepath.FromSlash(logical)
-	if err := s.rootHandle.MkdirAll(filepath.Dir(destination), 0o755); err != nil {
-		return "", filesystemError("create workspace directory", err)
+	directory := filepath.Dir(destination)
+	if err := s.rootHandle.MkdirAll(directory, 0o755); err != nil {
+		return nil, "", filesystemError("create workspace directory", err)
 	}
-	return destination, nil
+	directoryRoot, err := s.rootHandle.OpenRoot(directory)
+	if err != nil {
+		return nil, "", filesystemError("open workspace directory", err)
+	}
+	return directoryRoot, filepath.Base(destination), nil
 }
 
-func (s *FilesystemServer) createStagingFile(destination string) (*os.File, string, error) {
-	directory := filepath.Dir(destination)
+func createStagingFile(directory *os.Root) (*os.File, string, error) {
 	for range 100 {
 		var random [16]byte
 		if _, err := rand.Read(random[:]); err != nil {
-			return nil, "", status.Errorf(codes.Internal, "generate staging name: %v", err)
+			return nil, "", status.Error(codes.Internal, "generate staging name: host failure")
 		}
-		name := filepath.Join(directory, ".sandboxd-write-"+hex.EncodeToString(random[:]))
-		file, err := s.rootHandle.OpenFile(name, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o600)
+		name := ".sandboxd-write-" + hex.EncodeToString(random[:])
+		file, err := directory.OpenFile(name, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o600)
 		if errors.Is(err, os.ErrExist) {
 			continue
 		}
@@ -208,18 +257,18 @@ func filesystemError(operation string, err error) error {
 		return err
 	}
 	if errors.Is(err, os.ErrNotExist) {
-		return status.Errorf(codes.NotFound, "%s: %v", operation, err)
+		return status.Errorf(codes.NotFound, "%s: not found", operation)
 	}
 	if errors.Is(err, os.ErrExist) {
 		return status.Errorf(codes.FailedPrecondition, "%s: path component has an incompatible type", operation)
 	}
 	if errors.Is(err, os.ErrPermission) {
-		return status.Errorf(codes.PermissionDenied, "%s: %v", operation, err)
+		return status.Errorf(codes.PermissionDenied, "%s: permission denied", operation)
 	}
 	if errors.Is(err, os.ErrInvalid) || pathEscapesRoot(err) {
 		return status.Errorf(codes.FailedPrecondition, "%s: path is not confined to the workspace", operation)
 	}
-	return status.Errorf(codes.Internal, "%s: %v", operation, err)
+	return status.Errorf(codes.Internal, "%s: host I/O failure", operation)
 }
 
 func pathEscapesRoot(err error) bool {
@@ -265,7 +314,7 @@ func hashFile(ctx context.Context, file *os.File) (string, error) {
 
 func (s *FilesystemServer) Read(ctx context.Context, req *sandboxdv1.ReadRequest) (*sandboxdv1.ReadResponse, error) {
 	if err := s.initialize(); err != nil {
-		return nil, status.Errorf(codes.Internal, "initialize filesystem: %v", err)
+		return nil, status.Error(codes.Internal, "initialize filesystem")
 	}
 	logical, err := normalizeWorkspacePath(req.GetPath(), false)
 	if err != nil {
@@ -333,8 +382,12 @@ func (s *FilesystemServer) Read(ctx context.Context, req *sandboxdv1.ReadRequest
 
 func (s *FilesystemServer) Write(stream sandboxdv1.FilesystemService_WriteServer) error {
 	if err := s.initialize(); err != nil {
-		return status.Errorf(codes.Internal, "initialize filesystem: %v", err)
+		return status.Error(codes.Internal, "initialize filesystem")
 	}
+	if err := s.beginWrite(); err != nil {
+		return err
+	}
+	defer s.active.Done()
 	select {
 	case s.writeSlots <- struct{}{}:
 		defer func() { <-s.writeSlots }()
@@ -365,9 +418,9 @@ func (s *FilesystemServer) Write(stream sandboxdv1.FilesystemService_WriteServer
 	}
 
 	s.commitMu.Lock()
-	destination, err := s.prepareWritePath(logical)
+	directory, destination, err := s.prepareWriteDirectory(logical)
 	if err == nil {
-		if info, statErr := s.rootHandle.Lstat(destination); statErr == nil {
+		if info, statErr := directory.Lstat(destination); statErr == nil {
 			if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
 				err = status.Error(codes.FailedPrecondition, "write destination is not a regular file")
 			}
@@ -378,13 +431,17 @@ func (s *FilesystemServer) Write(stream sandboxdv1.FilesystemService_WriteServer
 	var staged *os.File
 	var stagedName string
 	if err == nil {
-		staged, stagedName, err = s.createStagingFile(destination)
+		staged, stagedName, err = createStagingFile(directory)
 	}
 	s.commitMu.Unlock()
 	if err != nil {
+		if directory != nil {
+			_ = directory.Close()
+		}
 		return err
 	}
-	defer s.rootHandle.Remove(stagedName)
+	defer directory.Close()
+	defer directory.Remove(stagedName)
 	defer staged.Close()
 
 	hash := sha256.New()
@@ -446,21 +503,17 @@ func (s *FilesystemServer) Write(stream sandboxdv1.FilesystemService_WriteServer
 	if err := contextError(ctx); err != nil {
 		return err
 	}
-	destination, err = s.prepareWritePath(logical)
-	if err != nil {
-		return err
-	}
-	if err := s.checkWritePrecondition(ctx, destination, header); err != nil {
+	if err := checkWritePrecondition(ctx, directory, destination, header); err != nil {
 		return err
 	}
 	if header.GetPrecondition() == sandboxdv1.WritePrecondition_WRITE_PRECONDITION_MUST_NOT_EXIST {
-		if err := s.rootHandle.Link(stagedName, destination); err != nil {
+		if err := directory.Link(stagedName, destination); err != nil {
 			if errors.Is(err, os.ErrExist) {
 				return status.Error(codes.FailedPrecondition, "write destination already exists")
 			}
 			return filesystemError("commit new workspace file", err)
 		}
-	} else if err := s.rootHandle.Rename(stagedName, destination); err != nil {
+	} else if err := directory.Rename(stagedName, destination); err != nil {
 		return filesystemError("commit workspace file", err)
 	}
 	return stream.SendAndClose(&sandboxdv1.WriteResponse{Size: size, Version: version})
@@ -484,8 +537,8 @@ func validateWriteHeader(header *sandboxdv1.WriteHeader) error {
 	return nil
 }
 
-func (s *FilesystemServer) checkWritePrecondition(ctx context.Context, destination string, header *sandboxdv1.WriteHeader) error {
-	info, err := s.rootHandle.Lstat(destination)
+func checkWritePrecondition(ctx context.Context, directory *os.Root, destination string, header *sandboxdv1.WriteHeader) error {
+	info, err := directory.Lstat(destination)
 	exists := err == nil
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return filesystemError("inspect write destination", err)
@@ -505,7 +558,7 @@ func (s *FilesystemServer) checkWritePrecondition(ctx context.Context, destinati
 		if !exists {
 			return status.Error(codes.FailedPrecondition, "write destination does not exist")
 		}
-		file, err := s.rootHandle.Open(destination)
+		file, err := directory.Open(destination)
 		if err != nil {
 			return filesystemError("open write destination", err)
 		}
@@ -528,7 +581,7 @@ func (s *FilesystemServer) checkWritePrecondition(ctx context.Context, destinati
 
 func (s *FilesystemServer) List(ctx context.Context, req *sandboxdv1.ListRequest) (*sandboxdv1.ListResponse, error) {
 	if err := s.initialize(); err != nil {
-		return nil, status.Errorf(codes.Internal, "initialize filesystem: %v", err)
+		return nil, status.Error(codes.Internal, "initialize filesystem")
 	}
 	logical, err := normalizeWorkspacePath(req.GetPath(), true)
 	if err != nil {
@@ -593,7 +646,7 @@ func (s *FilesystemServer) List(ctx context.Context, req *sandboxdv1.ListRequest
 		if err := contextError(ctx); err != nil {
 			return nil, err
 		}
-		if strings.HasPrefix(child.Name(), ".sandboxd-write-") {
+		if isReservedStagingComponent(child.Name()) {
 			continue
 		}
 		entryType := sandboxdv1.EntryType_ENTRY_TYPE_OTHER

@@ -19,8 +19,10 @@ also invalid.
 The workspace root is opened and fixed before the gRPC server starts. Resolution uses
 that root's race-safe host handles: a relative symlink may be followed only when its
 target remains inside the fixed workspace. Dangling, absolute, and outside-workspace
-links fail; writes reject an encountered symlink and always refuse to replace a symlink
-at the final destination. `List`
+links fail. Writes may follow a confined relative link in a parent component. A final
+symlink observed while evaluating a write precondition is rejected; publication replaces
+the final directory entry without following its target, so an external process racing
+publication may have its symlink entry replaced but cannot redirect the write. `List`
 reports a direct child link as `ENTRY_TYPE_SYMLINK` without following it. These rules
 prevent escapes even if another workspace process swaps a checked component; callers
 with `Exec` remain able to access whatever that separate capability permits.
@@ -49,9 +51,11 @@ server admits at most 16 concurrent streams by default. Cancellation observed be
 publication and malformed, over-limit, or interrupted streams remove their staging file
 and leave the destination unchanged.
 
-Data is staged in the destination directory, flushed, closed, and published with the
-host's same-filesystem atomic replacement operation only after the complete stream is
-received. Staging names cannot be addressed or listed through this capability. `ANY`
+Data is staged in the destination directory, flushed, closed, and published with one
+host replacement operation only after the complete stream is received. The portable
+guarantee is that the destination never contains partially streamed data; namespace
+replacement is atomic where the host and workspace filesystem guarantee atomic rename.
+Staging names cannot be addressed or listed through this capability. `ANY`
 replaces any regular file; `MUST_NOT_EXIST` uses atomic no-replace publication and
 creates only when absent. `MATCH_VERSION` replaces only when the current complete-file
 SHA-256 equals `expected_version`. Hash checking and replacement are serialized with

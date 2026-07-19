@@ -69,7 +69,6 @@ func main() {
 	if err != nil {
 		log.Fatalf("open workspace filesystem: %v", err)
 	}
-	defer filesystemServer.Close()
 	grpcServer := grpc.NewServer(
 		grpc.Creds(credentials.NewTLS(&tls.Config{
 			Certificates: []tls.Certificate{certificate},
@@ -88,22 +87,43 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	shutdownDone := make(chan struct{})
 	go func() {
 		<-ctx.Done()
+		defer close(shutdownDone)
 		log.Println("shutting down")
+		filesystemServer.BeginShutdown()
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
 		if err := processServer.CloseContext(shutdownCtx); err != nil {
 			log.Printf("sandboxd shutdown fencing failed: %v", err)
-			grpcServer.Stop()
-			return
 		}
-		grpcServer.GracefulStop()
+		cancel()
+		gracefulDone := make(chan struct{})
+		go func() {
+			grpcServer.GracefulStop()
+			close(gracefulDone)
+		}()
+		select {
+		case <-gracefulDone:
+		case <-time.After(10 * time.Second):
+			log.Println("gRPC graceful shutdown timed out; canceling active RPCs")
+			grpcServer.Stop()
+		}
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		if err := filesystemServer.CloseContext(cleanupCtx); err != nil {
+			log.Printf("filesystem shutdown cleanup failed: %v", err)
+		}
+		cleanupCancel()
 	}()
 
 	log.Printf("sandboxd %s listening on %s (workspace %s)", Version, *addr, *workspace)
 	if err := grpcServer.Serve(lis); err != nil {
 		log.Fatalf("serve: %v", err)
+	}
+	if ctx.Err() != nil {
+		<-shutdownDone
+	} else if err := filesystemServer.Close(); err != nil {
+		log.Printf("close filesystem: %v", err)
 	}
 }
 

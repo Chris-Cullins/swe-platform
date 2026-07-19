@@ -42,16 +42,6 @@ func (d *processDomain) start() error {
 	// This follows the MIT-licensed microsoft/hcsshim job-list launch pattern:
 	// put the Job and the exact inherited handles in the startup attribute list.
 	const procThreadAttributeJobList = 0x0002000D
-	attrs, err := windows.NewProcThreadAttributeList(2)
-	if err != nil {
-		windows.CloseHandle(job)
-		return err
-	}
-	defer attrs.Delete()
-	if err = attrs.Update(procThreadAttributeJobList, unsafe.Pointer(&job), unsafe.Sizeof(job)); err != nil {
-		windows.CloseHandle(job)
-		return err
-	}
 	files := []*os.File{d.cmd.Stdin.(*os.File), d.cmd.Stdout.(*os.File), d.cmd.Stderr.(*os.File)}
 	handles := make([]windows.Handle, len(files))
 	for i, f := range files {
@@ -61,10 +51,6 @@ func (d *processDomain) start() error {
 			return err
 		}
 		defer windows.SetHandleInformation(handles[i], windows.HANDLE_FLAG_INHERIT, 0)
-	}
-	if err = attrs.Update(windows.PROC_THREAD_ATTRIBUTE_HANDLE_LIST, unsafe.Pointer(&handles[0]), uintptr(len(handles))*unsafe.Sizeof(handles[0])); err != nil {
-		windows.CloseHandle(job)
-		return err
 	}
 	path, err := exec.LookPath(d.cmd.Path)
 	if err != nil {
@@ -77,11 +63,6 @@ func (d *processDomain) start() error {
 		return err
 	}
 	app, err := windows.UTF16PtrFromString(path)
-	if err != nil {
-		windows.CloseHandle(job)
-		return err
-	}
-	line, err := windows.UTF16PtrFromString(windows.ComposeCommandLine(d.cmd.Args))
 	if err != nil {
 		windows.CloseHandle(job)
 		return err
@@ -107,12 +88,59 @@ func (d *processDomain) start() error {
 		env = append(env, 0)
 	}
 	env = append(env, 0)
-	si := windows.StartupInfoEx{ProcThreadAttributeList: attrs.List()}
-	si.StartupInfo.Cb = uint32(unsafe.Sizeof(si))
-	si.StartupInfo.Flags = windows.STARTF_USESTDHANDLES
-	si.StartupInfo.StdInput, si.StartupInfo.StdOutput, si.StartupInfo.StdErr = handles[0], handles[1], handles[2]
-	var pi windows.ProcessInformation
-	err = windows.CreateProcess(app, line, nil, nil, true, windows.EXTENDED_STARTUPINFO_PRESENT|windows.CREATE_UNICODE_ENVIRONMENT, &env[0], cwd, &si.StartupInfo, &pi)
+	create := func(includeJob bool, flags uint32) (windows.ProcessInformation, error) {
+		line, err := windows.UTF16PtrFromString(windows.ComposeCommandLine(d.cmd.Args))
+		if err != nil {
+			return windows.ProcessInformation{}, err
+		}
+		attributeCount := uint32(1)
+		if includeJob {
+			attributeCount++
+		}
+		attrs, err := windows.NewProcThreadAttributeList(attributeCount)
+		if err != nil {
+			return windows.ProcessInformation{}, err
+		}
+		defer attrs.Delete()
+		if includeJob {
+			if err := attrs.Update(procThreadAttributeJobList, unsafe.Pointer(&job), unsafe.Sizeof(job)); err != nil {
+				return windows.ProcessInformation{}, err
+			}
+		}
+		if err := attrs.Update(windows.PROC_THREAD_ATTRIBUTE_HANDLE_LIST, unsafe.Pointer(&handles[0]), uintptr(len(handles))*unsafe.Sizeof(handles[0])); err != nil {
+			return windows.ProcessInformation{}, err
+		}
+		si := windows.StartupInfoEx{ProcThreadAttributeList: attrs.List()}
+		si.StartupInfo.Cb = uint32(unsafe.Sizeof(si))
+		si.StartupInfo.Flags = windows.STARTF_USESTDHANDLES
+		si.StartupInfo.StdInput, si.StartupInfo.StdOutput, si.StartupInfo.StdErr = handles[0], handles[1], handles[2]
+		var pi windows.ProcessInformation
+		err = windows.CreateProcess(app, line, nil, nil, true, windows.EXTENDED_STARTUPINFO_PRESENT|windows.CREATE_UNICODE_ENVIRONMENT|flags, &env[0], cwd, &si.StartupInfo, &pi)
+		return pi, err
+	}
+
+	pi, err := create(true, 0)
+	if errors.Is(err, windows.ERROR_INVALID_PARAMETER) {
+		// Some supervised hosts reject an additional job in the startup list.
+		// Launch suspended, assign before any child instruction can run, then
+		// resume. Failure remains fail-closed.
+		pi, err = create(false, windows.CREATE_SUSPENDED)
+		if err == nil {
+			if err = windows.AssignProcessToJobObject(job, pi.Process); err == nil {
+				var previous uint32
+				previous, err = windows.ResumeThread(pi.Thread)
+				if err == nil && previous != 1 {
+					err = fmt.Errorf("resume suspended process returned count %d", previous)
+				}
+			}
+			if err != nil {
+				_ = windows.TerminateProcess(pi.Process, 1)
+				_, _ = windows.WaitForSingleObject(pi.Process, windows.INFINITE)
+				windows.CloseHandle(pi.Thread)
+				windows.CloseHandle(pi.Process)
+			}
+		}
+	}
 	if err != nil {
 		windows.CloseHandle(job)
 		return err
