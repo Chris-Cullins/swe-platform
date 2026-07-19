@@ -22,8 +22,9 @@ import (
 )
 
 const (
-	wakeTimeout      = 2 * time.Minute
-	wakePollInterval = 250 * time.Millisecond
+	wakeTimeout              = 2 * time.Minute
+	wakePollInterval         = 250 * time.Millisecond
+	terminalHandshakeTimeout = 5 * time.Second
 )
 
 // TerminalDialer resolves an Environment and connects to its sandboxd API.
@@ -178,9 +179,10 @@ type terminalControl struct {
 }
 
 var terminalUpgrader = websocket.Upgrader{
-	ReadBufferSize:  32 * 1024,
-	WriteBufferSize: 32 * 1024,
-	CheckOrigin:     func(*http.Request) bool { return true }, // checked before backend dial
+	HandshakeTimeout: terminalHandshakeTimeout,
+	ReadBufferSize:   32 * 1024,
+	WriteBufferSize:  32 * 1024,
+	CheckOrigin:      func(*http.Request) bool { return true }, // checked before backend dial
 }
 
 func (s *Server) handleTerminal(w http.ResponseWriter, r *http.Request, namespace, environment string) {
@@ -204,6 +206,8 @@ func (s *Server) handleTerminal(w http.ResponseWriter, r *http.Request, namespac
 		http.Error(w, "terminal gateway is unavailable", http.StatusServiceUnavailable)
 		return
 	}
+	r, cancelStream := s.withStreamLifecycle(r)
+	defer cancelStream()
 
 	terminal, closer, err := s.terminalDialer.DialTerminal(r.Context(), namespace, environment)
 	if err != nil {
@@ -218,6 +222,8 @@ func (s *Server) handleTerminal(w http.ResponseWriter, r *http.Request, namespac
 		return
 	}
 	defer connection.Close()
+	stopCloseOnCancel := context.AfterFunc(r.Context(), func() { _ = connection.Close() })
+	defer stopCloseOnCancel()
 	connection.SetReadLimit(1 << 20)
 	if err := bridgeWebTerminal(r.Context(), connection, terminal); err != nil {
 		if r.Context().Err() == nil {

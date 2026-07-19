@@ -19,7 +19,10 @@ import (
 	platformv1alpha1 "github.com/Chris-Cullins/swe-platform/api/v1alpha1"
 )
 
-const namespacedPathPrefix = "/api/v1/namespaces/"
+const (
+	namespacedPathPrefix               = "/api/v1/namespaces/"
+	defaultTranscriptHeartbeatInterval = 15 * time.Second
+)
 
 type appendTranscriptRequest struct {
 	Source         string          `json:"source"`
@@ -37,6 +40,8 @@ type Server struct {
 	runs           RunResolver
 	terminalDialer TerminalDialer
 	trustProxy     bool
+	heartbeat      time.Duration
+	streams        context.Context
 }
 
 // RunResolver verifies that a namespaced Run exists before transcript state is used.
@@ -65,12 +70,26 @@ type ServerOptions struct {
 	TranscriptStore TranscriptStore
 	TerminalDialer  TerminalDialer
 	TrustProxy      bool
+	// StreamLifecycle is canceled when long-lived SSE and terminal handlers
+	// must exit during process shutdown. Ordinary requests do not use it.
+	StreamLifecycle context.Context
+	// TranscriptHeartbeatInterval controls SSE keepalive comments. Values less
+	// than or equal to zero use the production default.
+	TranscriptHeartbeatInterval time.Duration
 }
 
 // NewServer constructs a control-plane API handler.
 func NewServer(log *slog.Logger, options ServerOptions) *Server {
 	if log == nil {
 		log = slog.Default()
+	}
+	heartbeat := options.TranscriptHeartbeatInterval
+	if heartbeat <= 0 {
+		heartbeat = defaultTranscriptHeartbeatInterval
+	}
+	streams := options.StreamLifecycle
+	if streams == nil {
+		streams = context.Background()
 	}
 	return &Server{
 		log:            log,
@@ -79,6 +98,20 @@ func NewServer(log *slog.Logger, options ServerOptions) *Server {
 		runs:           options.Runs,
 		terminalDialer: options.TerminalDialer,
 		trustProxy:     options.TrustProxy,
+		heartbeat:      heartbeat,
+		streams:        streams,
+	}
+}
+
+func (s *Server) withStreamLifecycle(r *http.Request) (*http.Request, func()) {
+	ctx, cancel := context.WithCancel(r.Context())
+	stop := context.AfterFunc(s.streams, cancel)
+	if s.streams.Err() != nil {
+		cancel()
+	}
+	return r.WithContext(ctx), func() {
+		stop()
+		cancel()
 	}
 }
 
@@ -250,6 +283,8 @@ func (s *Server) streamTranscript(w http.ResponseWriter, r *http.Request, run Ru
 		http.Error(w, "transcript store is unavailable", http.StatusServiceUnavailable)
 		return
 	}
+	r, cancelStream := s.withStreamLifecycle(r)
+	defer cancelStream()
 	cursor := r.Header.Get("Last-Event-ID")
 	if cursor == "" {
 		cursor = r.URL.Query().Get("after")
@@ -265,18 +300,15 @@ func (s *Server) streamTranscript(w http.ResponseWriter, r *http.Request, run Ru
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("X-Accel-Buffering", "no")
 	w.WriteHeader(http.StatusOK)
 
 	controller := http.NewResponseController(w)
-	writeEvent := func(event TranscriptEvent) error {
+	write := func(payload string) error {
 		if err := controller.SetWriteDeadline(time.Now().Add(15 * time.Second)); err != nil && !errors.Is(err, http.ErrNotSupported) {
 			return err
 		}
-		payload, err := json.Marshal(event)
-		if err != nil {
-			return err
-		}
-		if _, err = fmt.Fprintf(w, "id: %s\nevent: transcript\ndata: %s\n\n", event.ID, payload); err != nil {
+		if _, err := io.WriteString(w, payload); err != nil {
 			return err
 		}
 		if err := controller.Flush(); err != nil {
@@ -287,12 +319,19 @@ func (s *Server) streamTranscript(w http.ResponseWriter, r *http.Request, run Ru
 		}
 		return nil
 	}
+	writeEvent := func(event TranscriptEvent) error {
+		payload, err := json.Marshal(event)
+		if err != nil {
+			return err
+		}
+		return write(fmt.Sprintf("id: %s\nevent: transcript\ndata: %s\n\n", event.ID, payload))
+	}
 	if subscription.Gap != nil {
 		payload, marshalErr := json.Marshal(subscription.Gap)
 		if marshalErr != nil {
 			return
 		}
-		if _, err = fmt.Fprintf(w, "event: transcript-gap\ndata: %s\n\n", payload); err != nil {
+		if err = write(fmt.Sprintf("event: transcript-gap\ndata: %s\n\n", payload)); err != nil {
 			return
 		}
 	}
@@ -306,6 +345,8 @@ func (s *Server) streamTranscript(w http.ResponseWriter, r *http.Request, run Ru
 	if err := controller.Flush(); err != nil {
 		return
 	}
+	heartbeats := time.NewTicker(s.heartbeat)
+	defer heartbeats.Stop()
 
 	for {
 		select {
@@ -316,6 +357,10 @@ func (s *Server) streamTranscript(w http.ResponseWriter, r *http.Request, run Ru
 		case <-subscription.Dropped:
 			s.log.Warn("closing slow transcript subscriber", "namespace", run.Namespace, "runUID", run.UID)
 			return
+		case <-heartbeats.C:
+			if err := write(": ping\n\n"); err != nil {
+				return
+			}
 		case <-r.Context().Done():
 			return
 		}
