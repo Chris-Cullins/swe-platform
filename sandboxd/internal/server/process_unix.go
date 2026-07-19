@@ -10,7 +10,10 @@ import (
 	"time"
 )
 
-var errInterruptUnsupported = errors.New("interrupt unsupported")
+var (
+	errInterruptUnsupported = errors.New("interrupt unsupported")
+	signalProcessGroup      = syscall.Kill
+)
 
 // Each launched command owns a private process group.
 type processDomain struct {
@@ -46,7 +49,7 @@ func (d *processDomain) signal(sig syscall.Signal) error {
 	if d.cmd.Process == nil || d.terminal || d.closed || d.closing != nil {
 		return nil
 	}
-	return syscall.Kill(-d.cmd.Process.Pid, sig)
+	return signalProcessGroup(-d.cmd.Process.Pid, sig)
 }
 
 func (d *processDomain) interrupt() error { return d.signal(syscall.SIGINT) }
@@ -64,7 +67,7 @@ func (d *processDomain) forceLocked() error {
 	if d.cmd.Process == nil || d.terminal || d.closed || d.forced {
 		return nil
 	}
-	err := syscall.Kill(-d.cmd.Process.Pid, syscall.SIGKILL)
+	err := signalProcessGroup(-d.cmd.Process.Pid, syscall.SIGKILL)
 	if err == nil || errors.Is(err, syscall.ESRCH) {
 		d.forced = true
 		return nil
