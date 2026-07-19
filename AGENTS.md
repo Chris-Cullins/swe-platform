@@ -89,6 +89,9 @@ runs both via `make` targets:
 
 - **Build all binaries:** `make build` (outputs operator, control plane, CLI, and sandboxd to `bin/`, gitignored)
 - **Unit tests:** `make test` · **Vet:** `make vet`
+- **Operations console:** from `ui/`, install with `npm ci`; use `npm run lint`,
+  `npm run typecheck`, `npm test -- --run`, and `npm run build`. Start the standalone
+  Vite development server with `npm run dev`.
 - **Windows portability:** CI runs focused sandboxd process, Exec, and filesystem tests
   on `windows-latest`; keep OS-specific tests behind build tags.
 - **Regenerate deepcopy:** `make generate` · **CRDs + RBAC:** `make manifests`

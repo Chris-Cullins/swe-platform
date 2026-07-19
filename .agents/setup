@@ -3,11 +3,31 @@ set -euo pipefail
 
 GO_VERSION=1.26.5
 HELM_VERSION=v4.2.3
+NODE_VERSION=24.18.0
+NPM_VERSION=11.16.0
 
 mkdir -p "$HOME/.local/bin" "$HOME/.local/lib"
 
+case "$(uname -m)" in
+	x86_64) NODE_ARCH=x64; TOOL_ARCH=amd64 ;;
+	aarch64|arm64) NODE_ARCH=arm64; TOOL_ARCH=arm64 ;;
+	*) echo "unsupported Node architecture: $(uname -m)" >&2; exit 1 ;;
+esac
+
+if ! command -v node >/dev/null 2>&1 || ! command -v npm >/dev/null 2>&1 ||
+	[[ "$(node --version)" != "v${NODE_VERSION}" ]] || [[ "$(npm --version)" != "${NPM_VERSION}" ]]; then
+	curl -fsSL "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-linux-${NODE_ARCH}.tar.xz" -o /tmp/node.tar.xz
+	rm -rf "$HOME/.local/lib/node"
+	mkdir -p "$HOME/.local/lib/node"
+	tar -C "$HOME/.local/lib/node" --strip-components=1 -xf /tmp/node.tar.xz
+	ln -sf "$HOME/.local/lib/node/bin/node" "$HOME/.local/bin/node"
+	ln -sf "$HOME/.local/lib/node/bin/npm" "$HOME/.local/bin/npm"
+	ln -sf "$HOME/.local/lib/node/bin/npx" "$HOME/.local/bin/npx"
+	rm -f /tmp/node.tar.xz
+fi
+
 if ! command -v go >/dev/null 2>&1 || [[ "$(go version)" != *"go${GO_VERSION}"* ]]; then
-	curl -fsSL "https://go.dev/dl/go${GO_VERSION}.linux-amd64.tar.gz" -o /tmp/go.tar.gz
+	curl -fsSL "https://go.dev/dl/go${GO_VERSION}.linux-${TOOL_ARCH}.tar.gz" -o /tmp/go.tar.gz
 	rm -rf "$HOME/.local/lib/go"
 	tar -C "$HOME/.local/lib" -xzf /tmp/go.tar.gz
 	ln -sf "$HOME/.local/lib/go/bin/go" "$HOME/.local/bin/go"
@@ -16,8 +36,8 @@ if ! command -v go >/dev/null 2>&1 || [[ "$(go version)" != *"go${GO_VERSION}"* 
 fi
 
 if ! command -v helm >/dev/null 2>&1 || [[ "$(helm version --short)" != *"${HELM_VERSION}"* ]]; then
-	curl -fsSL "https://get.helm.sh/helm-${HELM_VERSION}-linux-amd64.tar.gz" -o /tmp/helm.tar.gz
+	curl -fsSL "https://get.helm.sh/helm-${HELM_VERSION}-linux-${TOOL_ARCH}.tar.gz" -o /tmp/helm.tar.gz
 	tar -C /tmp -xzf /tmp/helm.tar.gz
-	install /tmp/linux-amd64/helm "$HOME/.local/bin/helm"
-	rm -rf /tmp/helm.tar.gz /tmp/linux-amd64
+	install "/tmp/linux-${TOOL_ARCH}/helm" "$HOME/.local/bin/helm"
+	rm -rf /tmp/helm.tar.gz "/tmp/linux-${TOOL_ARCH}"
 fi
