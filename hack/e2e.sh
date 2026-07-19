@@ -311,21 +311,23 @@ if ! grep -q 'project-config-ok' /tmp/swe-platform-terminal.out; then
 	cat /tmp/swe-platform-terminal.out
 	exit 1
 fi
-if ! kubectl exec "env-${ENV_NAME}" -- sh -c 'test "$(cat /workspace/setup-result)" = project-config-ok'; then
+POD_NAME=$(kubectl get environment "$ENV_NAME" -o jsonpath='{.status.podName}')
+PVC_NAME=$(kubectl get pod "$POD_NAME" -o jsonpath='{.spec.volumes[?(@.name=="workspace")].persistentVolumeClaim.claimName}')
+if ! kubectl exec "$POD_NAME" -- sh -c 'test "$(cat /workspace/setup-result)" = project-config-ok'; then
 	echo "FAIL: project repository checkout or .agents/setup did not complete"
 	exit 1
 fi
 
 echo "==> verifying setup runs only once when the pod is recreated"
-kubectl delete pod "env-${ENV_NAME}" --wait=true >/dev/null
+kubectl delete pod "$POD_NAME" --wait=true >/dev/null
 for _ in $(seq 1 30); do
-	if kubectl get pod "env-${ENV_NAME}" >/dev/null 2>&1; then
+	if kubectl get pod "$POD_NAME" >/dev/null 2>&1; then
 		break
 	fi
 	sleep 1
 done
-kubectl wait --for=condition=Ready pod/"env-${ENV_NAME}" --timeout=2m
-if ! kubectl exec "env-${ENV_NAME}" -- sh -c 'test "$(wc -l < /workspace/setup-result)" -eq 1'; then
+kubectl wait --for=condition=Ready pod/"$POD_NAME" --timeout=2m
+if ! kubectl exec "$POD_NAME" -- sh -c 'test "$(wc -l < /workspace/setup-result)" -eq 1'; then
 	echo "FAIL: .agents/setup ran again for an initialized workspace"
 	exit 1
 fi
@@ -334,42 +336,42 @@ echo "==> verifying pause retains the workspace and resume runs its hook"
 kubectl patch environment "$ENV_NAME" --type=merge -p '{"spec":{"paused":true}}' >/dev/null
 for _ in $(seq 1 60); do
 	PHASE=$(kubectl get environment "$ENV_NAME" -o jsonpath='{.status.phase}')
-	if [[ "$PHASE" == "Paused" ]] && ! kubectl get pod "env-${ENV_NAME}" >/dev/null 2>&1; then
+	if [[ "$PHASE" == "Paused" ]] && ! kubectl get pod "$POD_NAME" >/dev/null 2>&1; then
 		break
 	fi
 	sleep 1
 done
-if [[ "${PHASE:-}" != "Paused" ]] || kubectl get pod "env-${ENV_NAME}" >/dev/null 2>&1; then
+if [[ "${PHASE:-}" != "Paused" ]] || kubectl get pod "$POD_NAME" >/dev/null 2>&1; then
 	echo "FAIL: environment did not pause and remove its pod"
 	exit 1
 fi
-if ! kubectl get pvc "env-${ENV_NAME}" >/dev/null 2>&1; then
+if ! kubectl get pvc "$PVC_NAME" >/dev/null 2>&1; then
 	echo "FAIL: pause removed the workspace PVC"
 	exit 1
 fi
 kubectl patch environment "$ENV_NAME" --type=merge -p '{"spec":{"paused":false}}' >/dev/null
 kubectl wait --for=jsonpath='{.status.phase}'=Ready environment/"$ENV_NAME" --timeout=2m
-kubectl wait --for=condition=Ready pod/"env-${ENV_NAME}" --timeout=2m
-if ! kubectl exec "env-${ENV_NAME}" -- sh -c 'test "$(cat /workspace/resume-result)" = project-config-ok'; then
+kubectl wait --for=condition=Ready pod/"$POD_NAME" --timeout=2m
+if ! kubectl exec "$POD_NAME" -- sh -c 'test "$(cat /workspace/resume-result)" = project-config-ok'; then
 	echo "FAIL: .agents/resume did not run with the project Secret"
 	exit 1
 fi
-if ! kubectl exec "env-${ENV_NAME}" -- sh -c 'test "$(wc -l < /workspace/setup-result)" -eq 1'; then
+if ! kubectl exec "$POD_NAME" -- sh -c 'test "$(wc -l < /workspace/setup-result)" -eq 1'; then
 	echo "FAIL: .agents/setup ran again while resuming"
 	exit 1
 fi
 
 echo "==> verifying idle pause and terminal wake through the control plane"
-PRE_IDLE_POD_UID=$(kubectl get pod "env-${ENV_NAME}" -o jsonpath='{.metadata.uid}')
+PRE_IDLE_POD_UID=$(kubectl get pod "$POD_NAME" -o jsonpath='{.metadata.uid}')
 kubectl patch environmenttemplate small --type=merge -p '{"spec":{"idleTimeout":"5s"}}' >/dev/null
 for _ in $(seq 1 30); do
 	PHASE=$(kubectl get environment "$ENV_NAME" -o jsonpath='{.status.phase}')
-	if [[ "$PHASE" == "Paused" ]] && ! kubectl get pod "env-${ENV_NAME}" >/dev/null 2>&1; then
+	if [[ "$PHASE" == "Paused" ]] && ! kubectl get pod "$POD_NAME" >/dev/null 2>&1; then
 		break
 	fi
 	sleep 1
 done
-if [[ "${PHASE:-}" != "Paused" ]] || kubectl get pod "env-${ENV_NAME}" >/dev/null 2>&1; then
+if [[ "${PHASE:-}" != "Paused" ]] || kubectl get pod "$POD_NAME" >/dev/null 2>&1; then
 	echo "FAIL: idle environment did not pause and remove its pod"
 	exit 1
 fi
@@ -420,21 +422,21 @@ if [[ "$(kubectl get environment "$ENV_NAME" -o jsonpath='{.status.phase}')" != 
 	echo "FAIL: woken environment did not become ready"
 	exit 1
 fi
-POST_WAKE_POD_UID=$(kubectl get pod "env-${ENV_NAME}" -o jsonpath='{.metadata.uid}')
+POST_WAKE_POD_UID=$(kubectl get pod "$POD_NAME" -o jsonpath='{.metadata.uid}')
 if [[ "$POST_WAKE_POD_UID" == "$PRE_IDLE_POD_UID" ]]; then
 	echo "FAIL: terminal request connected without recreating the paused pod"
 	exit 1
 fi
 
-POD_PHASE=$(kubectl get pod "env-${ENV_NAME}" -o jsonpath='{.status.phase}')
+POD_PHASE=$(kubectl get pod "$POD_NAME" -o jsonpath='{.status.phase}')
 if [[ "$POD_PHASE" != "Running" ]]; then
-	echo "FAIL: pod env-${ENV_NAME} is ${POD_PHASE}, expected Running"
+	echo "FAIL: pod ${POD_NAME} is ${POD_PHASE}, expected Running"
 	echo "--- operator log ---"
 	kubectl logs deployment/swe-platform-swe-platform --tail=50
 	exit 1
 fi
 
 echo "==> sandboxd logs from the environment pod"
-kubectl logs "env-${ENV_NAME}" -c environment | head -3
+kubectl logs "$POD_NAME" -c environment | head -3
 
 echo "E2E OK"

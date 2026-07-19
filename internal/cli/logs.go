@@ -6,6 +6,10 @@ import (
 
 	"github.com/spf13/cobra"
 	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
+
+	platformv1alpha1 "github.com/Chris-Cullins/swe-platform/api/v1alpha1"
 )
 
 func newLogsCommand() *cobra.Command {
@@ -29,7 +33,21 @@ func streamLogs(cmd *cobra.Command, namespace, envName string) error {
 		return err
 	}
 
-	podName := "env-" + envName
+	var env platformv1alpha1.Environment
+	if err := clients.Get(cmd.Context(), types.NamespacedName{Namespace: namespace, Name: envName}, &env); err != nil {
+		return fmt.Errorf("get environment %s: %w", envName, err)
+	}
+	if env.Status.PodName == "" {
+		return fmt.Errorf("environment %s has no active pod", envName)
+	}
+	podName := env.Status.PodName
+	var pod corev1.Pod
+	if err := clients.Get(cmd.Context(), types.NamespacedName{Namespace: namespace, Name: podName}, &pod); err != nil {
+		return fmt.Errorf("get environment pod %s: %w", podName, err)
+	}
+	if !metav1.IsControlledBy(&pod, &env) {
+		return fmt.Errorf("environment pod %s is not owned by the current environment", podName)
+	}
 	req := clients.Clientset.CoreV1().Pods(namespace).GetLogs(podName, &corev1.PodLogOptions{
 		Container: "environment",
 		Follow:    true,

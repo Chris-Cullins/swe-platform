@@ -5,21 +5,25 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
 	stderrors "errors"
 	"fmt"
 	"math/big"
 	"net"
+	"strings"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
 	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	"k8s.io/apimachinery/pkg/api/errors"
+	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -53,6 +57,15 @@ const (
 )
 
 var errPodReplacing = stderrors.New("environment pod is being replaced")
+
+type childOwnershipCollisionError struct {
+	kind string
+	name string
+}
+
+func (e *childOwnershipCollisionError) Error() string {
+	return fmt.Sprintf("%s %q is not owned by this environment", e.kind, e.name)
+}
 
 const (
 	sandboxdCredentialMount    = "/var/run/swe-platform/sandboxd"
@@ -116,7 +129,11 @@ func (r *EnvironmentReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	// Cancellation/finalization can therefore stop an execution domain even
 	// after its template was deleted or provisioning became permanently broken.
 	if env.Spec.Paused {
-		return r.reconcilePaused(ctx, &env)
+		result, err := r.reconcilePaused(ctx, &env)
+		if err != nil {
+			return ctrl.Result{}, r.fail(ctx, &env, fmt.Errorf("pause environment: %w", err))
+		}
+		return result, nil
 	}
 	var tmpl platformv1alpha1.EnvironmentTemplate
 	if err := r.Get(ctx, types.NamespacedName{Namespace: env.Namespace, Name: env.Spec.TemplateRef}, &tmpl); err != nil {
@@ -204,7 +221,7 @@ func (r *EnvironmentReconciler) reconcileDeleting(ctx context.Context, env *plat
 	if err := r.Get(ctx, types.NamespacedName{Namespace: env.Namespace, Name: envPodName(env)}, &pod); err == nil {
 		if !metav1.IsControlledBy(&pod, env) {
 			// A foreign fixed-name object must not be destroyed by this finalizer.
-		} else if err := r.Delete(ctx, &pod); err != nil && !errors.IsNotFound(err) {
+		} else if err := r.deleteObservedChild(ctx, &pod); err != nil && !errors.IsNotFound(err) {
 			return ctrl.Result{}, fmt.Errorf("delete pod during environment deletion: %w", err)
 		} else {
 			return ctrl.Result{Requeue: true}, nil
@@ -216,7 +233,7 @@ func (r *EnvironmentReconciler) reconcileDeleting(ctx context.Context, env *plat
 	if err := r.Get(ctx, types.NamespacedName{Namespace: env.Namespace, Name: envCredentialName(env)}, &credentials); err == nil {
 		if !metav1.IsControlledBy(&credentials, env) {
 			// Leave foreign objects untouched.
-		} else if err := r.Delete(ctx, &credentials); err != nil && !errors.IsNotFound(err) {
+		} else if err := r.deleteObservedChild(ctx, &credentials); err != nil && !errors.IsNotFound(err) {
 			return ctrl.Result{}, fmt.Errorf("revoke sandboxd credentials during environment deletion: %w", err)
 		} else {
 			return ctrl.Result{Requeue: true}, nil
@@ -228,7 +245,7 @@ func (r *EnvironmentReconciler) reconcileDeleting(ctx context.Context, env *plat
 	if err := r.Get(ctx, types.NamespacedName{Namespace: env.Namespace, Name: envNetworkPolicyName(env)}, &policy); err == nil {
 		if !metav1.IsControlledBy(&policy, env) {
 			// Leave foreign objects untouched.
-		} else if err := r.Delete(ctx, &policy); err != nil && !errors.IsNotFound(err) {
+		} else if err := r.deleteObservedChild(ctx, &policy); err != nil && !errors.IsNotFound(err) {
 			return ctrl.Result{}, fmt.Errorf("delete sandboxd network policy: %w", err)
 		} else {
 			return ctrl.Result{Requeue: true}, nil
@@ -240,7 +257,7 @@ func (r *EnvironmentReconciler) reconcileDeleting(ctx context.Context, env *plat
 	if err := r.Get(ctx, types.NamespacedName{Namespace: env.Namespace, Name: envPVCName(env)}, &pvc); err == nil {
 		if !metav1.IsControlledBy(&pvc, env) {
 			// Leave foreign objects untouched.
-		} else if err := r.Delete(ctx, &pvc); err != nil && !errors.IsNotFound(err) {
+		} else if err := r.deleteObservedChild(ctx, &pvc); err != nil && !errors.IsNotFound(err) {
 			return ctrl.Result{}, fmt.Errorf("delete workspace during environment deletion: %w", err)
 		} else {
 			return ctrl.Result{Requeue: true}, nil
@@ -258,11 +275,10 @@ func (r *EnvironmentReconciler) reconcilePaused(ctx context.Context, env *platfo
 	var pod corev1.Pod
 	err := r.Get(ctx, types.NamespacedName{Namespace: env.Namespace, Name: podName}, &pod)
 	if err == nil {
-		current, stale := dependentOwnership(&pod, env)
-		if !current && !stale {
-			return ctrl.Result{}, fmt.Errorf("pod %q is not owned by this environment", podName)
+		if !metav1.IsControlledBy(&pod, env) {
+			return ctrl.Result{}, &childOwnershipCollisionError{kind: "Pod", name: podName}
 		}
-		if delErr := r.Delete(ctx, &pod); delErr != nil && !errors.IsNotFound(delErr) {
+		if delErr := r.deleteObservedChild(ctx, &pod); delErr != nil && !errors.IsNotFound(delErr) {
 			return ctrl.Result{}, fmt.Errorf("delete pod for pause: %w", delErr)
 		}
 		return ctrl.Result{Requeue: true}, nil
@@ -271,11 +287,10 @@ func (r *EnvironmentReconciler) reconcilePaused(ctx context.Context, env *platfo
 	}
 	var credentials corev1.Secret
 	if err := r.Get(ctx, types.NamespacedName{Namespace: env.Namespace, Name: envCredentialName(env)}, &credentials); err == nil {
-		current, stale := dependentOwnership(&credentials, env)
-		if !current && !stale {
-			return ctrl.Result{}, fmt.Errorf("Secret %q is not owned by this environment", credentials.Name)
+		if !metav1.IsControlledBy(&credentials, env) {
+			return ctrl.Result{}, &childOwnershipCollisionError{kind: "Secret", name: credentials.Name}
 		}
-		if err := r.Delete(ctx, &credentials); err != nil && !errors.IsNotFound(err) {
+		if err := r.deleteObservedChild(ctx, &credentials); err != nil && !errors.IsNotFound(err) {
 			return ctrl.Result{}, fmt.Errorf("revoke sandboxd credentials: %w", err)
 		}
 		return ctrl.Result{Requeue: true}, nil
@@ -291,17 +306,10 @@ func (r *EnvironmentReconciler) ensureWorkspacePVC(ctx context.Context, env *pla
 	var pvc corev1.PersistentVolumeClaim
 	err := r.Get(ctx, types.NamespacedName{Namespace: env.Namespace, Name: pvcName}, &pvc)
 	if err == nil {
-		current, stale := dependentOwnership(&pvc, env)
-		if current {
-			return true, nil
+		if !metav1.IsControlledBy(&pvc, env) {
+			return false, &childOwnershipCollisionError{kind: "PersistentVolumeClaim", name: pvcName}
 		}
-		if !stale {
-			return false, fmt.Errorf("PVC %q is not owned by this environment", pvcName)
-		}
-		if err := r.Delete(ctx, &pvc); err != nil && !errors.IsNotFound(err) {
-			return false, err
-		}
-		return false, nil
+		return true, nil
 	}
 	if !errors.IsNotFound(err) {
 		return false, err
@@ -329,7 +337,7 @@ func (r *EnvironmentReconciler) ensureWorkspacePVC(ctx context.Context, env *pla
 		return false, err
 	}
 	if err := r.Create(ctx, &pvc); err != nil {
-		return false, err
+		return false, collisionOnAlreadyExists(err, "PersistentVolumeClaim", pvcName)
 	}
 	return true, nil
 }
@@ -340,8 +348,7 @@ func (r *EnvironmentReconciler) ensurePod(ctx context.Context, env *platformv1al
 	var pod corev1.Pod
 	err := r.Get(ctx, types.NamespacedName{Namespace: env.Namespace, Name: podName}, &pod)
 	if err == nil {
-		current, stale := dependentOwnership(&pod, env)
-		if current {
+		if metav1.IsControlledBy(&pod, env) {
 			secure, err := r.currentSandboxdPod(ctx, env, &pod)
 			if err != nil {
 				return nil, err
@@ -350,7 +357,7 @@ func (r *EnvironmentReconciler) ensurePod(ctx context.Context, env *platformv1al
 				if err := r.setPhase(ctx, env, platformv1alpha1.EnvironmentPhaseSetup, "", ""); err != nil {
 					return nil, err
 				}
-				if err := r.Delete(ctx, &pod); err != nil {
+				if err := r.deleteObservedChild(ctx, &pod); err != nil && !errors.IsNotFound(err) {
 					return nil, fmt.Errorf("replace pod for project change: %w", err)
 				}
 				return nil, errPodReplacing
@@ -359,10 +366,10 @@ func (r *EnvironmentReconciler) ensurePod(ctx context.Context, env *platformv1al
 				return &pod, nil
 			}
 		}
-		if !current && !stale {
-			return nil, fmt.Errorf("pod %q is not owned by this environment", podName)
+		if !metav1.IsControlledBy(&pod, env) {
+			return nil, &childOwnershipCollisionError{kind: "Pod", name: podName}
 		}
-		if err := r.Delete(ctx, &pod); err != nil && !errors.IsNotFound(err) {
+		if err := r.deleteObservedChild(ctx, &pod); err != nil && !errors.IsNotFound(err) {
 			return nil, err
 		}
 		return nil, nil
@@ -373,15 +380,8 @@ func (r *EnvironmentReconciler) ensurePod(ctx context.Context, env *platformv1al
 	var existingCredentials corev1.Secret
 	err = r.Get(ctx, types.NamespacedName{Namespace: env.Namespace, Name: envCredentialName(env)}, &existingCredentials)
 	if err == nil {
-		current, stale := dependentOwnership(&existingCredentials, env)
-		if stale {
-			if err := r.Delete(ctx, &existingCredentials); err != nil && !errors.IsNotFound(err) {
-				return nil, err
-			}
-			return nil, nil
-		}
-		if !current {
-			return nil, fmt.Errorf("Secret %q is not owned by this environment", existingCredentials.Name)
+		if !metav1.IsControlledBy(&existingCredentials, env) {
+			return nil, &childOwnershipCollisionError{kind: "Secret", name: existingCredentials.Name}
 		}
 		// The prior pod disappeared, so rotate this incarnation's Secret in place.
 	}
@@ -517,7 +517,7 @@ func (r *EnvironmentReconciler) ensurePod(ctx context.Context, env *platformv1al
 		return nil, err
 	}
 	if err := r.Create(ctx, &pod); err != nil {
-		return nil, err
+		return nil, collisionOnAlreadyExists(err, "Pod", podName)
 	}
 	// Bind the private adapter credential to the exact execution incarnation.
 	// Real API servers always assign a Pod UID. Fake clients do not, so an empty
@@ -545,8 +545,10 @@ func (r *EnvironmentReconciler) currentSandboxdPod(ctx context.Context, env *pla
 		}
 		return false, fmt.Errorf("get sandboxd credentials: %w", err)
 	}
-	return exactControllerOwner(&secret, platformv1alpha1.GroupVersion.String(), "Environment", env.Name, env.UID) &&
-		secret.UID != "" && pod.Annotations[sandboxdauth.SecretUIDAnnotation] == string(secret.UID) &&
+	if !exactControllerOwner(&secret, platformv1alpha1.GroupVersion.String(), "Environment", env.Name, env.UID) {
+		return false, &childOwnershipCollisionError{kind: "Secret", name: secret.Name}
+	}
+	return secret.UID != "" && pod.Annotations[sandboxdauth.SecretUIDAnnotation] == string(secret.UID) &&
 		secret.Annotations[sandboxdauth.IdentityAnnotation] == pod.Annotations[sandboxdauth.IdentityAnnotation] &&
 		pod.UID != "" && secret.Annotations[sandboxdauth.PodUIDAnnotation] == string(pod.UID) &&
 		len(secret.Data[sandboxdauth.TLSCertKey]) > 0 && len(secret.Data[sandboxdauth.TLSKeyKey]) > 0 &&
@@ -590,11 +592,14 @@ func (r *EnvironmentReconciler) rotateSandboxdCredentials(ctx context.Context, e
 		secret.Data = sandboxdCredentialData(certificate, privateKey, capabilities, processToken)
 		secret.Annotations = map[string]string{sandboxdauth.IdentityAnnotation: serverName}
 		if err := r.Create(ctx, &secret); err != nil {
-			return "", nil, "", err
+			return "", nil, "", collisionOnAlreadyExists(err, "Secret", key.Name)
 		}
 	} else if err != nil {
 		return "", nil, "", err
 	} else {
+		if !exactControllerOwner(&secret, platformv1alpha1.GroupVersion.String(), "Environment", env.Name, env.UID) {
+			return "", nil, "", &childOwnershipCollisionError{kind: "Secret", name: secret.Name}
+		}
 		secret.Data = sandboxdCredentialData(certificate, privateKey, capabilities, processToken)
 		if secret.Annotations == nil {
 			secret.Annotations = map[string]string{}
@@ -669,15 +674,8 @@ func (r *EnvironmentReconciler) ensureSandboxdNetworkPolicy(ctx context.Context,
 	}
 	original := policy.DeepCopy()
 	if !creating {
-		current, stale := dependentOwnership(&policy, env)
-		if !current && !stale {
-			return false, fmt.Errorf("NetworkPolicy %q is not owned by this environment", name)
-		}
-		if stale {
-			if err := r.Delete(ctx, &policy); err != nil && !errors.IsNotFound(err) {
-				return false, err
-			}
-			return false, nil
+		if !metav1.IsControlledBy(&policy, env) {
+			return false, &childOwnershipCollisionError{kind: "NetworkPolicy", name: name}
 		}
 	}
 	policy.Labels = envLabels(env)
@@ -696,7 +694,7 @@ func (r *EnvironmentReconciler) ensureSandboxdNetworkPolicy(ctx context.Context,
 	}
 	protocol := corev1.ProtocolTCP
 	policy.Spec = networkingv1.NetworkPolicySpec{
-		PodSelector: metav1.LabelSelector{MatchLabels: map[string]string{"swe.dev/environment": env.Name}},
+		PodSelector: metav1.LabelSelector{MatchLabels: map[string]string{"swe.dev/environment": envSelectorLabel(env)}},
 		PolicyTypes: []networkingv1.PolicyType{networkingv1.PolicyTypeIngress},
 		Ingress: []networkingv1.NetworkPolicyIngressRule{{
 			From: []networkingv1.NetworkPolicyPeer{{
@@ -723,7 +721,7 @@ func (r *EnvironmentReconciler) ensureSandboxdNetworkPolicy(ctx context.Context,
 	}
 	if creating {
 		if err := r.Create(ctx, &policy); err != nil {
-			return false, err
+			return false, collisionOnAlreadyExists(err, "NetworkPolicy", name)
 		}
 		return true, nil
 	}
@@ -736,21 +734,6 @@ func (r *EnvironmentReconciler) ensureSandboxdNetworkPolicy(ctx context.Context,
 		return false, err
 	}
 	return true, nil
-}
-
-// dependentOwnership distinguishes the current owner from a stale incarnation
-// with the same Environment name. Unowned and differently owned objects are
-// foreign collisions and must never be adopted or deleted.
-func dependentOwnership(object metav1.Object, env *platformv1alpha1.Environment) (current, stale bool) {
-	if exactControllerOwner(object, platformv1alpha1.GroupVersion.String(), "Environment", env.Name, env.UID) {
-		return true, false
-	}
-	owner := metav1.GetControllerOf(object)
-	if owner == nil {
-		return false, false
-	}
-	return false, owner.APIVersion == platformv1alpha1.GroupVersion.String() &&
-		owner.Kind == "Environment" && owner.Name == env.Name && owner.UID != env.UID
 }
 
 // syncStatus maps pod state onto the Environment phase.
@@ -794,7 +777,8 @@ func podReady(pod *corev1.Pod) bool {
 }
 
 func (r *EnvironmentReconciler) setPhase(ctx context.Context, env *platformv1alpha1.Environment, phase platformv1alpha1.EnvironmentPhase, podName, sandboxdEndpoint string) error {
-	if env.Status.Phase == phase && env.Status.PodName == podName && env.Status.Endpoints.Sandboxd == sandboxdEndpoint {
+	conditionChanged := clearChildOwnershipCollision(env)
+	if env.Status.Phase == phase && env.Status.PodName == podName && env.Status.Endpoints.Sandboxd == sandboxdEndpoint && !conditionChanged {
 		return nil
 	}
 	env.Status.Phase = phase
@@ -805,6 +789,21 @@ func (r *EnvironmentReconciler) setPhase(ctx context.Context, env *platformv1alp
 
 func (r *EnvironmentReconciler) fail(ctx context.Context, env *platformv1alpha1.Environment, err error) error {
 	log.FromContext(ctx).Error(err, "reconcile failed", "environment", env.Name)
+	var collision *childOwnershipCollisionError
+	if stderrors.As(err, &collision) {
+		env.Status.Phase = platformv1alpha1.EnvironmentPhaseFailed
+		changed := apimeta.SetStatusCondition(&env.Status.Conditions, metav1.Condition{
+			Type:               "ChildOwnershipConflict",
+			Status:             metav1.ConditionTrue,
+			ObservedGeneration: env.Generation,
+			Reason:             "ResourceCollision",
+			Message:            collision.Error(),
+		})
+		if !changed {
+			return nil
+		}
+		return r.Status().Update(ctx, env)
+	}
 	env.Status.Phase = platformv1alpha1.EnvironmentPhaseFailed
 	if statusErr := r.Status().Update(ctx, env); statusErr != nil {
 		return statusErr
@@ -812,19 +811,74 @@ func (r *EnvironmentReconciler) fail(ctx context.Context, env *platformv1alpha1.
 	return err
 }
 
-func envPodName(env *platformv1alpha1.Environment) string { return "env-" + env.Name }
-func envPVCName(env *platformv1alpha1.Environment) string { return "env-" + env.Name }
+func clearChildOwnershipCollision(env *platformv1alpha1.Environment) bool {
+	if apimeta.FindStatusCondition(env.Status.Conditions, "ChildOwnershipConflict") == nil {
+		return false
+	}
+	return apimeta.SetStatusCondition(&env.Status.Conditions, metav1.Condition{
+		Type:               "ChildOwnershipConflict",
+		Status:             metav1.ConditionFalse,
+		ObservedGeneration: env.Generation,
+		Reason:             "CollisionResolved",
+		Message:            "all child resources are owned by this Environment",
+	})
+}
+
+func collisionOnAlreadyExists(err error, kind, name string) error {
+	if errors.IsAlreadyExists(err) {
+		return &childOwnershipCollisionError{kind: kind, name: name}
+	}
+	return err
+}
+
+func (r *EnvironmentReconciler) deleteObservedChild(ctx context.Context, object client.Object) error {
+	uid := object.GetUID()
+	if uid == "" {
+		return fmt.Errorf("refuse to delete %T %s/%s without UID", object, object.GetNamespace(), object.GetName())
+	}
+	return r.Delete(ctx, object, client.Preconditions{UID: &uid})
+}
+
+func envPodName(env *platformv1alpha1.Environment) string { return envChildName(env, "") }
+func envPVCName(env *platformv1alpha1.Environment) string { return envChildName(env, "") }
 func envCredentialName(env *platformv1alpha1.Environment) string {
-	return "env-" + env.Name + "-sandboxd"
+	return envChildName(env, "-sandboxd")
 }
 func envNetworkPolicyName(env *platformv1alpha1.Environment) string {
-	return "env-" + env.Name + "-sandboxd"
+	return envChildName(env, "-sandboxd")
+}
+
+// envChildName preserves valid legacy names so existing Environments retain
+// their workspaces across upgrades. Names that would exceed 63 characters are
+// bounded and include the Environment UID, avoiding collisions between long
+// same-name Environment incarnations.
+func envChildName(env *platformv1alpha1.Environment, suffix string) string {
+	legacyName := "env-" + env.Name + suffix
+	if len(env.Name) <= 63 {
+		return legacyName
+	}
+	digest := sha256.Sum256([]byte(env.UID))
+	incarnation := hex.EncodeToString(digest[:])[:12]
+	const prefix = "env-"
+	maxEnvironmentLength := 63 - len(prefix) - 1 - len(incarnation) - len(suffix)
+	environmentName := env.Name
+	if len(environmentName) > maxEnvironmentLength {
+		environmentName = strings.TrimRight(environmentName[:maxEnvironmentLength], "-.")
+	}
+	return prefix + environmentName + "-" + incarnation + suffix
+}
+
+func envSelectorLabel(env *platformv1alpha1.Environment) string {
+	if len(env.Name) <= 63 {
+		return env.Name
+	}
+	return envPodName(env)
 }
 
 func envLabels(env *platformv1alpha1.Environment) map[string]string {
 	return map[string]string{
 		"app.kubernetes.io/managed-by": "swe-platform",
-		"swe.dev/environment":          env.Name,
+		"swe.dev/environment":          envSelectorLabel(env),
 	}
 }
 

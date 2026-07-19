@@ -12,11 +12,17 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/validation"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
 	platformv1alpha1 "github.com/Chris-Cullins/swe-platform/api/v1alpha1"
@@ -234,7 +240,7 @@ func TestSandboxdNetworkPolicyOnlyAllowsControlPlaneIngress(t *testing.T) {
 	}
 }
 
-func TestEnsurePodReplacesLegacyOrWrongOwnerPod(t *testing.T) {
+func TestEnsurePodRefusesWrongOwnerPod(t *testing.T) {
 	scheme := runtime.NewScheme()
 	if err := corev1.AddToScheme(scheme); err != nil {
 		t.Fatal(err)
@@ -257,15 +263,13 @@ func TestEnsurePodReplacesLegacyOrWrongOwnerPod(t *testing.T) {
 	}
 
 	pod, err := reconciler.ensurePod(context.Background(), env, &platformv1alpha1.EnvironmentTemplate{})
-	if err != nil {
-		t.Fatal(err)
+	var collision *childOwnershipCollisionError
+	if pod != nil || !stderrors.As(err, &collision) {
+		t.Fatalf("ensurePod() = (%#v, %v), want ownership collision", pod, err)
 	}
-	if pod != nil {
-		t.Fatal("ensurePod adopted an insecure pod from another environment incarnation")
-	}
-	var deleted corev1.Pod
-	if err := reconciler.Get(context.Background(), client.ObjectKeyFromObject(legacyPod), &deleted); err == nil {
-		t.Fatal("legacy pod was not deleted for secure recreation")
+	var retained corev1.Pod
+	if err := reconciler.Get(context.Background(), client.ObjectKeyFromObject(legacyPod), &retained); err != nil {
+		t.Fatal("wrong-owner pod was modified or deleted")
 	}
 }
 
@@ -308,6 +312,53 @@ func TestEnsurePodRetainsCurrentPodWhenSecretReadFails(t *testing.T) {
 	}
 }
 
+func TestEnsurePodRetainsCurrentPodAndForeignSecretOnCollision(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	if err := platformv1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	env := &platformv1alpha1.Environment{ObjectMeta: metav1.ObjectMeta{
+		Name: "test", Namespace: "default", UID: "environment-uid",
+	}}
+	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
+		Name: envPodName(env), Namespace: env.Namespace,
+		Annotations: map[string]string{
+			sandboxdRevisionAnnotation:      sandboxdSecurityRevision,
+			sandboxdauth.IdentityAnnotation: "current.sandboxd.swe.dev",
+			sandboxdauth.TrustAnnotation:    "public trust bundle",
+			sandboxdauth.TokenAnnotation:    "terminal token",
+		},
+	}}
+	if err := controllerutil.SetControllerReference(env, pod, scheme); err != nil {
+		t.Fatal(err)
+	}
+	foreignSecret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{
+		Name: envCredentialName(env), Namespace: env.Namespace,
+	}}
+	reconciler := &EnvironmentReconciler{
+		Client: fake.NewClientBuilder().WithScheme(scheme).WithObjects(pod, foreignSecret).Build(), Scheme: scheme,
+	}
+
+	got, err := reconciler.ensurePod(context.Background(), env, &platformv1alpha1.EnvironmentTemplate{})
+	var collision *childOwnershipCollisionError
+	if got != nil || !stderrors.As(err, &collision) {
+		t.Fatalf("ensurePod() = (%#v, %v), want Secret ownership collision", got, err)
+	}
+	if err := reconciler.Get(context.Background(), client.ObjectKeyFromObject(pod), &corev1.Pod{}); err != nil {
+		t.Fatal("current pod was deleted because of a foreign Secret")
+	}
+	var retainedSecret corev1.Secret
+	if err := reconciler.Get(context.Background(), client.ObjectKeyFromObject(foreignSecret), &retainedSecret); err != nil {
+		t.Fatal("foreign Secret was modified or deleted")
+	}
+	if len(retainedSecret.Data) != 0 || len(retainedSecret.Annotations) != 0 {
+		t.Fatal("foreign Secret was mutated")
+	}
+}
+
 type secretReadErrorClient struct {
 	client.Client
 	err error
@@ -320,7 +371,7 @@ func (c secretReadErrorClient) Get(ctx context.Context, key client.ObjectKey, ob
 	return c.Client.Get(ctx, key, object, options...)
 }
 
-func TestStaleDependentsAreRemovedButForeignCollisionsArePreserved(t *testing.T) {
+func TestWrongOwnerAndForeignDependentsArePreserved(t *testing.T) {
 	scheme := runtime.NewScheme()
 	if err := corev1.AddToScheme(scheme); err != nil {
 		t.Fatal(err)
@@ -349,17 +400,178 @@ func TestStaleDependentsAreRemovedButForeignCollisionsArePreserved(t *testing.T)
 	}
 
 	ready, err := reconciler.ensureWorkspacePVC(context.Background(), env, &platformv1alpha1.EnvironmentTemplate{})
-	if err != nil || ready {
-		t.Fatalf("stale PVC reconciliation = (%t, %v), want removed and requeue", ready, err)
+	var collision *childOwnershipCollisionError
+	if ready || !stderrors.As(err, &collision) {
+		t.Fatalf("wrong-owner PVC reconciliation = (%t, %v), want collision", ready, err)
 	}
-	if err := reconciler.Get(context.Background(), client.ObjectKeyFromObject(stalePVC), &corev1.PersistentVolumeClaim{}); err == nil {
-		t.Fatal("stale PVC from prior Environment UID was retained")
+	if err := reconciler.Get(context.Background(), client.ObjectKeyFromObject(stalePVC), &corev1.PersistentVolumeClaim{}); err != nil {
+		t.Fatal("wrong-owner PVC was modified or deleted")
 	}
 	if ready, err := reconciler.ensureSandboxdNetworkPolicy(context.Background(), env); err == nil || ready {
 		t.Fatalf("foreign NetworkPolicy reconciliation = (%t, %v), want collision error", ready, err)
 	}
 	if err := reconciler.Get(context.Background(), client.ObjectKeyFromObject(foreignPolicy), &networkingv1.NetworkPolicy{}); err != nil {
 		t.Fatal("foreign NetworkPolicy was modified or deleted")
+	}
+}
+
+func TestChildNamesAreBoundedAndScopedToEnvironmentUID(t *testing.T) {
+	longName := strings.Repeat("a", 253)
+	first := &platformv1alpha1.Environment{ObjectMeta: metav1.ObjectMeta{Name: longName, UID: "first-environment-uid"}}
+	second := &platformv1alpha1.Environment{ObjectMeta: metav1.ObjectMeta{Name: longName, UID: "second-environment-uid"}}
+
+	for _, name := range []string{envPodName(first), envPVCName(first), envCredentialName(first), envNetworkPolicyName(first)} {
+		if len(name) > 63 {
+			t.Errorf("child name length = %d, want at most 63: %q", len(name), name)
+		}
+		if problems := validation.IsDNS1123Subdomain(name); len(problems) != 0 {
+			t.Errorf("child name %q is invalid: %v", name, problems)
+		}
+	}
+	if envPodName(first) == envPodName(second) || envPVCName(first) == envPVCName(second) {
+		t.Fatal("same-name Environment recreations share child names")
+	}
+
+	legacy := &platformv1alpha1.Environment{ObjectMeta: metav1.ObjectMeta{Name: strings.Repeat("a", 63), UID: "legacy-uid"}}
+	wantPodName := "env-" + legacy.Name
+	if envPodName(legacy) != wantPodName || envPVCName(legacy) != wantPodName {
+		t.Fatalf("63-character Environment did not retain legacy Pod/PVC name %q", wantPodName)
+	}
+	wantSandboxdName := wantPodName + "-sandboxd"
+	if envCredentialName(legacy) != wantSandboxdName || envNetworkPolicyName(legacy) != wantSandboxdName {
+		t.Fatalf("63-character Environment did not retain legacy sandboxd name %q", wantSandboxdName)
+	}
+	for _, name := range []string{wantPodName, wantSandboxdName} {
+		if problems := validation.IsDNS1123Subdomain(name); len(problems) != 0 {
+			t.Errorf("legacy child name %q is invalid: %v", name, problems)
+		}
+	}
+}
+
+func TestDeleteObservedChildUsesUIDPrecondition(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	replacement := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "environment", Namespace: "default", UID: "replacement-uid"}}
+	baseClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(replacement).Build()
+	var preconditionUID *types.UID
+	interceptedClient := interceptor.NewClient(baseClient, interceptor.Funcs{
+		Delete: func(_ context.Context, _ client.WithWatch, object client.Object, options ...client.DeleteOption) error {
+			deleteOptions := &client.DeleteOptions{}
+			for _, option := range options {
+				option.ApplyToDelete(deleteOptions)
+			}
+			if deleteOptions.Preconditions != nil {
+				preconditionUID = deleteOptions.Preconditions.UID
+			}
+			return apierrors.NewConflict(schema.GroupResource{Resource: "pods"}, object.GetName(), stderrors.New("UID mismatch"))
+		},
+	})
+	reconciler := &EnvironmentReconciler{Client: interceptedClient, Scheme: scheme}
+	observed := replacement.DeepCopy()
+	observed.UID = "observed-uid"
+
+	if err := reconciler.deleteObservedChild(context.Background(), observed); !apierrors.IsConflict(err) {
+		t.Fatalf("deleteObservedChild() error = %v, want UID precondition conflict", err)
+	}
+	if preconditionUID == nil || *preconditionUID != observed.UID {
+		t.Fatalf("delete UID precondition = %v, want %q", preconditionUID, observed.UID)
+	}
+	if err := reconciler.Get(context.Background(), client.ObjectKeyFromObject(replacement), &corev1.Pod{}); err != nil {
+		t.Fatal("replacement Pod was deleted despite UID precondition")
+	}
+}
+
+func TestNewEnvironmentRefusesTerminatingPriorIncarnationPVC(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	if err := platformv1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	oldEnv := &platformv1alpha1.Environment{ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default", UID: "old-uid"}}
+	newEnv := &platformv1alpha1.Environment{ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default", UID: "new-uid"}}
+	deletedAt := metav1.Now()
+	oldPVC := &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{
+		Name: envPVCName(oldEnv), Namespace: oldEnv.Namespace, DeletionTimestamp: &deletedAt, Finalizers: []string{"test/finalizer"},
+	}}
+	if err := controllerutil.SetControllerReference(oldEnv, oldPVC, scheme); err != nil {
+		t.Fatal(err)
+	}
+	reconciler := &EnvironmentReconciler{
+		Client: fake.NewClientBuilder().WithScheme(scheme).WithObjects(oldPVC).Build(), Scheme: scheme,
+	}
+
+	ready, err := reconciler.ensureWorkspacePVC(context.Background(), newEnv, &platformv1alpha1.EnvironmentTemplate{})
+	var collision *childOwnershipCollisionError
+	if ready || !stderrors.As(err, &collision) {
+		t.Fatalf("new incarnation PVC reconciliation = (%t, %v), want ownership collision", ready, err)
+	}
+	if err := reconciler.Get(context.Background(), client.ObjectKeyFromObject(oldPVC), &corev1.PersistentVolumeClaim{}); err != nil {
+		t.Fatal("terminating prior-incarnation PVC was touched")
+	}
+}
+
+func TestReconcileReportsStableChildOwnershipCondition(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	if err := platformv1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	env := &platformv1alpha1.Environment{
+		ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default", UID: "environment-uid", Generation: 3, Finalizers: []string{environmentFinalizer}},
+		Spec:       platformv1alpha1.EnvironmentSpec{TemplateRef: "small"},
+	}
+	template := &platformv1alpha1.EnvironmentTemplate{ObjectMeta: metav1.ObjectMeta{Name: "small", Namespace: "default"}}
+	foreignPVC := &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: envPVCName(env), Namespace: env.Namespace}}
+	reconciler := &EnvironmentReconciler{
+		Client: fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(env).WithObjects(env, template, foreignPVC).Build(), Scheme: scheme,
+	}
+
+	request := ctrl.Request{NamespacedName: types.NamespacedName{Namespace: env.Namespace, Name: env.Name}}
+	for i := 0; i < 2; i++ {
+		result, err := reconciler.Reconcile(context.Background(), request)
+		if err != nil || result.Requeue || result.RequeueAfter != 0 {
+			t.Fatalf("reconcile %d = (%#v, %v), want stable success without requeue", i+1, result, err)
+		}
+	}
+	var updated platformv1alpha1.Environment
+	if err := reconciler.Get(context.Background(), client.ObjectKeyFromObject(env), &updated); err != nil {
+		t.Fatal(err)
+	}
+	condition := apimeta.FindStatusCondition(updated.Status.Conditions, "ChildOwnershipConflict")
+	if updated.Status.Phase != platformv1alpha1.EnvironmentPhaseFailed || condition == nil ||
+		condition.Status != metav1.ConditionTrue || condition.Reason != "ResourceCollision" || condition.ObservedGeneration != env.Generation {
+		t.Fatalf("collision status = phase %q, condition %#v", updated.Status.Phase, condition)
+	}
+	if err := reconciler.Get(context.Background(), client.ObjectKeyFromObject(foreignPVC), &corev1.PersistentVolumeClaim{}); err != nil {
+		t.Fatal("foreign PVC was modified or deleted")
+	}
+}
+
+func TestReconcilePausedRefusesForeignPod(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	if err := platformv1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	env := &platformv1alpha1.Environment{ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default", UID: "environment-uid"}}
+	foreignPod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: envPodName(env), Namespace: env.Namespace}}
+	reconciler := &EnvironmentReconciler{Client: fake.NewClientBuilder().WithScheme(scheme).WithObjects(foreignPod).Build(), Scheme: scheme}
+
+	result, err := reconciler.reconcilePaused(context.Background(), env)
+	var collision *childOwnershipCollisionError
+	if result.Requeue || !stderrors.As(err, &collision) {
+		t.Fatalf("reconcilePaused() = (%#v, %v), want ownership collision", result, err)
+	}
+	if err := reconciler.Get(context.Background(), client.ObjectKeyFromObject(foreignPod), &corev1.Pod{}); err != nil {
+		t.Fatal("pause modified or deleted a foreign pod")
 	}
 }
 
@@ -377,9 +589,9 @@ func TestEnvironmentDeletionStopsPodBeforeRevokingCredentials(t *testing.T) {
 	env := &platformv1alpha1.Environment{ObjectMeta: metav1.ObjectMeta{
 		Name: "test", Namespace: "default", UID: "environment-uid", Finalizers: []string{environmentFinalizer},
 	}}
-	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: envPodName(env), Namespace: env.Namespace}}
-	secret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: envCredentialName(env), Namespace: env.Namespace}}
-	policy := &networkingv1.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{Name: envNetworkPolicyName(env), Namespace: env.Namespace}}
+	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: envPodName(env), Namespace: env.Namespace, UID: "pod-uid"}}
+	secret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: envCredentialName(env), Namespace: env.Namespace, UID: "secret-uid"}}
+	policy := &networkingv1.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{Name: envNetworkPolicyName(env), Namespace: env.Namespace, UID: "policy-uid"}}
 	for _, object := range []client.Object{pod, secret, policy} {
 		if err := controllerutil.SetControllerReference(env, object, scheme); err != nil {
 			t.Fatal(err)
@@ -576,11 +788,11 @@ func TestReconcilePausedWaitsForPodDeletion(t *testing.T) {
 	env := &platformv1alpha1.Environment{
 		ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default", UID: "environment-uid"},
 		Status: platformv1alpha1.EnvironmentStatus{
-			Phase:   platformv1alpha1.EnvironmentPhaseReady,
-			PodName: "env-test",
+			Phase: platformv1alpha1.EnvironmentPhaseReady,
 		},
 	}
-	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "env-test", Namespace: "default"}}
+	env.Status.PodName = envPodName(env)
+	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: envPodName(env), Namespace: "default", UID: "pod-uid"}}
 	if err := controllerutil.SetControllerReference(env, pod, scheme); err != nil {
 		t.Fatal(err)
 	}
