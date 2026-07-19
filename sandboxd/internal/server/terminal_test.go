@@ -1,12 +1,14 @@
 package server
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"io"
 	"net"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -207,6 +209,37 @@ func TestTmuxOutputDecodesBinaryData(t *testing.T) {
 	if _, ok := tmuxOutput("%begin 1 2 3"); ok {
 		t.Fatal("decoded a non-output control record")
 	}
+}
+
+func TestWaitForTmuxReady(t *testing.T) {
+	t.Run("waits for commands and attachment", func(t *testing.T) {
+		scanner := bufio.NewScanner(strings.NewReader("%begin 1 1 0\n%output %0 ready\\015\\012\n%end 1 1 0\n%begin 1 2 0\n%end 1 2 0\n%session-changed $0 swe\n"))
+		output, err := waitForTmuxReady(scanner, 2, "swe")
+		if err != nil {
+			t.Fatalf("wait for tmux: %v", err)
+		}
+		if string(output) != "ready\r\n" {
+			t.Fatalf("startup output = %q", output)
+		}
+	})
+	t.Run("reports setup failure", func(t *testing.T) {
+		scanner := bufio.NewScanner(strings.NewReader("%begin 1 1 0\n%error 1 1 0\n"))
+		if _, err := waitForTmuxReady(scanner, 1, "swe"); err == nil {
+			t.Fatal("expected command failure")
+		}
+	})
+	t.Run("rejects missing attachment", func(t *testing.T) {
+		scanner := bufio.NewScanner(strings.NewReader("%begin 1 1 0\n%end 1 1 0\n"))
+		if _, err := waitForTmuxReady(scanner, 1, "swe"); !errors.Is(err, io.ErrUnexpectedEOF) {
+			t.Fatalf("incomplete setup error = %v, want unexpected EOF", err)
+		}
+	})
+	t.Run("ignores mismatched completion and error records", func(t *testing.T) {
+		scanner := bufio.NewScanner(strings.NewReader("%begin 1 1 0\n%end 1 9 0\n%error 1 9 0\n%end 1 1 0\n%session-changed $0 swe\n"))
+		if _, err := waitForTmuxReady(scanner, 1, "swe"); err != nil {
+			t.Fatalf("wait for matching response: %v", err)
+		}
+	})
 }
 
 func TestTerminalStatusMapsBackendErrors(t *testing.T) {

@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -31,7 +32,7 @@ var testSocketCounter atomic.Uint64
 // and returns a client connection to it.
 func newConn(t *testing.T, workspace string) *grpc.ClientConn {
 	t.Helper()
-	socketName := fmt.Sprintf("swe-test-%d", testSocketCounter.Add(1))
+	socketName := fmt.Sprintf("swe-test-%d-%d", os.Getpid(), testSocketCounter.Add(1))
 	t.Cleanup(func() {
 		_ = exec.Command("tmux", "-L", socketName, "kill-server").Run()
 	})
@@ -278,6 +279,87 @@ func receiveTerminalMarker(t *testing.T, stream interface {
 		}
 		output = append(output, message.GetData()...)
 	}
+}
+
+func TestTerminalDrainsOutputWhenShellExits(t *testing.T) {
+	tmuxPath, err := exec.LookPath("tmux")
+	if err != nil {
+		t.Skip("tmux is not installed")
+	}
+	version, err := exec.Command(tmuxPath, "-V").Output()
+	if err != nil || !strings.Contains(string(version), "swe-drain") {
+		t.Skip("tmux does not include the control output drain fix")
+	}
+
+	socketName := fmt.Sprintf("swe-drain-test-%d-%d", os.Getpid(), testSocketCounter.Add(1))
+	t.Cleanup(func() {
+		_ = exec.Command("tmux", "-L", socketName, "kill-server").Run()
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	backend := newTmuxTerminalBackend(t.TempDir(), socketName, []string{"sh"})
+	session, err := backend.Open(ctx, 80, 24)
+	if err != nil {
+		t.Fatalf("open terminal backend: %v", err)
+	}
+	defer session.Close()
+	if err := session.Write([]byte("printf 'shell-ready\\n'\n")); err != nil {
+		t.Fatalf("write terminal readiness input: %v", err)
+	}
+	var output []byte
+	for !strings.Contains(string(output), "shell-ready") {
+		data, err := session.Read()
+		output = append(output, data...)
+		if err != nil {
+			t.Fatalf("wait for shell readiness: %v (output %q)", err, output)
+		}
+	}
+	second, err := backend.Open(ctx, 80, 24)
+	if err != nil {
+		t.Fatalf("open second terminal backend: %v", err)
+	}
+	defer second.Close()
+	if err := session.Write([]byte("printf 'both-ready\\n'\n")); err != nil {
+		t.Fatalf("write shared readiness input: %v", err)
+	}
+	for i, attachment := range []terminalSession{session, second} {
+		if _, err := readTerminalSessionThrough(attachment, []byte("both-ready"), false); err != nil {
+			t.Fatalf("wait for attachment %d: %v", i+1, err)
+		}
+	}
+	if pipe, err := exec.Command("tmux", "-L", socketName, "display-message", "-p", "-t", "swe:", "#{pane_pipe}").Output(); err != nil {
+		t.Fatalf("inspect pane output pipe: %v", err)
+	} else if strings.TrimSpace(string(pipe)) != "1" {
+		t.Fatalf("pane output drain was not active before terminal input: %q", pipe)
+	}
+	if err := session.Write([]byte("printf '\\106\\111\\116\\101\\114\\055\\104\\122\\101\\111\\116'; exit\n")); err != nil {
+		t.Fatalf("write terminal input: %v", err)
+	}
+
+	for i, attachment := range []terminalSession{session, second} {
+		output, err := readTerminalSessionThrough(attachment, nil, true)
+		if err != nil {
+			t.Fatalf("receive attachment %d output: %v", i+1, err)
+		}
+		if !strings.Contains(string(output), "FINAL-DRAIN") {
+			t.Fatalf("attachment %d output missing final marker after shell exit: %q", i+1, output)
+		}
+	}
+}
+
+func readTerminalSessionThrough(session terminalSession, marker []byte, throughEOF bool) ([]byte, error) {
+	var output []byte
+	for throughEOF || !bytes.Contains(output, marker) {
+		data, err := session.Read()
+		output = append(output, data...)
+		if err != nil {
+			if err == io.EOF && throughEOF {
+				return output, nil
+			}
+			return output, err
+		}
+	}
+	return output, nil
 }
 
 func TestTerminalCloseSendDetaches(t *testing.T) {

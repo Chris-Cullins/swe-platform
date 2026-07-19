@@ -1,0 +1,41 @@
+--- a/control.c
++++ b/control.c
+@@ -719,0 +720,30 @@
++/* Flush all queued output for a pane before it is destroyed. */
++void
++control_flush_pane_output(struct window_pane *wp)
++{
++	struct client		*c;
++	struct control_state	*cs;
++	struct control_pane	*cp;
++
++	TAILQ_FOREACH(c, &clients, entry) {
++		if (c->session == NULL || c->control_state == NULL ||
++		    (~c->flags & CLIENT_CONTROL) || (c->flags & CONTROL_IGNORE_FLAGS))
++			continue;
++		if (winlink_find_by_window(&c->session->windows,
++		    wp->window) == NULL)
++			continue;
++
++		control_write_output(c, wp);
++
++		cs = c->control_state;
++		cp = control_get_pane(c, wp);
++		if (cp == NULL || !cp->pending_flag)
++			continue;
++		if (control_write_pending(c, cp, SIZE_MAX))
++			continue;
++		TAILQ_REMOVE(&cs->pending_list, cp, pending_entry);
++		cp->pending_flag = 0;
++		cs->pending_count--;
++	}
++}
++
+--- a/server-fn.c
++++ b/server-fn.c
+@@ -319,0 +320 @@
++		control_flush_pane_output(wp);
+--- a/tmux.h
++++ b/tmux.h
+@@ -3123,0 +3124 @@
++void	control_flush_pane_output(struct window_pane *);
