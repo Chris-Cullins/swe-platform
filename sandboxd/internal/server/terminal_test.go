@@ -212,9 +212,9 @@ func TestTmuxOutputDecodesBinaryData(t *testing.T) {
 }
 
 func TestWaitForTmuxReady(t *testing.T) {
-	t.Run("waits for commands and attachment", func(t *testing.T) {
-		scanner := bufio.NewScanner(strings.NewReader("%begin 1 1 0\n%output %0 ready\\015\\012\n%end 1 1 0\n%begin 1 2 0\n%end 1 2 0\n%session-changed $0 swe\n"))
-		output, err := waitForTmuxReady(scanner, 2, "swe")
+	t.Run("waits for tagged probe after delayed pipe setup", func(t *testing.T) {
+		scanner := bufio.NewScanner(strings.NewReader("%begin 1 1 0\n%end 1 1 0\n%begin 1 2 0\n%end 1 2 0\n%session-changed $0 swe\n%begin 1 3 0\n%output %0 ready\\015\\012\n%end 1 3 0\n%begin 1 4 0\nswe-output-drain-ready:1\n%end 1 4 0\n"))
+		output, err := waitForTmuxReady(scanner, "swe")
 		if err != nil {
 			t.Fatalf("wait for tmux: %v", err)
 		}
@@ -222,22 +222,22 @@ func TestWaitForTmuxReady(t *testing.T) {
 			t.Fatalf("startup output = %q", output)
 		}
 	})
-	t.Run("reports setup failure", func(t *testing.T) {
-		scanner := bufio.NewScanner(strings.NewReader("%begin 1 1 0\n%error 1 1 0\n"))
-		if _, err := waitForTmuxReady(scanner, 1, "swe"); err == nil {
+	t.Run("reports delayed pipe setup failure", func(t *testing.T) {
+		scanner := bufio.NewScanner(strings.NewReader("%begin 1 1 0\n%end 1 1 0\n%begin 1 2 0\n%end 1 2 0\n%begin 1 3 0\n%error 1 3 0\n"))
+		if _, err := waitForTmuxReady(scanner, "swe"); err == nil {
 			t.Fatal("expected command failure")
 		}
 	})
-	t.Run("rejects missing attachment", func(t *testing.T) {
-		scanner := bufio.NewScanner(strings.NewReader("%begin 1 1 0\n%end 1 1 0\n"))
-		if _, err := waitForTmuxReady(scanner, 1, "swe"); !errors.Is(err, io.ErrUnexpectedEOF) {
+	t.Run("rejects completion before readiness probe", func(t *testing.T) {
+		scanner := bufio.NewScanner(strings.NewReader("%begin 1 1 0\n%end 1 1 0\n%begin 1 2 0\n%end 1 2 0\n%session-changed $0 swe\n"))
+		if _, err := waitForTmuxReady(scanner, "swe"); !errors.Is(err, io.ErrUnexpectedEOF) {
 			t.Fatalf("incomplete setup error = %v, want unexpected EOF", err)
 		}
 	})
-	t.Run("ignores mismatched completion and error records", func(t *testing.T) {
-		scanner := bufio.NewScanner(strings.NewReader("%begin 1 1 0\n%end 1 9 0\n%error 1 9 0\n%end 1 1 0\n%session-changed $0 swe\n"))
-		if _, err := waitForTmuxReady(scanner, 1, "swe"); err != nil {
-			t.Fatalf("wait for matching response: %v", err)
+	t.Run("rejects inactive drain probe", func(t *testing.T) {
+		scanner := bufio.NewScanner(strings.NewReader("%begin 1 3 0\nswe-output-drain-ready:0\n%end 1 3 0\n%session-changed $0 swe\n"))
+		if _, err := waitForTmuxReady(scanner, "swe"); err == nil {
+			t.Fatal("expected inactive drain failure")
 		}
 	})
 }

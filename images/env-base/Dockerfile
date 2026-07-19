@@ -9,6 +9,11 @@ ARG TARGETOS
 ARG TARGETARCH
 RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -o /out/sandboxd ./cmd/sandboxd
 
+FROM build AS terminal-test-build
+ARG TARGETOS
+ARG TARGETARCH
+RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go test -c -o /out/server.test ./internal/server
+
 FROM debian:12-slim AS tmux-build
 
 ARG TMUX_VERSION=3.3a
@@ -27,7 +32,7 @@ RUN patch -p1 <tmux-control-output-drain.patch \
 	&& test "$(./tmux -V)" = "tmux 3.3a-swe-drain"
 
 # Base image for environments.
-FROM debian:12-slim
+FROM debian:12-slim AS environment
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
 		git ca-certificates curl tmux jq ripgrep \
@@ -46,3 +51,9 @@ WORKDIR /workspace
 # sandboxd is the environment's entrypoint: it is the single contract the
 # control plane uses to reach inside (exec / fs / terminal / ports / health).
 ENTRYPOINT ["sandboxd", "serve"]
+
+FROM environment AS terminal-test
+COPY --from=terminal-test-build /out/server.test /usr/local/bin/server.test
+ENTRYPOINT ["/usr/local/bin/server.test"]
+
+FROM environment AS release

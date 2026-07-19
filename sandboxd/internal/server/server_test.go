@@ -282,14 +282,7 @@ func receiveTerminalMarker(t *testing.T, stream interface {
 }
 
 func TestTerminalDrainsOutputWhenShellExits(t *testing.T) {
-	tmuxPath, err := exec.LookPath("tmux")
-	if err != nil {
-		t.Skip("tmux is not installed")
-	}
-	version, err := exec.Command(tmuxPath, "-V").Output()
-	if err != nil || !strings.Contains(string(version), "swe-drain") {
-		t.Skip("tmux does not include the control output drain fix")
-	}
+	requirePatchedTmux(t)
 
 	socketName := fmt.Sprintf("swe-drain-test-%d-%d", os.Getpid(), testSocketCounter.Add(1))
 	t.Cleanup(func() {
@@ -341,10 +334,59 @@ func TestTerminalDrainsOutputWhenShellExits(t *testing.T) {
 		if err != nil {
 			t.Fatalf("receive attachment %d output: %v", i+1, err)
 		}
-		if !strings.Contains(string(output), "FINAL-DRAIN") {
-			t.Fatalf("attachment %d output missing final marker after shell exit: %q", i+1, output)
+		if count := bytes.Count(output, []byte("FINAL-DRAIN")); count != 1 {
+			t.Fatalf("attachment %d final marker count = %d, want 1: %q", i+1, count, output)
 		}
 	}
+}
+
+func TestTerminalDrainsImmediateOutputAfterFirstOpen(t *testing.T) {
+	requirePatchedTmux(t)
+
+	socketName := fmt.Sprintf("swe-immediate-drain-test-%d-%d", os.Getpid(), testSocketCounter.Add(1))
+	t.Cleanup(func() {
+		_ = exec.Command("tmux", "-L", socketName, "kill-server").Run()
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	backend := newTmuxTerminalBackend(t.TempDir(), socketName, []string{`sh -c 'IFS= read -r line; eval "$line"'`})
+	session, err := backend.Open(ctx, 80, 24)
+	if err != nil {
+		t.Fatalf("open terminal backend: %v", err)
+	}
+	defer session.Close()
+	if err := session.Write([]byte("printf '\\111\\115\\115\\105\\104\\111\\101\\124\\105\\055\\104\\122\\101\\111\\116'; exit\n")); err != nil {
+		t.Fatalf("write immediate terminal input: %v", err)
+	}
+	output, err := readTerminalSessionThrough(session, nil, true)
+	if err != nil {
+		t.Fatalf("receive immediate output: %v", err)
+	}
+	if count := bytes.Count(output, []byte("IMMEDIATE-DRAIN")); count != 1 {
+		t.Fatalf("immediate final marker count = %d, want 1: %q", count, output)
+	}
+}
+
+func requirePatchedTmux(t *testing.T) {
+	t.Helper()
+	tmuxPath, err := exec.LookPath("tmux")
+	detail := err
+	if err == nil {
+		var version []byte
+		version, err = exec.Command(tmuxPath, "-V").Output()
+		if err == nil && strings.Contains(string(version), "swe-drain") {
+			return
+		}
+		if err == nil {
+			detail = fmt.Errorf("unexpected version %q", strings.TrimSpace(string(version)))
+		} else {
+			detail = err
+		}
+	}
+	if os.Getenv("SWE_REQUIRE_PATCHED_TMUX") == "1" {
+		t.Fatalf("patched tmux is required: %v", detail)
+	}
+	t.Skip("tmux does not include the control output drain fix")
 }
 
 func readTerminalSessionThrough(session terminalSession, marker []byte, throughEOF bool) ([]byte, error) {

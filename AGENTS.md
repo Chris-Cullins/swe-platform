@@ -109,7 +109,8 @@ runs both via `make` targets:
   as the `e2e` workflow on relevant PRs and via `workflow_dispatch`.
 - **Images:** `make docker-build` (operator + env-base). The env-base image builds
   its pinned tmux with `images/env-base/tmux-control-output-drain.patch`; keep the
-  source checksum and patch synchronized when upgrading tmux.
+  source checksum and patch synchronized when upgrading tmux. Its `terminal-test`
+  target runs the patched-runtime terminal regression during `hack/e2e.sh`.
 - **Publish images:** pushes to `main` and `v*` tags publish multi-architecture operator
   and env-base images to GHCR via `.github/workflows/publish-images.yaml`.
 

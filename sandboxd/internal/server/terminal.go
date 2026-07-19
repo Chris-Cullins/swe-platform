@@ -20,6 +20,7 @@ import (
 
 const defaultTmuxSocket = "swe-platform"
 const tmuxEnableOutputDrainCommand = "pipe-pane -t swe: 'cat >/dev/null'"
+const tmuxOutputDrainReady = "swe-output-drain-ready:"
 
 var errTerminalUnavailable = errors.New("terminal backend unavailable")
 
@@ -169,6 +170,7 @@ func (b *tmuxTerminalBackend) Open(ctx context.Context, cols, rows uint32) (term
 	args = append(args, b.shell...)
 	args = append(args,
 		";", "if-shell", "-F", "-t", "swe:", "#{?pane_pipe,0,1}", tmuxEnableOutputDrainCommand,
+		";", "display-message", "-p", "-t", "swe:", tmuxOutputDrainReady+"#{pane_pipe}",
 	)
 
 	commandCtx, cancel := context.WithCancel(ctx)
@@ -191,7 +193,7 @@ func (b *tmuxTerminalBackend) Open(ctx context.Context, cols, rows uint32) (term
 	}
 	scanner := bufio.NewScanner(stdout)
 	scanner.Buffer(make([]byte, 4096), 1024*1024)
-	initialOutput, err := waitForTmuxReady(scanner, 2, "swe")
+	initialOutput, err := waitForTmuxReady(scanner, "swe")
 	if err != nil {
 		cancel()
 		_ = stdin.Close()
@@ -215,12 +217,14 @@ func (b *tmuxTerminalBackend) Open(ctx context.Context, cols, rows uint32) (term
 	return session, nil
 }
 
-func waitForTmuxReady(scanner *bufio.Scanner, count int, sessionName string) ([]byte, error) {
-	completed := 0
+func waitForTmuxReady(scanner *bufio.Scanner, sessionName string) ([]byte, error) {
 	attached := false
+	ready := false
 	response := ""
+	probeSeen := false
+	probeValue := ""
 	var output []byte
-	for (completed < count || !attached) && scanner.Scan() {
+	for (!ready || !attached) && scanner.Scan() {
 		line := scanner.Text()
 		switch {
 		case strings.HasPrefix(line, "%begin "):
@@ -230,10 +234,17 @@ func waitForTmuxReady(scanner *bufio.Scanner, count int, sessionName string) ([]
 			response = strings.TrimPrefix(line, "%begin ")
 		case strings.HasPrefix(line, "%end "):
 			if response != "" && strings.TrimPrefix(line, "%end ") == response {
-				completed++
+				if probeSeen {
+					if probeValue != "1" {
+						return nil, fmt.Errorf("tmux output drain is inactive")
+					}
+					ready = true
+				}
 				response = ""
+				probeSeen = false
+				probeValue = ""
 			}
-		case strings.HasPrefix(scanner.Text(), "%session-changed "):
+		case strings.HasPrefix(line, "%session-changed "):
 			fields := strings.Fields(line)
 			attached = len(fields) == 3 && fields[2] == sessionName
 		case strings.HasPrefix(line, "%error "):
@@ -243,7 +254,10 @@ func waitForTmuxReady(scanner *bufio.Scanner, count int, sessionName string) ([]
 		case strings.HasPrefix(line, "%exit"):
 			return nil, fmt.Errorf("tmux exited during setup")
 		default:
-			if data, ok := tmuxOutput(line); ok {
+			if response != "" && strings.HasPrefix(line, tmuxOutputDrainReady) {
+				probeSeen = true
+				probeValue = strings.TrimPrefix(line, tmuxOutputDrainReady)
+			} else if data, ok := tmuxOutput(line); ok {
 				output = append(output, data...)
 			}
 		}
@@ -251,7 +265,7 @@ func waitForTmuxReady(scanner *bufio.Scanner, count int, sessionName string) ([]
 	if err := scanner.Err(); err != nil {
 		return nil, fmt.Errorf("read command response: %w", err)
 	}
-	if completed < count || !attached {
+	if !ready || !attached {
 		return nil, io.ErrUnexpectedEOF
 	}
 	return output, nil
