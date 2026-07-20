@@ -116,11 +116,14 @@ runs both via `make` targets:
   and all three image digests.
 - **E2E acceptance:** `./hack/e2e.sh` — full kind + operator + `swe run` pass with the
   env-base image built and loaded locally (no registry credentials needed). It also verifies
+  the documented server-side CRD upgrade from the pre-scoped-credentials schema,
   control-plane TokenReview/SAR scoping, opaque browser session exchange/logout and CSRF,
   the embedded console entry point/SPA fallback/static assets, typed Run
   list/get/create/retry/cancel, Environment get, transcript SSE, terminal attach, and
   process-scoped fake API-key delivery without ambient setup/resume/sandboxd exposure.
   Runs in CI as the `e2e` workflow on relevant PRs and via `workflow_dispatch`.
+- **CRD installation/upgrades:** `make install-crds` uses server-side apply with force-conflicts;
+  plain Helm upgrades must apply the chart's `crds/` directory before `helm upgrade`.
 - **Images:** `make docker-build` (operator + env-base). The env-base image builds
   its pinned tmux with `images/env-base/tmux-control-output-drain.patch`; keep the
   source checksum and patch synchronized when upgrading tmux. Its `terminal-test`

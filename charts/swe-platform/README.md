@@ -21,6 +21,25 @@ helm upgrade --install swe-platform ./charts/swe-platform \
   --values ./charts/swe-platform/values-k3s.yaml
 ```
 
+## Upgrade
+
+Helm installs definitions from a chart's `crds/` directory only on the first install; it does
+not upgrade existing CRDs. Before every plain-Helm upgrade, server-side apply the CRDs from the
+same checked-out or unpacked chart version, then upgrade the release:
+
+```sh
+kubectl apply --server-side --force-conflicts -f ./charts/swe-platform/crds
+helm upgrade swe-platform ./charts/swe-platform \
+  --namespace swe-platform-system \
+  --values ./charts/swe-platform/values-k3s.yaml
+```
+
+Skipping the apply leaves the prior API schemas installed: new resource kinds and fields will
+be unavailable, and removed fields will continue to be admitted. `--force-conflicts` makes the
+checked-in CRD definition authoritative when ownership moves from Helm's initial create to
+server-side apply. The Argo CD preset does not need this manual step because Argo synchronizes
+the chart's `crds/` files as manifests.
+
 The production presets create a `medium` `EnvironmentTemplate` using the published
 `env-base` image. Operator, control-plane, and env-base tags default to the chart
 `appVersion`, keeping a released chart on one tested version set and making Helm rollback

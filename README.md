@@ -155,10 +155,13 @@ Create runs with an explicit template, or reference a `Project` to use its defau
 template:
 
 > **Breaking v1alpha1 credential migration:** `Project.spec.secretRef` has been removed
-> and is now rejected by CRD admission. Upgrading also replaces existing Environment pods
-> so previously injected ambient Secret values are removed. Private repository clones and
-> `.agents/setup` or `.agents/resume` hooks that relied on those values will break. There is
-> no fallback; purpose-scoped Git and setup credentials remain future work.
+> and is now rejected by CRD admission. For an existing plain-Helm installation, first
+> [server-side apply the chart CRDs](charts/swe-platform/README.md#upgrade), because Helm does
+> not upgrade files in a chart's `crds/` directory, and then run `helm upgrade`. The operator
+> upgrade replaces existing Environment pods so previously injected ambient Secret values are
+> removed. Private repository clones and `.agents/setup` or `.agents/resume` hooks that relied
+> on those values will break. There is no fallback; purpose-scoped Git and setup credentials
+> remain future work.
 
 ```sh
 swe run --template small "Fix the flaky test"

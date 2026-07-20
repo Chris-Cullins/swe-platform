@@ -131,7 +131,7 @@ argocd-down: ## Delete the Argo CD cluster
 
 .PHONY: install-crds
 install-crds: manifests ## Install CRDs into the current cluster
-	kubectl apply -f config/crd/bases
+	kubectl apply --server-side --force-conflicts -f config/crd/bases
 
 .PHONY: run
 run: ## Run the operator locally against the current cluster

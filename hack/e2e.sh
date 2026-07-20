@@ -125,7 +125,16 @@ docker run --rm -e SWE_REQUIRE_PATCHED_TMUX=1 swe-platform-terminal-test \
 echo "==> loading images into kind"
 kind load docker-image "$ENV_IMAGE" "$E2E_ENV_IMAGE" "$OPERATOR_IMAGE" "$CONTROL_PLANE_IMAGE" --name "$CLUSTER"
 
-echo "==> installing operator, CRDs, and kind template through Helm"
+echo "==> simulating a plain-Helm CRD upgrade from the pre-scoped-credentials schema"
+PRE_SCOPED_CREDENTIALS_SHA=d76e694521b18f1b3921311c7886f53e5a3c8806
+git fetch --depth=1 origin "$PRE_SCOPED_CREDENTIALS_SHA"
+for resource in environments environmenttemplates projects runs; do
+	git show FETCH_HEAD:"config/crd/bases/swe.dev_${resource}.yaml" | kubectl create -f -
+done
+kubectl apply --server-side --force-conflicts -f charts/swe-platform/crds
+kubectl get crd agentcredentialprofiles.swe.dev >/dev/null
+
+echo "==> installing operator and kind template through Helm with upgraded CRDs"
 E2E_BOOTSTRAP_TOKEN="$(openssl rand -hex 32)"
 kubectl create secret generic swe-platform-bootstrap --from-literal=token="$E2E_BOOTSTRAP_TOKEN"
 helm upgrade --install swe-platform charts/swe-platform \
