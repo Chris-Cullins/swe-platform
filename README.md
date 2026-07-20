@@ -312,7 +312,8 @@ custom Environment images must provide a compatible `pi` executable and Node >=2
 
 The adapter runs one-shot `pi --mode json` under a Run-UID-keyed sandboxd process. Sessions
 are ephemeral (`--no-session`), `PI_CODING_AGENT_DIR` is isolated at
-`/tmp/swe-platform/pi/<Run UID>`, and project approval/settings plus extension, skill,
+the workspace-relative, OS-portable `.swe-platform/pi/<Run UID>`, and project
+approval/settings plus extension, skill,
 prompt-template, theme, context-file, package-resource, and startup-network discovery are disabled. It
 never continues or resumes a latest/partial session. A zero process exit succeeds only when
 the complete retained stream ends with `agent_settled` after a non-retrying `agent_end`

@@ -103,7 +103,9 @@ func (a *Adapter) processSpec(task controllers.AdapterTask) *sandboxdv1.ProcessS
 			"\n" + task.Prompt,
 		},
 		Env: map[string]string{
-			"PI_CODING_AGENT_DIR": "/tmp/swe-platform/pi/" + task.ID,
+			// Process cwd defaults to the backend's workspace. A relative path
+			// remains OS-portable while keeping Pi state private to this Run UID.
+			"PI_CODING_AGENT_DIR": ".swe-platform/pi/" + task.ID,
 		},
 		EnvMode: sandboxdv1.EnvironmentMode_ENVIRONMENT_MODE_INHERIT,
 	}

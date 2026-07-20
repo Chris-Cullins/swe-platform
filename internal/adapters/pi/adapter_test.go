@@ -143,7 +143,7 @@ func TestAcceptanceIsDuplicateSafeAndEpochFenced(t *testing.T) {
 		t.Fatalf("argv = %#v, want %#v", got, wantArgv)
 	}
 	if firstEpoch.startedSpec.EnvMode != sandboxdv1.EnvironmentMode_ENVIRONMENT_MODE_INHERIT || !reflect.DeepEqual(firstEpoch.startedSpec.Env, map[string]string{
-		"PI_CODING_AGENT_DIR": "/tmp/swe-platform/pi/run-uid",
+		"PI_CODING_AGENT_DIR": ".swe-platform/pi/run-uid",
 	}) {
 		t.Fatalf("environment = %s %#v", firstEpoch.startedSpec.EnvMode, firstEpoch.startedSpec.Env)
 	}

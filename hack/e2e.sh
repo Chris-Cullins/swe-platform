@@ -185,10 +185,10 @@ test "${10}" = --offline
 test "${11}" = '
 --fake-pi-e2e'
 case "${PI_CODING_AGENT_DIR:-}" in
-	/tmp/swe-platform/pi/*) ;;
+	.swe-platform/pi/*) ;;
 	*) echo 'fake Pi received a shared config directory' >&2; exit 65 ;;
 esac
-run_dir=${PI_CODING_AGENT_DIR#/tmp/swe-platform/pi/}
+run_dir=${PI_CODING_AGENT_DIR#.swe-platform/pi/}
 test -n "$run_dir"
 test "$run_dir" = "${run_dir#*/}"
 printf '%s\n' '{"type":"agent_start"}'
