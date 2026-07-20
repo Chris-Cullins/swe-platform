@@ -111,6 +111,9 @@ func (d *processDomain) start() error {
 		env = append(env, 0)
 	}
 	env = append(env, 0)
+	// CreateProcess copies the environment block; wipe our UTF-16 copy on every
+	// return path after the final append so launch material is not retained.
+	defer func() { clear(env) }()
 	si := windows.StartupInfoEx{ProcThreadAttributeList: attrs.List()}
 	si.StartupInfo.Cb = uint32(unsafe.Sizeof(si))
 	si.StartupInfo.Flags = windows.STARTF_USESTDHANDLES
