@@ -111,8 +111,9 @@ runs both via `make` targets:
   For operator/control-plane iteration, `make dev` runs the pinned Skaffold watch loop,
   builds and loads changed images, and upgrades the same Helm release on the explicit
   `kind-swe-dev` context (or `kind-$KIND_CLUSTER`), while refusing the Argo mirror named
-  by `KIND_ARGO_CLUSTER`. Build/load `env-base:dev` separately when a test needs a fresh
-  Environment pod; apply CRD upgrades separately because Helm does not upgrade `crds/`.
+  by `KIND_ARGO_CLUSTER` or detected by its `argocd` namespace. Build/load `env-base:dev`
+  separately when a test needs a fresh Environment pod; apply CRD upgrades separately
+  because Helm does not upgrade `crds/`.
 - **Argo CD main mirror:** `make argocd-up` creates a separate `swe-argo` kind
   cluster running Argo CD + the Image Updater (`hack/argocd/`,
   `values-argocd.yaml` preset). It syncs the chart from `origin/main` and rolls

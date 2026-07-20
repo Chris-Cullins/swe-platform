@@ -173,11 +173,12 @@ Skaffold builds and loads the operator and control-plane images, installs or upg
 `swe-platform` Helm release with `values-kind.yaml`, and repeats that cycle when relevant
 source, chart template, or values files change. `make dev` always targets the
 `kind-swe-dev` context (or `kind-$KIND_CLUSTER` when overridden) and refuses the Argo mirror
-cluster named by `KIND_ARGO_CLUSTER` (default `swe-argo`). The environment base image is
-outside this controller loop; build and load it separately before starting Runs that need a
-fresh environment. Helm does not upgrade CRDs from a chart's `crds/` directory, so apply
-CRD changes separately with `kubectl --context "kind-${KIND_CLUSTER:-swe-dev}" apply
---server-side --force-conflicts -f config/crd/bases`.
+cluster named by `KIND_ARGO_CLUSTER` (default `swe-argo`) or any target cluster containing
+the `argocd` namespace. The environment base image is outside this controller loop; build
+and load it separately before starting Runs that need a fresh environment. Helm does not
+upgrade CRDs from a chart's `crds/` directory, so apply CRD changes separately with
+`kubectl --context "kind-${KIND_CLUSTER:-swe-dev}" apply --server-side --force-conflicts -f
+config/crd/bases`.
 
 Create runs with an explicit template, or reference a `Project` to use its default
 template:

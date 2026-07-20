@@ -145,6 +145,9 @@ dev: ## Watch, rebuild, and redeploy operator/control-plane into the kind dev cl
 	@kind get clusters | grep -Fx -- "$(KIND_CLUSTER)" >/dev/null || { \
 		echo "kind cluster '$(KIND_CLUSTER)' does not exist; run 'make kind-up KIND_CLUSTER=$(KIND_CLUSTER)'" >&2; exit 1; \
 	}
+	@if kubectl --context "kind-$(KIND_CLUSTER)" get namespace argocd >/dev/null 2>&1; then \
+		echo "refusing to target Argo CD cluster '$(KIND_CLUSTER)'" >&2; exit 1; \
+	fi
 	skaffold dev --kube-context "kind-$(KIND_CLUSTER)" --cleanup=false
 
 ##@ Images
