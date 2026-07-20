@@ -145,11 +145,20 @@ allowed to overlap the new one.
 
 ## Local development
 
-Development targets a local [kind](https://kind.sigs.k8s.io/) cluster. Run `make kind-up`,
-build and load the operator and env-base images as printed by that command, then install
-`charts/swe-platform` with `values-kind.yaml`. The preset creates the `small` template
-in `default`. Production installation assumptions and k3s/GKE/EKS presets are documented
-in the [chart README](charts/swe-platform/README.md).
+Development targets a local [kind](https://kind.sigs.k8s.io/) cluster. Run `make kind-up`
+to create a cluster with the `gvisor` RuntimeClass and the snapshot-capable CSI hostpath
+driver, build and load the platform images, then install
+`charts/swe-platform` with `values-kind.yaml` and the printed
+`environmentTemplates[0].spec.runtimeClass=gvisor` override. The preset creates the
+`small` template in `default`; the explicit override keeps it usable in ordinary CI kind
+clusters that do not install runsc. Production installation assumptions and k3s/GKE/EKS
+presets are documented in the [chart README](charts/swe-platform/README.md).
+
+Run the acceptance suite against the bootstrapped cluster with gVisor enabled:
+
+```sh
+KIND_CLUSTER=swe-dev E2E_USE_EXISTING_CLUSTER=true E2E_RUNTIME_CLASS=gvisor ./hack/e2e.sh
+```
 
 Create runs with an explicit template, or reference a `Project` to use its default
 template:

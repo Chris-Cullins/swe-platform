@@ -6,7 +6,10 @@
 # loaded into the kind cluster directly.
 #
 # Prerequisites: go, docker, kind, kubectl, helm.
-# Env: KIND_CLUSTER (default swe-e2e), KEEP_CLUSTER=true to skip teardown.
+# Env: KIND_CLUSTER (default swe-e2e), KEEP_CLUSTER=true to skip teardown,
+# E2E_USE_EXISTING_CLUSTER=true to test a bootstrapped cluster, and
+# E2E_RUNTIME_CLASS (for example gvisor) to select its environment runtime. Existing
+# cluster mode expects a fresh `make kind-up` cluster without an installed platform.
 set -euo pipefail
 
 CLUSTER="${KIND_CLUSTER:-swe-e2e}"
@@ -22,6 +25,7 @@ WEB_TERMINAL_CLIENT=""
 PROJECT_REPO=""
 PROJECT_WORKTREE=""
 FAKE_ENV_CONTEXT=""
+E2E_KUBECONFIG=""
 
 cleanup() {
 	if [[ -n "$PORT_FORWARD_PID" ]]; then
@@ -44,8 +48,11 @@ cleanup() {
 	if [[ -n "$FAKE_ENV_CONTEXT" ]]; then
 		rm -rf "$FAKE_ENV_CONTEXT"
 	fi
+	if [[ -n "$E2E_KUBECONFIG" ]]; then
+		rm -f "$E2E_KUBECONFIG"
+	fi
 	rm -f /tmp/swe-platform-sandboxd-cert-"$$" /tmp/swe-platform-sandboxd-token-"$$"
-	if [[ "${KEEP_CLUSTER:-false}" != "true" ]]; then
+	if [[ "${KEEP_CLUSTER:-false}" != "true" && "${E2E_USE_EXISTING_CLUSTER:-false}" != "true" ]]; then
 		kind delete cluster --name "$CLUSTER" >/dev/null 2>&1 || true
 	fi
 }
@@ -85,9 +92,22 @@ cd "$(dirname "$0")/.."
 echo "==> building binaries"
 make build
 
-echo "==> creating kind cluster '$CLUSTER'"
-kind delete cluster --name "$CLUSTER" >/dev/null 2>&1 || true
-kind create cluster --name "$CLUSTER"
+if [[ "${E2E_USE_EXISTING_CLUSTER:-false}" == "true" ]]; then
+	echo "==> using existing kind cluster '$CLUSTER'"
+	E2E_KUBECONFIG="$(mktemp /tmp/swe-e2e-kubeconfig-XXXXXX)"
+	kubectl config view --raw > "$E2E_KUBECONFIG"
+	export KUBECONFIG="$E2E_KUBECONFIG"
+	kubectl cluster-info --context "kind-$CLUSTER" >/dev/null
+	kubectl config use-context "kind-$CLUSTER" >/dev/null
+	if kubectl get crd runs.swe.dev >/dev/null 2>&1; then
+		echo "FAIL: existing-cluster E2E requires a fresh make kind-up cluster without swe-platform CRDs" >&2
+		exit 1
+	fi
+else
+	echo "==> creating kind cluster '$CLUSTER'"
+	kind delete cluster --name "$CLUSTER" >/dev/null 2>&1 || true
+	kind create cluster --name "$CLUSTER"
+fi
 
 echo "==> building platform images"
 make docker-build >/dev/null
@@ -153,11 +173,17 @@ kubectl get crd agentcredentialprofiles.swe.dev >/dev/null
 echo "==> installing operator and kind template through Helm with upgraded CRDs"
 E2E_BOOTSTRAP_TOKEN="$(openssl rand -hex 32)"
 kubectl create secret generic swe-platform-bootstrap --from-literal=token="$E2E_BOOTSTRAP_TOKEN"
-helm upgrade --install swe-platform charts/swe-platform \
-	--namespace default --values charts/swe-platform/values-kind.yaml \
-	--set controlPlane.auth.bootstrapTokenSecret.name=swe-platform-bootstrap \
-	--set-string "environmentTemplates[0].spec.image=$E2E_ENV_IMAGE" \
+HELM_ARGS=(
+	upgrade --install swe-platform charts/swe-platform
+	--namespace default --values charts/swe-platform/values-kind.yaml
+	--set controlPlane.auth.bootstrapTokenSecret.name=swe-platform-bootstrap
+	--set-string "environmentTemplates[0].spec.image=$E2E_ENV_IMAGE"
 	--wait --timeout 2m
+)
+if [[ -n "${E2E_RUNTIME_CLASS:-}" ]]; then
+	HELM_ARGS+=(--set-string "environmentTemplates[0].spec.runtimeClass=$E2E_RUNTIME_CLASS")
+fi
+helm "${HELM_ARGS[@]}"
 
 echo "==> waiting for warm environment"
 kubectl wait --for=jsonpath='{.status.warmPoolReady}'=1 environmenttemplate/small --timeout=2m
@@ -167,6 +193,21 @@ if [[ -z "$WARM_ENV_NAME" ]]; then
 	exit 1
 fi
 WARM_POD_UID=$(kubectl get pod "env-${WARM_ENV_NAME}" -o jsonpath='{.metadata.uid}')
+if [[ -n "${E2E_RUNTIME_CLASS:-}" ]]; then
+	WARM_RUNTIME_CLASS=$(kubectl get pod "env-${WARM_ENV_NAME}" -o jsonpath='{.spec.runtimeClassName}')
+	if [[ "$WARM_RUNTIME_CLASS" != "$E2E_RUNTIME_CLASS" ]]; then
+		echo "FAIL: warm Environment uses RuntimeClass '$WARM_RUNTIME_CLASS', expected '$E2E_RUNTIME_CLASS'"
+		exit 1
+	fi
+fi
+if [[ "${E2E_USE_EXISTING_CLUSTER:-false}" == "true" ]]; then
+	WARM_PVC_NAME=$(kubectl get pod "env-${WARM_ENV_NAME}" -o jsonpath='{.spec.volumes[?(@.name=="workspace")].persistentVolumeClaim.claimName}')
+	WARM_STORAGE_CLASS=$(kubectl get pvc "$WARM_PVC_NAME" -o jsonpath='{.spec.storageClassName}')
+	if [[ "$WARM_STORAGE_CLASS" != "csi-hostpath-sc" ]]; then
+		echo "FAIL: warm Environment workspace uses StorageClass '$WARM_STORAGE_CLASS', expected 'csi-hostpath-sc'"
+		exit 1
+	fi
+fi
 
 echo "==> creating project configuration"
 PROJECT_REPO="$(mktemp -d /tmp/swe-e2e-project-XXXXXX)"
