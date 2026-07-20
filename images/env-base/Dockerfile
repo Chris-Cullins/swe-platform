@@ -96,8 +96,8 @@ COPY --from=claude-code /usr/local/bin/claude /usr/local/bin/claude
 COPY --from=amp /usr/local/bin/amp /usr/local/bin/amp
 COPY --from=codex /opt/codex /opt/codex
 COPY --from=pi /usr/local/lib/node_modules/@earendil-works /usr/local/lib/node_modules/@earendil-works
-COPY --from=pi /usr/local/bin/pi /usr/local/bin/pi
-RUN ln -s /opt/codex/bin/codex /usr/local/bin/codex
+RUN ln -s /opt/codex/bin/codex /usr/local/bin/codex \
+	&& ln -s ../lib/node_modules/@earendil-works/pi-coding-agent/dist/cli.js /usr/local/bin/pi
 ENV AMP_SKIP_UPDATE_CHECK=1
 RUN claude --version \
 	&& test "$(amp --version | awk '{print $1}')" = "0.0.1784492094-g5d18e2" \
