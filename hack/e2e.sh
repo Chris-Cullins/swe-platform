@@ -369,52 +369,6 @@ for _ in $(seq 1 30); do
 	sleep 1
 done
 
-echo "==> running Amp adapter through allocation, transcript, and cleanup"
-bin/swe run "end-to-end Amp adapter smoke test" --name e2e-amp --project e2e --agent amp --wait=false
-kubectl wait --for=jsonpath='{.status.state}'=Running run/e2e-amp --timeout=3m
-kubectl wait --for=jsonpath='{.status.state}'=Succeeded run/e2e-amp --timeout=3m
-AMP_ENV_NAME=$(kubectl get run e2e-amp -o jsonpath='{.status.environmentRef.name}')
-AMP_ENV_OWNERSHIP=$(kubectl get run e2e-amp -o jsonpath='{.status.environmentRef.ownership}')
-if [[ -z "$AMP_ENV_NAME" || "$AMP_ENV_OWNERSHIP" != "Claimed" ]]; then
-	echo "FAIL: Amp Run allocation was ${AMP_ENV_NAME:-<empty>} (${AMP_ENV_OWNERSHIP:-<empty>}), expected a claimed warm Environment"
-	exit 1
-fi
-set +e
-curl --fail --silent --no-buffer --max-time 5 \
-	-H "Authorization: Bearer ${E2E_BOOTSTRAP_TOKEN}" \
-	"http://127.0.0.1:18080/api/v1/namespaces/default/runs/e2e-amp/transcript" \
-	> /tmp/swe-platform-amp-transcript.out
-AMP_TRANSCRIPT_STATUS=$?
-set -e
-if [[ "$AMP_TRANSCRIPT_STATUS" -ne 0 && "$AMP_TRANSCRIPT_STATUS" -ne 28 ]]; then
-	echo "FAIL: Amp transcript request exited ${AMP_TRANSCRIPT_STATUS}"
-	exit 1
-fi
-if ! grep -Fq '"source":"amp"' /tmp/swe-platform-amp-transcript.out || \
-	! grep -Fq '"type":"amp.process-output"' /tmp/swe-platform-amp-transcript.out || \
-	! grep -Fq '"stream":"stdout"' /tmp/swe-platform-amp-transcript.out || \
-	! grep -Fq '"stream":"stderr"' /tmp/swe-platform-amp-transcript.out; then
-	echo "FAIL: Amp stdout/stderr adapter-owned transcript events were not replayed"
-	cat /tmp/swe-platform-amp-transcript.out
-	exit 1
-fi
-for _ in $(seq 1 60); do
-	AMP_CLAIM_UID=$(kubectl get environment "$AMP_ENV_NAME" -o jsonpath='{.status.claimedBy.uid}' 2>/dev/null || true)
-	if [[ -z "$AMP_CLAIM_UID" ]]; then
-		break
-	fi
-	sleep 1
-done
-if [[ -n "${AMP_CLAIM_UID:-}" ]]; then
-	echo "FAIL: terminal Amp Run did not release its Environment claim"
-	exit 1
-fi
-kubectl delete run e2e-amp --wait=true >/dev/null
-if ! kubectl get environment "$AMP_ENV_NAME" >/dev/null 2>&1; then
-	echo "FAIL: deleting the Amp Run removed its claimed Environment"
-	exit 1
-fi
-
 echo "==> verifying embedded operations console through the control-plane Service"
 ROOT_STATUS=$(curl --silent --dump-header /tmp/swe-platform-console-root.headers \
 	--output /tmp/swe-platform-console-root.html --write-out '%{http_code}' \
@@ -687,5 +641,51 @@ fi
 
 echo "==> sandboxd logs from the environment pod"
 kubectl logs "$POD_NAME" -c environment | head -3
+
+echo "==> running Amp adapter through allocation, transcript, and cleanup"
+bin/swe run "end-to-end Amp adapter smoke test" --name e2e-amp --project e2e --agent amp --wait=false
+kubectl wait --for=jsonpath='{.status.state}'=Running run/e2e-amp --timeout=3m
+kubectl wait --for=jsonpath='{.status.state}'=Succeeded run/e2e-amp --timeout=3m
+AMP_ENV_NAME=$(kubectl get run e2e-amp -o jsonpath='{.status.environmentRef.name}')
+AMP_ENV_OWNERSHIP=$(kubectl get run e2e-amp -o jsonpath='{.status.environmentRef.ownership}')
+if [[ -z "$AMP_ENV_NAME" || "$AMP_ENV_OWNERSHIP" != "Claimed" ]]; then
+	echo "FAIL: Amp Run allocation was ${AMP_ENV_NAME:-<empty>} (${AMP_ENV_OWNERSHIP:-<empty>}), expected a claimed warm Environment"
+	exit 1
+fi
+set +e
+curl --fail --silent --no-buffer --max-time 5 \
+	-H "Authorization: Bearer ${E2E_BOOTSTRAP_TOKEN}" \
+	"http://127.0.0.1:18080/api/v1/namespaces/default/runs/e2e-amp/transcript" \
+	> /tmp/swe-platform-amp-transcript.out
+AMP_TRANSCRIPT_STATUS=$?
+set -e
+if [[ "$AMP_TRANSCRIPT_STATUS" -ne 0 && "$AMP_TRANSCRIPT_STATUS" -ne 28 ]]; then
+	echo "FAIL: Amp transcript request exited ${AMP_TRANSCRIPT_STATUS}"
+	exit 1
+fi
+if ! grep -Fq '"source":"amp"' /tmp/swe-platform-amp-transcript.out || \
+	! grep -Fq '"type":"amp.process-output"' /tmp/swe-platform-amp-transcript.out || \
+	! grep -Fq '"stream":"stdout"' /tmp/swe-platform-amp-transcript.out || \
+	! grep -Fq '"stream":"stderr"' /tmp/swe-platform-amp-transcript.out; then
+	echo "FAIL: Amp stdout/stderr adapter-owned transcript events were not replayed"
+	cat /tmp/swe-platform-amp-transcript.out
+	exit 1
+fi
+for _ in $(seq 1 60); do
+	AMP_CLAIM_UID=$(kubectl get environment "$AMP_ENV_NAME" -o jsonpath='{.status.claimedBy.uid}' 2>/dev/null || true)
+	if [[ -z "$AMP_CLAIM_UID" ]]; then
+		break
+	fi
+	sleep 1
+done
+if [[ -n "${AMP_CLAIM_UID:-}" ]]; then
+	echo "FAIL: terminal Amp Run did not release its Environment claim"
+	exit 1
+fi
+kubectl delete run e2e-amp --wait=true >/dev/null
+if ! kubectl get environment "$AMP_ENV_NAME" >/dev/null 2>&1; then
+	echo "FAIL: deleting the Amp Run removed its claimed Environment"
+	exit 1
+fi
 
 echo "E2E OK"
