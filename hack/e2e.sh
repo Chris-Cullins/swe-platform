@@ -171,7 +171,7 @@ chmod 0755 "$FAKE_ENV_CONTEXT/codex"
 cat > "$FAKE_ENV_CONTEXT/pi" <<'EOF'
 #!/bin/sh
 set -eu
-test "$#" -eq 10
+test "$#" -eq 11
 test "$1" = --mode
 test "$2" = json
 test "$3" = --no-session
@@ -180,8 +180,9 @@ test "$5" = --no-extensions
 test "$6" = --no-skills
 test "$7" = --no-prompt-templates
 test "$8" = --no-themes
-test "$9" = --offline
-test "${10}" = '
+test "$9" = --no-context-files
+test "${10}" = --offline
+test "${11}" = '
 --fake-pi-e2e'
 case "${PI_CODING_AGENT_DIR:-}" in
 	/tmp/swe-platform/pi/*) ;;
@@ -193,7 +194,8 @@ test "$run_dir" = "${run_dir#*/}"
 printf '%s\n' '{"type":"agent_start"}'
 printf '%s\n' 'fake Pi diagnostic' >&2
 sleep 5
-printf '%s\n' '{"type":"agent_end","messages":[{"role":"assistant","content":[{"type":"text","text":"fake Pi is working"}],"stopReason":"stop"}]}'
+printf '%s\n' '{"type":"agent_end","messages":[{"role":"assistant","content":[{"type":"text","text":"fake Pi is working"}],"stopReason":"stop"}],"willRetry":false}'
+printf '%s\n' '{"type":"agent_settled"}'
 EOF
 chmod 0755 "$FAKE_ENV_CONTEXT/pi"
 cat > "$FAKE_ENV_CONTEXT/Dockerfile" <<'EOF'

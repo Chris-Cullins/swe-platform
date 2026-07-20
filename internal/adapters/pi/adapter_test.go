@@ -48,6 +48,10 @@ func (f *fakeProcessClient) Start(_ context.Context, request *sandboxdv1.StartPr
 	return f.process, nil
 }
 
+func (f *fakeProcessClient) StartWithLaunchMaterial(context.Context, *sandboxdv1.StartProcessWithLaunchMaterialRequest, ...grpc.CallOption) (*sandboxdv1.Process, error) {
+	return nil, errors.New("unexpected launch material")
+}
+
 func (f *fakeProcessClient) Get(context.Context, *sandboxdv1.GetProcessRequest, ...grpc.CallOption) (*sandboxdv1.Process, error) {
 	if f.getErr != nil {
 		return nil, f.getErr
@@ -120,7 +124,7 @@ func TestAcceptanceIsDuplicateSafeAndEpochFenced(t *testing.T) {
 	adapter := &Adapter{Executable: "fake-pi"}
 	firstEpoch := &fakeProcessClient{}
 	for range 2 {
-		if err := adapter.EnsureAccepted(context.Background(), task, sandboxFor(firstEpoch)); err != nil {
+		if err := adapter.EnsureAccepted(context.Background(), task, sandboxFor(firstEpoch), nil); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -133,7 +137,7 @@ func TestAcceptanceIsDuplicateSafeAndEpochFenced(t *testing.T) {
 	wantArgv := []string{
 		"fake-pi", "--mode", "json", "--no-session", "--no-approve",
 		"--no-extensions", "--no-skills", "--no-prompt-templates", "--no-themes",
-		"--offline", "\n" + task.Prompt,
+		"--no-context-files", "--offline", "\n" + task.Prompt,
 	}
 	if got := firstEpoch.startedSpec.Argv; !reflect.DeepEqual(got, wantArgv) {
 		t.Fatalf("argv = %#v, want %#v", got, wantArgv)
@@ -145,7 +149,7 @@ func TestAcceptanceIsDuplicateSafeAndEpochFenced(t *testing.T) {
 	}
 
 	secondEpoch := &fakeProcessClient{}
-	if err := adapter.EnsureAccepted(context.Background(), task, sandboxFor(secondEpoch)); err != nil {
+	if err := adapter.EnsureAccepted(context.Background(), task, sandboxFor(secondEpoch), nil); err != nil {
 		t.Fatal(err)
 	}
 	if secondEpoch.launches != 1 || !reflect.DeepEqual(secondEpoch.startedKey, firstEpoch.startedKey) {
@@ -153,8 +157,21 @@ func TestAcceptanceIsDuplicateSafeAndEpochFenced(t *testing.T) {
 	}
 }
 
+func TestCredentialIsRejectedBeforeDial(t *testing.T) {
+	dials := 0
+	sandbox := controllers.AdapterSandbox{DialProcess: func(context.Context) (sandboxdv1.ProcessServiceClient, func() error, error) {
+		dials++
+		return nil, nil, errors.New("unexpected dial")
+	}}
+	err := (&Adapter{}).EnsureAccepted(context.Background(), controllers.AdapterTask{ID: "run"}, sandbox, &controllers.AdapterCredential{APIKey: []byte("secret")})
+	if !errors.Is(err, controllers.ErrAdapterTaskRejected) || dials != 0 {
+		t.Fatalf("EnsureAccepted() = %v with %d dials", err, dials)
+	}
+}
+
 func TestObservationRequiresNormalAgentEndAndCoherentProcessExit(t *testing.T) {
 	exit0, exit1 := int32(0), int32(1)
+	settled := "\n{\"type\":\"agent_settled\"}\n"
 	tests := []struct {
 		name    string
 		process *sandboxdv1.Process
@@ -164,13 +181,17 @@ func TestObservationRequiresNormalAgentEndAndCoherentProcessExit(t *testing.T) {
 		{name: "running", process: &sandboxdv1.Process{State: sandboxdv1.ProcessState_PROCESS_STATE_RUNNING, ExecutionId: "e"}, want: controllers.AdapterObservationRunning},
 		{name: "start failure", process: &sandboxdv1.Process{State: sandboxdv1.ProcessState_PROCESS_STATE_FAILED, Error: "executable not found", ExecutionId: "e"}, want: controllers.AdapterObservationFailed},
 		{name: "nonzero exit", process: &sandboxdv1.Process{State: sandboxdv1.ProcessState_PROCESS_STATE_EXITED, ExitCode: &exit1, ExecutionId: "e"}, want: controllers.AdapterObservationFailed},
-		{name: "success", process: &sandboxdv1.Process{State: sandboxdv1.ProcessState_PROCESS_STATE_EXITED, ExitCode: &exit0, ExecutionId: "e"}, stdout: "{\"type\":\"agent_end\",\"messages\":[{\"role\":\"assistant\",\"stopReason\":\"stop\"}]}\n", want: controllers.AdapterObservationSucceeded},
-		{name: "reported error", process: &sandboxdv1.Process{State: sandboxdv1.ProcessState_PROCESS_STATE_EXITED, ExitCode: &exit0, ExecutionId: "e"}, stdout: "{\"type\":\"agent_end\",\"messages\":[{\"role\":\"assistant\",\"stopReason\":\"error\",\"errorMessage\":\"provider failed\"}]}\n", want: controllers.AdapterObservationFailed},
-		{name: "reported abort", process: &sandboxdv1.Process{State: sandboxdv1.ProcessState_PROCESS_STATE_EXITED, ExitCode: &exit0, ExecutionId: "e"}, stdout: "{\"type\":\"agent_end\",\"messages\":[{\"role\":\"assistant\",\"stopReason\":\"aborted\",\"errorMessage\":\"request aborted\"}]}\n", want: controllers.AdapterObservationFailed},
-		{name: "length stop", process: &sandboxdv1.Process{State: sandboxdv1.ProcessState_PROCESS_STATE_EXITED, ExitCode: &exit0, ExecutionId: "e"}, stdout: "{\"type\":\"agent_end\",\"messages\":[{\"role\":\"assistant\",\"stopReason\":\"length\"}]}\n", want: controllers.AdapterObservationFailed},
+		{name: "success", process: &sandboxdv1.Process{State: sandboxdv1.ProcessState_PROCESS_STATE_EXITED, ExitCode: &exit0, ExecutionId: "e"}, stdout: "{\"type\":\"agent_end\",\"messages\":[{\"role\":\"assistant\",\"stopReason\":\"stop\"}],\"willRetry\":false}" + settled, want: controllers.AdapterObservationSucceeded},
+		{name: "success after retry", process: &sandboxdv1.Process{State: sandboxdv1.ProcessState_PROCESS_STATE_EXITED, ExitCode: &exit0, ExecutionId: "e"}, stdout: "{\"type\":\"agent_end\",\"messages\":[{\"role\":\"assistant\",\"stopReason\":\"error\"}],\"willRetry\":true}\n{\"type\":\"auto_retry_end\"}\n{\"type\":\"agent_end\",\"messages\":[{\"role\":\"assistant\",\"stopReason\":\"stop\"}],\"willRetry\":false}" + settled, want: controllers.AdapterObservationSucceeded},
+		{name: "reported error", process: &sandboxdv1.Process{State: sandboxdv1.ProcessState_PROCESS_STATE_EXITED, ExitCode: &exit0, ExecutionId: "e"}, stdout: "{\"type\":\"agent_end\",\"messages\":[{\"role\":\"assistant\",\"stopReason\":\"error\",\"errorMessage\":\"provider failed\"}],\"willRetry\":false}" + settled, want: controllers.AdapterObservationFailed},
+		{name: "reported abort", process: &sandboxdv1.Process{State: sandboxdv1.ProcessState_PROCESS_STATE_EXITED, ExitCode: &exit0, ExecutionId: "e"}, stdout: "{\"type\":\"agent_end\",\"messages\":[{\"role\":\"assistant\",\"stopReason\":\"aborted\",\"errorMessage\":\"request aborted\"}],\"willRetry\":false}" + settled, want: controllers.AdapterObservationFailed},
+		{name: "length stop", process: &sandboxdv1.Process{State: sandboxdv1.ProcessState_PROCESS_STATE_EXITED, ExitCode: &exit0, ExecutionId: "e"}, stdout: "{\"type\":\"agent_end\",\"messages\":[{\"role\":\"assistant\",\"stopReason\":\"length\"}],\"willRetry\":false}" + settled, want: controllers.AdapterObservationFailed},
 		{name: "malformed stream", process: &sandboxdv1.Process{State: sandboxdv1.ProcessState_PROCESS_STATE_EXITED, ExitCode: &exit0, ExecutionId: "e"}, stdout: "not-json\n", want: controllers.AdapterObservationFailed},
 		{name: "unknown event", process: &sandboxdv1.Process{State: sandboxdv1.ProcessState_PROCESS_STATE_EXITED, ExitCode: &exit0, ExecutionId: "e"}, stdout: "{\"type\":\"future_event\"}\n", want: controllers.AdapterObservationFailed},
-		{name: "terminal event without assistant", process: &sandboxdv1.Process{State: sandboxdv1.ProcessState_PROCESS_STATE_EXITED, ExitCode: &exit0, ExecutionId: "e"}, stdout: "{\"type\":\"agent_end\",\"messages\":[]}\n", want: controllers.AdapterObservationFailed},
+		{name: "terminal event without assistant", process: &sandboxdv1.Process{State: sandboxdv1.ProcessState_PROCESS_STATE_EXITED, ExitCode: &exit0, ExecutionId: "e"}, stdout: "{\"type\":\"agent_end\",\"messages\":[],\"willRetry\":false}" + settled, want: controllers.AdapterObservationFailed},
+		{name: "missing settlement", process: &sandboxdv1.Process{State: sandboxdv1.ProcessState_PROCESS_STATE_EXITED, ExitCode: &exit0, ExecutionId: "e"}, stdout: "{\"type\":\"agent_end\",\"messages\":[{\"role\":\"assistant\",\"stopReason\":\"stop\"}],\"willRetry\":false}\n", want: controllers.AdapterObservationFailed},
+		{name: "output after settlement", process: &sandboxdv1.Process{State: sandboxdv1.ProcessState_PROCESS_STATE_EXITED, ExitCode: &exit0, ExecutionId: "e"}, stdout: "{\"type\":\"agent_end\",\"messages\":[{\"role\":\"assistant\",\"stopReason\":\"stop\"}],\"willRetry\":false}" + settled + "{\"type\":\"future_event\"}\n", want: controllers.AdapterObservationFailed},
+		{name: "missing retry marker", process: &sandboxdv1.Process{State: sandboxdv1.ProcessState_PROCESS_STATE_EXITED, ExitCode: &exit0, ExecutionId: "e"}, stdout: "{\"type\":\"agent_end\",\"messages\":[{\"role\":\"assistant\",\"stopReason\":\"stop\"}]}" + settled, want: controllers.AdapterObservationFailed},
 		{name: "missing exit code", process: &sandboxdv1.Process{State: sandboxdv1.ProcessState_PROCESS_STATE_EXITED, ExecutionId: "e"}, want: controllers.AdapterObservationFailed},
 	}
 	for _, test := range tests {
@@ -189,7 +210,7 @@ func TestUnavailableAndAbsentExecution(t *testing.T) {
 	sandbox := controllers.AdapterSandbox{DialProcess: func(context.Context) (sandboxdv1.ProcessServiceClient, func() error, error) {
 		return nil, nil, dialError
 	}}
-	if err := (&Adapter{}).EnsureAccepted(context.Background(), controllers.AdapterTask{ID: "run"}, sandbox); !errors.Is(err, dialError) {
+	if err := (&Adapter{}).EnsureAccepted(context.Background(), controllers.AdapterTask{ID: "run"}, sandbox, nil); !errors.Is(err, dialError) {
 		t.Fatalf("EnsureAccepted() error = %v", err)
 	}
 	client := &fakeProcessClient{getErr: status.Error(codes.NotFound, "absent")}
@@ -302,10 +323,13 @@ func TestOutputPaginationRetriesTheSameIdempotencyKey(t *testing.T) {
 		stdout:  bytes.Repeat([]byte("x"), outputPageMax+1),
 	}
 	var keys []string
+	var payloads [][]byte
 	sandbox := sandboxFor(client)
 	sandbox.EmitEvent = func(_ context.Context, event controllers.AdapterEvent) error {
 		keys = append(keys, event.IdempotencyKey)
+		payloads = append(payloads, append([]byte(nil), event.Data...))
 		if len(keys) == 1 {
+			client.stdout = append(client.stdout, []byte("grew-after-uncertain-append")...)
 			return transient
 		}
 		return nil
@@ -317,8 +341,21 @@ func TestOutputPaginationRetriesTheSameIdempotencyKey(t *testing.T) {
 	if got, _, err := adapter.Observe(context.Background(), controllers.AdapterTask{ID: "run"}, sandbox); err != nil || got != controllers.AdapterObservationRunning {
 		t.Fatalf("retry Observe() = (%q, %v)", got, err)
 	}
-	if len(keys) != 3 || keys[0] != keys[1] || keys[1] == keys[2] {
+	if len(keys) != 3 || keys[0] != keys[1] || !bytes.Equal(payloads[0], payloads[1]) || keys[1] == keys[2] {
 		t.Fatalf("event keys = %#v, want identical retry followed by a second page", keys)
+	}
+}
+
+func TestRetainedOutputGapFailsTerminalValidation(t *testing.T) {
+	exitCode := int32(0)
+	client := &fakeProcessClient{
+		process:     &sandboxdv1.Process{State: sandboxdv1.ProcessState_PROCESS_STATE_EXITED, ExecutionId: "execution", ExitCode: &exitCode},
+		stdoutStart: 7,
+		stdout:      []byte("{\"type\":\"agent_end\",\"messages\":[{\"role\":\"assistant\",\"stopReason\":\"stop\"}],\"willRetry\":false}\n{\"type\":\"agent_settled\"}\n"),
+	}
+	got, message, err := (&Adapter{}).Observe(context.Background(), controllers.AdapterTask{ID: "run"}, sandboxFor(client))
+	if err != nil || got != controllers.AdapterObservationFailed || !strings.Contains(message, "truncated") {
+		t.Fatalf("Observe() = (%q, %q, %v)", got, message, err)
 	}
 }
 

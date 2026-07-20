@@ -28,8 +28,9 @@ type assistantMessage struct {
 }
 
 type agentEndEvent struct {
-	Type     string             `json:"type"`
-	Messages []assistantMessage `json:"messages"`
+	Type      string             `json:"type"`
+	Messages  []assistantMessage `json:"messages"`
+	WillRetry *bool              `json:"willRetry"`
 }
 
 // Adapter drives one non-interactive Pi process per Run UID.
@@ -38,6 +39,7 @@ type Adapter struct {
 
 	mu      sync.Mutex
 	cursors map[outputCursor]uint64
+	pending map[outputCursor]pendingEvent
 }
 
 type outputCursor struct {
@@ -57,6 +59,19 @@ type outputEvent struct {
 	ProducedEnd  uint64 `json:"producedEnd"`
 	EOF          bool   `json:"eof"`
 	Data         []byte `json:"data,omitempty"`
+}
+
+type pendingEvent struct {
+	event      controllers.AdapterEvent
+	nextOffset uint64
+}
+
+type outputTruncatedError struct {
+	retainedFrom uint64
+}
+
+func (e *outputTruncatedError) Error() string {
+	return fmt.Sprintf("retained from offset %d", e.retainedFrom)
 }
 
 func (a *Adapter) executable() string {
@@ -81,6 +96,7 @@ func (a *Adapter) processSpec(task controllers.AdapterTask) *sandboxdv1.ProcessS
 			"--no-skills",
 			"--no-prompt-templates",
 			"--no-themes",
+			"--no-context-files",
 			"--offline",
 			// Pi 0.80.10 has no flag terminator. Leading whitespace keeps a
 			// flag-shaped task in the positional-message parser.
@@ -94,7 +110,10 @@ func (a *Adapter) processSpec(task controllers.AdapterTask) *sandboxdv1.ProcessS
 }
 
 // EnsureAccepted duplicate-safely starts (or recovers) the Run-keyed process.
-func (a *Adapter) EnsureAccepted(ctx context.Context, task controllers.AdapterTask, sandbox controllers.AdapterSandbox) error {
+func (a *Adapter) EnsureAccepted(ctx context.Context, task controllers.AdapterTask, sandbox controllers.AdapterSandbox, credential *controllers.AdapterCredential) error {
+	if credential != nil {
+		return fmt.Errorf("%w: Pi credential delivery is not implemented", controllers.ErrAdapterTaskRejected)
+	}
 	client, closeConnection, err := sandbox.DialProcess(ctx)
 	if err != nil {
 		return err
@@ -140,11 +159,15 @@ func (a *Adapter) Observe(ctx context.Context, task controllers.AdapterTask, san
 		}
 		output, err := readRetainedOutput(ctx, client, processKey(task), process.ExecutionId, sandboxdv1.OutputStream_OUTPUT_STREAM_STDOUT)
 		if err != nil {
+			var truncated *outputTruncatedError
+			if errors.As(err, &truncated) {
+				return controllers.AdapterObservationFailed, processMessage("Pi stdout was truncated before terminal validation", truncated.Error()), nil
+			}
 			return "", "", err
 		}
-		message, ok := finalAssistant(output)
+		message, detail, ok := finalAssistant(output)
 		if !ok {
-			return controllers.AdapterObservationFailed, "Pi exited without a valid agent_end assistant message", nil
+			return controllers.AdapterObservationFailed, processMessage("Pi exited without a coherent settled result", detail), nil
 		}
 		switch message.StopReason {
 		case "stop":
@@ -199,6 +222,14 @@ func (a *Adapter) forwardOutput(ctx context.Context, client sandboxdv1.ProcessSe
 		cursor := outputCursor{environment: string(sandbox.EnvironmentUID), owner: task.ID, execution: process.ExecutionId, stream: stream}
 		offset := a.cursor(cursor)
 		for {
+			if pending, ok := a.pendingEvent(cursor); ok {
+				if err := sandbox.EmitEvent(ctx, pending.event); err != nil {
+					return err
+				}
+				offset = pending.nextOffset
+				a.commitPending(cursor, offset)
+				continue
+			}
 			response, err := client.ReadOutput(ctx, &sandboxdv1.ReadOutputRequest{Key: processKey(task), ExecutionId: process.ExecutionId, Stream: stream, Offset: offset, MaxBytes: outputPageMax})
 			if err != nil {
 				return err
@@ -216,11 +247,13 @@ func (a *Adapter) forwardOutput(ctx context.Context, client sandboxdv1.ProcessSe
 			}
 			digest := sha256.Sum256(payload)
 			key := fmt.Sprintf("v1:%s:%x", streamName(stream), digest)
-			if err := sandbox.EmitEvent(ctx, controllers.AdapterEvent{Source: "pi", IdempotencyKey: key, Type: "pi.process-output", Data: payload}); err != nil {
+			event := controllers.AdapterEvent{Source: "pi", IdempotencyKey: key, Type: "pi.process-output", Data: payload}
+			a.setPending(cursor, pendingEvent{event: event, nextOffset: response.NextOffset})
+			if err := sandbox.EmitEvent(ctx, event); err != nil {
 				return err
 			}
 			offset = response.NextOffset
-			a.setCursor(cursor, offset)
+			a.commitPending(cursor, offset)
 			if response.Eof || offset >= response.ProducedEnd {
 				break
 			}
@@ -237,6 +270,9 @@ func readRetainedOutput(ctx context.Context, client sandboxdv1.ProcessServiceCli
 		if err != nil {
 			return nil, err
 		}
+		if response.GapBytes != 0 || response.Offset != offset {
+			return nil, &outputTruncatedError{retainedFrom: response.RetainedStart}
+		}
 		output.Write(response.Data)
 		offset = response.NextOffset
 		if response.Eof || offset >= response.ProducedEnd {
@@ -245,24 +281,46 @@ func readRetainedOutput(ctx context.Context, client sandboxdv1.ProcessServiceCli
 	}
 }
 
-func finalAssistant(output []byte) (assistantMessage, bool) {
+func finalAssistant(output []byte) (assistantMessage, string, bool) {
 	var terminal agentEndEvent
-	found := false
+	settled := false
 	for _, line := range bytes.Split(output, []byte("\n")) {
+		line = bytes.TrimSpace(line)
+		if len(line) == 0 {
+			continue
+		}
 		var candidate agentEndEvent
-		if json.Unmarshal(line, &candidate) == nil && candidate.Type == "agent_end" {
-			terminal, found = candidate, true
+		if json.Unmarshal(line, &candidate) != nil {
+			return assistantMessage{}, "malformed JSONL output", false
+		}
+		if settled {
+			return assistantMessage{}, "output after agent_settled", false
+		}
+		switch candidate.Type {
+		case "agent_end":
+			terminal = candidate
+		case "agent_settled":
+			if terminal.Type == "" {
+				return assistantMessage{}, "agent_settled before agent_end", false
+			}
+			settled = true
 		}
 	}
-	if !found {
-		return assistantMessage{}, false
+	if !settled {
+		return assistantMessage{}, "missing agent_settled", false
+	}
+	if terminal.WillRetry == nil {
+		return assistantMessage{}, "final agent_end is missing willRetry", false
+	}
+	if *terminal.WillRetry {
+		return assistantMessage{}, "final agent_end still indicates a retry", false
 	}
 	for i := len(terminal.Messages) - 1; i >= 0; i-- {
 		if terminal.Messages[i].Role == "assistant" {
-			return terminal.Messages[i], true
+			return terminal.Messages[i], "", true
 		}
 	}
-	return assistantMessage{}, false
+	return assistantMessage{}, "final agent_end has no assistant message", false
 }
 
 func processMessage(summary, detail string) string {
@@ -292,11 +350,28 @@ func (a *Adapter) cursor(key outputCursor) uint64 {
 	return a.cursors[key]
 }
 
-func (a *Adapter) setCursor(key outputCursor, offset uint64) {
+func (a *Adapter) pendingEvent(key outputCursor) (pendingEvent, bool) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	pending, ok := a.pending[key]
+	return pending, ok
+}
+
+func (a *Adapter) setPending(key outputCursor, pending pendingEvent) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.pending == nil {
+		a.pending = make(map[outputCursor]pendingEvent)
+	}
+	a.pending[key] = pending
+}
+
+func (a *Adapter) commitPending(key outputCursor, offset uint64) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if a.cursors == nil {
 		a.cursors = make(map[outputCursor]uint64)
 	}
+	delete(a.pending, key)
 	a.cursors[key] = offset
 }

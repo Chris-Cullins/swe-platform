@@ -75,7 +75,7 @@ ARG PI_CODING_AGENT_INTEGRITY=sha512-aL4apbupCHiVLSXASXvRzH4Q2vmtfrDa+0s909CJuVu
 WORKDIR /tmp/pi
 RUN npm pack "@earendil-works/pi-coding-agent@${PI_CODING_AGENT_VERSION}" --json > pack.json \
 	&& test "$(node -p 'JSON.parse(require("fs").readFileSync("pack.json"))[0].integrity')" = "${PI_CODING_AGENT_INTEGRITY}" \
-	&& npm install -g "./$(node -p 'JSON.parse(require("fs").readFileSync("pack.json"))[0].filename')" \
+	&& npm install -g --ignore-scripts "./$(node -p 'JSON.parse(require("fs").readFileSync("pack.json"))[0].filename')" \
 	&& test "$(pi --version)" = "${PI_CODING_AGENT_VERSION}"
 
 # Base image for environments.
