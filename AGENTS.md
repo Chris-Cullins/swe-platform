@@ -22,9 +22,9 @@ browser sessions backed by repeated Kubernetes TokenReview/SAR authorization, an
 Run/Environment resource APIs for the console.
 Remaining gaps are marked `TODO(P0/P1/P2)` in code — most notably secure agent credential
 injection, additional agent adapters, GitHub App–scoped git tokens, and egress/portal
-networking. The `claude-code` (default), `amp`, `codex`, and `pi` adapters are registered and
-use sandboxd managed processes; Amp and Pi credential delivery remain unmet prerequisites and
-adapter tests use fake process services; Codex supports process-scoped `CODEX_API_KEY` delivery.
+networking. The `claude-code` (default), `amp`, and `codex` adapters are registered and use sandboxd
+managed processes; Amp's `AMP_API_KEY` delivery remains an unmet prerequisite and adapter
+tests use fake process services; Codex supports process-scoped `CODEX_API_KEY` delivery.
 
 ## Architecture invariants — do not violate these
 
@@ -129,7 +129,6 @@ runs both via `make` targets:
 - **E2E acceptance:** `./hack/e2e.sh` — full kind + operator + `swe run` pass with the
   env-base image built and loaded locally (no registry credentials needed). It also verifies
   the documented server-side CRD upgrade from the pre-scoped-credentials schema,
-  the Pi adapter through the real Run controller with a credential-free fake executable,
   control-plane TokenReview/SAR scoping, opaque browser session exchange/logout and CSRF,
   the embedded console entry point/SPA fallback/static assets, typed Run
   list/get/create/retry/cancel, Environment get, transcript SSE, terminal attach, and
@@ -141,9 +140,8 @@ runs both via `make` targets:
   its pinned tmux with `images/env-base/tmux-control-output-drain.patch`; keep the
   source checksum and patch synchronized when upgrading tmux. Its `terminal-test`
   target runs the patched-runtime terminal regression during `hack/e2e.sh`. The image
-  also includes version-pinned Claude Code (the default adapter), Amp, Codex, and Pi CLIs.
-  Amp image installs must retain `AMP_SKIP_UPDATE_CHECK=1`; Amp and Pi installs must retain
-  their pinned npm integrity checks.
+  also includes version-pinned Claude Code (the default adapter) and Amp CLIs. Amp image
+  installs must retain `AMP_SKIP_UPDATE_CHECK=1` and the pinned npm integrity check.
 - **Publish images:** pushes to `main` and `v*` tags publish multi-architecture operator
   and env-base images to GHCR via `.github/workflows/publish-images.yaml`.
 

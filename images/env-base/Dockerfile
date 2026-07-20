@@ -69,17 +69,8 @@ RUN case "$TARGETARCH" in \
 	&& test -f /opt/codex/codex-package.json \
 	&& test "$(/opt/codex/bin/codex --version)" = "codex-cli ${CODEX_VERSION}"
 
-FROM node:24-bookworm-slim AS pi
-ARG PI_CODING_AGENT_VERSION=0.80.10
-ARG PI_CODING_AGENT_INTEGRITY=sha512-aL4apbupCHiVLSXASXvRzH4Q2vmtfrDa+0s909CJuVu/GgGylbDzr7oyF1mPmip5E+VxYYxKWmph4hV04wUcQg==
-WORKDIR /tmp/pi
-RUN npm pack "@earendil-works/pi-coding-agent@${PI_CODING_AGENT_VERSION}" --json > pack.json \
-	&& test "$(node -p 'JSON.parse(require("fs").readFileSync("pack.json"))[0].integrity')" = "${PI_CODING_AGENT_INTEGRITY}" \
-	&& npm install -g --ignore-scripts "./$(node -p 'JSON.parse(require("fs").readFileSync("pack.json"))[0].filename')" \
-	&& test "$(pi --version)" = "${PI_CODING_AGENT_VERSION}"
-
 # Base image for environments.
-FROM node:24-bookworm-slim AS environment
+FROM debian:12-slim AS environment
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
 		git ca-certificates curl tmux jq ripgrep \
@@ -95,17 +86,14 @@ COPY --from=claude-code /usr/local/lib/node_modules/@anthropic-ai /usr/local/lib
 COPY --from=claude-code /usr/local/bin/claude /usr/local/bin/claude
 COPY --from=amp /usr/local/bin/amp /usr/local/bin/amp
 COPY --from=codex /opt/codex /opt/codex
-COPY --from=pi /usr/local/lib/node_modules/@earendil-works /usr/local/lib/node_modules/@earendil-works
-RUN ln -s /opt/codex/bin/codex /usr/local/bin/codex \
-	&& ln -s ../lib/node_modules/@earendil-works/pi-coding-agent/dist/cli.js /usr/local/bin/pi
+RUN ln -s /opt/codex/bin/codex /usr/local/bin/codex
 ENV AMP_SKIP_UPDATE_CHECK=1
 RUN claude --version \
 	&& test "$(amp --version | awk '{print $1}')" = "0.0.1784492094-g5d18e2" \
 	&& test "$(codex --version)" = "codex-cli 0.144.6" \
 	&& test "$(readlink -f "$(command -v codex)")" = /opt/codex/bin/codex \
 	&& test -x /opt/codex/codex-resources/bwrap \
-	&& test -f /opt/codex/codex-package.json \
-	&& test "$(pi --version)" = "0.80.10"
+	&& test -f /opt/codex/codex-package.json
 
 USER swe
 WORKDIR /workspace
