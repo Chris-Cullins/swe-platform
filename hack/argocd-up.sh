@@ -7,13 +7,18 @@
 # two operators must never reconcile the same custom resources, and Argo CD
 # selfHeal would fight manual dev installs.
 #
-# Prerequisites: kind, kubectl. Env overrides: KIND_ARGO_CLUSTER (default
-# swe-argo), ARGOCD_VERSION, IMAGE_UPDATER_VERSION.
+# Prerequisites: kind, kubectl, and a container runtime that gives one kind node
+# at least 5 CPUs and 6 GiB allocatable. Env overrides: KIND_ARGO_CLUSTER
+# (default swe-argo), ARGOCD_VERSION, IMAGE_UPDATER_VERSION.
 set -euo pipefail
 
 CLUSTER="${KIND_ARGO_CLUSTER:-swe-argo}"
 ARGOCD_VERSION="${ARGOCD_VERSION:-v3.4.5}"
 IMAGE_UPDATER_VERSION="${IMAGE_UPDATER_VERSION:-v1.2.2}"
+# Two tiny Environments reserve 2 CPUs/4 GiB during warm-pool replacement; the
+# remainder covers the observed Argo, Kubernetes, and swe-platform workloads.
+MIN_NODE_CPU_MILLICORES=5000
+MIN_NODE_MEMORY_MIB=6144
 ARGOCD_NAMESPACE="argocd"
 APP_NAMESPACE="swe-platform-system"
 BOOTSTRAP_SECRET="swe-platform-bootstrap"
@@ -28,6 +33,35 @@ else
 fi
 
 "${KUBECTL[@]}" cluster-info >/dev/null
+
+capacity_ok=false
+capacity_summary=()
+while IFS='|' read -r node cpu memory; do
+	[[ -n "$node" ]] || continue
+	cpu_millicores="$(awk -v value="$cpu" 'BEGIN {
+		if (value ~ /m$/) { sub(/m$/, "", value); print int(value) }
+		else { print int(value * 1000) }
+	}')"
+	memory_mib="$(awk -v value="$memory" 'BEGIN {
+		if (value ~ /Ki$/) { sub(/Ki$/, "", value); print int(value / 1024) }
+		else if (value ~ /Mi$/) { sub(/Mi$/, "", value); print int(value) }
+		else if (value ~ /Gi$/) { sub(/Gi$/, "", value); print int(value * 1024) }
+		else { print int(value / 1048576) }
+	}')"
+	capacity_summary+=("$node: ${cpu_millicores}m CPU, ${memory_mib}Mi memory allocatable")
+	if (( cpu_millicores >= MIN_NODE_CPU_MILLICORES && memory_mib >= MIN_NODE_MEMORY_MIB )); then
+		capacity_ok=true
+	fi
+done < <("${KUBECTL[@]}" get nodes -o jsonpath='{range .items[*]}{.metadata.name}{"|"}{.status.allocatable.cpu}{"|"}{.status.allocatable.memory}{"\n"}{end}')
+
+if [[ "$capacity_ok" != true ]]; then
+	printf 'kind cluster %q needs one node with at least 5 CPUs and 6 GiB allocatable before installing the Argo demo.\n' "$CLUSTER" >&2
+	printf 'The warm pool intentionally keeps one 1-CPU tiny Environment ready and creates a second during a claim; Argo and system workloads need the remaining capacity.\n' >&2
+	printf 'Increase the CPU/memory available to your container runtime, delete this undersized cluster, and run make argocd-up again.\n' >&2
+	printf 'Observed: %s\n' "${capacity_summary[@]:-no nodes}" >&2
+	exit 1
+fi
+printf '==> capacity check passed: %s\n' "${capacity_summary[@]}"
 
 echo "==> installing Argo CD $ARGOCD_VERSION"
 "${KUBECTL[@]}" create namespace "$ARGOCD_NAMESPACE" --dry-run=client -o yaml | "${KUBECTL[@]}" apply -f -
