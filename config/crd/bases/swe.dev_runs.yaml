@@ -125,6 +125,14 @@ spec:
           status:
             description: RunStatus defines the observed state of Run.
             properties:
+              acceptedEnvironmentEpoch:
+                description: |-
+                  AcceptedEnvironmentEpoch is the Environment lifecycle epoch in which the
+                  adapter most recently accepted this Run. A different current epoch fences
+                  observation until credentials are rematerialized and acceptance succeeds.
+                format: int64
+                minimum: 0
+                type: integer
               branch:
                 description: Branch is the git branch holding the run's changes, once
                   pushed.

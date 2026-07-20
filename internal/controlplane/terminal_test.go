@@ -35,6 +35,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
 	platformv1alpha1 "github.com/Chris-Cullins/swe-platform/api/v1alpha1"
+	"github.com/Chris-Cullins/swe-platform/internal/lifecycle"
 	sandboxdauth "github.com/Chris-Cullins/swe-platform/sandboxd/auth"
 	sandboxdv1 "github.com/Chris-Cullins/swe-platform/sandboxd/gen/proto/sandboxd/v1"
 )
@@ -297,21 +298,22 @@ func TestKubernetesTerminalDialerMarksEnvironmentActive(t *testing.T) {
 	}
 	oldActivity := metav1.NewTime(time.Now().Add(-time.Hour))
 	environment := &platformv1alpha1.Environment{
-		ObjectMeta: metav1.ObjectMeta{Name: "env-1", Namespace: "project-1"},
+		ObjectMeta: metav1.ObjectMeta{Name: "env-1", Namespace: "project-1", UID: "env-uid"},
 		Status:     platformv1alpha1.EnvironmentStatus{LastActiveAt: &oldActivity},
 	}
 	kubeClient := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(environment).WithObjects(environment).Build()
 	dialer := KubernetesTerminalDialer{Client: kubeClient}
 
-	if err := dialer.markActive(context.Background(), environment, environment.UID); err != nil {
+	if err := dialer.markActive(context.Background(), environment, environment.UID, 0); err != nil {
 		t.Fatalf("markActive() error = %v", err)
 	}
 	var updated platformv1alpha1.Environment
 	if err := kubeClient.Get(context.Background(), client.ObjectKeyFromObject(environment), &updated); err != nil {
 		t.Fatal(err)
 	}
-	if updated.Status.LastActiveAt == nil || !updated.Status.LastActiveAt.After(oldActivity.Time) {
-		t.Fatalf("LastActiveAt = %v, want after %s", updated.Status.LastActiveAt, oldActivity.Time)
+	requests := lifecycle.ActivityRequests(&updated)
+	if len(requests) != 1 || requests[0].Source != platformv1alpha1.EnvironmentActivitySourceTerminal {
+		t.Fatalf("terminal activity intent = %#v", requests)
 	}
 }
 
@@ -325,15 +327,55 @@ func TestKubernetesTerminalDialerDoesNotMarkReplacementEnvironmentActive(t *test
 	replacement.UID = "new-uid"
 	kubeClient := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(replacement).WithObjects(replacement).Build()
 	dialer := KubernetesTerminalDialer{Client: kubeClient}
-	if err := dialer.markActive(context.Background(), original, original.UID); err == nil || !strings.Contains(err.Error(), "incarnation changed") {
+	if err := dialer.markActive(context.Background(), original, original.UID, 0); err == nil || !strings.Contains(err.Error(), "incarnation changed") {
 		t.Fatalf("markActive() replacement error = %v", err)
 	}
 	var updated platformv1alpha1.Environment
 	if err := kubeClient.Get(context.Background(), client.ObjectKeyFromObject(replacement), &updated); err != nil {
 		t.Fatal(err)
 	}
-	if updated.Status.LastActiveAt != nil {
-		t.Fatal("replacement Environment was marked active")
+	if len(lifecycle.ActivityRequests(&updated)) != 0 {
+		t.Fatal("replacement Environment received stale activity intent")
+	}
+}
+
+func TestKubernetesTerminalDialerRejectsNonIdleSuspension(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		mutate func(*platformv1alpha1.Environment)
+	}{
+		{name: "requested suspension", mutate: func(environment *platformv1alpha1.Environment) {
+			environment.Status.Lifecycle.Suspended = true
+			environment.Status.Lifecycle.SuspensionReason = platformv1alpha1.EnvironmentSuspensionReasonRequested
+		}},
+		{name: "enabled hold", mutate: func(environment *platformv1alpha1.Environment) {
+			environment.Spec.Lifecycle.Hold = &platformv1alpha1.EnvironmentHoldPolicy{Enabled: true, Revision: 2}
+		}},
+		{name: "legacy pause migration", mutate: func(environment *platformv1alpha1.Environment) {
+			environment.Spec.Paused = true
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			scheme := runtime.NewScheme()
+			if err := platformv1alpha1.AddToScheme(scheme); err != nil {
+				t.Fatal(err)
+			}
+			environment := &platformv1alpha1.Environment{ObjectMeta: metav1.ObjectMeta{Name: "env-1", Namespace: "project-1", UID: "env-uid"}}
+			test.mutate(environment)
+			kubeClient := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(environment).WithObjects(environment).Build()
+			dialer := KubernetesTerminalDialer{Client: kubeClient}
+
+			if _, _, _, err := dialer.DialTerminal(context.Background(), environment.Namespace, environment.Name); err == nil {
+				t.Fatal("DialTerminal() unexpectedly succeeded")
+			}
+			var retained platformv1alpha1.Environment
+			if err := kubeClient.Get(context.Background(), client.ObjectKeyFromObject(environment), &retained); err != nil {
+				t.Fatal(err)
+			}
+			if retained.Spec.Lifecycle.Wake != nil || len(lifecycle.ActivityRequests(&retained)) != 0 {
+				t.Fatalf("rejected terminal wrote lifecycle traffic: %#v", retained.Spec.Lifecycle)
+			}
+		})
 	}
 }
 
@@ -349,7 +391,7 @@ func TestTerminalHeartbeatRecoversAfterTransientGetFailure(t *testing.T) {
 	dialer := KubernetesTerminalDialer{Client: transient}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go dialer.heartbeatActivity(ctx, client.ObjectKeyFromObject(environment), environment.UID, 5*time.Millisecond)
+	go dialer.heartbeatActivity(ctx, client.ObjectKeyFromObject(environment), environment.UID, 0, 5*time.Millisecond, func() {})
 
 	deadline := time.Now().Add(time.Second)
 	for time.Now().Before(deadline) {
@@ -357,7 +399,7 @@ func TestTerminalHeartbeatRecoversAfterTransientGetFailure(t *testing.T) {
 		if err := baseClient.Get(context.Background(), client.ObjectKeyFromObject(environment), &updated); err != nil {
 			t.Fatal(err)
 		}
-		if updated.Status.LastActiveAt != nil && updated.Status.LastActiveAt.After(oldActivity.Time) {
+		if len(lifecycle.ActivityRequests(&updated)) == 1 {
 			return
 		}
 		time.Sleep(time.Millisecond)
@@ -365,11 +407,187 @@ func TestTerminalHeartbeatRecoversAfterTransientGetFailure(t *testing.T) {
 	t.Fatal("terminal heartbeat stopped after a transient Get failure")
 }
 
+func TestTerminalHeartbeatAdoptsNewerDisabledHoldRevision(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := platformv1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	environment := &platformv1alpha1.Environment{
+		ObjectMeta: metav1.ObjectMeta{Name: "env-1", Namespace: "project-1", UID: "env-uid"},
+		Spec: platformv1alpha1.EnvironmentSpec{Lifecycle: platformv1alpha1.EnvironmentLifecycleSpec{
+			Hold: &platformv1alpha1.EnvironmentHoldPolicy{Revision: 1},
+		}},
+	}
+	kubeClient := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(environment).WithObjects(environment).Build()
+	dialer := KubernetesTerminalDialer{Client: kubeClient, policyPollInterval: time.Millisecond}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	revoked := atomic.Bool{}
+	go dialer.heartbeatActivity(ctx, client.ObjectKeyFromObject(environment), environment.UID, 1, 20*time.Millisecond, func() { revoked.Store(true) })
+
+	var updated platformv1alpha1.Environment
+	if err := kubeClient.Get(context.Background(), client.ObjectKeyFromObject(environment), &updated); err != nil {
+		t.Fatal(err)
+	}
+	updated.Spec.Lifecycle.Hold = &platformv1alpha1.EnvironmentHoldPolicy{Revision: 2}
+	if err := kubeClient.Update(context.Background(), &updated); err != nil {
+		t.Fatal(err)
+	}
+	waitForTerminalActivityRevision(t, kubeClient, environment, 2)
+	if revoked.Load() {
+		t.Fatal("disabled hold-policy revision revoked terminal activity")
+	}
+}
+
+func TestTerminalHeartbeatRevokesConnectionWhenHoldEnabled(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := platformv1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	environment := &platformv1alpha1.Environment{
+		ObjectMeta: metav1.ObjectMeta{Name: "env-1", Namespace: "project-1", UID: "env-uid"},
+		Spec: platformv1alpha1.EnvironmentSpec{Lifecycle: platformv1alpha1.EnvironmentLifecycleSpec{
+			Hold: &platformv1alpha1.EnvironmentHoldPolicy{Revision: 1},
+		}},
+	}
+	baseClient := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(environment).WithObjects(environment).Build()
+	kubeClient := &activityCountingClient{Client: baseClient}
+	dialer := KubernetesTerminalDialer{Client: kubeClient, policyPollInterval: time.Millisecond}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	closed := make(chan struct{})
+	lease := &terminalConnectionLease{}
+	if !lease.attach(closeFunc(func() error { close(closed); return nil })) {
+		t.Fatal("failed to attach test terminal connection")
+	}
+	go dialer.heartbeatActivity(ctx, client.ObjectKeyFromObject(environment), environment.UID, 1, time.Hour, func() { _ = lease.Close() })
+
+	var updated platformv1alpha1.Environment
+	if err := kubeClient.Get(context.Background(), client.ObjectKeyFromObject(environment), &updated); err != nil {
+		t.Fatal(err)
+	}
+	updated.Spec.Lifecycle.Hold = &platformv1alpha1.EnvironmentHoldPolicy{Enabled: true, Revision: 2}
+	if err := kubeClient.Update(context.Background(), &updated); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-closed:
+	case <-time.After(time.Second):
+		t.Fatal("enabled hold did not revoke the live terminal connection")
+	}
+	if writes := kubeClient.count(); writes != 0 {
+		t.Fatalf("activity writes after enabled hold = %d, want 0", writes)
+	}
+}
+
+func TestTerminalPolicyPollRetriesTransientFailuresAndRevokesRecoveredHold(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := platformv1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	environment := &platformv1alpha1.Environment{
+		ObjectMeta: metav1.ObjectMeta{Name: "env-1", Namespace: "project-1", UID: "env-uid"},
+		Spec: platformv1alpha1.EnvironmentSpec{Lifecycle: platformv1alpha1.EnvironmentLifecycleSpec{
+			Hold: &platformv1alpha1.EnvironmentHoldPolicy{Revision: 1},
+		}},
+	}
+	baseClient := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(environment).WithObjects(environment).Build()
+	failedGets := make(chan struct{}, 2)
+	transient := &transientTerminalGetClient{Client: baseClient, getFailures: 2, failedGets: failedGets}
+	dialer := KubernetesTerminalDialer{Client: transient, policyPollInterval: time.Millisecond}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	closed := make(chan struct{})
+	go dialer.heartbeatActivity(ctx, client.ObjectKeyFromObject(environment), environment.UID, 1, time.Hour, func() { close(closed) })
+
+	for range 2 {
+		select {
+		case <-failedGets:
+		case <-time.After(time.Second):
+			t.Fatal("policy poll did not retry transient Get failure")
+		}
+	}
+	select {
+	case <-closed:
+		t.Fatal("transient policy Get failure revoked terminal")
+	default:
+	}
+	var updated platformv1alpha1.Environment
+	if err := baseClient.Get(context.Background(), client.ObjectKeyFromObject(environment), &updated); err != nil {
+		t.Fatal(err)
+	}
+	updated.Spec.Lifecycle.Hold = &platformv1alpha1.EnvironmentHoldPolicy{Enabled: true, Revision: 2}
+	if err := baseClient.Update(context.Background(), &updated); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-closed:
+	case <-time.After(time.Second):
+		t.Fatal("recovered policy poll did not detect enabled hold")
+	}
+}
+
+func TestTerminalHeartbeatRevokesConnectionForReplacementUID(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := platformv1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	environment := &platformv1alpha1.Environment{ObjectMeta: metav1.ObjectMeta{Name: "env-1", Namespace: "project-1", UID: "old-uid"}}
+	kubeClient := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(environment).WithObjects(environment).Build()
+	dialer := KubernetesTerminalDialer{Client: kubeClient, policyPollInterval: time.Millisecond}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	closed := make(chan struct{})
+	lease := &terminalConnectionLease{}
+	if !lease.attach(closeFunc(func() error { close(closed); return nil })) {
+		t.Fatal("failed to attach test terminal connection")
+	}
+	go dialer.heartbeatActivity(ctx, client.ObjectKeyFromObject(environment), environment.UID, 0, time.Hour, func() { _ = lease.Close() })
+
+	if err := kubeClient.Delete(context.Background(), environment); err != nil {
+		t.Fatal(err)
+	}
+	replacement := &platformv1alpha1.Environment{ObjectMeta: metav1.ObjectMeta{Name: environment.Name, Namespace: environment.Namespace, UID: "new-uid"}}
+	if err := kubeClient.Create(context.Background(), replacement); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-closed:
+	case <-time.After(time.Second):
+		t.Fatal("replacement Environment UID did not revoke the live terminal connection")
+	}
+	var retained platformv1alpha1.Environment
+	if err := kubeClient.Get(context.Background(), client.ObjectKeyFromObject(replacement), &retained); err != nil {
+		t.Fatal(err)
+	}
+	if requests := lifecycle.ActivityRequests(&retained); len(requests) != 0 {
+		t.Fatalf("replacement received stale terminal activity: %#v", requests)
+	}
+}
+
+func waitForTerminalActivityRevision(t *testing.T, kubeClient client.Client, environment *platformv1alpha1.Environment, revision int64) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		var updated platformv1alpha1.Environment
+		if err := kubeClient.Get(context.Background(), client.ObjectKeyFromObject(environment), &updated); err != nil {
+			t.Fatal(err)
+		}
+		requests := lifecycle.ActivityRequests(&updated)
+		if len(requests) == 1 && requests[0].HoldPolicyRevision == revision {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("terminal activity did not adopt hold-policy revision %d", revision)
+}
+
 type transientTerminalGetClient struct {
 	client.Client
 	mu             sync.Mutex
 	getFailures    int
 	updateFailures int
+	failedGets     chan<- struct{}
 }
 
 func (c *transientTerminalGetClient) Get(ctx context.Context, key client.ObjectKey, object client.Object, options ...client.GetOption) error {
@@ -377,6 +595,9 @@ func (c *transientTerminalGetClient) Get(ctx context.Context, key client.ObjectK
 	defer c.mu.Unlock()
 	if c.getFailures > 0 {
 		c.getFailures--
+		if c.failedGets != nil {
+			c.failedGets <- struct{}{}
+		}
 		return errors.New("transient API failure")
 	}
 	return c.Client.Get(ctx, key, object, options...)
@@ -401,6 +622,53 @@ func (w *transientTerminalStatusWriter) Update(ctx context.Context, object clien
 	return w.SubResourceWriter.Update(ctx, object, options...)
 }
 
+func TestKubernetesTerminalDialerActivityPreservesReadyGeneration(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	if err := platformv1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	environment := &platformv1alpha1.Environment{
+		ObjectMeta: metav1.ObjectMeta{Name: "env-1", Namespace: "project-1", UID: "env-uid", Generation: 1},
+		Spec:       platformv1alpha1.EnvironmentSpec{TemplateRef: "default"},
+	}
+	applyReadyTerminalStatus(environment, "env-pod")
+	template := &platformv1alpha1.EnvironmentTemplate{ObjectMeta: metav1.ObjectMeta{Name: "default", Namespace: environment.Namespace}}
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "env-pod", Namespace: environment.Namespace, UID: "pod-uid",
+			Annotations: map[string]string{
+				sandboxdauth.IdentityAnnotation: "env-pod.sandboxd.swe.dev",
+				sandboxdauth.TrustAnnotation:    testCertificatePEM(t, "env-pod.sandboxd.swe.dev"),
+				sandboxdauth.TokenAnnotation:    "terminal-token",
+			},
+		},
+		Status: corev1.PodStatus{PodIP: "192.0.2.10", Conditions: []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}}},
+	}
+	if err := controllerutil.SetControllerReference(environment, pod, scheme); err != nil {
+		t.Fatal(err)
+	}
+	kubeClient := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(environment).WithObjects(environment, template, pod).Build()
+	dialer := KubernetesTerminalDialer{Client: kubeClient}
+
+	_, _, closer, err := dialer.DialTerminal(context.Background(), environment.Namespace, environment.Name)
+	if err != nil {
+		t.Fatalf("DialTerminal() error = %v", err)
+	}
+	if err := closer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	var active platformv1alpha1.Environment
+	if err := kubeClient.Get(context.Background(), client.ObjectKeyFromObject(environment), &active); err != nil {
+		t.Fatal(err)
+	}
+	if active.Generation != environment.Generation || active.Status.ObservedGeneration != active.Generation || !platformv1alpha1.IsEnvironmentReady(&active) {
+		t.Fatalf("terminal activity disturbed Ready generation: generation=%d status=%#v", active.Generation, active.Status)
+	}
+}
+
 func TestKubernetesTerminalDialerUsesRecreatedPodCredentialsAfterWake(t *testing.T) {
 	scheme := runtime.NewScheme()
 	if err := corev1.AddToScheme(scheme); err != nil {
@@ -412,12 +680,11 @@ func TestKubernetesTerminalDialerUsesRecreatedPodCredentialsAfterWake(t *testing
 	environment := &platformv1alpha1.Environment{
 		ObjectMeta: metav1.ObjectMeta{Name: "env-1", Namespace: "project-1", UID: "current-environment"},
 		Spec: platformv1alpha1.EnvironmentSpec{
-			Paused:      true,
 			TemplateRef: "default",
 		},
 		Status: platformv1alpha1.EnvironmentStatus{
-			Phase:   platformv1alpha1.EnvironmentPhasePaused,
-			PodName: "old-pod",
+			Phase: platformv1alpha1.EnvironmentPhasePaused, PodName: "old-pod",
+			Lifecycle: platformv1alpha1.EnvironmentLifecycleStatus{Suspended: true, SuspensionReason: platformv1alpha1.EnvironmentSuspensionReasonIdle, Epoch: 1},
 		},
 	}
 	template := &platformv1alpha1.EnvironmentTemplate{
@@ -449,6 +716,13 @@ func TestKubernetesTerminalDialerUsesRecreatedPodCredentialsAfterWake(t *testing
 	if err := closer.Close(); err != nil {
 		t.Fatal(err)
 	}
+	var woken platformv1alpha1.Environment
+	if err := baseClient.Get(context.Background(), client.ObjectKeyFromObject(environment), &woken); err != nil {
+		t.Fatal(err)
+	}
+	if woken.Spec.Lifecycle.Wake == nil || woken.Spec.Lifecycle.Wake.ExpectedSuspensionReason != platformv1alpha1.EnvironmentSuspensionReasonIdle {
+		t.Fatalf("idle terminal wake = %#v", woken.Spec.Lifecycle.Wake)
+	}
 }
 
 func TestTerminalHeartbeatProtectsSlowWakeBeforeConnection(t *testing.T) {
@@ -461,8 +735,8 @@ func TestTerminalHeartbeatProtectsSlowWakeBeforeConnection(t *testing.T) {
 	}
 	environment := &platformv1alpha1.Environment{
 		ObjectMeta: metav1.ObjectMeta{Name: "env-1", Namespace: "project-1", UID: "current-environment"},
-		Spec:       platformv1alpha1.EnvironmentSpec{Paused: true, TemplateRef: "default"},
-		Status:     platformv1alpha1.EnvironmentStatus{Phase: platformv1alpha1.EnvironmentPhasePaused},
+		Spec:       platformv1alpha1.EnvironmentSpec{TemplateRef: "default"},
+		Status:     platformv1alpha1.EnvironmentStatus{Phase: platformv1alpha1.EnvironmentPhasePaused, Lifecycle: platformv1alpha1.EnvironmentLifecycleStatus{Suspended: true, SuspensionReason: platformv1alpha1.EnvironmentSuspensionReasonIdle, Epoch: 1}},
 	}
 	template := &platformv1alpha1.EnvironmentTemplate{
 		ObjectMeta: metav1.ObjectMeta{Name: "default", Namespace: environment.Namespace},
@@ -572,6 +846,18 @@ type activityCountingClient struct {
 	activityWrites int
 }
 
+func (c *activityCountingClient) Patch(ctx context.Context, object client.Object, patch client.Patch, options ...client.PatchOption) error {
+	if err := c.Client.Patch(ctx, object, patch, options...); err != nil {
+		return err
+	}
+	if environment, ok := object.(*platformv1alpha1.Environment); ok && len(lifecycle.ActivityRequests(environment)) != 0 {
+		c.mu.Lock()
+		c.activityWrites++
+		c.mu.Unlock()
+	}
+	return nil
+}
+
 func (c *activityCountingClient) Status() client.SubResourceWriter {
 	return &activityCountingStatusWriter{SubResourceWriter: c.Client.Status(), client: c}
 }
@@ -636,6 +922,8 @@ func (*failingWakeClient) Patch(context.Context, client.Object, client.Patch, ..
 
 func applyReadyTerminalStatus(environment *platformv1alpha1.Environment, podName string) {
 	environment.Status.Phase = platformv1alpha1.EnvironmentPhaseReady
+	environment.Status.Lifecycle.Suspended = false
+	environment.Status.Lifecycle.SuspensionReason = ""
 	environment.Status.PodName = podName
 	environment.Status.Endpoints.Sandboxd = "192.0.2.10:50051"
 	environment.Status.ObservedGeneration = environment.Generation
@@ -662,7 +950,12 @@ func (c wakeReadyClient) Patch(ctx context.Context, object client.Object, patch 
 	if err := c.Client.Get(ctx, client.ObjectKeyFromObject(environment), &current); err != nil {
 		return err
 	}
+	if current.Spec.Lifecycle.Wake == nil {
+		return nil
+	}
 	current.Status.Phase = platformv1alpha1.EnvironmentPhaseReady
+	current.Status.Lifecycle.Suspended = false
+	current.Status.Lifecycle.SuspensionReason = ""
 	current.Status.PodName = c.podName
 	var pod corev1.Pod
 	if err := c.Client.Get(ctx, types.NamespacedName{Namespace: current.Namespace, Name: c.podName}, &pod); err != nil {

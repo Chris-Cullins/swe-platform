@@ -118,16 +118,48 @@ Environment ownership and cleanup are explicit:
 | Controller-created (`Owned`) | Environment has a Run controller owner reference | Stop Run-scoped work and pause the Environment; retain workspace and transcript for review | Finalizer stops work, then Kubernetes garbage-collects the Environment, pod, and PVC |
 | Existing (`Claimed`) | `Environment.status.claimedBy` stores Run name + UID; optimistic concurrency permits one claimant | Stop Run-scoped work, clear only the matching UID claim, and leave the Environment active and reusable | Finalizer stops work and releases only the matching claim; it never deletes the Environment |
 
-An explicit `--environment` request fails terminally if another Run already holds the claim; it
-does not wait and unexpectedly start later after that claim is released.
+An explicit `--environment` request fails terminally if another Run already holds the claim or
+the Environment has an enabled explicit hold. It does not wait for claim release or hold-policy
+changes and unexpectedly start later. Automatic Idle suspension is ordinarily wakeable. A Run
+claim can also publish a Requested-scoped wake, but an accepted cleanup fence completes before
+that wake releases the Environment.
 
-Pause is not process checkpointing. Pausing fences the current execution domain and stops
-**every** agent and declared-service process by removing the environment pod (or the
+Pause is not process checkpointing. One Environment lifecycle controller owns every
+suspend/resume transition. Explicit user/admin policy lives in
+`spec.lifecycle.hold`; automatic idle and requested suspension are controller-owned
+observed state in `status.lifecycle`, including a reason and monotonically increasing
+epoch. Pausing increments that epoch before fencing the current execution domain and
+stops **every** agent and declared-service process by removing the environment pod (or the
 backend equivalent), while retaining the workspace disk and adapter-owned transcript.
+Ordinary callers never toggle observed suspension. They publish bounded durable
+`wake`, `suspend`, or source-keyed `activity` intents. Every intent carries the exact
+Environment UID, hold-policy revision, and an idempotency key; stale-incarnation and
+stale-policy requests are ignored. A wake consumed while an explicit hold is enabled is
+recorded but refused, so terminal, portal, inbox, agent, and Run traffic cannot erase an
+administrator's decision. Activity receipts are bounded to one latest request for each
+defined source, and an exact non-terminal Run owner or claim remains authoritative active
+work for idle decisions. Ordinary wake intents are scoped to the suspension reason they
+observed, so an Idle wake racing a Requested cleanup fence is consumed without resuming
+the Environment. Terminal access wakes Idle suspension only; Requested suspension,
+enabled holds, and legacy pause migration are not terminal-wakeable. A live terminal
+heartbeat adopts newer disabled hold-policy revisions, while enabling a hold revokes the
+terminal connection instead of continuing stale-revision activity.
+
+The deprecated `spec.paused: true` input is retained for upgrade safety only. On first
+reconciliation it becomes an enabled explicit hold at revision 1 and is cleared. New
+clients must use `spec.lifecycle`; writing `paused: false` is not a wake operation.
+Use the CLI to publish monotonic user/admin hold-policy revisions:
+
+```sh
+swe environment hold my-environment
+swe environment release my-environment
+```
+
 Accepted work is cancelled only while that exact execution incarnation is securely
 reachable, or cleanup proceeds without an RPC after pause has removed its pod and
 endpoint. For unreachable or unavailable-adapter cleanup, the Run controller requests backend
-pause and retains the claim/finalizer until the Environment reports the pod and endpoint gone.
+fencing through a durable lifecycle suspend intent and retains the claim/finalizer until
+the Environment reports the pod and endpoint gone.
 Resume creates a fresh sandboxd epoch, runs the repository resume hook, and calls the
 adapter's idempotent acceptance path again with the same Run UID. Adapters reconstruct or
 restart their processes from workspace/transcript state; no old process incarnation is
@@ -312,9 +344,10 @@ the controller creates or claims the Environment server-side.
 
 The repository configured on a Project is cloned into `/workspace` when its
 environment is created. If the repository contains `.agents/setup`, the hook runs once
-after checkout. Set `Environment.spec.paused` to `true` to delete the pod while retaining
-its workspace PVC, then set it to `false` to create a fresh pod; `.agents/resume` runs
-after the volume is reattached. Setup and resume hooks receive only the controller's
+after checkout. `swe environment hold ENVIRONMENT` deletes the pod while retaining its
+workspace PVC, and `swe environment release ENVIRONMENT` publishes the next policy revision
+to create a fresh pod; `.agents/resume` runs after the volume is reattached.
+Setup and resume hooks receive only the controller's
 non-secret repository and timeout values. They are limited to 30 minutes each. Failed or
 completed environment pods are replaced with bounded exponential
 backoff while retaining the workspace PVC; recovery progress and exhaustion are reported by

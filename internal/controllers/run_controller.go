@@ -15,7 +15,6 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -25,6 +24,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 
 	platformv1alpha1 "github.com/Chris-Cullins/swe-platform/api/v1alpha1"
+	"github.com/Chris-Cullins/swe-platform/internal/lifecycle"
 	"github.com/Chris-Cullins/swe-platform/internal/sandboxclient"
 	sandboxdv1 "github.com/Chris-Cullins/swe-platform/sandboxd/gen/proto/sandboxd/v1"
 )
@@ -36,6 +36,8 @@ const credentialReadyTimeout = time.Minute
 
 var errAllocatedEnvironmentGone = errors.New("allocated environment is gone or no longer claimed by this run")
 var errExplicitEnvironmentClaimed = errors.New("explicit environment is already claimed")
+var errExplicitEnvironmentHeld = errors.New("explicit environment is held")
+var errExplicitEnvironmentSuspensionNotWakeable = errors.New("explicit environment suspension is not wakeable")
 
 // ErrAdapterCancellationPending means cancellation was accepted but the
 // adapter-owned execution tree has not reached a terminal state yet.
@@ -196,13 +198,18 @@ func (r *RunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.R
 				return ctrl.Result{}, getErr
 			}
 			if run.Spec.EnvironmentRef != "" {
-				err = r.wakeExplicitClaim(ctx, &recovered)
+				err = r.wakeExplicitClaim(ctx, &recovered, &run)
+				if errors.Is(err, errExplicitEnvironmentHeld) || errors.Is(err, errExplicitEnvironmentSuspensionNotWakeable) {
+					if releaseErr := r.releaseClaim(ctx, &run, &recovered); releaseErr != nil {
+						return ctrl.Result{}, releaseErr
+					}
+				}
 			} else {
 				err = r.promoteWarmEnvironment(ctx, &run, &recovered)
 			}
 		}
 		if err != nil {
-			if errors.Is(err, errExplicitEnvironmentClaimed) {
+			if errors.Is(err, errExplicitEnvironmentClaimed) || errors.Is(err, errExplicitEnvironmentHeld) || errors.Is(err, errExplicitEnvironmentSuspensionNotWakeable) {
 				return ctrl.Result{}, r.setRunState(ctx, &run, platformv1alpha1.RunStateFailed, "EnvironmentUnavailable", err.Error(), false)
 			}
 			return ctrl.Result{}, err
@@ -217,11 +224,6 @@ func (r *RunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.R
 			return ctrl.Result{}, r.setRunState(ctx, &run, platformv1alpha1.RunStateFailed, "EnvironmentLost", err.Error(), false)
 		}
 		return ctrl.Result{}, err
-	}
-	if !env.Spec.Paused {
-		if err := r.touchEnvironmentActivity(ctx, env); err != nil {
-			return ctrl.Result{}, err
-		}
 	}
 	if run.Spec.Cancel {
 		if runMayHaveAccepted(&run) && !environmentFenced(env) {
@@ -239,6 +241,13 @@ func (r *RunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.R
 		return ctrl.Result{}, r.setRunState(ctx, &run, platformv1alpha1.RunStateCancelled, "Cancelled", "cancellation completed", environmentReachable(env))
 	}
 	if env.Status.ObservedGeneration != env.Generation {
+		if runAccepted(&run) {
+			// An accepted execution remains authoritative while its Environment
+			// controller classifies a new generation. In particular, legacy
+			// spec-based activity must not restart adapter acceptance. Once the
+			// Environment status converges, its resulting phase drives the Run.
+			return ctrl.Result{RequeueAfter: adapterPollInterval}, nil
+		}
 		return ctrl.Result{}, r.setRunState(ctx, &run, platformv1alpha1.RunStateAllocating, "EnvironmentStatusStale", "environment status has not observed the current generation", false)
 	}
 
@@ -258,6 +267,9 @@ func (r *RunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.R
 	}
 	if !environmentReachable(env) {
 		return ctrl.Result{RequeueAfter: adapterPollInterval}, r.setRunState(ctx, &run, platformv1alpha1.RunStateAllocating, "EnvironmentNotReachable", "sandboxd endpoint is not currently reachable", false)
+	}
+	if runAccepted(&run) && !acceptedEnvironmentEpochCurrent(&run, env) && run.Status.State != platformv1alpha1.RunStateEnvironmentReady {
+		return ctrl.Result{Requeue: true}, r.setRunState(ctx, &run, platformv1alpha1.RunStateEnvironmentReady, "EnvironmentEpochChanged", "fresh environment lifecycle epoch requires adapter acceptance", true)
 	}
 
 	if run.Status.State == platformv1alpha1.RunStateAllocating || run.Status.State == platformv1alpha1.RunStatePaused || run.Status.State == "" {
@@ -291,6 +303,8 @@ func (r *RunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.R
 			}
 			return ctrl.Result{}, err
 		}
+		acceptedEpoch := env.Status.Lifecycle.Epoch
+		run.Status.AcceptedEnvironmentEpoch = &acceptedEpoch
 		return ctrl.Result{Requeue: true}, r.setRunState(ctx, &run, platformv1alpha1.RunStateAdapterAccepted, "AdapterAccepted", "adapter accepted the task", true)
 	}
 
@@ -487,6 +501,12 @@ func (r *RunReconciler) allocateEnvironment(ctx context.Context, run *platformv1
 		if owner := metav1.GetControllerOf(&env); owner != nil {
 			return nil, fmt.Errorf("environment %q is controller-owned by %s %q and cannot be claimed", env.Name, owner.Kind, owner.Name)
 		}
+		if explicitHoldEnabled(&env) {
+			return nil, fmt.Errorf("%w: environment %q is explicitly held at policy revision %d", errExplicitEnvironmentHeld, env.Name, lifecycle.HoldPolicyRevision(&env))
+		}
+		if _, err := explicitClaimWakeReason(&env); err != nil {
+			return nil, err
+		}
 		claim := &platformv1alpha1.RunReference{Name: run.Name, UID: run.UID}
 		if env.Status.ClaimedBy != nil && (env.Status.ClaimedBy.Name != claim.Name || env.Status.ClaimedBy.UID != claim.UID) {
 			return nil, fmt.Errorf("%w: environment %q is claimed by run %s", errExplicitEnvironmentClaimed, env.Name, env.Status.ClaimedBy.Name)
@@ -497,10 +517,8 @@ func (r *RunReconciler) allocateEnvironment(ctx context.Context, run *platformv1
 				return nil, err
 			}
 		}
-		if env.Spec.Paused {
-			before := env.DeepCopy()
-			env.Spec.Paused = false
-			if err := r.Patch(ctx, &env, client.MergeFromWithOptions(before, client.MergeFromWithOptimisticLock{})); err != nil {
+		if environmentSuspended(&env) {
+			if err := r.wakeExplicitClaim(ctx, &env, run); err != nil {
 				return nil, err
 			}
 		}
@@ -547,9 +565,13 @@ func (r *RunReconciler) allocateEnvironment(ctx context.Context, run *platformv1
 }
 
 func (r *RunReconciler) getAllocatedEnvironment(ctx context.Context, run *platformv1alpha1.Run) (*platformv1alpha1.Environment, error) {
+	return getAllocatedEnvironment(ctx, r.Client, run)
+}
+
+func getAllocatedEnvironment(ctx context.Context, reader client.Reader, run *platformv1alpha1.Run) (*platformv1alpha1.Environment, error) {
 	ref := run.Status.EnvironmentRef
 	var env platformv1alpha1.Environment
-	if err := r.Get(ctx, types.NamespacedName{Namespace: run.Namespace, Name: ref.Name}, &env); err != nil {
+	if err := reader.Get(ctx, types.NamespacedName{Namespace: run.Namespace, Name: ref.Name}, &env); err != nil {
 		return nil, err
 	}
 	if env.UID != ref.UID {
@@ -634,7 +656,7 @@ func (r *RunReconciler) claimWarmEnvironment(ctx context.Context, run *platformv
 	for i := range environments.Items {
 		env := &environments.Items[i]
 		owner := metav1.GetControllerOf(env)
-		if env.Spec.TemplateRef != template || env.Spec.Paused || !platformv1alpha1.IsEnvironmentReady(env) || env.Status.ClaimedBy != nil || owner == nil || owner.Kind != "EnvironmentTemplate" || owner.Name != template {
+		if env.Spec.TemplateRef != template || environmentSuspended(env) || !platformv1alpha1.IsEnvironmentReady(env) || env.Status.ClaimedBy != nil || owner == nil || owner.Kind != "EnvironmentTemplate" || owner.Name != template {
 			continue
 		}
 		now := metav1.Now()
@@ -666,7 +688,6 @@ func (r *RunReconciler) promoteWarmEnvironment(ctx context.Context, run *platfor
 	}
 	env.OwnerReferences = owners
 	env.Spec.ProjectRef = run.Spec.ProjectRef
-	env.Spec.Paused = false
 	if !reflect.DeepEqual(before.ObjectMeta, env.ObjectMeta) || !reflect.DeepEqual(before.Spec, env.Spec) {
 		if err := r.Patch(ctx, env, client.MergeFromWithOptions(before, client.MergeFromWithOptimisticLock{})); err != nil {
 			return fmt.Errorf("promote warm environment %q: %w", env.Name, err)
@@ -686,47 +707,38 @@ func (r *RunReconciler) promoteWarmEnvironment(ctx context.Context, run *platfor
 	return nil
 }
 
-func (r *RunReconciler) touchEnvironmentActivity(ctx context.Context, env *platformv1alpha1.Environment) error {
-	key := client.ObjectKeyFromObject(env)
-	expectedUID := env.UID
-	var updated platformv1alpha1.Environment
-	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
-		var current platformv1alpha1.Environment
-		if err := r.Get(ctx, key, &current); err != nil {
-			return err
-		}
-		if current.UID != expectedUID {
-			return errAllocatedEnvironmentGone
-		}
-		now := metav1.Now()
-		if current.Status.LastActiveAt != nil && now.Sub(current.Status.LastActiveAt.Time) < adapterPollInterval {
-			updated = current
-			return nil
-		}
-		current.Status.LastActiveAt = &now
-		if err := r.Status().Update(ctx, &current); err != nil {
-			return err
-		}
-		updated = current
-		return nil
-	})
-	if err == nil {
-		*env = *updated.DeepCopy()
+func (r *RunReconciler) wakeExplicitClaim(ctx context.Context, env *platformv1alpha1.Environment, run *platformv1alpha1.Run) error {
+	if explicitHoldEnabled(env) {
+		return fmt.Errorf("%w: environment %q is explicitly held at policy revision %d", errExplicitEnvironmentHeld, env.Name, lifecycle.HoldPolicyRevision(env))
 	}
-	return err
+	if !environmentSuspended(env) {
+		return nil
+	}
+	reason, err := explicitClaimWakeReason(env)
+	if err != nil {
+		return err
+	}
+	return lifecycle.RequestWakeForReason(ctx, r.Client, client.ObjectKeyFromObject(env), env.UID, lifecycle.HoldPolicyRevision(env), "run/"+string(run.UID)+"/wake", reason)
 }
 
-func (r *RunReconciler) wakeExplicitClaim(ctx context.Context, env *platformv1alpha1.Environment) error {
-	if !env.Spec.Paused {
-		return nil
+func explicitClaimWakeReason(env *platformv1alpha1.Environment) (platformv1alpha1.EnvironmentSuspensionReason, error) {
+	if !environmentSuspended(env) {
+		return "", nil
 	}
-	before := env.DeepCopy()
-	env.Spec.Paused = false
-	return r.Patch(ctx, env, client.MergeFromWithOptions(before, client.MergeFromWithOptimisticLock{}))
+	switch env.Status.Lifecycle.SuspensionReason {
+	case platformv1alpha1.EnvironmentSuspensionReasonIdle, platformv1alpha1.EnvironmentSuspensionReasonRequested:
+		return env.Status.Lifecycle.SuspensionReason, nil
+	default:
+		return "", fmt.Errorf("%w: environment %q has suspension reason %q", errExplicitEnvironmentSuspensionNotWakeable, env.Name, env.Status.Lifecycle.SuspensionReason)
+	}
+}
+
+func explicitHoldEnabled(env *platformv1alpha1.Environment) bool {
+	return env.Spec.Paused || env.Spec.Lifecycle.Hold != nil && env.Spec.Lifecycle.Hold.Enabled
 }
 
 func environmentReachable(env *platformv1alpha1.Environment) bool {
-	return platformv1alpha1.IsEnvironmentReady(env) && env.Status.PodName != "" && env.Status.Endpoints.Sandboxd != ""
+	return !environmentSuspended(env) && platformv1alpha1.IsEnvironmentReady(env) && env.Status.PodName != "" && env.Status.Endpoints.Sandboxd != ""
 }
 
 func exactControllerOwner(object metav1.Object, apiVersion, kind, name string, uid types.UID) bool {
@@ -743,12 +755,25 @@ func unpromotedWarmClaim(env *platformv1alpha1.Environment, run *platformv1alpha
 }
 
 func environmentFenced(env *platformv1alpha1.Environment) bool {
-	return env.Spec.Paused && env.Status.Phase == platformv1alpha1.EnvironmentPhasePaused && env.Status.PodName == "" && env.Status.Endpoints.Sandboxd == ""
+	return environmentSuspended(env) && env.Status.Phase == platformv1alpha1.EnvironmentPhasePaused && env.Status.PodName == "" && env.Status.Endpoints.Sandboxd == ""
+}
+
+func environmentSuspended(env *platformv1alpha1.Environment) bool {
+	return env.Spec.Paused || env.Status.Lifecycle.Suspended
 }
 
 func runAccepted(run *platformv1alpha1.Run) bool {
 	condition := apiMeta.FindStatusCondition(run.Status.Conditions, runConditionAdapterAccepted)
 	return condition != nil && condition.Status == metav1.ConditionTrue
+}
+
+func acceptedEnvironmentEpochCurrent(run *platformv1alpha1.Run, env *platformv1alpha1.Environment) bool {
+	if run.Status.AcceptedEnvironmentEpoch == nil {
+		// Runs accepted before the epoch fence was introduced are compatible
+		// with the initial epoch. A nonzero epoch must be accepted explicitly.
+		return env.Status.Lifecycle.Epoch == 0
+	}
+	return *run.Status.AcceptedEnvironmentEpoch == env.Status.Lifecycle.Epoch
 }
 
 func acceptanceAttempted(run *platformv1alpha1.Run) bool {
@@ -774,9 +799,13 @@ func (r *RunReconciler) markAcceptanceAttempted(ctx context.Context, run *platfo
 }
 
 func (r *RunReconciler) requestEnvironmentFence(ctx context.Context, env *platformv1alpha1.Environment) (ctrl.Result, error) {
-	if !env.Spec.Paused {
-		env.Spec.Paused = true
-		if err := r.Update(ctx, env); err != nil {
+	if !environmentSuspended(env) {
+		nextEpoch := env.Status.Lifecycle.Epoch + 1
+		requestID := fmt.Sprintf("environment/%s/fence/%d", env.UID, nextEpoch)
+		if env.Status.ClaimedBy != nil {
+			requestID = fmt.Sprintf("run/%s/fence/%d", env.Status.ClaimedBy.UID, nextEpoch)
+		}
+		if err := lifecycle.RequestSuspend(ctx, r.Client, client.ObjectKeyFromObject(env), env.UID, lifecycle.HoldPolicyRevision(env), requestID); err != nil {
 			return ctrl.Result{}, err
 		}
 	}
@@ -817,10 +846,12 @@ func (r *RunReconciler) cleanupTerminal(ctx context.Context, run *platformv1alph
 			return ctrl.Result{}, err
 		}
 	}
+	if env.Spec.Lifecycle.Suspend != nil || env.Status.Lifecycle.PendingSuspendRequestID != "" {
+		return ctrl.Result{RequeueAfter: adapterPollInterval}, nil
+	}
 	if run.Status.EnvironmentRef.Ownership == platformv1alpha1.EnvironmentOwnershipOwned {
-		if !env.Spec.Paused {
-			env.Spec.Paused = true
-			return ctrl.Result{}, r.Update(ctx, env)
+		if !environmentSuspended(env) {
+			return r.requestEnvironmentFence(ctx, env)
 		}
 		if environmentFenced(env) {
 			return ctrl.Result{}, r.setEnvironmentReadyCondition(ctx, run, false, "EnvironmentFenced", "owned environment is paused and fenced")
@@ -873,6 +904,9 @@ func (r *RunReconciler) finalize(ctx context.Context, run *platformv1alpha1.Run)
 					}
 					return ctrl.Result{}, err
 				}
+			}
+			if env.Spec.Lifecycle.Suspend != nil || env.Status.Lifecycle.PendingSuspendRequestID != "" {
+				return ctrl.Result{RequeueAfter: adapterPollInterval}, nil
 			}
 			if run.Status.EnvironmentRef.Ownership == platformv1alpha1.EnvironmentOwnershipClaimed {
 				if err := r.releaseClaim(ctx, run, env); err != nil {
@@ -941,13 +975,15 @@ func adapterTask(run *platformv1alpha1.Run) AdapterTask {
 }
 
 func (r *RunReconciler) adapterSandbox(run *platformv1alpha1.Run, env *platformv1alpha1.Environment) AdapterSandbox {
+	expectedEpoch := env.Status.Lifecycle.Epoch
 	sandbox := AdapterSandbox{EnvironmentName: env.Name, EnvironmentUID: env.UID,
 		DialProcess: func(ctx context.Context) (sandboxdv1.ProcessServiceClient, func() error, error) {
-			current, err := r.getAllocatedEnvironment(ctx, run)
+			reader := r.apiReader()
+			current, err := getAllocatedEnvironment(ctx, reader, run)
 			if err != nil {
 				return nil, nil, err
 			}
-			return (sandboxclient.Connector{Reader: r.Client}).DialProcess(ctx, current.Namespace, current.Name, current.UID)
+			return (sandboxclient.Connector{Reader: reader}).DialProcessForEpoch(ctx, current.Namespace, current.Name, current.UID, expectedEpoch)
 		}}
 	if r.EventSink != nil {
 		sandbox.EmitEvent = func(ctx context.Context, event AdapterEvent) error {
@@ -992,11 +1028,17 @@ func (r *RunReconciler) SetupWithManager(mgr ctrl.Manager) error {
 }
 
 func runRelevantEnvironmentUpdate(oldEnvironment, newEnvironment *platformv1alpha1.Environment) bool {
+	oldSpec := oldEnvironment.Spec.DeepCopy()
+	newSpec := newEnvironment.Spec.DeepCopy()
+	oldSpec.Lifecycle.Activity = nil
+	newSpec.Lifecycle.Activity = nil
 	oldStatus := oldEnvironment.Status.DeepCopy()
 	newStatus := newEnvironment.Status.DeepCopy()
 	oldStatus.LastActiveAt = nil
 	newStatus.LastActiveAt = nil
-	return oldEnvironment.Generation != newEnvironment.Generation ||
+	oldStatus.Lifecycle.ActivityReceipts = nil
+	newStatus.Lifecycle.ActivityReceipts = nil
+	return oldEnvironment.Generation != newEnvironment.Generation && !reflect.DeepEqual(*oldSpec, *newSpec) ||
 		oldEnvironment.UID != newEnvironment.UID ||
 		!reflect.DeepEqual(oldEnvironment.DeletionTimestamp, newEnvironment.DeletionTimestamp) ||
 		!reflect.DeepEqual(oldEnvironment.OwnerReferences, newEnvironment.OwnerReferences) ||

@@ -733,7 +733,7 @@ if ! kubectl exec "$POD_NAME" -- sh -c 'test "$(wc -l < /workspace/setup-result)
 fi
 
 echo "==> verifying pause retains the workspace and resume runs its hook"
-kubectl patch environment "$ENV_NAME" --type=merge -p '{"spec":{"paused":true}}' >/dev/null
+bin/swe environment hold "$ENV_NAME"
 for _ in $(seq 1 60); do
 	PHASE=$(kubectl get environment "$ENV_NAME" -o jsonpath='{.status.phase}')
 	if [[ "$PHASE" == "Paused" ]] && ! kubectl get pod "$POD_NAME" >/dev/null 2>&1; then
@@ -753,7 +753,17 @@ if ! kubectl get pvc "$PVC_NAME" >/dev/null 2>&1; then
 	echo "FAIL: pause removed the workspace PVC"
 	exit 1
 fi
-kubectl patch environment "$ENV_NAME" --type=merge -p '{"spec":{"paused":false}}' >/dev/null
+HOLD_REVISION=$(kubectl get environment "$ENV_NAME" -o jsonpath='{.spec.lifecycle.hold.revision}')
+if [[ "$(kubectl get environment "$ENV_NAME" -o jsonpath='{.spec.lifecycle.hold.enabled}')" != "true" || -z "$HOLD_REVISION" ]]; then
+	echo "FAIL: swe environment hold did not publish enabled revisioned policy"
+	exit 1
+fi
+bin/swe environment release "$ENV_NAME"
+RELEASE_REVISION=$(kubectl get environment "$ENV_NAME" -o jsonpath='{.spec.lifecycle.hold.revision}')
+if [[ "$(kubectl get environment "$ENV_NAME" -o jsonpath='{.spec.lifecycle.hold.enabled}')" != "false" || "$RELEASE_REVISION" -le "$HOLD_REVISION" ]]; then
+	echo "FAIL: swe environment release did not publish a newer disabled policy"
+	exit 1
+fi
 kubectl wait --for=jsonpath='{.status.phase}'=Ready environment/"$ENV_NAME" --timeout=2m
 kubectl wait --for=condition=Ready pod/"$POD_NAME" --timeout=2m
 RESUMED_IMAGE_ID=$(kubectl get environment "$ENV_NAME" -o jsonpath='{.status.imageID}')

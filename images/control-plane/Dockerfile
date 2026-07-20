@@ -18,6 +18,7 @@ RUN go mod download
 COPY api/ api/
 COPY cmd/control-plane/ cmd/control-plane/
 COPY internal/controlplane/ internal/controlplane/
+COPY internal/lifecycle/ internal/lifecycle/
 COPY internal/sandboxclient/ internal/sandboxclient/
 COPY ui/*.go ui/
 COPY --from=console-build /src/ui/dist ui/dist/
