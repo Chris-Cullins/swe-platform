@@ -58,7 +58,7 @@ digest-pinned installation overrides.
 
 | Preset | Assumptions |
 |---|---|
-| `values-kind.yaml` | Local kind development with `:dev` images; explicitly permits insecure HTTP browser sessions. |
+| `values-kind.yaml` | Local kind development with `:dev` images; explicitly permits insecure HTTP browser sessions. `make kind-up` installs gVisor and snapshot-capable CSI; pass the printed `environmentTemplates[0].spec.runtimeClass=gvisor` override when installing the chart. |
 | `values-argocd.yaml` | Local Argo CD mirror with mutable `:latest` images and an out-of-band bootstrap Secret; explicitly permits insecure HTTP browser sessions. |
 | `values-k3s.yaml` | A default CSI-backed StorageClass is available. Uses one operator replica and the default OCI runtime because k3s does not ship gVisor. |
 | `values-gke.yaml` | GKE Sandbox is enabled on every node that can host environments. Sets `runtimeClass: gvisor` and runs two operator replicas with leader election. |

@@ -114,8 +114,8 @@ $(CONTROLLER_GEN):
 ##@ Local cluster
 
 .PHONY: kind-up
-kind-up: ## Create the kind dev cluster
-	./hack/kind-up.sh
+kind-up: ## Create the kind dev cluster with gVisor and snapshot-capable CSI
+	KIND_CLUSTER=$(KIND_CLUSTER) ./hack/kind-up.sh
 
 .PHONY: kind-down
 kind-down: ## Delete the kind dev cluster

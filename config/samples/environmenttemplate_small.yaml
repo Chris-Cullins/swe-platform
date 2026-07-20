@@ -1,5 +1,6 @@
 # Sample EnvironmentTemplate for local development and e2e.
-# Intentionally has no runtimeClass: kind/minikube nodes have no gVisor.
+# Intentionally has no runtimeClass so it also works in plain kind/minikube clusters.
+# The `make kind-up` development cluster supports runtimeClass: gvisor.
 apiVersion: swe.dev/v1alpha1
 kind: EnvironmentTemplate
 metadata:

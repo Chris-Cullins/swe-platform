@@ -102,8 +102,12 @@ runs both via `make` targets:
   (`manifests` synchronizes chart CRDs; CI fails on a diff). Use `make check-chart-crds`
   to verify the checked-in Helm CRDs independently.
 - **Regenerate protobuf:** `make proto` (requires `protoc`; plugins install locally)
-- **Dev cluster:** `make kind-up`, build/load the images, then install
-  `charts/swe-platform` with `values-kind.yaml` as printed by the script.
+- **Dev cluster:** `make kind-up` creates/reuses `swe-dev`, installs the pinned gVisor
+  `gvisor` RuntimeClass plus the CSI hostpath driver and VolumeSnapshot controller, and
+  verifies both with smoke resources. Build/load the images, then install
+  `charts/swe-platform` with `values-kind.yaml` and the gVisor override printed by the
+  script. Run the full acceptance suite against it with
+  `KIND_CLUSTER=swe-dev E2E_USE_EXISTING_CLUSTER=true E2E_RUNTIME_CLASS=gvisor ./hack/e2e.sh`.
 - **Argo CD main mirror:** `make argocd-up` creates a separate `swe-argo` kind
   cluster running Argo CD + the Image Updater (`hack/argocd/`,
   `values-argocd.yaml` preset). It syncs the chart from `origin/main` and rolls
