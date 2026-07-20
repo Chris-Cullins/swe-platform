@@ -52,6 +52,23 @@ RUN case "$TARGETARCH" in \
 	&& rm "$wrapper" "$archive" amp \
 	&& test "$(/usr/local/bin/amp --version | awk '{print $1}')" = "${AMP_VERSION}"
 
+FROM node:24-bookworm-slim AS codex
+ARG CODEX_VERSION=0.144.6
+ARG TARGETARCH
+RUN case "$TARGETARCH" in \
+		amd64) suffix=linux-x64; triple=x86_64-unknown-linux-musl; integrity='sha512-4E7EnzCg0OnBxCyYnwJ+qnZwWHYe0YScr5ucKWbngE9u4+0XrpWELqq2Kn9jl5GZK8MDjU7PrJwFIwusHOHjuw==' ;; \
+		arm64) suffix=linux-arm64; triple=aarch64-unknown-linux-musl; integrity='sha512-PGiLXMN+2IQRkf7tOLi64dMInjU1pRLbz0Rwfj/yt2Y97SZQqAjFQoi2wmswmqtqMDnfwCPTC1DRXVQkvU6T6Q==' ;; \
+		*) echo "unsupported TARGETARCH: $TARGETARCH" >&2; exit 1 ;; \
+	esac \
+	&& wrapper="$(npm pack "@openai/codex@${CODEX_VERSION}" --silent)" \
+	&& archive="$(npm pack "@openai/codex@${CODEX_VERSION}-${suffix}" --silent)" \
+	&& node -e 'const [file, want] = process.argv.slice(1); const fs = require("fs"), crypto = require("crypto"); const got = "sha512-" + crypto.createHash("sha512").update(fs.readFileSync(file)).digest("base64"); if (got !== want) throw new Error(`integrity mismatch for ${file}`)' "$wrapper" 'sha512-wk+2CWiBNXiJLBoN2D08N9RceWkSBnlgk5g2K1a4CXrP/C0gdlHyRUG7RFzm9y41DCK/7tvCct233JVxyFmznw==' \
+	&& node -e 'const [file, want] = process.argv.slice(1); const fs = require("fs"), crypto = require("crypto"); const got = "sha512-" + crypto.createHash("sha512").update(fs.readFileSync(file)).digest("base64"); if (got !== want) throw new Error(`integrity mismatch for ${file}`)' "$archive" "$integrity" \
+	&& mkdir -p /opt/codex && tar -xzf "$archive" -C /opt/codex --strip-components=3 "package/vendor/$triple" \
+	&& test -x /opt/codex/codex-resources/bwrap \
+	&& test -f /opt/codex/codex-package.json \
+	&& test "$(/opt/codex/bin/codex --version)" = "codex-cli ${CODEX_VERSION}"
+
 # Base image for environments.
 FROM debian:12-slim AS environment
 
@@ -68,9 +85,15 @@ COPY --from=tmux-build /src/tmux /usr/bin/tmux
 COPY --from=claude-code /usr/local/lib/node_modules/@anthropic-ai /usr/local/lib/node_modules/@anthropic-ai
 COPY --from=claude-code /usr/local/bin/claude /usr/local/bin/claude
 COPY --from=amp /usr/local/bin/amp /usr/local/bin/amp
+COPY --from=codex /opt/codex /opt/codex
+RUN ln -s /opt/codex/bin/codex /usr/local/bin/codex
 ENV AMP_SKIP_UPDATE_CHECK=1
 RUN claude --version \
-	&& test "$(amp --version | awk '{print $1}')" = "0.0.1784492094-g5d18e2"
+	&& test "$(amp --version | awk '{print $1}')" = "0.0.1784492094-g5d18e2" \
+	&& test "$(codex --version)" = "codex-cli 0.144.6" \
+	&& test "$(readlink -f "$(command -v codex)")" = /opt/codex/bin/codex \
+	&& test -x /opt/codex/codex-resources/bwrap \
+	&& test -f /opt/codex/codex-package.json
 
 USER swe
 WORKDIR /workspace

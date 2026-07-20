@@ -6,6 +6,10 @@ chart or operator yet; secure runtime delivery remains deferred to issue #9. Do 
 credentials in chart values, Project configuration, or a custom image. The image only pins the
 public Amp CLI and disables its update check.
 
+The image also bundles the explicitly selected `codex` adapter and pinned Codex CLI. Codex API
+key profiles use sandboxd's process-scoped launch-material path as `CODEX_API_KEY`; never put the
+key in chart values, Project configuration, or custom-image ambient environment variables.
+
 This chart installs the swe-platform CRDs, operator, and the first control-plane API.
 The control plane accepts adapter-owned transcript events and streams them over SSE.
 Its bounded transcript store is currently process-local, so the chart requires one control-plane
