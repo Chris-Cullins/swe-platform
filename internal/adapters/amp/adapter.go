@@ -82,7 +82,7 @@ func (a *Adapter) spec(task controllers.AdapterTask) *sandboxdv1.ProcessSpec {
 // EnsureAccepted duplicate-safely starts (or recovers) the Run-keyed process.
 func (a *Adapter) EnsureAccepted(ctx context.Context, task controllers.AdapterTask, sandbox controllers.AdapterSandbox, credential *controllers.AdapterCredential) error {
 	if credential != nil {
-		return errors.New("Amp credential delivery is not implemented; AMP_API_KEY is a runtime prerequisite")
+		return fmt.Errorf("%w: Amp credential delivery is not implemented; AMP_API_KEY is a runtime prerequisite", controllers.ErrAdapterTaskRejected)
 	}
 	client, closeConnection, err := sandbox.DialProcess(ctx)
 	if err != nil {

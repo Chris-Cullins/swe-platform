@@ -132,7 +132,7 @@ func TestCredentialIsRejectedWithoutDial(t *testing.T) {
 		return nil, nil, nil
 	}}
 	err := (&Adapter{}).EnsureAccepted(context.Background(), controllers.AdapterTask{}, sandbox, &controllers.AdapterCredential{APIKey: []byte("secret")})
-	if err == nil || dials != 0 {
+	if !errors.Is(err, controllers.ErrAdapterTaskRejected) || dials != 0 {
 		t.Fatalf("error/dials = %v/%d", err, dials)
 	}
 }
