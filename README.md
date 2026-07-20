@@ -270,6 +270,30 @@ against its service without separately solving that prerequisite; tests use a fa
 Abrupt cancellation stops only the Run-owned local process tree, but Amp's public contract does
 not guarantee that remote/server-backed thread work has also stopped.
 
+### Codex adapter
+
+Select Codex with `swe run --agent codex ...`. The coordinated image pins
+`@openai/codex@0.144.6`; the adapter invokes `codex exec --json --ephemeral
+--ignore-user-config --ignore-rules --sandbox workspace-write --color never
+--skip-git-repo-check -- PROMPT`. Exactly `-` is rejected because it is Codex's stdin sentinel,
+while other leading-hyphen prompts are protected by `--`. Each Run starts an ephemeral thread:
+the adapter never resumes latest or shared state, and requires exit zero, a nonempty
+`thread.started` ID, and a final coherent `turn.completed` with usage and no later terminal
+failure, error, or malformed line.
+
+Stdout and stderr are forwarded as bounded, gap-visible `codex.process-output` events with
+absolute offsets and exact uncertain-append retry behavior. On resume, the same Run identity
+starts a fresh process and thread in the new sandbox epoch against the retained workspace.
+Codex's nested `workspace-write` sandbox is defense in depth inside the outer Environment;
+gVisor availability and its current limitation are tracked in issue #10.
+
+An API-key profile is delivered as `CODEX_API_KEY` only through sandboxd launch material to the
+Run-owned process. It is never included in the public process spec or ambient environment, and
+other credential types are rejected before dialing. The selected agent and same-UID descendants
+can still read or disclose it; stronger credential isolation and additional credential forms
+remain issue #9 limitations. Acceptance tests use a fake Codex executable and no provider or
+network access.
+
 `--name` is the create idempotency key: retry an uncertain request with the same name and
 immutable task arguments. The CLI returns the existing Run only when its intent matches;
 the controller creates or claims the Environment server-side.

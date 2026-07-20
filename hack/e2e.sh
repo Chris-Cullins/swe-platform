@@ -141,12 +141,40 @@ sleep 5
 printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"result":"fake Amp completed"}'
 EOF
 chmod 0755 "$FAKE_ENV_CONTEXT/amp"
+cat > "$FAKE_ENV_CONTEXT/codex" <<'EOF'
+#!/bin/sh
+set -eu
+test "$#" -eq 12
+test "$1" = exec
+test "$2" = --json
+test "$3" = --ephemeral
+test "$4" = --ignore-user-config
+test "$5" = --ignore-rules
+test "$6" = --sandbox
+test "$7" = workspace-write
+test "$8" = --color
+test "$9" = never
+test "${10}" = --skip-git-repo-check
+test "${11}" = --
+test -z "${CODEX_API_KEY+x}"
+printf '%s\n' '{"type":"thread.started","thread_id":"fake-codex-thread"}'
+printf '%s\n' 'fake-codex-stderr-marker' >&2
+if [ "${12}" = 'fake Codex failure smoke test' ]; then
+	printf '%s\n' '{"type":"turn.failed","error":{"message":"fake Codex failed"}}'
+	exit 0
+fi
+test "${12}" = 'fake Codex lifecycle smoke test'
+sleep 5
+printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":1,"output_tokens":2}}'
+EOF
+chmod 0755 "$FAKE_ENV_CONTEXT/codex"
 cat > "$FAKE_ENV_CONTEXT/Dockerfile" <<'EOF'
 ARG BASE_IMAGE
 FROM ${BASE_IMAGE}
 USER root
 COPY claude /usr/local/bin/claude
 COPY amp /usr/local/bin/amp
+COPY codex /usr/local/bin/codex
 USER swe
 EOF
 docker build --build-arg BASE_IMAGE="$ENV_IMAGE" -t "$E2E_ENV_IMAGE" "$FAKE_ENV_CONTEXT" >/dev/null
@@ -814,6 +842,28 @@ if ! grep -Fq 'fake-amp-stdout-marker' /tmp/swe-platform-amp-process-output.out 
 	exit 1
 fi
 kubectl delete run "$AMP_RUN_NAME" --wait=true >/dev/null
+
+echo "==> verifying fake Codex real Run lifecycle without credentials or network"
+CODEX_RUN_NAME=e2e-fake-codex-run
+bin/swe run "fake Codex lifecycle smoke test" --name "$CODEX_RUN_NAME" --environment "$ENV_NAME" --agent codex --wait=false
+kubectl wait --for=jsonpath='{.status.state}'=Running run/"$CODEX_RUN_NAME" --timeout=3m
+kubectl wait --for=jsonpath='{.status.state}'=Succeeded run/"$CODEX_RUN_NAME" --timeout=3m
+set +e
+curl --silent --no-buffer --max-time 2 -H "Authorization: Bearer ${E2E_BOOTSTRAP_TOKEN}" \
+	"http://127.0.0.1:18080/api/v1/namespaces/default/runs/${CODEX_RUN_NAME}/transcript" > /tmp/swe-platform-codex-transcript.out
+CODEX_TRANSCRIPT_STATUS=$?
+set -e
+if [[ "$CODEX_TRANSCRIPT_STATUS" != "0" && "$CODEX_TRANSCRIPT_STATUS" != "28" ]]; then echo "FAIL: Codex transcript read failed"; exit 1; fi
+grep -F '"source":"codex"' /tmp/swe-platform-codex-transcript.out | grep -F '"type":"codex.process-output"' | \
+	grep -oE '"data":"[A-Za-z0-9+/=]+"' | sed 's/^"data":"//; s/"$//' | while IFS= read -r encoded; do printf '%s' "$encoded" | base64 --decode || exit 1; done > /tmp/swe-platform-codex-process-output.out
+for marker in fake-codex-thread fake-codex-stderr-marker turn.completed; do grep -Fq "$marker" /tmp/swe-platform-codex-process-output.out || { echo "FAIL: missing Codex marker $marker"; exit 1; }; done
+kubectl delete run "$CODEX_RUN_NAME" --wait=true >/dev/null
+
+echo "==> verifying fake Codex terminal failure through the real controller"
+CODEX_FAILED_RUN_NAME=e2e-fake-codex-failed-run
+bin/swe run "fake Codex failure smoke test" --name "$CODEX_FAILED_RUN_NAME" --environment "$ENV_NAME" --agent codex --wait=false
+kubectl wait --for=jsonpath='{.status.state}'=Failed run/"$CODEX_FAILED_RUN_NAME" --timeout=3m
+kubectl delete run "$CODEX_FAILED_RUN_NAME" --wait=true >/dev/null
 
 echo "==> verifying idle pause and terminal wake through the control plane"
 PRE_IDLE_POD_UID=$(kubectl get pod "$POD_NAME" -o jsonpath='{.metadata.uid}')
