@@ -587,6 +587,12 @@ func (r *RunReconciler) cleanupTerminal(ctx context.Context, run *platformv1alph
 	if run.Status.EnvironmentRef == nil {
 		return ctrl.Result{}, r.setEnvironmentReadyCondition(ctx, run, false, "EnvironmentReleased", "Run has no allocated environment")
 	}
+	if run.Status.EnvironmentRef.Ownership == platformv1alpha1.EnvironmentOwnershipClaimed {
+		condition := apiMeta.FindStatusCondition(run.Status.Conditions, runConditionEnvironmentReady)
+		if condition != nil && condition.Status == metav1.ConditionFalse && condition.Reason == "EnvironmentReleased" {
+			return ctrl.Result{}, r.setEnvironmentReadyCondition(ctx, run, false, "EnvironmentReleased", "claimed environment was released")
+		}
+	}
 	env, err := r.getAllocatedEnvironment(ctx, run)
 	if apierrors.IsNotFound(err) || errors.Is(err, errAllocatedEnvironmentGone) {
 		return ctrl.Result{}, r.setEnvironmentReadyCondition(ctx, run, false, "EnvironmentLost", err.Error())

@@ -104,7 +104,8 @@ type RunStatus struct {
 	// +optional
 	State RunState `json:"state,omitempty"`
 
-	// EnvironmentRef is the exact owned or claimed Environment incarnation.
+	// EnvironmentRef is the exact owned or claimed Environment incarnation. It
+	// remains as historical identity after terminal cleanup.
 	// +optional
 	EnvironmentRef *RunEnvironmentReference `json:"environmentRef,omitempty"`
 

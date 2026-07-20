@@ -457,6 +457,152 @@ func TestTerminalCleanupPausesOwnedEnvironment(t *testing.T) {
 	}
 }
 
+func TestTerminalClaimReleaseRemainsReleasedAcrossReconcileAndRestart(t *testing.T) {
+	for _, state := range []platformv1alpha1.RunState{
+		platformv1alpha1.RunStateSucceeded,
+		platformv1alpha1.RunStateFailed,
+		platformv1alpha1.RunStateCancelled,
+	} {
+		t.Run(string(state), func(t *testing.T) {
+			run := &platformv1alpha1.Run{ObjectMeta: metav1.ObjectMeta{Name: "r", Namespace: "ns", UID: "run-uid", Generation: 1}, Spec: platformv1alpha1.RunSpec{Agent: "test"}, Status: platformv1alpha1.RunStatus{
+				State:          state,
+				EnvironmentRef: &platformv1alpha1.RunEnvironmentReference{Name: "shared", UID: "env-uid", Ownership: platformv1alpha1.EnvironmentOwnershipClaimed},
+				Conditions:     []metav1.Condition{{Type: runConditionEnvironmentReady, Status: metav1.ConditionTrue, Reason: "EnvironmentReady", Message: "sandboxd is ready", ObservedGeneration: 1}},
+			}}
+			env := &platformv1alpha1.Environment{ObjectMeta: metav1.ObjectMeta{Name: "shared", Namespace: "ns", UID: "env-uid"}, Status: platformv1alpha1.EnvironmentStatus{
+				Phase: platformv1alpha1.EnvironmentPhaseReady, ClaimedBy: &platformv1alpha1.RunReference{Name: run.Name, UID: run.UID},
+			}}
+			adapter := &scriptedAdapter{}
+			r := reconciler(t, adapter, run, env)
+
+			for range 2 {
+				got := reconcileRun(t, r, run.Name)
+				assertTerminalEnvironmentCondition(t, got, state, "EnvironmentReleased", "claimed environment was released")
+				if got.Status.EnvironmentRef == nil || got.Status.EnvironmentRef.Name != env.Name || got.Status.EnvironmentRef.UID != env.UID || got.Status.EnvironmentRef.Ownership != platformv1alpha1.EnvironmentOwnershipClaimed {
+					t.Fatalf("historical Environment reference = %#v", got.Status.EnvironmentRef)
+				}
+			}
+			var released platformv1alpha1.Environment
+			if err := r.Get(context.Background(), client.ObjectKeyFromObject(env), &released); err != nil || released.Status.ClaimedBy != nil || adapter.cancelled != 0 {
+				t.Fatalf("released Environment = %#v, cancellations = %d, error = %v", released, adapter.cancelled, err)
+			}
+
+			if err := r.Delete(context.Background(), &released); err != nil {
+				t.Fatal(err)
+			}
+			replacement := &platformv1alpha1.Environment{ObjectMeta: metav1.ObjectMeta{Name: env.Name, Namespace: env.Namespace, UID: "replacement-uid"}, Status: platformv1alpha1.EnvironmentStatus{
+				ClaimedBy: &platformv1alpha1.RunReference{Name: "other", UID: "other-run-uid"},
+			}}
+			if err := r.Create(context.Background(), replacement); err != nil {
+				t.Fatal(err)
+			}
+			if err := r.Status().Update(context.Background(), replacement); err != nil {
+				t.Fatal(err)
+			}
+
+			restarted := &RunReconciler{Client: r.Client, Scheme: r.Scheme, Adapters: map[string]AdapterLifecycle{"test": adapter}}
+			got := reconcileRun(t, restarted, run.Name)
+			assertTerminalEnvironmentCondition(t, got, state, "EnvironmentReleased", "claimed environment was released")
+			var retainedReplacement platformv1alpha1.Environment
+			if err := restarted.Get(context.Background(), client.ObjectKeyFromObject(replacement), &retainedReplacement); err != nil || retainedReplacement.UID != replacement.UID || retainedReplacement.Status.ClaimedBy == nil || retainedReplacement.Status.ClaimedBy.UID != "other-run-uid" {
+				t.Fatalf("replacement Environment = %#v, error = %v", retainedReplacement, err)
+			}
+		})
+	}
+}
+
+func TestTerminalClaimLossBeforeReleaseRemainsStrict(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		environment *platformv1alpha1.Environment
+		wantMessage string
+	}{
+		{
+			name:        "deleted",
+			wantMessage: `environments.swe.dev "shared" not found`,
+		},
+		{
+			name: "same-name UID replacement",
+			environment: &platformv1alpha1.Environment{ObjectMeta: metav1.ObjectMeta{Name: "shared", Namespace: "ns", UID: "replacement-uid"}, Status: platformv1alpha1.EnvironmentStatus{
+				ClaimedBy: &platformv1alpha1.RunReference{Name: "other", UID: "other-run-uid"},
+			}},
+			wantMessage: `allocated environment is gone or no longer claimed by this run: environment "shared" was replaced (wanted UID env-uid, got replacement-uid)`,
+		},
+		{
+			name: "unexpected claim mismatch",
+			environment: &platformv1alpha1.Environment{ObjectMeta: metav1.ObjectMeta{Name: "shared", Namespace: "ns", UID: "env-uid"}, Status: platformv1alpha1.EnvironmentStatus{
+				ClaimedBy: &platformv1alpha1.RunReference{Name: "other", UID: "other-run-uid"},
+			}},
+			wantMessage: `allocated environment is gone or no longer claimed by this run: environment "shared" claim does not match run UID run-uid`,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			run := &platformv1alpha1.Run{ObjectMeta: metav1.ObjectMeta{Name: "r", Namespace: "ns", UID: "run-uid"}, Spec: platformv1alpha1.RunSpec{Agent: "test"}, Status: platformv1alpha1.RunStatus{
+				State:          platformv1alpha1.RunStateSucceeded,
+				EnvironmentRef: &platformv1alpha1.RunEnvironmentReference{Name: "shared", UID: "env-uid", Ownership: platformv1alpha1.EnvironmentOwnershipClaimed},
+				Conditions:     []metav1.Condition{{Type: runConditionEnvironmentReady, Status: metav1.ConditionTrue, Reason: "EnvironmentReady", Message: "sandboxd is ready"}},
+			}}
+			objects := []client.Object{run}
+			if tc.environment != nil {
+				objects = append(objects, tc.environment)
+			}
+			r := reconciler(t, &scriptedAdapter{}, objects...)
+			got := reconcileRun(t, r, run.Name)
+			assertTerminalEnvironmentCondition(t, got, platformv1alpha1.RunStateSucceeded, "EnvironmentLost", tc.wantMessage)
+			if tc.environment != nil {
+				var retained platformv1alpha1.Environment
+				if err := r.Get(context.Background(), client.ObjectKeyFromObject(tc.environment), &retained); err != nil || retained.Spec.Paused || retained.Status.ClaimedBy == nil || retained.Status.ClaimedBy.UID != "other-run-uid" {
+					t.Fatalf("foreign Environment = %#v, error = %v", retained, err)
+				}
+			}
+		})
+	}
+}
+
+func TestOwnedTerminalCleanupAndActiveEnvironmentLossRemainStrict(t *testing.T) {
+	t.Run("terminal owned Environment deletion", func(t *testing.T) {
+		run := &platformv1alpha1.Run{ObjectMeta: metav1.ObjectMeta{Name: "r", Namespace: "ns", UID: "run-uid"}, Spec: platformv1alpha1.RunSpec{Agent: "test"}, Status: platformv1alpha1.RunStatus{
+			State:          platformv1alpha1.RunStateSucceeded,
+			EnvironmentRef: &platformv1alpha1.RunEnvironmentReference{Name: "owned", UID: "env-uid", Ownership: platformv1alpha1.EnvironmentOwnershipOwned},
+		}}
+		r := reconciler(t, &scriptedAdapter{}, run)
+		got := reconcileRun(t, r, run.Name)
+		assertTerminalEnvironmentCondition(t, got, platformv1alpha1.RunStateSucceeded, "EnvironmentLost", `environments.swe.dev "owned" not found`)
+	})
+
+	t.Run("terminal owned Environment fencing", func(t *testing.T) {
+		run := &platformv1alpha1.Run{ObjectMeta: metav1.ObjectMeta{Name: "r", Namespace: "ns", UID: "run-uid"}, Spec: platformv1alpha1.RunSpec{Agent: "test"}, Status: platformv1alpha1.RunStatus{
+			State:          platformv1alpha1.RunStateSucceeded,
+			EnvironmentRef: &platformv1alpha1.RunEnvironmentReference{Name: "owned", UID: "env-uid", Ownership: platformv1alpha1.EnvironmentOwnershipOwned},
+		}}
+		env := &platformv1alpha1.Environment{ObjectMeta: metav1.ObjectMeta{Name: "owned", Namespace: "ns", UID: "env-uid"}, Spec: platformv1alpha1.EnvironmentSpec{Paused: true}, Status: platformv1alpha1.EnvironmentStatus{Phase: platformv1alpha1.EnvironmentPhasePaused}}
+		r := reconciler(t, &scriptedAdapter{}, run, env)
+		got := reconcileRun(t, r, run.Name)
+		assertTerminalEnvironmentCondition(t, got, platformv1alpha1.RunStateSucceeded, "EnvironmentFenced", "owned environment is paused and fenced")
+	})
+
+	t.Run("active claimed Environment deletion", func(t *testing.T) {
+		run := &platformv1alpha1.Run{ObjectMeta: metav1.ObjectMeta{Name: "r", Namespace: "ns", UID: "run-uid", Finalizers: []string{runFinalizer}}, Spec: platformv1alpha1.RunSpec{Agent: "test"}, Status: platformv1alpha1.RunStatus{
+			State:          platformv1alpha1.RunStateRunning,
+			EnvironmentRef: &platformv1alpha1.RunEnvironmentReference{Name: "shared", UID: "env-uid", Ownership: platformv1alpha1.EnvironmentOwnershipClaimed},
+			Conditions:     []metav1.Condition{{Type: runConditionEnvironmentReady, Status: metav1.ConditionTrue}, {Type: runConditionAdapterAccepted, Status: metav1.ConditionTrue}},
+		}}
+		r := reconciler(t, &scriptedAdapter{}, run)
+		got := reconcileRun(t, r, run.Name)
+		assertTerminalEnvironmentCondition(t, got, platformv1alpha1.RunStateFailed, "EnvironmentLost", `environments.swe.dev "shared" not found`)
+		got = reconcileRun(t, r, run.Name)
+		assertTerminalEnvironmentCondition(t, got, platformv1alpha1.RunStateFailed, "EnvironmentLost", `environments.swe.dev "shared" not found`)
+	})
+}
+
+func assertTerminalEnvironmentCondition(t *testing.T, run platformv1alpha1.Run, wantState platformv1alpha1.RunState, wantReason, wantMessage string) {
+	t.Helper()
+	condition := apiMeta.FindStatusCondition(run.Status.Conditions, runConditionEnvironmentReady)
+	if run.Status.State != wantState || condition == nil || condition.Status != metav1.ConditionFalse || condition.Reason != wantReason || condition.Message != wantMessage {
+		t.Fatalf("Run status = %#v, EnvironmentReady = %#v; want state %s, reason %q, message %q", run.Status, condition, wantState, wantReason, wantMessage)
+	}
+}
+
 func TestAdapterShapesPauseResumeAndStatus(t *testing.T) {
 	for _, tc := range []struct {
 		name         string
