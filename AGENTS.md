@@ -95,8 +95,8 @@ runs both via `make` targets:
   followed by `make build-control-plane-production`; the tagged build embeds `ui/dist`,
   while ordinary Go builds intentionally work without generated assets. The control-plane
   image performs both stages in one multi-stage build.
-- **Windows portability:** CI runs focused sandboxd process, Exec, and filesystem tests
-  on `windows-latest`; keep OS-specific tests behind build tags.
+- **Windows portability:** CI runs focused sandboxd process, launch-material, Exec, and
+  filesystem tests on `windows-latest`; keep OS-specific tests behind build tags.
 - **Regenerate deepcopy:** `make generate` · **CRDs + RBAC:** `make manifests`
   (`manifests` synchronizes chart CRDs; CI fails on a diff). Use `make check-chart-crds`
   to verify the checked-in Helm CRDs independently.

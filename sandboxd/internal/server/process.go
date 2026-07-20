@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
@@ -14,6 +15,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -26,6 +28,10 @@ const (
 	defaultOutputCapacity     = 1024 * 1024
 	defaultMaxRecords         = 1024
 	defaultReadMax            = 64 * 1024
+	maxLaunchMaterialEntries  = 64
+	maxLaunchMaterialName     = 256
+	maxLaunchMaterialValue    = 64 * 1024
+	maxLaunchMaterialTotal    = 256 * 1024
 )
 
 type processKey struct{ ownerID, role string }
@@ -69,6 +75,7 @@ type managedProcess struct {
 	terminalRequested bool
 	stdout, stderr    outputBuffer
 	drains            int
+	secretLaunch      bool
 	timer             *time.Timer
 	graceTimer        *time.Timer
 	doneOnce          sync.Once
@@ -102,6 +109,13 @@ func requestKey(key *sandboxdv1.ProcessKey) (processKey, error) {
 	return processKey{key.OwnerId, key.Role}, nil
 }
 
+func canonicalEnvName(name string) string {
+	if runtime.GOOS == "windows" {
+		return strings.ToUpper(name)
+	}
+	return name
+}
+
 func normalizeEnv(mode sandboxdv1.EnvironmentMode, overrides map[string]string) ([]string, error) {
 	if mode == sandboxdv1.EnvironmentMode_ENVIRONMENT_MODE_UNSPECIFIED {
 		mode = sandboxdv1.EnvironmentMode_ENVIRONMENT_MODE_INHERIT
@@ -111,16 +125,10 @@ func normalizeEnv(mode sandboxdv1.EnvironmentMode, overrides map[string]string) 
 	}
 	m := map[string]string{}
 	names := map[string]string{}
-	canonical := func(k string) string {
-		if runtime.GOOS == "windows" {
-			return strings.ToUpper(k)
-		}
-		return k
-	}
 	if mode == sandboxdv1.EnvironmentMode_ENVIRONMENT_MODE_INHERIT {
 		for _, item := range os.Environ() {
 			if i := strings.IndexByte(item, '='); i >= 0 {
-				ck := canonical(item[:i])
+				ck := canonicalEnvName(item[:i])
 				names[ck], m[ck] = item[:i], item[i+1:]
 			}
 		}
@@ -129,7 +137,7 @@ func normalizeEnv(mode sandboxdv1.EnvironmentMode, overrides map[string]string) 
 		if k == "" || strings.ContainsAny(k, "=\x00") || strings.ContainsRune(v, 0) {
 			return nil, status.Error(codes.InvalidArgument, "invalid environment entry")
 		}
-		ck := canonical(k)
+		ck := canonicalEnvName(k)
 		names[ck], m[ck] = k, v
 	}
 	keys := make([]string, 0, len(m))
@@ -189,13 +197,104 @@ func (s *ProcessServer) Start(_ context.Context, req *sandboxdv1.StartProcessReq
 	if req == nil {
 		return nil, status.Error(codes.InvalidArgument, "request must not be nil")
 	}
-	key, err := requestKey(req.Key)
+	return s.start(req.Key, req.Spec, nil, false)
+}
+
+func (s *ProcessServer) StartWithLaunchMaterial(_ context.Context, req *sandboxdv1.StartProcessWithLaunchMaterialRequest) (*sandboxdv1.Process, error) {
+	if req == nil {
+		return nil, status.Error(codes.InvalidArgument, "request must not be nil")
+	}
+	secretEnv := req.GetLaunchMaterial().GetSecretEnv()
+	defer clearSecretEnv(secretEnv)
+	return s.start(req.Key, req.Spec, secretEnv, true)
+}
+
+func clearSecretEnv(env map[string][]byte) {
+	for _, value := range env {
+		clear(value)
+	}
+}
+
+func mergeSecretEnv(environment []string, secret map[string][]byte) []string {
+	secretNames := make(map[string]struct{}, len(secret))
+	for name := range secret {
+		secretNames[canonicalEnvName(name)] = struct{}{}
+	}
+	merged := environment[:0]
+	for _, item := range environment {
+		separator := strings.IndexByte(item, '=')
+		if separator < 0 {
+			continue
+		}
+		if _, replaced := secretNames[canonicalEnvName(item[:separator])]; !replaced {
+			merged = append(merged, item)
+		}
+	}
+	for name, value := range secret {
+		merged = append(merged, name+"="+string(value))
+	}
+	return merged
+}
+
+func portableEnvName(name string) bool {
+	if name == "" || !utf8.ValidString(name) || len(name) > maxLaunchMaterialName {
+		return false
+	}
+	for i := 0; i < len(name); i++ {
+		c := name[i]
+		if (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || c == '_' || (i > 0 && c >= '0' && c <= '9') {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+func validateLaunchMaterial(secret map[string][]byte, public map[string]string) error {
+	if len(secret) > maxLaunchMaterialEntries {
+		return status.Error(codes.InvalidArgument, "launch material has too many environment entries")
+	}
+	total := 0
+	names := make(map[string]struct{}, len(secret))
+	for name, value := range secret {
+		if !portableEnvName(name) {
+			return status.Error(codes.InvalidArgument, "launch material has an invalid environment name")
+		}
+		if len(value) > maxLaunchMaterialValue || bytes.IndexByte(value, 0) >= 0 {
+			return status.Error(codes.InvalidArgument, "launch material has an invalid environment value")
+		}
+		total += len(name) + len(value)
+		if total > maxLaunchMaterialTotal {
+			return status.Error(codes.InvalidArgument, "launch material exceeds aggregate size limit")
+		}
+		canonical := canonicalEnvName(name)
+		if _, exists := names[canonical]; exists {
+			return status.Error(codes.InvalidArgument, "launch material has duplicate environment names")
+		}
+		names[canonical] = struct{}{}
+	}
+	for name := range public {
+		canonical := canonicalEnvName(name)
+		if _, exists := names[canonical]; exists {
+			return status.Error(codes.InvalidArgument, "launch material conflicts with public environment")
+		}
+	}
+	return nil
+}
+
+func (s *ProcessServer) start(keyRequest *sandboxdv1.ProcessKey, specRequest *sandboxdv1.ProcessSpec, secretEnv map[string][]byte, secretLaunch bool) (*sandboxdv1.Process, error) {
+	key, err := requestKey(keyRequest)
 	if err != nil {
 		return nil, err
 	}
-	spec, err := s.normalizeSpec(req.Spec)
+	spec, err := s.normalizeSpec(specRequest)
 	if err != nil {
 		return nil, err
+	}
+	if secretLaunch {
+		if err := validateLaunchMaterial(secretEnv, spec.Env); err != nil {
+			return nil, err
+		}
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -205,6 +304,9 @@ func (s *ProcessServer) Start(_ context.Context, req *sandboxdv1.StartProcessReq
 	if p, ok := s.processes[key]; ok {
 		if !reflect.DeepEqual(p.spec, spec) {
 			return nil, status.Error(codes.FailedPrecondition, "process key already has a different spec")
+		}
+		if p.secretLaunch != secretLaunch {
+			return nil, status.Error(codes.FailedPrecondition, "process key already has a different launch mode")
 		}
 		return processResponse(p), nil
 	}
@@ -219,10 +321,11 @@ func (s *ProcessServer) Start(_ context.Context, req *sandboxdv1.StartProcessReq
 	if idErr != nil {
 		return nil, status.Errorf(codes.Internal, "generate execution id: %v", idErr)
 	}
-	p := &managedProcess{key: &sandboxdv1.ProcessKey{OwnerId: key.ownerID, Role: key.role}, spec: spec, executionID: executionID}
+	p := &managedProcess{key: &sandboxdv1.ProcessKey{OwnerId: key.ownerID, Role: key.role}, spec: spec, executionID: executionID, secretLaunch: secretLaunch}
 	cmd := exec.Command(spec.Argv[0], spec.Argv[1:]...)
 	cmd.Dir = spec.Cwd
 	cmd.Env, _ = normalizeEnv(spec.EnvMode, spec.Env)
+	cmd.Env = mergeSecretEnv(cmd.Env, secretEnv)
 	stdin, e := os.Open(os.DevNull)
 	if e != nil {
 		return nil, status.Errorf(codes.Internal, "open null stdin: %v", e)
@@ -245,7 +348,12 @@ func (s *ProcessServer) Start(_ context.Context, req *sandboxdv1.StartProcessReq
 	// Publish only after every fallible pre-launch resource is allocated.
 	s.processes[key] = p
 	cmd.Stdout, cmd.Stderr = stdoutW, stderrW
-	if e = s.supervisor.start(p.domain, func() { s.shutdownManaged(key, p) }); e != nil {
+	e = s.supervisor.start(p.domain, func() { s.shutdownManaged(key, p) })
+	// exec.Cmd has copied the environment into OS-owned launch storage by now.
+	// Drop our only retained copy whether launch succeeded or failed.
+	clear(cmd.Env)
+	cmd.Env = nil
+	if e != nil {
 		stdin.Close()
 		stdout.Close()
 		stdoutW.Close()

@@ -49,9 +49,9 @@ jobs:
         with:
           go-version: "1.26"
           cache-dependency-path: sandboxd/go.sum
-      - name: Test Windows process containment and portable filesystem
+      - name: Test Windows process containment, launch material, and portable filesystem
         working-directory: sandboxd
-        run: go test ./internal/server -run "^(TestProcessDomainAssignsLeaderToJob|TestProcessServiceForceContainsDescendant|TestExecExplicitAndCloseSendEOFStillPublishOutputAndExit|TestFilesystem.*)$" -count=1
+        run: go test ./internal/server -run "^(TestProcessDomainAssignsLeaderToJob|TestProcessServiceForceContainsDescendant|TestExecExplicitAndCloseSendEOFStillPublishOutputAndExit|TestLaunchMaterial.*|TestFilesystem.*)$" -count=1
 
   build-test:
     runs-on: ubuntu-latest

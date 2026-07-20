@@ -98,6 +98,9 @@ service ProcessService {
   // Start is detached from the RPC context. Repeating the same key and spec
   // returns the existing process; the same key with a different spec fails.
   rpc Start(StartProcessRequest) returns (Process);
+  // StartWithLaunchMaterial supplies write-only data used only to construct the
+  // child environment. It is never retained in or returned by a Process.
+  rpc StartWithLaunchMaterial(StartProcessWithLaunchMaterialRequest) returns (Process);
   // Get returns running and retained terminal state in this sandboxd epoch.
   rpc Get(GetProcessRequest) returns (Process);
   // Stop is idempotent, including when the key is absent or already terminal.
@@ -122,6 +125,17 @@ message ProcessSpec {
 message StartProcessRequest {
   ProcessKey key = 1;
   ProcessSpec spec = 2;
+}
+
+message LaunchMaterial {
+  // Values are bytes so this transport does not imply UTF-8 credentials.
+  map<string, bytes> secret_env = 1;
+}
+
+message StartProcessWithLaunchMaterialRequest {
+  ProcessKey key = 1;
+  ProcessSpec spec = 2;
+  LaunchMaterial launch_material = 3;
 }
 
 message GetProcessRequest {
