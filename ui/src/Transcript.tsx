@@ -1,5 +1,6 @@
-import { useEffect, useState, type ReactNode } from 'react'
+import { useEffect, useMemo, useState, type ReactNode } from 'react'
 import { api } from './api'
+import { CLAUDE_PROCESS_OUTPUT_KEY, ClaudeProcessOutput, reduceClaudeTranscript } from './ClaudeTranscript'
 
 export interface TranscriptEntry {
   id: string
@@ -7,6 +8,7 @@ export interface TranscriptEntry {
   source?: string
   type?: string
   data: unknown
+  raw: unknown
 }
 
 export interface TranscriptGap {
@@ -15,7 +17,7 @@ export interface TranscriptGap {
   latestSequence?: number
 }
 
-type TimelineItem =
+export type TranscriptRenderItem =
   | { kind: 'event'; entry: TranscriptEntry; position: number }
   | { kind: 'gap'; gap: TranscriptGap; position: number }
 
@@ -25,10 +27,6 @@ const opaque: Renderer = data => {
   if (data === null || typeof data === 'number' || typeof data === 'boolean') return String(data)
   try { return JSON.stringify(data, null, 2) } catch { return '[Unrenderable event data]' }
 }
-
-// Agent adapters can register precise renderers without changing stream handling.
-// eslint-disable-next-line react-refresh/only-export-components
-export const transcriptRenderers: Record<string, Renderer> = {}
 
 function parseEntry(event: MessageEvent): TranscriptEntry | undefined {
   let value: unknown
@@ -43,6 +41,7 @@ function parseEntry(event: MessageEvent): TranscriptEntry | undefined {
     source: typeof object?.source === 'string' ? object.source : undefined,
     type: typeof object?.type === 'string' ? object.type : undefined,
     data: object && 'data' in object ? object.data : value,
+    raw: value,
   }
 }
 
@@ -69,12 +68,16 @@ function GapNotice({ gap }: { gap: TranscriptGap }) {
       : `History before sequence ${gap.earliestSequence} is unavailable.`}
     {gap.latestSequence !== undefined && ` Retained history is available through sequence ${gap.latestSequence}.`}
     {' '}Recovery cursor: <code>{gap.resumeAfter}</code>.
-  </p></li>
+  </p><p>Adapter stream assembly restarts after this boundary; partial records from before it are not joined to later bytes.</p></li>
+}
+
+function RawTransportEvent({ entry }: { entry: TranscriptEntry }) {
+  return <details className="raw-event"><summary>Raw transport event</summary><pre>{opaque(entry.raw)}</pre></details>
 }
 
 export function Transcript({ namespace, run }: { namespace: string; run: string }) {
   const [status, setStatus] = useState('Connecting')
-  const [timeline, setTimeline] = useState<TimelineItem[]>([])
+  const [timeline, setTimeline] = useState<TranscriptRenderItem[]>([])
   useEffect(() => {
     setTimeline([])
     setStatus('Connecting')
@@ -87,7 +90,7 @@ export function Transcript({ namespace, run }: { namespace: string; run: string 
       if (!entry) return
       setTimeline(current => {
         if (current.some(item => item.kind === 'event' && (item.entry.id === entry.id || item.entry.sequence === entry.sequence))) return current
-        const next: TimelineItem = { kind: 'event', entry, position: entry.sequence }
+        const next: TranscriptRenderItem = { kind: 'event', entry, position: entry.sequence }
         return [...current, next].sort((a, b) => a.position - b.position || (a.kind === 'gap' ? -1 : 1))
       })
     }
@@ -98,7 +101,7 @@ export function Transcript({ namespace, run }: { namespace: string; run: string 
         if (current.some(item => item.kind === 'gap' && item.gap.resumeAfter === gap.resumeAfter && item.gap.earliestSequence === gap.earliestSequence && item.gap.latestSequence === gap.latestSequence)) return current
         const lastPosition = current.reduce((latest, item) => Math.max(latest, item.position), 0)
         const position = gap.earliestSequence ?? lastPosition + 0.5
-        const next: TimelineItem = { kind: 'gap', gap, position }
+        const next: TranscriptRenderItem = { kind: 'gap', gap, position }
         return [...current, next].sort((a, b) => a.position - b.position || (a.kind === 'gap' ? -1 : 1))
       })
     }
@@ -145,14 +148,20 @@ export function Transcript({ namespace, run }: { namespace: string; run: string 
       stream?.close()
     }
   }, [namespace, run])
+  const claude = useMemo(() => reduceClaudeTranscript(timeline), [timeline])
   return <section><p role="status" aria-live="polite">Transcript: {status}</p>
     {!timeline.length ? <p>No transcript events yet.</p> : <ol className="transcript">
       {timeline.map(item => {
         if (item.kind === 'gap') return <GapNotice key={`gap:${item.gap.resumeAfter}:${item.gap.earliestSequence}:${item.gap.latestSequence}`} gap={item.gap} />
         const { entry } = item
         const key = `${entry.source || ''}:${entry.type || ''}`
-        const renderer = transcriptRenderers[key] || opaque
-        return <li key={`event:${entry.id}`}><span>{[entry.source, entry.type].filter(Boolean).join(' / ') || 'Event'}</span><pre>{renderer(entry.data)}</pre></li>
+        const presentation = claude.get(entry.id)
+        return <li key={`event:${entry.id}`}><span>{[entry.source, entry.type].filter(Boolean).join(' / ') || 'Event'}</span>
+          {key === CLAUDE_PROCESS_OUTPUT_KEY && presentation
+            ? <ClaudeProcessOutput presentation={presentation} />
+            : <pre>{opaque(entry.data)}</pre>}
+          <RawTransportEvent entry={entry} />
+        </li>
       })}
     </ol>}
   </section>

@@ -95,6 +95,7 @@ EOF
 cat > "$PROJECT_WORKTREE/bin/claude" <<'EOF'
 #!/bin/sh
 printf '%s\n' '{"type":"system","subtype":"init","session_id":"fake-e2e"}'
+printf '%s\n' '{"type":"assistant","session_id":"fake-e2e","message":{"id":"msg-fake-e2e","type":"message","role":"assistant","model":"claude-e2e","content":[{"type":"text","text":"fake Claude Code is working"},{"type":"tool_use","id":"tool-fake-e2e","name":"Read","input":{"file_path":"README.md"}}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":2}},"parent_tool_use_id":null}'
 sleep 5
 printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"result":"fake Claude Code completed"}'
 EOF
@@ -484,6 +485,19 @@ wait "$STREAM_PID" >/dev/null 2>&1 || true
 if ! grep -q 'e2e transcript event' /tmp/swe-platform-transcript.out; then
 	echo "FAIL: transcript event was not received from the SSE stream"
 	cat /tmp/swe-platform-transcript.out
+	exit 1
+fi
+if ! grep -oE '"data":"[A-Za-z0-9+/=]+"' /tmp/swe-platform-transcript.out | \
+	sed 's/^"data":"//; s/"$//' | \
+	while IFS= read -r encoded; do printf '%s' "$encoded" | base64 --decode || exit 1; done \
+	>/tmp/swe-platform-process-output.out; then
+	echo "FAIL: Claude Code process output was not valid base64 in the deployed transcript transport"
+	exit 1
+fi
+if ! grep -Fq '"type":"assistant"' /tmp/swe-platform-process-output.out || \
+	! grep -Fq '"text":"fake Claude Code is working"' /tmp/swe-platform-process-output.out; then
+	echo "FAIL: deployed transcript transport did not retain the realistic Claude assistant record"
+	cat /tmp/swe-platform-process-output.out
 	exit 1
 fi
 
