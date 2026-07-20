@@ -231,3 +231,11 @@ func TestLaunchMaterialValidationBeforePublication(t *testing.T) {
 		t.Fatalf("case-distinct Unix names rejected: %v", err)
 	}
 }
+
+func runLaunchMaterialWindowsCI(t *testing.T) {
+	t.Run("delivery-redaction-cleanup", TestLaunchMaterialDeliveryRedactionAndCleanup)
+	t.Run("inherited-environment-override", TestLaunchMaterialOverridesInheritedEnvironment)
+	t.Run("ordinary-exec-isolation", TestLaunchMaterialIsNotAmbientForOrdinaryExec)
+	t.Run("idempotency-mode-fencing", TestLaunchMaterialIdempotencyAndModeFencing)
+	t.Run("validation-before-publication", TestLaunchMaterialValidationBeforePublication)
+}

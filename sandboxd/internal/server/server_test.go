@@ -171,6 +171,11 @@ func TestExecExplicitAndCloseSendEOFStillPublishOutputAndExit(t *testing.T) {
 			}
 		})
 	}
+	// The Windows CI job intentionally runs a focused test regex. Keep the
+	// launch-material portability cases attached to one of those selected tests.
+	if runtime.GOOS == "windows" {
+		t.Run("launch-material-portability", runLaunchMaterialWindowsCI)
+	}
 }
 
 func TestProcessBoundedOutputOffsetsGapEOFAndStaleID(t *testing.T) {
