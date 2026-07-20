@@ -2,8 +2,10 @@ package main
 
 import "testing"
 
-func TestDefaultClaudeCodeAdapterIsRegistered(t *testing.T) {
-	if registeredAdapters()["claude-code"] == nil {
-		t.Fatal("claude-code adapter is not registered")
+func TestAdaptersAreRegistered(t *testing.T) {
+	for _, name := range []string{"amp", "claude-code"} {
+		if registeredAdapters()[name] == nil {
+			t.Fatalf("%s adapter is not registered", name)
+		}
 	}
 }

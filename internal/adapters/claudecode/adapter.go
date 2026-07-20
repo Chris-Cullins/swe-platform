@@ -4,49 +4,25 @@ package claudecode
 import (
 	"bytes"
 	"context"
-	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"sync"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
+	"github.com/Chris-Cullins/swe-platform/internal/adapters/processoutput"
 	"github.com/Chris-Cullins/swe-platform/internal/controllers"
 	sandboxdv1 "github.com/Chris-Cullins/swe-platform/sandboxd/gen/proto/sandboxd/v1"
 )
 
-const (
-	processRole   = "agent"
-	outputPageMax = 64 * 1024
-)
+const processRole = "agent"
 
 // Adapter drives one non-interactive Claude Code process per Run UID.
 type Adapter struct {
 	Executable string
 
-	mu      sync.Mutex
-	cursors map[outputCursor]uint64
-}
-
-type outputCursor struct {
-	environment string
-	owner       string
-	execution   string
-	stream      sandboxdv1.OutputStream
-}
-
-type outputEvent struct {
-	ExecutionID  string `json:"executionId"`
-	Stream       string `json:"stream"`
-	Offset       uint64 `json:"offset"`
-	NextOffset   uint64 `json:"nextOffset"`
-	GapBytes     uint64 `json:"gapBytes,omitempty"`
-	RetainedFrom uint64 `json:"retainedFrom"`
-	ProducedEnd  uint64 `json:"producedEnd"`
-	EOF          bool   `json:"eof"`
-	Data         []byte `json:"data,omitempty"`
+	output processoutput.Forwarder
 }
 
 type resultEvent struct {
@@ -109,7 +85,7 @@ func (a *Adapter) Observe(ctx context.Context, task controllers.AdapterTask, san
 		}
 		return "", "", err
 	}
-	if err := a.forwardOutput(ctx, client, task, sandbox, process); err != nil {
+	if err := a.output.Forward(ctx, client, processKey(task), sandbox, process, "claude-code", "claude-code.process-output"); err != nil {
 		if errors.Is(err, controllers.ErrAdapterEventRejected) {
 			return controllers.AdapterObservationFailed, "Claude Code transcript output was permanently rejected", nil
 		}
@@ -128,7 +104,7 @@ func (a *Adapter) Observe(ctx context.Context, task controllers.AdapterTask, san
 		if process.GetExitCode() != 0 {
 			return controllers.AdapterObservationFailed, fmt.Sprintf("Claude Code exited with code %d", process.GetExitCode()), nil
 		}
-		output, err := readRetainedOutput(ctx, client, processKey(task), process.ExecutionId, sandboxdv1.OutputStream_OUTPUT_STREAM_STDOUT)
+		output, err := processoutput.ReadRetained(ctx, client, processKey(task), process.ExecutionId, sandboxdv1.OutputStream_OUTPUT_STREAM_STDOUT)
 		if err != nil {
 			return "", "", err
 		}
@@ -167,67 +143,13 @@ func (a *Adapter) Cancel(ctx context.Context, task controllers.AdapterTask, sand
 	case sandboxdv1.ProcessState_PROCESS_STATE_RUNNING, sandboxdv1.ProcessState_PROCESS_STATE_STOPPING:
 		return controllers.ErrAdapterCancellationPending
 	case sandboxdv1.ProcessState_PROCESS_STATE_EXITED, sandboxdv1.ProcessState_PROCESS_STATE_FAILED:
-		err := a.forwardOutput(ctx, client, task, sandbox, process)
+		err := a.output.Forward(ctx, client, processKey(task), sandbox, process, "claude-code", "claude-code.process-output")
 		if errors.Is(err, controllers.ErrAdapterEventRejected) {
 			return nil
 		}
 		return err
 	default:
 		return fmt.Errorf("Claude Code cancellation returned invalid process state %s", process.State)
-	}
-}
-
-func (a *Adapter) forwardOutput(ctx context.Context, client sandboxdv1.ProcessServiceClient, task controllers.AdapterTask, sandbox controllers.AdapterSandbox, process *sandboxdv1.Process) error {
-	if sandbox.EmitEvent == nil || process.ExecutionId == "" {
-		return nil
-	}
-	for _, stream := range []sandboxdv1.OutputStream{sandboxdv1.OutputStream_OUTPUT_STREAM_STDOUT, sandboxdv1.OutputStream_OUTPUT_STREAM_STDERR} {
-		cursor := outputCursor{environment: string(sandbox.EnvironmentUID), owner: task.ID, execution: process.ExecutionId, stream: stream}
-		offset := a.cursor(cursor)
-		for {
-			response, err := client.ReadOutput(ctx, &sandboxdv1.ReadOutputRequest{Key: processKey(task), ExecutionId: process.ExecutionId, Stream: stream, Offset: offset, MaxBytes: outputPageMax})
-			if err != nil {
-				return err
-			}
-			if len(response.Data) == 0 && response.GapBytes == 0 {
-				break
-			}
-			payload, err := json.Marshal(outputEvent{
-				ExecutionID: process.ExecutionId, Stream: streamName(stream), Offset: response.Offset,
-				NextOffset: response.NextOffset, GapBytes: response.GapBytes, RetainedFrom: response.RetainedStart,
-				ProducedEnd: response.ProducedEnd, EOF: response.Eof, Data: response.Data,
-			})
-			if err != nil {
-				return err
-			}
-			digest := sha256.Sum256(payload)
-			key := fmt.Sprintf("v1:%s:%x", streamName(stream), digest)
-			if err := sandbox.EmitEvent(ctx, controllers.AdapterEvent{Source: "claude-code", IdempotencyKey: key, Type: "claude-code.process-output", Data: payload}); err != nil {
-				return err
-			}
-			offset = response.NextOffset
-			a.setCursor(cursor, offset)
-			if response.Eof || offset >= response.ProducedEnd {
-				break
-			}
-		}
-	}
-	return nil
-}
-
-func readRetainedOutput(ctx context.Context, client sandboxdv1.ProcessServiceClient, key *sandboxdv1.ProcessKey, executionID string, stream sandboxdv1.OutputStream) ([]byte, error) {
-	var output bytes.Buffer
-	var offset uint64
-	for {
-		response, err := client.ReadOutput(ctx, &sandboxdv1.ReadOutputRequest{Key: key, ExecutionId: executionID, Stream: stream, Offset: offset, MaxBytes: outputPageMax})
-		if err != nil {
-			return nil, err
-		}
-		output.Write(response.Data)
-		offset = response.NextOffset
-		if response.Eof || offset >= response.ProducedEnd {
-			return output.Bytes(), nil
-		}
 	}
 }
 
@@ -243,13 +165,6 @@ func finalResult(output []byte) (resultEvent, bool) {
 	return result, found
 }
 
-func streamName(stream sandboxdv1.OutputStream) string {
-	if stream == sandboxdv1.OutputStream_OUTPUT_STREAM_STDERR {
-		return "stderr"
-	}
-	return "stdout"
-}
-
 func processMessage(summary, detail string) string {
 	if detail == "" {
 		return summary
@@ -259,22 +174,4 @@ func processMessage(summary, detail string) string {
 		detail = detail[:maxDetail] + "…"
 	}
 	return summary + ": " + detail
-}
-
-func (a *Adapter) cursor(key outputCursor) uint64 {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	if a.cursors == nil {
-		a.cursors = make(map[outputCursor]uint64)
-	}
-	return a.cursors[key]
-}
-
-func (a *Adapter) setCursor(key outputCursor, offset uint64) {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	if a.cursors == nil {
-		a.cursors = make(map[outputCursor]uint64)
-	}
-	a.cursors[key] = offset
 }

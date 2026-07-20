@@ -1,0 +1,7 @@
+{
+  "name": "swe-platform-env-base-amp",
+  "private": true,
+  "dependencies": {
+    "@ampcode/cli": "0.0.1784492094-g5d18e2"
+  }
+}

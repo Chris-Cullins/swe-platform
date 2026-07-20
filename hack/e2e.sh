@@ -17,6 +17,7 @@ PORT_FORWARD_PID=""
 WEB_TERMINAL_CLIENT=""
 PROJECT_REPO=""
 PROJECT_WORKTREE=""
+AMP_CLI_BUILDER=""
 
 cleanup() {
 	if [[ -n "$PORT_FORWARD_PID" ]]; then
@@ -32,6 +33,9 @@ cleanup() {
 	if [[ -n "$PROJECT_WORKTREE" ]]; then
 		rm -rf "$PROJECT_WORKTREE"
 	fi
+	if [[ -n "$AMP_CLI_BUILDER" ]]; then
+		docker buildx rm "$AMP_CLI_BUILDER" >/dev/null 2>&1 || true
+	fi
 	if [[ "${KEEP_CLUSTER:-false}" != "true" ]]; then
 		kind delete cluster --name "$CLUSTER" >/dev/null 2>&1 || true
 	fi
@@ -46,6 +50,18 @@ make build
 echo "==> creating kind cluster '$CLUSTER'"
 kind delete cluster --name "$CLUSTER" >/dev/null 2>&1 || true
 kind create cluster --name "$CLUSTER"
+
+echo "==> verifying pinned Amp CLI for linux/amd64 and linux/arm64"
+docker run --privileged --rm \
+	tonistiigi/binfmt@sha256:400a4873b838d1b89194d982c45e5fb3cda4593fbfd7e08a02e76b03b21166f0 \
+	--install arm64 >/dev/null
+AMP_CLI_BUILDER="swe-e2e-amp-cli-${GITHUB_RUN_ID:-$$}-${RANDOM}"
+docker buildx create --name "$AMP_CLI_BUILDER" --driver docker-container >/dev/null
+docker buildx build --builder "$AMP_CLI_BUILDER" \
+	--platform linux/amd64,linux/arm64 --target amp-cli \
+	-f images/env-base/Dockerfile . >/dev/null
+docker buildx rm "$AMP_CLI_BUILDER" >/dev/null
+AMP_CLI_BUILDER=""
 
 echo "==> building platform images"
 make docker-build >/dev/null
@@ -98,8 +114,20 @@ printf '%s\n' '{"type":"system","subtype":"init","session_id":"fake-e2e"}'
 sleep 5
 printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"result":"fake Claude Code completed"}'
 EOF
-chmod +x "$PROJECT_WORKTREE/bin/claude"
-git -C "$PROJECT_WORKTREE" add .agents/setup .agents/resume bin/claude
+cat > "$PROJECT_WORKTREE/bin/amp" <<'EOF'
+#!/bin/sh
+if [ "$#" -ne 2 ] || [ "$1" != "--stream-json" ] || [ "$2" != "--execute=end-to-end Amp adapter smoke test" ] || [ "$AMP_SKIP_UPDATE_CHECK" != "1" ]; then
+	printf '%s\n' "unexpected fake Amp invocation: $*" >&2
+	exit 2
+fi
+printf '%s\n' '{"type":"system","subtype":"init","cwd":"/workspace","session_id":"T-fake-amp-e2e","tools":[],"mcp_servers":[]}'
+printf '%s\n' 'fake Amp stderr' >&2
+sleep 5
+printf '%s\n' '{"type":"assistant","message":{"type":"message","role":"assistant","content":[{"type":"text","text":"fake Amp completed"}],"stop_reason":"end_turn"},"parent_tool_use_id":null,"session_id":"T-fake-amp-e2e"}'
+printf '%s\n' '{"type":"result","subtype":"success","duration_ms":5000,"is_error":false,"num_turns":1,"result":"fake Amp completed","session_id":"T-fake-amp-e2e"}'
+EOF
+chmod +x "$PROJECT_WORKTREE/bin/claude" "$PROJECT_WORKTREE/bin/amp"
+git -C "$PROJECT_WORKTREE" add .agents/setup .agents/resume bin/claude bin/amp
 git -C "$PROJECT_WORKTREE" commit -m "Add e2e lifecycle hooks" >/dev/null
 git -C "$PROJECT_WORKTREE" bundle create "$PROJECT_REPO/repo.bundle" main
 kubectl create configmap e2e-git-repo --from-file="$PROJECT_REPO/repo.bundle"
@@ -340,6 +368,52 @@ for _ in $(seq 1 30); do
 	fi
 	sleep 1
 done
+
+echo "==> running Amp adapter through allocation, transcript, and cleanup"
+bin/swe run "end-to-end Amp adapter smoke test" --name e2e-amp --project e2e --agent amp --wait=false
+kubectl wait --for=jsonpath='{.status.state}'=Running run/e2e-amp --timeout=3m
+kubectl wait --for=jsonpath='{.status.state}'=Succeeded run/e2e-amp --timeout=3m
+AMP_ENV_NAME=$(kubectl get run e2e-amp -o jsonpath='{.status.environmentRef.name}')
+AMP_ENV_OWNERSHIP=$(kubectl get run e2e-amp -o jsonpath='{.status.environmentRef.ownership}')
+if [[ -z "$AMP_ENV_NAME" || "$AMP_ENV_OWNERSHIP" != "Claimed" ]]; then
+	echo "FAIL: Amp Run allocation was ${AMP_ENV_NAME:-<empty>} (${AMP_ENV_OWNERSHIP:-<empty>}), expected a claimed warm Environment"
+	exit 1
+fi
+set +e
+curl --fail --silent --no-buffer --max-time 5 \
+	-H "Authorization: Bearer ${E2E_BOOTSTRAP_TOKEN}" \
+	"http://127.0.0.1:18080/api/v1/namespaces/default/runs/e2e-amp/transcript" \
+	> /tmp/swe-platform-amp-transcript.out
+AMP_TRANSCRIPT_STATUS=$?
+set -e
+if [[ "$AMP_TRANSCRIPT_STATUS" -ne 0 && "$AMP_TRANSCRIPT_STATUS" -ne 28 ]]; then
+	echo "FAIL: Amp transcript request exited ${AMP_TRANSCRIPT_STATUS}"
+	exit 1
+fi
+if ! grep -Fq '"source":"amp"' /tmp/swe-platform-amp-transcript.out || \
+	! grep -Fq '"type":"amp.process-output"' /tmp/swe-platform-amp-transcript.out || \
+	! grep -Fq '"stream":"stdout"' /tmp/swe-platform-amp-transcript.out || \
+	! grep -Fq '"stream":"stderr"' /tmp/swe-platform-amp-transcript.out; then
+	echo "FAIL: Amp stdout/stderr adapter-owned transcript events were not replayed"
+	cat /tmp/swe-platform-amp-transcript.out
+	exit 1
+fi
+for _ in $(seq 1 60); do
+	AMP_CLAIM_UID=$(kubectl get environment "$AMP_ENV_NAME" -o jsonpath='{.status.claimedBy.uid}' 2>/dev/null || true)
+	if [[ -z "$AMP_CLAIM_UID" ]]; then
+		break
+	fi
+	sleep 1
+done
+if [[ -n "${AMP_CLAIM_UID:-}" ]]; then
+	echo "FAIL: terminal Amp Run did not release its Environment claim"
+	exit 1
+fi
+kubectl delete run e2e-amp --wait=true >/dev/null
+if ! kubectl get environment "$AMP_ENV_NAME" >/dev/null 2>&1; then
+	echo "FAIL: deleting the Amp Run removed its claimed Environment"
+	exit 1
+fi
 
 echo "==> verifying embedded operations console through the control-plane Service"
 ROOT_STATUS=$(curl --silent --dump-header /tmp/swe-platform-console-root.headers \

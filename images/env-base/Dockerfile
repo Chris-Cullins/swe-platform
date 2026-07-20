@@ -35,6 +35,12 @@ FROM node:24-bookworm-slim AS claude-code
 ARG CLAUDE_CODE_VERSION=2.1.215
 RUN npm install -g "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}"
 
+FROM node:24-bookworm-slim AS amp-cli
+WORKDIR /opt/amp
+COPY images/env-base/amp/package.json images/env-base/amp/package-lock.json ./
+RUN npm ci --no-audit --no-fund \
+	&& test "$(AMP_SKIP_UPDATE_CHECK=1 ./node_modules/.bin/amp --version | cut -d' ' -f1)" = '0.0.1784492094-g5d18e2'
+
 # Base image for environments.
 FROM debian:12-slim AS environment
 
@@ -50,7 +56,9 @@ COPY --from=build /out/sandboxd /usr/local/bin/sandboxd
 COPY --from=tmux-build /src/tmux /usr/bin/tmux
 COPY --from=claude-code /usr/local/lib/node_modules/@anthropic-ai /usr/local/lib/node_modules/@anthropic-ai
 COPY --from=claude-code /usr/local/bin/claude /usr/local/bin/claude
-RUN claude --version
+COPY --from=amp-cli /opt/amp/node_modules/@ampcode/cli/bin/amp.exe /usr/local/bin/amp
+RUN claude --version \
+	&& test "$(AMP_SKIP_UPDATE_CHECK=1 amp --version | cut -d' ' -f1)" = '0.0.1784492094-g5d18e2'
 
 USER swe
 WORKDIR /workspace

@@ -22,8 +22,8 @@ browser sessions backed by repeated Kubernetes TokenReview/SAR authorization, an
 Run/Environment resource APIs for the console.
 Remaining gaps are marked `TODO(P0/P1/P2)` in code — most notably secure agent credential
 injection, additional agent adapters, GitHub App–scoped git tokens, and egress/portal
-networking. The first `claude-code` adapter is registered and uses sandboxd managed
-processes; tests use a fake process service and require no credentials.
+networking. The `claude-code` (default) and `amp` leaf adapters are registered and use
+sandboxd managed processes; tests use fake process services and require no credentials.
 
 ## Architecture invariants — do not violate these
 
@@ -97,6 +97,8 @@ runs both via `make` targets:
   image performs both stages in one multi-stage build.
 - **Windows portability:** CI runs focused sandboxd process, Exec, and filesystem tests
   on `windows-latest`; keep OS-specific tests behind build tags.
+- **Amp image portability:** CI builds the locked Amp CLI image stage and runs its exact
+  version smoke under `linux/amd64` and `linux/arm64` before the multi-architecture publish path.
 - **Regenerate deepcopy:** `make generate` · **CRDs + RBAC:** `make manifests`
   (`manifests` synchronizes chart CRDs; CI fails on a diff). Use `make check-chart-crds`
   to verify the checked-in Helm CRDs independently.
@@ -115,7 +117,9 @@ runs both via `make` targets:
   the chart README. Image publish runs attach a release manifest with the chart version
   and all three image digests.
 - **E2E acceptance:** `./hack/e2e.sh` — full kind + operator + `swe run` pass with the
-  env-base image built and loaded locally (no registry credentials needed). It also verifies
+  env-base image built and loaded locally (no registry credentials needed). It runs the
+  default Claude path and an explicit fake-Amp Run through Running, terminal success,
+  adapter-owned transcript replay, and cleanup. It also verifies
   control-plane TokenReview/SAR scoping, opaque browser session exchange/logout and CSRF,
   the embedded console entry point/SPA fallback/static assets, typed Run
   list/get/create/retry/cancel, Environment get, transcript SSE, and terminal attach.
@@ -124,7 +128,8 @@ runs both via `make` targets:
   its pinned tmux with `images/env-base/tmux-control-output-drain.patch`; keep the
   source checksum and patch synchronized when upgrading tmux. Its `terminal-test`
   target runs the patched-runtime terminal regression during `hack/e2e.sh`. The image
-  also includes a version-pinned Claude Code CLI for the default adapter.
+  also includes a version-pinned Claude Code CLI for the default adapter and the npm-locked,
+  integrity-pinned Amp CLI for the optional `amp` adapter.
 - **Publish images:** pushes to `main` and `v*` tags publish multi-architecture operator
   and env-base images to GHCR via `.github/workflows/publish-images.yaml`.
 

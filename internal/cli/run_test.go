@@ -19,6 +19,13 @@ import (
 	platformv1alpha1 "github.com/Chris-Cullins/swe-platform/api/v1alpha1"
 )
 
+func TestRunCommandKeepsClaudeCodeAsDefaultAdapter(t *testing.T) {
+	agent := newRunCommand().Flags().Lookup("agent")
+	if agent == nil || agent.DefValue != "claude-code" {
+		t.Fatalf("--agent default = %#v, want claude-code", agent)
+	}
+}
+
 func TestTerminalGatewayURL(t *testing.T) {
 	tests := []struct {
 		base string

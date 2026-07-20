@@ -14,8 +14,8 @@ with a reviewable diff, branch, or PR.
 > plane's WebSocket terminal endpoint connect to a shared tmux session through `sandboxd`;
 > pause/resume preserves workspace disks and runs repository resume hooks, and idle
 > environments pause automatically before terminal requests wake them. Template warm
-> pools keep unclaimed environments ready for `swe run` to claim. The first agent adapter
-> runs Claude Code through sandboxd's managed-process API. Portal proxying is not built yet.
+> pools keep unclaimed environments ready for `swe run` to claim. The `claude-code` and
+> `amp` leaf adapters run through sandboxd's managed-process API. Portal proxying is not built yet.
 > The Helm chart installs the
 > operator, control plane, and CRDs. Values presets
 > cover kind, k3s, GKE with GKE Sandbox, and EKS.
@@ -162,13 +162,23 @@ swe run --environment warm-env-1 "Fix the flaky test"
 swe cancel fix-flaky-42
 ```
 
-### Claude Code adapter
+### Agent adapters
 
 `claude-code` is the default `swe run` adapter. It starts one non-interactive `claude`
 process keyed by the immutable Run UID, observes and cancels that process through sandboxd,
 and restarts the same task identity in a fresh sandboxd epoch after an Environment resume.
-The coordinated `env-base` image includes a pinned Claude Code CLI. Custom Environment
-images must provide a compatible `claude` executable on `PATH`.
+Select Amp explicitly with `swe run --agent amp ...`; the operations console's Agent field
+accepts the same key. The coordinated `env-base` image includes pinned Claude Code and Amp
+CLIs. Custom Environment images must provide the selected `claude` or `amp` executable on
+`PATH`.
+
+Both adapters use sandboxd's retry-safe `ProcessKey{owner_id: Run UID, role: agent}` rather
+than a process-global agent session. Duplicate reconciliation and uncertain start responses
+therefore recover one execution in the current sandbox epoch. Resume starts one fresh process
+with the same Run task identity against the retained workspace. It does not continue a global
+or latest harness session.
+
+#### Claude Code
 
 The adapter runs Claude Code in print mode with stream JSON output and unattended
 permissions inside the isolated Environment. Bounded stdout/stderr chunks are forwarded as
@@ -191,6 +201,31 @@ successful result remains `Succeeded` even when its history contains permission 
 Non-success results, non-zero exits, missing executables, malformed/missing final result
 events, and permanent transcript rejection map to `Failed`. Transcript storage is currently
 process-local to one control-plane replica.
+
+#### Amp
+
+The Amp adapter runs the pinned `@ampcode/cli@0.0.1784492094-g5d18e2` once in explicit
+execute mode with `--stream-json`. The prompt is passed in Amp's documented
+`--execute=<message>` assignment form so leading flags remain prompt text. Each sandbox epoch
+creates a new Amp thread; the adapter never uses `amp last` or `amp threads continue`.
+`AMP_SKIP_UPDATE_CHECK=1` is set only on the managed Amp process.
+
+Bounded stdout and stderr are forwarded as opaque `amp.process-output` events with source
+`amp`. The events carry the execution ID, stream, absolute offset and next offset, retained
+bounds, exact gap bytes, EOF, and the opaque byte payload. A natural exit with code zero is
+successful only when the last non-empty stdout line is Amp's documented `result` record with
+subtype `success`, `is_error: false`, and the required result/session/stat fields. Documented
+`error_during_execution` and `error_max_turns` results, malformed or missing terminal records,
+non-zero or non-natural exits, start failures, absent process records, and permanent transcript
+rejection map to `Failed`.
+
+Real Amp runs require `AMP_API_KEY`, but this repository does not inject it, mount personal Amp
+settings, or treat ambient Project Secrets as adapter credential delivery. Secure, Run-scoped
+delivery remains owned by issue #9; until it lands, the real Amp adapter has an unmet runtime
+credential prerequisite. Unit tests and kind acceptance use a deterministic repository-local
+fake `amp` executable and require no credential or network access. Never put a credential in a
+Run prompt. Cancellation stops the local Run-owned process tree; Amp's public contract does not
+guarantee that abruptly killing the CLI also stops remote work already dispatched by that CLI.
 
 `--name` is the create idempotency key: retry an uncertain request with the same name and
 immutable task arguments. The CLI returns the existing Run only when its intent matches;

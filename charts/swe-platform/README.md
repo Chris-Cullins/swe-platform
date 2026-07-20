@@ -31,6 +31,14 @@ Each image publish run emits a `swe-platform-release-*` artifact containing the 
 version, app version, and the registry digest of every image for incident diagnosis and
 digest-pinned installation overrides.
 
+The published `env-base` image includes the pinned CLIs for the default `claude-code`
+adapter and the optional `amp` adapter. Select Amp with `swe run --agent amp ...` or enter
+`amp` in the operations console's Agent field. The chart and adapters do not inject agent
+provider credentials or mount personal harness settings. In particular, real Amp execution
+requires `AMP_API_KEY`, but secure Run-scoped delivery remains blocked on issue #9; ambient
+Project Secret exposure is not the credential solution. Kind acceptance uses a deterministic
+fake `amp` from its test repository and needs neither a credential nor network access.
+
 | Preset | Assumptions |
 |---|---|
 | `values-kind.yaml` | Local kind development with `:dev` images; explicitly permits insecure HTTP browser sessions. |
