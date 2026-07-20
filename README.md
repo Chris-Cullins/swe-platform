@@ -14,8 +14,8 @@ with a reviewable diff, branch, or PR.
 > plane's WebSocket terminal endpoint connect to a shared tmux session through `sandboxd`;
 > pause/resume preserves workspace disks and runs repository resume hooks, and idle
 > environments pause automatically before terminal requests wake them. Template warm
-> pools keep unclaimed environments ready for `swe run` to claim. The first agent adapter
-> runs Claude Code through sandboxd's managed-process API. Portal proxying is not built yet.
+> pools keep unclaimed environments ready for `swe run` to claim. Claude Code and Pi agent
+> adapters run through sandboxd's managed-process API. Portal proxying is not built yet.
 > The Helm chart installs the
 > operator, control plane, and CRDs. Values presets
 > cover kind, k3s, GKE with GKE Sandbox, and EKS.
@@ -302,6 +302,35 @@ other credential types are rejected before dialing. The selected agent and same-
 can still read or disclose it; stronger credential isolation and additional credential forms
 remain issue #9 limitations. Acceptance tests use a fake Codex executable and no provider or
 network access.
+
+### Pi adapter
+
+Select Pi with `swe run --agent pi`. The coordinated `env-base` image installs
+`@earendil-works/pi-coding-agent@0.80.10` with its pinned npm integrity and Node 24;
+custom Environment images must provide a compatible `pi` executable and Node >=22.19 on
+`PATH`.
+
+The adapter runs one-shot `pi --mode json` under a Run-UID-keyed sandboxd process. Sessions
+are ephemeral (`--no-session`), `PI_CODING_AGENT_DIR` is isolated at
+the workspace-relative, OS-portable `.swe-platform/pi/<Run UID>`, and project
+approval/settings plus extension, skill,
+prompt-template, theme, context-file, package-resource, and startup-network discovery are disabled. It
+never continues or resumes a latest/partial session. A zero process exit succeeds only when
+the complete retained stream ends with `agent_settled` after a non-retrying `agent_end`
+whose final assistant message has `stopReason: "stop"`;
+error, abort, unknown, malformed, absent, and non-zero outcomes fail explicitly.
+
+Bounded stdout and stderr chunks are forwarded unchanged as opaque `pi.process-output`
+events. The events preserve execution identity, absolute offsets, retained-buffer gaps, and
+content-addressed idempotency keys so retries and fresh sandbox epochs cannot silently splice
+streams.
+
+Pi authentication must already be available through provider environment variables inside
+the Environment. The adapter does not read a shared Pi home or `auth.json`, inject keys, log
+credentials, or include any credential in the image. Secure Run-scoped credential delivery
+remains blocked on issue #9; until it exists, operators must provision authentication at the
+Environment layer and accept that it is not scoped to one adapter process. Never put a
+credential in a Run prompt.
 
 `--name` is the create idempotency key: retry an uncertain request with the same name and
 immutable task arguments. The CLI returns the existing Run only when its intent matches;
