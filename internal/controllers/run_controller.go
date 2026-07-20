@@ -7,7 +7,9 @@ import (
 	"fmt"
 	"reflect"
 	"time"
+	"unicode/utf8"
 
+	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	apiMeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -30,6 +32,7 @@ import (
 const runFinalizer = "swe.dev/run-cleanup"
 
 const adapterPollInterval = 2 * time.Second
+const credentialReadyTimeout = time.Minute
 
 var errAllocatedEnvironmentGone = errors.New("allocated environment is gone or no longer claimed by this run")
 var errExplicitEnvironmentClaimed = errors.New("explicit environment is already claimed")
@@ -44,6 +47,7 @@ var ErrAdapterEventRejected = errors.New("adapter event permanently rejected")
 
 const (
 	runConditionEnvironmentReady           = "EnvironmentReady"
+	runConditionCredentialProfileBound     = "CredentialProfileBound"
 	runConditionAdapterAcceptanceAttempted = "AdapterAcceptanceAttempted"
 	runConditionAdapterAccepted            = "AdapterAccepted"
 )
@@ -64,6 +68,13 @@ const (
 type AdapterTask struct {
 	ID     string
 	Prompt string
+}
+
+// AdapterCredential is ephemeral launch-only credential material. Callers must
+// not retain APIKey after EnsureAccepted returns.
+type AdapterCredential struct {
+	Type   platformv1alpha1.AgentCredentialType
+	APIKey []byte
 }
 
 // AdapterEvent is an adapter-owned transcript event carried by the platform's
@@ -96,7 +107,7 @@ type AdapterSandbox struct {
 // when work is already absent or terminal and returns
 // ErrAdapterCancellationPending while its execution tree is still stopping.
 type AdapterLifecycle interface {
-	EnsureAccepted(context.Context, AdapterTask, AdapterSandbox) error
+	EnsureAccepted(context.Context, AdapterTask, AdapterSandbox, *AdapterCredential) error
 	Observe(context.Context, AdapterTask, AdapterSandbox) (AdapterObservation, string, error)
 	Cancel(context.Context, AdapterTask, AdapterSandbox) error
 }
@@ -106,6 +117,7 @@ type AdapterLifecycle interface {
 // and declared-service processes inside the Environment.
 type RunReconciler struct {
 	client.Client
+	APIReader client.Reader
 	Scheme    *runtime.Scheme
 	Adapters  map[string]AdapterLifecycle
 	EventSink AdapterEventSink
@@ -117,6 +129,8 @@ type RunReconciler struct {
 // +kubebuilder:rbac:groups=swe.dev,resources=environments,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=swe.dev,resources=environments/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=swe.dev,resources=projects,verbs=get;list;watch
+// +kubebuilder:rbac:groups=swe.dev,resources=agentcredentialprofiles,verbs=get;list;watch
+// +kubebuilder:rbac:groups="",resources=secrets,verbs=get
 
 func (r *RunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	var run platformv1alpha1.Run
@@ -152,6 +166,12 @@ func (r *RunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.R
 		}
 		run.Status.EnvironmentRef = ref
 		return ctrl.Result{Requeue: true}, r.setRunState(ctx, &run, platformv1alpha1.RunStateAllocating, "EnvironmentRecovered", fmt.Sprintf("recovered environment %s before cancellation", ref.Name), false)
+	}
+	if run.Status.EnvironmentRef == nil {
+		result, done, err := r.ensureCredentialBinding(ctx, &run)
+		if done || err != nil {
+			return result, err
+		}
 	}
 	if !controllerutil.ContainsFinalizer(&run, runFinalizer) {
 		controllerutil.AddFinalizer(&run, runFinalizer)
@@ -246,7 +266,21 @@ func (r *RunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.R
 		if !acceptanceAttempted(&run) {
 			return ctrl.Result{Requeue: true}, r.markAcceptanceAttempted(ctx, &run)
 		}
-		if err := adapter.EnsureAccepted(ctx, adapterTask(&run), r.adapterSandbox(&run, env)); err != nil {
+		credential, reason, err := r.resolveCredential(ctx, &run)
+		if err != nil {
+			if reason == "ProfileNotFound" || reason == "SecretNotReady" {
+				result, _, waitErr := r.waitForCredential(ctx, &run, reason, err.Error())
+				return result, waitErr
+			}
+			if reason == "" {
+				return ctrl.Result{}, err
+			}
+			return ctrl.Result{}, r.failCredential(ctx, &run, reason, err.Error())
+		}
+		if credential != nil {
+			defer clear(credential.APIKey)
+		}
+		if err := adapter.EnsureAccepted(ctx, adapterTask(&run), r.adapterSandbox(&run, env), credential); err != nil {
 			return ctrl.Result{}, err
 		}
 		return ctrl.Result{Requeue: true}, r.setRunState(ctx, &run, platformv1alpha1.RunStateAdapterAccepted, "AdapterAccepted", "adapter accepted the task", true)
@@ -275,6 +309,146 @@ func (r *RunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.R
 		return ctrl.Result{}, err
 	}
 	return ctrl.Result{RequeueAfter: adapterPollInterval}, nil
+}
+
+func (r *RunReconciler) apiReader() client.Reader {
+	if r.APIReader != nil {
+		return r.APIReader
+	}
+	return r.Client // Unit-test fallback only; managers set APIReader in SetupWithManager.
+}
+
+func (r *RunReconciler) ensureCredentialBinding(ctx context.Context, run *platformv1alpha1.Run) (ctrl.Result, bool, error) {
+	if run.Spec.CredentialProfileRef == "" {
+		condition := apiMeta.FindStatusCondition(run.Status.Conditions, runConditionCredentialProfileBound)
+		if condition == nil || condition.Status != metav1.ConditionTrue || condition.Reason != "Credentialless" {
+			apiMeta.SetStatusCondition(&run.Status.Conditions, metav1.Condition{Type: runConditionCredentialProfileBound, Status: metav1.ConditionTrue, Reason: "Credentialless", Message: "no credential profile selected", ObservedGeneration: run.Generation})
+		}
+		return ctrl.Result{}, false, nil
+	}
+	if run.Status.CredentialProfileRef != nil && run.Status.CredentialProfileRef.Name != run.Spec.CredentialProfileRef {
+		return ctrl.Result{}, true, r.failCredential(ctx, run, "ProfileReplaced", "bound credential profile does not match the selected profile")
+	}
+
+	var profile platformv1alpha1.AgentCredentialProfile
+	err := r.apiReader().Get(ctx, types.NamespacedName{Namespace: run.Namespace, Name: run.Spec.CredentialProfileRef}, &profile)
+	if apierrors.IsNotFound(err) {
+		return r.waitForCredential(ctx, run, "ProfileNotFound", "credential profile is not ready")
+	}
+	if err != nil {
+		return ctrl.Result{}, true, err
+	}
+	if run.Status.CredentialProfileRef != nil && run.Status.CredentialProfileRef.UID != profile.UID {
+		return ctrl.Result{}, true, r.failCredential(ctx, run, "ProfileReplaced", "bound credential profile was replaced")
+	}
+	if profile.Spec.Adapter != run.Spec.Agent {
+		return ctrl.Result{}, true, r.failCredential(ctx, run, "AdapterMismatch", "credential profile does not permit this adapter")
+	}
+	if profile.Spec.CredentialType != platformv1alpha1.AgentCredentialTypeAPIKey {
+		return ctrl.Result{}, true, r.failCredential(ctx, run, "UnsupportedCredentialType", "credential profile type is unsupported")
+	}
+	if run.Status.CredentialProfileRef == nil {
+		before := run.Status.DeepCopy()
+		run.Status.CredentialProfileRef = &platformv1alpha1.RunCredentialProfileReference{Name: profile.Name, UID: profile.UID}
+		apiMeta.SetStatusCondition(&run.Status.Conditions, metav1.Condition{Type: runConditionCredentialProfileBound, Status: metav1.ConditionTrue, Reason: "Bound", Message: "credential profile identity is bound", ObservedGeneration: run.Generation})
+		if !reflect.DeepEqual(*before, run.Status) {
+			return ctrl.Result{Requeue: true}, true, r.Status().Update(ctx, run)
+		}
+	}
+	credential, reason, err := r.resolveCredential(ctx, run)
+	if credential != nil {
+		clear(credential.APIKey)
+	}
+	if err != nil {
+		if reason == "SecretNotReady" {
+			return r.waitForCredential(ctx, run, reason, "credential secret is not ready")
+		}
+		if reason == "" {
+			return ctrl.Result{}, true, err
+		}
+		return ctrl.Result{}, true, r.failCredential(ctx, run, reason, err.Error())
+	}
+	condition := apiMeta.FindStatusCondition(run.Status.Conditions, runConditionCredentialProfileBound)
+	if condition == nil || condition.Status != metav1.ConditionTrue || condition.Reason != "Bound" {
+		apiMeta.SetStatusCondition(&run.Status.Conditions, metav1.Condition{Type: runConditionCredentialProfileBound, Status: metav1.ConditionTrue, Reason: "Bound", Message: "credential profile identity is bound", ObservedGeneration: run.Generation})
+		return ctrl.Result{Requeue: true}, true, r.Status().Update(ctx, run)
+	}
+	return ctrl.Result{}, false, nil
+}
+
+func (r *RunReconciler) waitForCredential(ctx context.Context, run *platformv1alpha1.Run, reason, message string) (ctrl.Result, bool, error) {
+	condition := apiMeta.FindStatusCondition(run.Status.Conditions, runConditionCredentialProfileBound)
+	if condition != nil && condition.Status == metav1.ConditionFalse && condition.Reason == reason {
+		remaining := credentialReadyTimeout - time.Since(condition.LastTransitionTime.Time)
+		if remaining <= 0 {
+			return ctrl.Result{}, true, r.failCredential(ctx, run, reason, message)
+		}
+		return ctrl.Result{RequeueAfter: remaining}, true, nil
+	}
+	apiMeta.SetStatusCondition(&run.Status.Conditions, metav1.Condition{Type: runConditionCredentialProfileBound, Status: metav1.ConditionFalse, Reason: reason, Message: message, ObservedGeneration: run.Generation})
+	return ctrl.Result{RequeueAfter: credentialReadyTimeout}, true, r.Status().Update(ctx, run)
+}
+
+func (r *RunReconciler) failCredential(ctx context.Context, run *platformv1alpha1.Run, reason, message string) error {
+	apiMeta.SetStatusCondition(&run.Status.Conditions, metav1.Condition{Type: runConditionCredentialProfileBound, Status: metav1.ConditionFalse, Reason: reason, Message: message, ObservedGeneration: run.Generation})
+	return r.setRunState(ctx, run, platformv1alpha1.RunStateFailed, reason, message, run.Status.EnvironmentRef != nil)
+}
+
+func (r *RunReconciler) resolveCredential(ctx context.Context, run *platformv1alpha1.Run) (*AdapterCredential, string, error) {
+	if run.Spec.CredentialProfileRef == "" {
+		return nil, "", nil
+	}
+	bound := run.Status.CredentialProfileRef
+	if bound == nil {
+		return nil, "MalformedSecret", errors.New("credential profile is not bound")
+	}
+	var profile platformv1alpha1.AgentCredentialProfile
+	if err := r.apiReader().Get(ctx, types.NamespacedName{Namespace: run.Namespace, Name: bound.Name}, &profile); err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil, "ProfileNotFound", errors.New("bound credential profile is not ready")
+		}
+		return nil, "", err
+	}
+	if profile.UID != bound.UID {
+		return nil, "ProfileReplaced", errors.New("bound credential profile was replaced")
+	}
+	if profile.Spec.Adapter != run.Spec.Agent {
+		return nil, "AdapterMismatch", errors.New("credential profile does not permit this adapter")
+	}
+	if profile.Spec.CredentialType != platformv1alpha1.AgentCredentialTypeAPIKey {
+		return nil, "UnsupportedCredentialType", errors.New("credential profile type is unsupported")
+	}
+	var secret corev1.Secret
+	key := types.NamespacedName{Namespace: run.Namespace, Name: platformv1alpha1.AgentCredentialSecretName(profile.UID)}
+	if err := r.apiReader().Get(ctx, key, &secret); err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil, "SecretNotReady", errors.New("credential secret is not ready")
+		}
+		return nil, "", err
+	}
+	defer func() {
+		for _, value := range secret.Data {
+			clear(value)
+		}
+	}()
+	owner := metav1.GetControllerOf(&secret)
+	if owner == nil || owner.APIVersion != platformv1alpha1.GroupVersion.String() || owner.Kind != "AgentCredentialProfile" || owner.Name != profile.Name || owner.UID != profile.UID {
+		return nil, "ForeignSecret", errors.New("credential secret is not controlled by the bound profile")
+	}
+	value, ok := secret.Data[platformv1alpha1.AgentCredentialAPIKeySecretKey]
+	if secret.Type != platformv1alpha1.AgentCredentialAPIKeySecretType || len(secret.Data) != 1 || !ok || len(value) == 0 || len(value) > platformv1alpha1.AgentCredentialAPIKeyMaxBytes || !utf8.Valid(value) || bytesContainNUL(value) {
+		return nil, "MalformedSecret", errors.New("credential secret is malformed")
+	}
+	return &AdapterCredential{Type: platformv1alpha1.AgentCredentialTypeAPIKey, APIKey: append([]byte(nil), value...)}, "", nil
+}
+
+func bytesContainNUL(value []byte) bool {
+	for _, b := range value {
+		if b == 0 {
+			return true
+		}
+	}
+	return false
 }
 
 func (r *RunReconciler) allocateEnvironment(ctx context.Context, run *platformv1alpha1.Run) (*platformv1alpha1.RunEnvironmentReference, error) {
@@ -760,6 +934,7 @@ func (r *RunReconciler) adapterSandbox(run *platformv1alpha1.Run, env *platformv
 // SetupWithManager registers Run watches. Owned Environments enqueue through
 // Owns; claimed Environments enqueue Runs selected by their exact reference.
 func (r *RunReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	r.APIReader = mgr.GetAPIReader()
 	environmentEvents := builder.WithPredicates(predicate.Funcs{
 		CreateFunc:  func(event.CreateEvent) bool { return true },
 		DeleteFunc:  func(event.DeleteEvent) bool { return true },

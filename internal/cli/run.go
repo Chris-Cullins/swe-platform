@@ -11,19 +11,21 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/validation"
 
 	platformv1alpha1 "github.com/Chris-Cullins/swe-platform/api/v1alpha1"
 )
 
 func newRunCommand() *cobra.Command {
 	var (
-		template    string
-		project     string
-		environment string
-		agent       string
-		name        string
-		wait        bool
-		timeout     time.Duration
+		template          string
+		project           string
+		environment       string
+		agent             string
+		name              string
+		credentialProfile string
+		wait              bool
+		timeout           time.Duration
 	)
 
 	cmd := &cobra.Command{
@@ -32,7 +34,7 @@ func newRunCommand() *cobra.Command {
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			namespace, _ := cmd.Flags().GetString("namespace")
-			return runEnvironment(cmd.Context(), namespace, name, template, project, environment, agent, args[0], wait, timeout)
+			return runEnvironmentWithCredential(cmd.Context(), namespace, name, template, project, environment, agent, args[0], credentialProfile, wait, timeout)
 		},
 	}
 
@@ -41,20 +43,32 @@ func newRunCommand() *cobra.Command {
 	cmd.Flags().StringVarP(&project, "project", "p", "", "Project providing the default template and environment configuration")
 	cmd.Flags().StringVarP(&environment, "environment", "e", "", "Existing unclaimed Environment to reuse (exclusive with --template/--project)")
 	cmd.Flags().StringVar(&agent, "agent", "claude-code", "Agent adapter to run")
+	cmd.Flags().StringVar(&credentialProfile, "credential-profile", "", "AgentCredentialProfile to use")
 	cmd.Flags().BoolVar(&wait, "wait", true, "Wait for the adapter to start or the Run to finish")
 	cmd.Flags().DurationVar(&timeout, "timeout", 5*time.Minute, "How long to wait for the Run")
 	return cmd
 }
 
 func runEnvironment(ctx context.Context, namespace, name, template, project, environment, agent, prompt string, wait bool, timeout time.Duration) error {
+	return runEnvironmentWithCredential(ctx, namespace, name, template, project, environment, agent, prompt, "", wait, timeout)
+}
+
+func runEnvironmentWithCredential(ctx context.Context, namespace, name, template, project, environment, agent, prompt, credentialProfile string, wait bool, timeout time.Duration) error {
 	clients, err := newKubeClients()
 	if err != nil {
 		return err
 	}
-	return createRun(ctx, clients, namespace, name, template, project, environment, agent, prompt, wait, timeout)
+	return createRunWithCredential(ctx, clients, namespace, name, template, project, environment, agent, prompt, credentialProfile, wait, timeout)
 }
 
 func createRun(ctx context.Context, clients *kubeClients, namespace, name, template, project, environment, agent, prompt string, wait bool, timeout time.Duration) error {
+	return createRunWithCredential(ctx, clients, namespace, name, template, project, environment, agent, prompt, "", wait, timeout)
+}
+
+func createRunWithCredential(ctx context.Context, clients *kubeClients, namespace, name, template, project, environment, agent, prompt, credentialProfile string, wait bool, timeout time.Duration) error {
+	if credentialProfile != "" && len(validation.IsDNS1123Subdomain(credentialProfile)) != 0 {
+		return fmt.Errorf("--credential-profile must be a Kubernetes DNS subdomain")
+	}
 	if environment == "" && template == "" && project == "" {
 		return fmt.Errorf("an environment, template, or project is required")
 	}
@@ -68,11 +82,12 @@ func createRun(ctx context.Context, clients *kubeClients, namespace, name, templ
 	run := &platformv1alpha1.Run{
 		ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: name},
 		Spec: platformv1alpha1.RunSpec{
-			EnvironmentRef: environment,
-			ProjectRef:     project,
-			TemplateRef:    template,
-			Agent:          agent,
-			Prompt:         prompt,
+			EnvironmentRef:       environment,
+			ProjectRef:           project,
+			TemplateRef:          template,
+			Agent:                agent,
+			Prompt:               prompt,
+			CredentialProfileRef: credentialProfile,
 		},
 	}
 	if err := clients.Create(ctx, run); err != nil {

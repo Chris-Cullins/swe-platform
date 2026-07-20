@@ -19,6 +19,7 @@ runs in them, and streams their output back to your terminal.`,
 
 	root.AddCommand(
 		newRunCommand(),
+		newCredentialsCommand(),
 		newCancelCommand(),
 		newLogsCommand(),
 		newAttachCommand(),

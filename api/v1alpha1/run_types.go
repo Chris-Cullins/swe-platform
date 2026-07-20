@@ -25,7 +25,7 @@ const (
 // A Run either claims environmentRef or asks the controller to allocate an
 // Environment from templateRef/projectRef.
 // +kubebuilder:validation:XValidation:rule="has(self.environmentRef) ? (!has(self.templateRef) && !has(self.projectRef)) : (has(self.templateRef) || has(self.projectRef))",message="set environmentRef or templateRef/projectRef, not both"
-// +kubebuilder:validation:XValidation:rule="self.agent == oldSelf.agent && self.prompt == oldSelf.prompt && ((!has(self.environmentRef) && !has(oldSelf.environmentRef)) || (has(self.environmentRef) && has(oldSelf.environmentRef) && self.environmentRef == oldSelf.environmentRef)) && ((!has(self.projectRef) && !has(oldSelf.projectRef)) || (has(self.projectRef) && has(oldSelf.projectRef) && self.projectRef == oldSelf.projectRef)) && ((!has(self.templateRef) && !has(oldSelf.templateRef)) || (has(self.templateRef) && has(oldSelf.templateRef) && self.templateRef == oldSelf.templateRef))",message="agent, prompt, and environment selection are immutable"
+// +kubebuilder:validation:XValidation:rule="self.agent == oldSelf.agent && self.prompt == oldSelf.prompt && ((!has(self.environmentRef) && !has(oldSelf.environmentRef)) || (has(self.environmentRef) && has(oldSelf.environmentRef) && self.environmentRef == oldSelf.environmentRef)) && ((!has(self.projectRef) && !has(oldSelf.projectRef)) || (has(self.projectRef) && has(oldSelf.projectRef) && self.projectRef == oldSelf.projectRef)) && ((!has(self.templateRef) && !has(oldSelf.templateRef)) || (has(self.templateRef) && has(oldSelf.templateRef) && self.templateRef == oldSelf.templateRef)) && ((!has(self.credentialProfileRef) && !has(oldSelf.credentialProfileRef)) || (has(self.credentialProfileRef) && has(oldSelf.credentialProfileRef) && self.credentialProfileRef == oldSelf.credentialProfileRef))",message="agent, prompt, environment selection, and credential profile are immutable"
 // +kubebuilder:validation:XValidation:rule="!has(oldSelf.cancel) || !oldSelf.cancel || (has(self.cancel) && self.cancel)",message="cancel cannot be unset"
 type RunSpec struct {
 	// EnvironmentRef claims an existing Environment. Claimed Environments are
@@ -44,6 +44,13 @@ type RunSpec struct {
 	// +optional
 	// +kubebuilder:validation:MinLength=1
 	TemplateRef string `json:"templateRef,omitempty"`
+
+	// CredentialProfileRef selects an AgentCredentialProfile for this run.
+	// +optional
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=253
+	// +kubebuilder:validation:Pattern=`^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$`
+	CredentialProfileRef string `json:"credentialProfileRef,omitempty"`
 
 	// Agent names the agent adapter to use (e.g. claude-code, aider).
 	Agent string `json:"agent"`
@@ -89,6 +96,12 @@ type RunEnvironmentReference struct {
 	Ownership EnvironmentOwnership `json:"ownership"`
 }
 
+// RunCredentialProfileReference records the exact credential profile selected for a Run.
+type RunCredentialProfileReference struct {
+	Name string    `json:"name"`
+	UID  types.UID `json:"uid"`
+}
+
 // RunUsage records consumption attributable to a run.
 type RunUsage struct {
 	// +optional
@@ -108,6 +121,11 @@ type RunStatus struct {
 	// remains as historical identity after terminal cleanup.
 	// +optional
 	EnvironmentRef *RunEnvironmentReference `json:"environmentRef,omitempty"`
+
+	// CredentialProfileRef is the exact profile incarnation selected for this Run.
+	// It remains as historical identity after the Run terminates.
+	// +optional
+	CredentialProfileRef *RunCredentialProfileReference `json:"credentialProfileRef,omitempty"`
 
 	// ObservedGeneration is the Run generation reflected by this status.
 	// +optional

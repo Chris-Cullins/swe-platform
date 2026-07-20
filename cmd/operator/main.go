@@ -95,6 +95,7 @@ func main() {
 	}
 	if err := (&controllers.RunReconciler{
 		Client:    mgr.GetClient(),
+		APIReader: mgr.GetAPIReader(),
 		Scheme:    mgr.GetScheme(),
 		Adapters:  registeredAdapters(),
 		EventSink: eventSink,

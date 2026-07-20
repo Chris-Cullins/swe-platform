@@ -28,17 +28,19 @@ type RunSelector struct {
 // CreateRunRequest is the immutable intent accepted by the Run create API.
 // Name is required and acts as the retry/idempotency key.
 type CreateRunRequest struct {
-	Name     string      `json:"name"`
-	Selector RunSelector `json:"selector"`
-	Agent    string      `json:"agent"`
-	Prompt   string      `json:"prompt"`
+	Name              string      `json:"name"`
+	Selector          RunSelector `json:"selector"`
+	Agent             string      `json:"agent"`
+	Prompt            string      `json:"prompt"`
+	CredentialProfile string      `json:"credentialProfile,omitempty"`
 }
 
 // RunIntent is the immutable portion of a Run exposed to API clients.
 type RunIntent struct {
-	Selector RunSelector `json:"selector"`
-	Agent    string      `json:"agent"`
-	Prompt   string      `json:"prompt"`
+	Selector          RunSelector `json:"selector"`
+	Agent             string      `json:"agent"`
+	Prompt            string      `json:"prompt"`
+	CredentialProfile string      `json:"credentialProfile,omitempty"`
 }
 
 // RunEnvironment identifies the controller-selected allocation without

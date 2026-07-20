@@ -90,7 +90,7 @@ func terminalEnvironment(err error) error {
 
 const (
 	sandboxdCredentialMount    = "/var/run/swe-platform/sandboxd"
-	sandboxdSecurityRevision   = "2"
+	sandboxdSecurityRevision   = "3"
 	sandboxdRevisionAnnotation = "swe.dev/sandboxd-security-revision"
 	environmentFinalizer       = "swe.dev/environment-security"
 )
@@ -835,13 +835,6 @@ func (r *EnvironmentReconciler) ensurePod(ctx context.Context, env *platformv1al
 			},
 			VolumeMounts: []corev1.VolumeMount{{Name: "workspace", MountPath: "/workspace"}},
 		}}
-		if project.Spec.SecretRef != nil {
-			projectSecret := []corev1.EnvFromSource{{
-				SecretRef: &corev1.SecretEnvSource{LocalObjectReference: *project.Spec.SecretRef},
-			}}
-			pod.Spec.InitContainers[0].EnvFrom = projectSecret
-			pod.Spec.Containers[0].EnvFrom = projectSecret
-		}
 	}
 	if err := controllerutil.SetControllerReference(env, &pod, r.Scheme); err != nil {
 		return nil, err

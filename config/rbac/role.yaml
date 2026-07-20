@@ -41,6 +41,16 @@ rules:
 - apiGroups:
   - swe.dev
   resources:
+  - agentcredentialprofiles
+  - environmenttemplates
+  - projects
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - swe.dev
+  resources:
   - environments
   verbs:
   - create
@@ -60,15 +70,6 @@ rules:
   - get
   - patch
   - update
-- apiGroups:
-  - swe.dev
-  resources:
-  - environmenttemplates
-  - projects
-  verbs:
-  - get
-  - list
-  - watch
 - apiGroups:
   - swe.dev
   resources:

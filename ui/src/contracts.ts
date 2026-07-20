@@ -21,6 +21,7 @@ export interface CreateRun {
   selector: Selector
   agent: string
   prompt: string
+  credentialProfile?: string
 }
 
 export interface Run {
@@ -31,6 +32,7 @@ export interface Run {
     selector: Selector
     agent: string
     prompt: string
+    credentialProfile?: string
   }
   cancelRequested: boolean
   state: string

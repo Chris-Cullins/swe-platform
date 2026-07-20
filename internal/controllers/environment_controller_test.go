@@ -34,7 +34,7 @@ import (
 	sandboxdauth "github.com/Chris-Cullins/swe-platform/sandboxd/auth"
 )
 
-func TestEnsurePodInjectsProjectSecret(t *testing.T) {
+func TestEnsurePodUsesOnlyNonSecretProjectValues(t *testing.T) {
 	scheme := runtime.NewScheme()
 	if err := corev1.AddToScheme(scheme); err != nil {
 		t.Fatal(err)
@@ -47,7 +47,6 @@ func TestEnsurePodInjectsProjectSecret(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{Name: "example", Namespace: "default"},
 		Spec: platformv1alpha1.ProjectSpec{
 			Repositories: []string{"https://github.com/example/repo"},
-			SecretRef:    &corev1.LocalObjectReference{Name: "project-config"},
 		},
 	}
 	reconciler := &EnvironmentReconciler{
@@ -69,12 +68,8 @@ func TestEnsurePodInjectsProjectSecret(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ensurePod() error = %v", err)
 	}
-	if len(pod.Spec.Containers[0].EnvFrom) != 1 {
-		t.Fatalf("EnvFrom length = %d, want 1", len(pod.Spec.Containers[0].EnvFrom))
-	}
-	secretRef := pod.Spec.Containers[0].EnvFrom[0].SecretRef
-	if secretRef == nil || secretRef.Name != "project-config" {
-		t.Fatalf("SecretRef = %#v, want project-config", secretRef)
+	if len(pod.Spec.Containers[0].EnvFrom) != 0 {
+		t.Fatalf("environment EnvFrom = %#v, want no ambient project secrets", pod.Spec.Containers[0].EnvFrom)
 	}
 	if len(pod.Spec.InitContainers) != 1 {
 		t.Fatalf("InitContainers length = %d, want 1", len(pod.Spec.InitContainers))
@@ -91,8 +86,8 @@ func TestEnsurePodInjectsProjectSecret(t *testing.T) {
 		envValues["SWE_HOOK_TIMEOUT"] != projectHookTimeout || envValues["SWE_HOOK_KILL_AFTER"] != hookKillAfter {
 		t.Errorf("init container Env = %#v, want repository and bounded hook timeout", setup.Env)
 	}
-	if len(setup.EnvFrom) != 1 || setup.EnvFrom[0].SecretRef == nil || setup.EnvFrom[0].SecretRef.Name != "project-config" {
-		t.Errorf("init container EnvFrom = %#v, want project-config Secret", setup.EnvFrom)
+	if len(setup.EnvFrom) != 0 {
+		t.Errorf("init container EnvFrom = %#v, want no ambient project secrets", setup.EnvFrom)
 	}
 	if len(setup.VolumeMounts) != 1 || setup.VolumeMounts[0].MountPath != "/workspace" {
 		t.Errorf("init container VolumeMounts = %#v, want /workspace", setup.VolumeMounts)
@@ -639,7 +634,7 @@ func TestPodReplacementWithdrawsReadinessBeforeDeletion(t *testing.T) {
 			ObservedGeneration: 3, Reason: "SandboxdReady", Message: "sandboxd is ready"}},
 	}}
 	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: envPodName(env), Namespace: env.Namespace, UID: "old-pod",
-		Annotations: map[string]string{sandboxdRevisionAnnotation: "1"}}}
+		Annotations: map[string]string{sandboxdRevisionAnnotation: "2"}}}
 	if err := controllerutil.SetControllerReference(env, pod, scheme); err != nil {
 		t.Fatal(err)
 	}

@@ -37,7 +37,7 @@ with a reviewable diff, branch, or PR.
 |---|---|
 | **Environment** | One ephemeral machine an agent works in (pod + volume + network policy) |
 | **Run** | One agent task executing in an environment |
-| **Project** | One or more git repos + config: secrets, setup hooks, size, changes workflow |
+| **Project** | One or more git repos + config: setup hooks, size, changes workflow |
 | **Template** | Environment class: image, size, runtime, egress rules, warm pool |
 | **Inbox** | Addressable message queue per run — how agents talk to each other |
 | **Portal** | Authenticated URL exposing a dev server inside an environment |
@@ -152,7 +152,13 @@ in `default`. Production installation assumptions and k3s/GKE/EKS presets are do
 in the [chart README](charts/swe-platform/README.md).
 
 Create runs with an explicit template, or reference a `Project` to use its default
-template and inject the environment variables from `spec.secretRef` into the environment:
+template:
+
+> **Breaking v1alpha1 credential migration:** `Project.spec.secretRef` has been removed
+> and is now rejected by CRD admission. Upgrading also replaces existing Environment pods
+> so previously injected ambient Secret values are removed. Private repository clones and
+> `.agents/setup` or `.agents/resume` hooks that relied on those values will break. There is
+> no fallback; purpose-scoped Git and setup credentials remain future work.
 
 ```sh
 swe run --template small "Fix the flaky test"
@@ -179,12 +185,32 @@ The process output and sandboxd records are epoch-local; the workspace PVC and a
 ingested transcript events survive pause. A resumed run therefore restarts the prompt against
 the preserved workspace rather than checkpointing the old Claude process or session.
 
-Claude Code authentication must already be available inside the Environment through one of
-Claude Code's supported non-interactive authentication mechanisms. The adapter does not read,
-mount, mint, log, or add credentials, and the image contains none. Adapter-scoped credential
-delivery and GitHub App token minting remain blocked on issue #9; until that exists, operators
-must provision authentication at the Environment layer and accept that it is not yet scoped
-to one adapter process. Never put a credential in a Run prompt.
+The v1alpha1 credential API models Claude authentication as an `AgentCredentialProfile` with
+`credentialType: APIKey`, selected by a Run's `spec.credentialProfileRef`. API keys are the
+only supported profile credential type. The CLI creates an owner-linked, same-namespace
+backing Secret and never prints the key or Secret representation:
+
+```sh
+secret-tool lookup service anthropic | swe credentials create anthropic --agent claude-code --api-key-stdin
+swe run --project org-repo --credential-profile anthropic "Fix the flaky test"
+secret-tool lookup service anthropic | swe credentials rotate anthropic --api-key-stdin
+swe credentials list
+```
+
+Immediately before adapter acceptance, the operator revalidates the bound profile UID and its
+exact backing Secret through uncached reads. sandboxd supplies the key as `ANTHROPIC_API_KEY`
+only to the selected Claude child process; it is absent from public process specifications,
+setup/resume hooks, the sandboxd environment, and ordinary sandboxd executions. Rotation does
+not restart or compare an existing process; a fresh sandbox epoch reads the newest key.
+
+This boundary prevents automatic platform-wide exposure, not disclosure by the selected agent
+or its descendants, repository wrappers left by setup, same-UID peers, or explicit process
+output. Transcript redaction is not guaranteed. Anyone authorized to create Runs in a namespace
+can initially select any profile there; profile creation and rotation additionally require
+Secret and CRD administration. Subscription/OAuth credentials, refresh and writeback, leases,
+Amp login persistence, per-user profiles, Git/setup/service credentials, hard same-user
+isolation, and stronger redaction remain deferred to issue #9. Never place credentials in a Run
+prompt or Project configuration.
 
 Current limitations: Claude print mode has no live input continuation channel, so an exit-zero
 successful result remains `Succeeded` even when its history contains permission denials.
@@ -200,9 +226,9 @@ The repository configured on a Project is cloned into `/workspace` when its
 environment is created. If the repository contains `.agents/setup`, the hook runs once
 after checkout. Set `Environment.spec.paused` to `true` to delete the pod while retaining
 its workspace PVC, then set it to `false` to create a fresh pod; `.agents/resume` runs
-after the volume is reattached. Both hooks can use values from the Project Secret, which
-also remains available to the running environment. Setup and resume hooks are limited to
-30 minutes each. Failed or completed environment pods are replaced with bounded exponential
+after the volume is reattached. Setup and resume hooks receive only the controller's
+non-secret repository and timeout values. They are limited to 30 minutes each. Failed or
+completed environment pods are replaced with bounded exponential
 backoff while retaining the workspace PVC; recovery progress and exhaustion are reported by
 the `Ready` condition and pod-recovery status fields. Environment readiness is reported by
 the current-generation `Ready` condition only after initialization completes and the sandboxd

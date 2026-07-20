@@ -3,10 +3,12 @@ package controllers
 import (
 	"context"
 	"errors"
+	"reflect"
 	"sync"
 	"testing"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	apiMeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -23,10 +25,12 @@ import (
 )
 
 type scriptedAdapter struct {
-	observations        []AdapterObservation
-	accepted, cancelled int
-	onCancel            func()
-	cancelErr           error
+	observations          []AdapterObservation
+	accepted, cancelled   int
+	onCancel              func()
+	cancelErr             error
+	acceptedCredentials   [][]byte
+	retainedCredentialKey []byte
 }
 
 type failAcceptedStatusClient struct {
@@ -55,7 +59,7 @@ func (w *failAcceptedStatusWriter) Update(ctx context.Context, object client.Obj
 // outcome.
 type foregroundAdapter struct{ process AdapterObservation }
 
-func (*foregroundAdapter) EnsureAccepted(context.Context, AdapterTask, AdapterSandbox) error {
+func (*foregroundAdapter) EnsureAccepted(context.Context, AdapterTask, AdapterSandbox, *AdapterCredential) error {
 	return nil
 }
 func (a *foregroundAdapter) Observe(context.Context, AdapterTask, AdapterSandbox) (AdapterObservation, string, error) {
@@ -70,7 +74,7 @@ type serviceAdapter struct {
 	event          AdapterObservation
 }
 
-func (a *serviceAdapter) EnsureAccepted(context.Context, AdapterTask, AdapterSandbox) error {
+func (a *serviceAdapter) EnsureAccepted(context.Context, AdapterTask, AdapterSandbox, *AdapterCredential) error {
 	a.serviceRunning = true
 	return nil
 }
@@ -82,8 +86,14 @@ func (a *serviceAdapter) Cancel(context.Context, AdapterTask, AdapterSandbox) er
 	return nil
 }
 
-func (a *scriptedAdapter) EnsureAccepted(context.Context, AdapterTask, AdapterSandbox) error {
+func (a *scriptedAdapter) EnsureAccepted(_ context.Context, _ AdapterTask, _ AdapterSandbox, credential *AdapterCredential) error {
 	a.accepted++
+	if credential == nil {
+		a.acceptedCredentials = append(a.acceptedCredentials, nil)
+	} else {
+		a.acceptedCredentials = append(a.acceptedCredentials, append([]byte(nil), credential.APIKey...))
+		a.retainedCredentialKey = credential.APIKey
+	}
 	return nil
 }
 func (a *scriptedAdapter) Cancel(context.Context, AdapterTask, AdapterSandbox) error {
@@ -104,6 +114,9 @@ func (a *scriptedAdapter) Observe(context.Context, AdapterTask, AdapterSandbox) 
 func runScheme(t *testing.T) *runtime.Scheme {
 	t.Helper()
 	s := runtime.NewScheme()
+	if err := corev1.AddToScheme(s); err != nil {
+		t.Fatal(err)
+	}
 	if err := platformv1alpha1.AddToScheme(s); err != nil {
 		t.Fatal(err)
 	}
@@ -141,6 +154,29 @@ func reconciler(t *testing.T, adapter AdapterLifecycle, objects ...client.Object
 	}
 	c := fake.NewClientBuilder().WithScheme(s).WithStatusSubresource(&platformv1alpha1.Run{}, &platformv1alpha1.Environment{}).WithObjects(objects...).Build()
 	return &RunReconciler{Client: c, Scheme: s, Adapters: map[string]AdapterLifecycle{"test": adapter}}
+}
+
+func credentialProfileAndSecret(run *platformv1alpha1.Run, value []byte) (*platformv1alpha1.AgentCredentialProfile, *corev1.Secret) {
+	profile := &platformv1alpha1.AgentCredentialProfile{
+		ObjectMeta: metav1.ObjectMeta{Name: run.Spec.CredentialProfileRef, Namespace: run.Namespace, UID: "profile-uid"},
+		Spec: platformv1alpha1.AgentCredentialProfileSpec{
+			Adapter: run.Spec.Agent, CredentialType: platformv1alpha1.AgentCredentialTypeAPIKey,
+		},
+	}
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      platformv1alpha1.AgentCredentialSecretName(profile.UID),
+			Namespace: profile.Namespace,
+			UID:       "secret-uid",
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: platformv1alpha1.GroupVersion.String(), Kind: "AgentCredentialProfile",
+				Name: profile.Name, UID: profile.UID, Controller: ptr(true), BlockOwnerDeletion: ptr(true),
+			}},
+		},
+		Type: platformv1alpha1.AgentCredentialAPIKeySecretType,
+		Data: map[string][]byte{platformv1alpha1.AgentCredentialAPIKeySecretKey: append([]byte(nil), value...)},
+	}
+	return profile, secret
 }
 
 func reconcileRun(t *testing.T, r *RunReconciler, name string) platformv1alpha1.Run {
@@ -1346,5 +1382,294 @@ func TestOwnershipMismatchNeverCancelsOrMutatesEnvironment(t *testing.T) {
 	}
 	if retained.Spec.Paused || adapter.cancelled != 0 || metav1.GetControllerOf(&retained).Name != "other" {
 		t.Fatalf("environment mutated or cancelled: %#v, cancellations = %d", retained, adapter.cancelled)
+	}
+}
+
+func TestCredentialProfileBindsExactUIDBeforeAllocation(t *testing.T) {
+	run := &platformv1alpha1.Run{
+		ObjectMeta: metav1.ObjectMeta{Name: "r", Namespace: "ns", UID: "run-uid"},
+		Spec:       platformv1alpha1.RunSpec{TemplateRef: "small", Agent: "test", CredentialProfileRef: "profile"},
+	}
+	profile, secret := credentialProfileAndSecret(run, []byte("!!BOUND-KEY-FIXTURE!!"))
+	r := reconciler(t, &scriptedAdapter{}, run, profile, secret)
+
+	result, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(run)})
+	if err != nil || !result.Requeue {
+		t.Fatalf("binding reconcile = (%#v, %v)", result, err)
+	}
+	var bound platformv1alpha1.Run
+	if err := r.Get(context.Background(), client.ObjectKeyFromObject(run), &bound); err != nil {
+		t.Fatal(err)
+	}
+	condition := apiMeta.FindStatusCondition(bound.Status.Conditions, runConditionCredentialProfileBound)
+	if bound.Status.CredentialProfileRef == nil || bound.Status.CredentialProfileRef.Name != profile.Name || bound.Status.CredentialProfileRef.UID != profile.UID ||
+		condition == nil || condition.Status != metav1.ConditionTrue || condition.Reason != "Bound" {
+		t.Fatalf("binding status = %#v, condition = %#v", bound.Status.CredentialProfileRef, condition)
+	}
+	var environments platformv1alpha1.EnvironmentList
+	if err := r.List(context.Background(), &environments, client.InNamespace(run.Namespace)); err != nil || len(environments.Items) != 0 {
+		t.Fatalf("binding allocated environments = %d, error = %v", len(environments.Items), err)
+	}
+}
+
+func TestCredentiallessRunPreservesAllocationBehavior(t *testing.T) {
+	run := &platformv1alpha1.Run{ObjectMeta: metav1.ObjectMeta{Name: "r", Namespace: "ns", UID: "run-uid"}, Spec: platformv1alpha1.RunSpec{TemplateRef: "small", Agent: "test"}}
+	r := reconciler(t, &scriptedAdapter{}, run)
+	reconcileRun(t, r, run.Name) // Finalizer.
+	got := reconcileRun(t, r, run.Name)
+	condition := apiMeta.FindStatusCondition(got.Status.Conditions, runConditionCredentialProfileBound)
+	if condition == nil || condition.Status != metav1.ConditionTrue || condition.Reason != "Credentialless" || got.Status.EnvironmentRef == nil {
+		t.Fatalf("credentialless status = %#v", got.Status)
+	}
+}
+
+func TestCredentialBindingWaitsBoundedlyAndRecovers(t *testing.T) {
+	t.Run("profile", func(t *testing.T) {
+		run := &platformv1alpha1.Run{ObjectMeta: metav1.ObjectMeta{Name: "r", Namespace: "ns", UID: "run-uid"}, Spec: platformv1alpha1.RunSpec{TemplateRef: "small", Agent: "test", CredentialProfileRef: "profile"}}
+		r := reconciler(t, &scriptedAdapter{}, run)
+		result, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(run)})
+		if err != nil || result.RequeueAfter <= 0 {
+			t.Fatalf("missing profile = (%#v, %v)", result, err)
+		}
+		var waiting platformv1alpha1.Run
+		if err := r.Get(context.Background(), client.ObjectKeyFromObject(run), &waiting); err != nil {
+			t.Fatal(err)
+		}
+		condition := apiMeta.FindStatusCondition(waiting.Status.Conditions, runConditionCredentialProfileBound)
+		if condition == nil || condition.Reason != "ProfileNotFound" || waiting.Status.EnvironmentRef != nil {
+			t.Fatalf("waiting status = %#v", waiting.Status)
+		}
+		profile, secret := credentialProfileAndSecret(&waiting, []byte("!!RECOVERED-KEY-FIXTURE!!"))
+		if err := r.Create(context.Background(), profile); err != nil {
+			t.Fatal(err)
+		}
+		if err := r.Create(context.Background(), secret); err != nil {
+			t.Fatal(err)
+		}
+		got := reconcileRun(t, r, run.Name)
+		if got.Status.CredentialProfileRef == nil || got.Status.CredentialProfileRef.UID != profile.UID || got.Status.EnvironmentRef != nil {
+			t.Fatalf("recovered binding = %#v", got.Status)
+		}
+	})
+
+	t.Run("secret timeout", func(t *testing.T) {
+		run := &platformv1alpha1.Run{ObjectMeta: metav1.ObjectMeta{Name: "r", Namespace: "ns", UID: "run-uid"}, Spec: platformv1alpha1.RunSpec{TemplateRef: "small", Agent: "test", CredentialProfileRef: "profile"}}
+		profile, _ := credentialProfileAndSecret(run, nil)
+		r := reconciler(t, &scriptedAdapter{}, run, profile)
+		reconcileRun(t, r, run.Name) // Bind the profile UID.
+		waiting := reconcileRun(t, r, run.Name)
+		condition := apiMeta.FindStatusCondition(waiting.Status.Conditions, runConditionCredentialProfileBound)
+		if condition == nil || condition.Reason != "SecretNotReady" || waiting.Status.EnvironmentRef != nil {
+			t.Fatalf("secret waiting status = %#v", waiting.Status)
+		}
+		condition.LastTransitionTime = metav1.NewTime(time.Now().Add(-credentialReadyTimeout - time.Second))
+		if err := r.Status().Update(context.Background(), &waiting); err != nil {
+			t.Fatal(err)
+		}
+		failed := reconcileRun(t, r, run.Name)
+		condition = apiMeta.FindStatusCondition(failed.Status.Conditions, runConditionCredentialProfileBound)
+		if failed.Status.State != platformv1alpha1.RunStateFailed || condition == nil || condition.Reason != "SecretNotReady" || failed.Status.EnvironmentRef != nil {
+			t.Fatalf("timed out status = %#v", failed.Status)
+		}
+	})
+}
+
+func TestCredentialBindingRejectsAdapterTypeAndReplacement(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*platformv1alpha1.Run, *platformv1alpha1.AgentCredentialProfile)
+		reason string
+	}{
+		{name: "adapter mismatch", mutate: func(_ *platformv1alpha1.Run, profile *platformv1alpha1.AgentCredentialProfile) {
+			profile.Spec.Adapter = "other"
+		}, reason: "AdapterMismatch"},
+		{name: "unsupported type", mutate: func(_ *platformv1alpha1.Run, profile *platformv1alpha1.AgentCredentialProfile) {
+			profile.Spec.CredentialType = "FutureType"
+		}, reason: "UnsupportedCredentialType"},
+		{name: "same-name replacement", mutate: func(run *platformv1alpha1.Run, _ *platformv1alpha1.AgentCredentialProfile) {
+			run.Status.CredentialProfileRef = &platformv1alpha1.RunCredentialProfileReference{Name: run.Spec.CredentialProfileRef, UID: "old-profile-uid"}
+		}, reason: "ProfileReplaced"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			run := &platformv1alpha1.Run{ObjectMeta: metav1.ObjectMeta{Name: "r", Namespace: "ns", UID: "run-uid"}, Spec: platformv1alpha1.RunSpec{TemplateRef: "small", Agent: "test", CredentialProfileRef: "profile"}}
+			profile, secret := credentialProfileAndSecret(run, []byte("!!REJECTED-KEY-FIXTURE!!"))
+			test.mutate(run, profile)
+			r := reconciler(t, &scriptedAdapter{}, run, profile, secret)
+			got := reconcileRun(t, r, run.Name)
+			condition := apiMeta.FindStatusCondition(got.Status.Conditions, runConditionCredentialProfileBound)
+			if got.Status.State != platformv1alpha1.RunStateFailed || condition == nil || condition.Status != metav1.ConditionFalse || condition.Reason != test.reason || got.Status.EnvironmentRef != nil {
+				t.Fatalf("rejected status = %#v", got.Status)
+			}
+		})
+	}
+}
+
+func TestResolveCredentialRejectsMalformedForeignAndWrongNamespaceSecrets(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*platformv1alpha1.AgentCredentialProfile, *corev1.Secret)
+		reason string
+	}{
+		{name: "wrong type", mutate: func(_ *platformv1alpha1.AgentCredentialProfile, secret *corev1.Secret) {
+			secret.Type = corev1.SecretTypeOpaque
+		}, reason: "MalformedSecret"},
+		{name: "extra key", mutate: func(_ *platformv1alpha1.AgentCredentialProfile, secret *corev1.Secret) {
+			secret.Data["extra"] = []byte("x")
+		}, reason: "MalformedSecret"},
+		{name: "empty", mutate: func(_ *platformv1alpha1.AgentCredentialProfile, secret *corev1.Secret) {
+			secret.Data[platformv1alpha1.AgentCredentialAPIKeySecretKey] = nil
+		}, reason: "MalformedSecret"},
+		{name: "invalid utf8", mutate: func(_ *platformv1alpha1.AgentCredentialProfile, secret *corev1.Secret) {
+			secret.Data[platformv1alpha1.AgentCredentialAPIKeySecretKey] = []byte{0xff}
+		}, reason: "MalformedSecret"},
+		{name: "nul", mutate: func(_ *platformv1alpha1.AgentCredentialProfile, secret *corev1.Secret) {
+			secret.Data[platformv1alpha1.AgentCredentialAPIKeySecretKey] = []byte{'x', 0}
+		}, reason: "MalformedSecret"},
+		{name: "oversize", mutate: func(_ *platformv1alpha1.AgentCredentialProfile, secret *corev1.Secret) {
+			secret.Data[platformv1alpha1.AgentCredentialAPIKeySecretKey] = make([]byte, platformv1alpha1.AgentCredentialAPIKeyMaxBytes+1)
+		}, reason: "MalformedSecret"},
+		{name: "foreign owner", mutate: func(_ *platformv1alpha1.AgentCredentialProfile, secret *corev1.Secret) {
+			secret.OwnerReferences[0].UID = "foreign-profile-uid"
+		}, reason: "ForeignSecret"},
+		{name: "wrong namespace", mutate: func(profile *platformv1alpha1.AgentCredentialProfile, secret *corev1.Secret) {
+			profile.Namespace = "other"
+			secret.Namespace = "other"
+		}, reason: "ProfileNotFound"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			run := &platformv1alpha1.Run{
+				ObjectMeta: metav1.ObjectMeta{Name: "r", Namespace: "ns", UID: "run-uid"},
+				Spec:       platformv1alpha1.RunSpec{Agent: "test", CredentialProfileRef: "profile"},
+				Status: platformv1alpha1.RunStatus{CredentialProfileRef: &platformv1alpha1.RunCredentialProfileReference{
+					Name: "profile", UID: "profile-uid",
+				}},
+			}
+			profile, secret := credentialProfileAndSecret(run, []byte("!!VALIDATION-KEY-FIXTURE!!"))
+			test.mutate(profile, secret)
+			r := reconciler(t, &scriptedAdapter{}, run, profile, secret)
+			credential, reason, err := r.resolveCredential(context.Background(), run)
+			if credential != nil || err == nil || reason != test.reason {
+				t.Fatalf("resolve = (%#v, %q, %v), want reason %q", credential, reason, err, test.reason)
+			}
+		})
+	}
+}
+
+func TestCredentialAcceptanceUsesUncachedCurrentKeyAndClearsCopy(t *testing.T) {
+	run := &platformv1alpha1.Run{
+		ObjectMeta: metav1.ObjectMeta{Name: "r", Namespace: "ns", UID: "run-uid", Generation: 1, Finalizers: []string{runFinalizer}},
+		Spec:       platformv1alpha1.RunSpec{Agent: "test", CredentialProfileRef: "profile"},
+		Status: platformv1alpha1.RunStatus{
+			State: platformv1alpha1.RunStateEnvironmentReady,
+			EnvironmentRef: &platformv1alpha1.RunEnvironmentReference{
+				Name: "e", UID: "env-uid", Ownership: platformv1alpha1.EnvironmentOwnershipOwned,
+			},
+			CredentialProfileRef: &platformv1alpha1.RunCredentialProfileReference{Name: "profile", UID: "profile-uid"},
+			Conditions: []metav1.Condition{
+				{Type: runConditionCredentialProfileBound, Status: metav1.ConditionTrue, Reason: "Bound", ObservedGeneration: 1},
+				{Type: runConditionAdapterAcceptanceAttempted, Status: metav1.ConditionTrue, Reason: "AcceptancePending", ObservedGeneration: 1},
+			},
+		},
+	}
+	env := &platformv1alpha1.Environment{
+		ObjectMeta: metav1.ObjectMeta{Name: "e", Namespace: "ns", UID: "env-uid"},
+		Status:     platformv1alpha1.EnvironmentStatus{Phase: platformv1alpha1.EnvironmentPhaseReady},
+	}
+	profile, staleSecret := credentialProfileAndSecret(run, []byte("!!STALE-CACHED-KEY!!"))
+	_, currentSecret := credentialProfileAndSecret(run, []byte("!!CURRENT-UNCACHED-KEY!!"))
+	adapter := &scriptedAdapter{}
+	r := reconciler(t, adapter, run, env, profile, staleSecret)
+	liveReader := fake.NewClientBuilder().WithScheme(r.Scheme).WithObjects(profile.DeepCopy(), currentSecret).Build()
+	r.APIReader = liveReader
+
+	if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(run)}); err != nil {
+		t.Fatal(err)
+	}
+	if len(adapter.acceptedCredentials) != 1 || string(adapter.acceptedCredentials[0]) != "!!CURRENT-UNCACHED-KEY!!" {
+		t.Fatalf("accepted credentials = %#v", adapter.acceptedCredentials)
+	}
+	if !reflect.DeepEqual(adapter.retainedCredentialKey, make([]byte, len(adapter.retainedCredentialKey))) {
+		t.Fatal("Run controller retained credential copy after EnsureAccepted")
+	}
+	if !reflect.DeepEqual(staleSecret.Data[platformv1alpha1.AgentCredentialAPIKeySecretKey], []byte("!!STALE-CACHED-KEY!!")) {
+		t.Fatal("cached Secret fixture was mutated")
+	}
+}
+
+func TestCredentialRotationIsRematerializedAfterResumeEpoch(t *testing.T) {
+	run := &platformv1alpha1.Run{
+		ObjectMeta: metav1.ObjectMeta{Name: "r", Namespace: "ns", UID: "run-uid", Generation: 1, Finalizers: []string{runFinalizer}},
+		Spec:       platformv1alpha1.RunSpec{Agent: "test", CredentialProfileRef: "profile"},
+		Status: platformv1alpha1.RunStatus{
+			State:                platformv1alpha1.RunStateEnvironmentReady,
+			EnvironmentRef:       &platformv1alpha1.RunEnvironmentReference{Name: "e", UID: "env-uid", Ownership: platformv1alpha1.EnvironmentOwnershipOwned},
+			CredentialProfileRef: &platformv1alpha1.RunCredentialProfileReference{Name: "profile", UID: "profile-uid"},
+			Conditions: []metav1.Condition{
+				{Type: runConditionCredentialProfileBound, Status: metav1.ConditionTrue, Reason: "Bound", ObservedGeneration: 1},
+				{Type: runConditionAdapterAcceptanceAttempted, Status: metav1.ConditionTrue, Reason: "AcceptancePending", ObservedGeneration: 1},
+			},
+		},
+	}
+	env := &platformv1alpha1.Environment{ObjectMeta: metav1.ObjectMeta{Name: "e", Namespace: "ns", UID: "env-uid"}, Status: platformv1alpha1.EnvironmentStatus{Phase: platformv1alpha1.EnvironmentPhaseReady}}
+	profile, secret := credentialProfileAndSecret(run, []byte("!!FIRST-EPOCH-KEY!!"))
+	adapter := &scriptedAdapter{}
+	r := reconciler(t, adapter, run, env, profile, secret)
+	reconcileRun(t, r, run.Name)
+
+	var rotated corev1.Secret
+	if err := r.Get(context.Background(), client.ObjectKeyFromObject(secret), &rotated); err != nil {
+		t.Fatal(err)
+	}
+	rotated.Data[platformv1alpha1.AgentCredentialAPIKeySecretKey] = []byte("!!SECOND-EPOCH-KEY!!")
+	if err := r.Update(context.Background(), &rotated); err != nil {
+		t.Fatal(err)
+	}
+	var currentEnv platformv1alpha1.Environment
+	if err := r.Get(context.Background(), client.ObjectKeyFromObject(env), &currentEnv); err != nil {
+		t.Fatal(err)
+	}
+	currentEnv.Spec.Paused = true
+	if err := r.Update(context.Background(), &currentEnv); err != nil {
+		t.Fatal(err)
+	}
+	applyEnvironmentStatus(&currentEnv, platformv1alpha1.EnvironmentPhasePaused, "", "", "Paused", "paused", nil)
+	if err := r.Status().Update(context.Background(), &currentEnv); err != nil {
+		t.Fatal(err)
+	}
+	reconcileRun(t, r, run.Name)
+	if err := r.Get(context.Background(), client.ObjectKeyFromObject(env), &currentEnv); err != nil {
+		t.Fatal(err)
+	}
+	currentEnv.Spec.Paused = false
+	if err := r.Update(context.Background(), &currentEnv); err != nil {
+		t.Fatal(err)
+	}
+	applyEnvironmentStatus(&currentEnv, platformv1alpha1.EnvironmentPhaseReady, "env-e", "10.0.0.2:50051", "SandboxdReady", "ready", nil)
+	if err := r.Status().Update(context.Background(), &currentEnv); err != nil {
+		t.Fatal(err)
+	}
+	reconcileRun(t, r, run.Name) // Paused -> EnvironmentReady.
+	reconcileRun(t, r, run.Name) // Reaccept in the fresh sandbox epoch.
+	if len(adapter.acceptedCredentials) != 2 || string(adapter.acceptedCredentials[0]) != "!!FIRST-EPOCH-KEY!!" || string(adapter.acceptedCredentials[1]) != "!!SECOND-EPOCH-KEY!!" {
+		t.Fatalf("epoch credentials = %#v", adapter.acceptedCredentials)
+	}
+}
+
+func TestCancellationBeforeAllocationDoesNotReadCredentialProfileOrSecret(t *testing.T) {
+	run := &platformv1alpha1.Run{
+		ObjectMeta: metav1.ObjectMeta{Name: "r", Namespace: "ns", UID: "run-uid"},
+		Spec:       platformv1alpha1.RunSpec{TemplateRef: "small", Agent: "test", CredentialProfileRef: "profile", Cancel: true},
+	}
+	r := reconciler(t, &scriptedAdapter{}, run)
+	reads := 0
+	r.APIReader = interceptor.NewClient(r.Client.(client.WithWatch), interceptor.Funcs{Get: func(context.Context, client.WithWatch, client.ObjectKey, client.Object, ...client.GetOption) error {
+		reads++
+		return errors.New("credential reader must not be called")
+	}})
+	got := reconcileRun(t, r, run.Name)
+	if got.Status.State != platformv1alpha1.RunStateCancelled || reads != 0 {
+		t.Fatalf("cancellation state = %s, credential reads = %d", got.Status.State, reads)
 	}
 }
