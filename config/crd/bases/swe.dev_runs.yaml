@@ -178,8 +178,9 @@ spec:
                 - type
                 x-kubernetes-list-type: map
               environmentRef:
-                description: EnvironmentRef is the exact owned or claimed Environment
-                  incarnation.
+                description: |-
+                  EnvironmentRef is the exact owned or claimed Environment incarnation. It
+                  remains as historical identity after terminal cleanup.
                 properties:
                   name:
                     type: string
