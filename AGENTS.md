@@ -118,7 +118,8 @@ runs both via `make` targets:
   env-base image built and loaded locally (no registry credentials needed). It also verifies
   control-plane TokenReview/SAR scoping, opaque browser session exchange/logout and CSRF,
   the embedded console entry point/SPA fallback/static assets, typed Run
-  list/get/create/retry/cancel, Environment get, transcript SSE, and terminal attach.
+  list/get/create/retry/cancel, Environment get, transcript SSE, terminal attach, and
+  process-scoped fake API-key delivery without ambient setup/resume/sandboxd exposure.
   Runs in CI as the `e2e` workflow on relevant PRs and via `workflow_dispatch`.
 - **Images:** `make docker-build` (operator + env-base). The env-base image builds
   its pinned tmux with `images/env-base/tmux-control-output-drain.patch`; keep the

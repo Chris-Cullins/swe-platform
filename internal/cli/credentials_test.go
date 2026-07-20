@@ -130,6 +130,9 @@ func TestCreateCredentialRejectsForeignAndMalformedCollisionsWithoutLeaking(t *t
 		mutate func(*corev1.Secret)
 	}{
 		{name: "foreign", mutate: func(secret *corev1.Secret) { secret.OwnerReferences[0].UID = "other-profile" }},
+		{name: "extra owner", mutate: func(secret *corev1.Secret) {
+			secret.OwnerReferences = append(secret.OwnerReferences, metav1.OwnerReference{APIVersion: "v1", Kind: "ConfigMap", Name: "other", UID: "other"})
+		}},
 		{name: "wrong type", mutate: func(secret *corev1.Secret) { secret.Type = corev1.SecretTypeOpaque }},
 		{name: "extra key", mutate: func(secret *corev1.Secret) { secret.Data["extra"] = []byte("x") }},
 		{name: "empty", mutate: func(secret *corev1.Secret) { secret.Data[platformv1alpha1.AgentCredentialAPIKeySecretKey] = nil }},
@@ -147,12 +150,39 @@ func TestCreateCredentialRejectsForeignAndMalformedCollisionsWithoutLeaking(t *t
 		t.Run(test.name, func(t *testing.T) {
 			profile, secret := cliCredentialObjects([]byte("!!COLLISION-KEY-FIXTURE!!"))
 			test.mutate(secret)
-			c := fake.NewClientBuilder().WithScheme(credentialCLIScheme(t)).WithObjects(profile, secret).Build()
+			base := fake.NewClientBuilder().WithScheme(credentialCLIScheme(t)).WithObjects(profile, secret).Build()
+			secretValueReads := 0
+			c := interceptor.NewClient(base, interceptor.Funcs{Get: func(ctx context.Context, underlying client.WithWatch, key client.ObjectKey, object client.Object, options ...client.GetOption) error {
+				if _, ok := object.(*corev1.Secret); ok {
+					secretValueReads++
+				}
+				return underlying.Get(ctx, key, object, options...)
+			}})
 			err := createCredential(context.Background(), c, "ns", profile.Name, profile.Spec.Adapter, []byte(cliKeyFixture))
 			if err == nil || strings.Contains(err.Error(), cliKeyFixture) || strings.Contains(err.Error(), secret.Name) {
 				t.Fatalf("unsafe collision error = %v", err)
 			}
+			if (test.name == "foreign" || test.name == "extra owner") && secretValueReads != 0 {
+				t.Fatalf("foreign collision caused %d Secret value reads", secretValueReads)
+			}
 		})
+	}
+}
+
+func TestRotateCredentialRejectsForeignMetadataWithoutReadingSecretData(t *testing.T) {
+	profile, secret := cliCredentialObjects([]byte("!!FOREIGN-KEY-FIXTURE!!"))
+	secret.OwnerReferences[0].UID = "foreign-profile"
+	base := fake.NewClientBuilder().WithScheme(credentialCLIScheme(t)).WithObjects(profile, secret).Build()
+	secretValueReads := 0
+	c := interceptor.NewClient(base, interceptor.Funcs{Get: func(ctx context.Context, underlying client.WithWatch, key client.ObjectKey, object client.Object, options ...client.GetOption) error {
+		if _, ok := object.(*corev1.Secret); ok {
+			secretValueReads++
+		}
+		return underlying.Get(ctx, key, object, options...)
+	}})
+	err := rotateCredential(context.Background(), c, profile.Namespace, profile.Name, []byte(cliKeyFixture))
+	if err == nil || secretValueReads != 0 || strings.Contains(err.Error(), cliKeyFixture) || strings.Contains(err.Error(), secret.Name) {
+		t.Fatalf("foreign rotate = error %v, Secret value reads %d", err, secretValueReads)
 	}
 }
 

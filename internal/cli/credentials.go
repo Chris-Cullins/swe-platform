@@ -155,26 +155,26 @@ func createCredential(ctx context.Context, c client.Client, namespace, name, age
 	}
 	secret := credentialSecret(profile, key)
 	defer clear(secret.Data[platformv1alpha1.AgentCredentialAPIKeySecretKey])
-	var existing corev1.Secret
-	err := c.Get(ctx, client.ObjectKeyFromObject(secret), &existing)
-	if err == nil {
-		defer clearCredentialData(existing.Data)
-		if err := validateCredentialSecret(profile, &existing); err != nil {
-			return err
-		}
-		return nil
-	}
-	if !apierrors.IsNotFound(err) {
-		return redactCredentialError("check backing credential data", err)
-	}
 	if err := c.Create(ctx, secret); err != nil {
-		if apierrors.IsAlreadyExists(err) {
-			if getErr := c.Get(ctx, client.ObjectKeyFromObject(secret), &existing); getErr == nil {
-				defer clearCredentialData(existing.Data)
-				return validateCredentialSecret(profile, &existing)
-			}
+		if !apierrors.IsAlreadyExists(err) {
+			return redactCredentialError("store credential data", err)
 		}
-		return redactCredentialError("store credential data", err)
+		metadata, getErr := getCredentialSecretMetadata(ctx, c, profile)
+		if getErr != nil {
+			return redactCredentialError("check backing credential ownership", getErr)
+		}
+		if !exactCredentialSecretOwner(profile, metadata) {
+			return fmt.Errorf("backing credential data for profile %q is not safely managed by that profile", profile.Name)
+		}
+		var existing corev1.Secret
+		if getErr := c.Get(ctx, client.ObjectKeyFromObject(secret), &existing); getErr != nil {
+			return redactCredentialError("check backing credential data", getErr)
+		}
+		defer clearCredentialData(existing.Data)
+		if existing.UID != metadata.UID || existing.ResourceVersion != metadata.ResourceVersion {
+			return fmt.Errorf("backing credential data for profile %q changed during validation", profile.Name)
+		}
+		return validateCredentialSecret(profile, &existing)
 	}
 	return nil
 }
@@ -185,14 +185,24 @@ func credentialSecret(profile *platformv1alpha1.AgentCredentialProfile, key []by
 }
 
 func validateCredentialSecret(profile *platformv1alpha1.AgentCredentialProfile, secret *corev1.Secret) error {
-	owner := metav1.GetControllerOf(secret)
 	value, hasKey := secret.Data[platformv1alpha1.AgentCredentialAPIKeySecretKey]
-	if owner == nil || owner.APIVersion != platformv1alpha1.GroupVersion.String() || owner.Kind != "AgentCredentialProfile" || owner.Name != profile.Name || owner.UID != profile.UID ||
-		secret.Type != platformv1alpha1.AgentCredentialAPIKeySecretType || len(secret.Data) != 1 || !hasKey || len(value) == 0 ||
+	if !exactCredentialSecretOwner(profile, secret) || secret.Type != platformv1alpha1.AgentCredentialAPIKeySecretType || len(secret.Data) != 1 || !hasKey || len(value) == 0 ||
 		len(value) > platformv1alpha1.AgentCredentialAPIKeyMaxBytes || !utf8.Valid(value) || bytes.IndexByte(value, 0) >= 0 {
 		return fmt.Errorf("backing credential data for profile %q is not safely managed by that profile", profile.Name)
 	}
 	return nil
+}
+
+func getCredentialSecretMetadata(ctx context.Context, c client.Reader, profile *platformv1alpha1.AgentCredentialProfile) (*metav1.PartialObjectMetadata, error) {
+	metadata := &metav1.PartialObjectMetadata{TypeMeta: metav1.TypeMeta{APIVersion: corev1.SchemeGroupVersion.String(), Kind: "Secret"}}
+	err := c.Get(ctx, types.NamespacedName{Namespace: profile.Namespace, Name: platformv1alpha1.AgentCredentialSecretName(profile.UID)}, metadata)
+	return metadata, err
+}
+
+func exactCredentialSecretOwner(profile *platformv1alpha1.AgentCredentialProfile, object metav1.Object) bool {
+	owner := metav1.GetControllerOf(object)
+	return len(object.GetOwnerReferences()) == 1 && owner != nil && owner.APIVersion == platformv1alpha1.GroupVersion.String() &&
+		owner.Kind == "AgentCredentialProfile" && owner.Name == profile.Name && owner.UID == profile.UID
 }
 
 func clearCredentialData(data map[string][]byte) {
@@ -209,11 +219,21 @@ func rotateCredential(ctx context.Context, c client.Client, namespace, name stri
 	if profile.Spec.CredentialType != platformv1alpha1.AgentCredentialTypeAPIKey {
 		return fmt.Errorf("credential profile %q is not an API key profile", name)
 	}
+	metadata, err := getCredentialSecretMetadata(ctx, c, &profile)
+	if err != nil {
+		return redactCredentialError(fmt.Sprintf("get backing credential ownership for profile %q", name), err)
+	}
+	if !exactCredentialSecretOwner(&profile, metadata) {
+		return fmt.Errorf("backing credential data for profile %q is not safely managed by that profile", profile.Name)
+	}
 	var secret corev1.Secret
 	if err := c.Get(ctx, types.NamespacedName{Namespace: namespace, Name: platformv1alpha1.AgentCredentialSecretName(profile.UID)}, &secret); err != nil {
 		return redactCredentialError(fmt.Sprintf("get backing credential data for profile %q", name), err)
 	}
 	defer clearCredentialData(secret.Data)
+	if secret.UID != metadata.UID || secret.ResourceVersion != metadata.ResourceVersion {
+		return fmt.Errorf("backing credential data for profile %q changed during validation", profile.Name)
+	}
 	if err := validateCredentialSecret(&profile, &secret); err != nil {
 		return err
 	}

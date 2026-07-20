@@ -1532,6 +1532,9 @@ func TestResolveCredentialRejectsMalformedForeignAndWrongNamespaceSecrets(t *tes
 		{name: "foreign owner", mutate: func(_ *platformv1alpha1.AgentCredentialProfile, secret *corev1.Secret) {
 			secret.OwnerReferences[0].UID = "foreign-profile-uid"
 		}, reason: "ForeignSecret"},
+		{name: "extra owner", mutate: func(_ *platformv1alpha1.AgentCredentialProfile, secret *corev1.Secret) {
+			secret.OwnerReferences = append(secret.OwnerReferences, metav1.OwnerReference{APIVersion: "v1", Kind: "ConfigMap", Name: "other", UID: "other"})
+		}, reason: "ForeignSecret"},
 		{name: "wrong namespace", mutate: func(profile *platformv1alpha1.AgentCredentialProfile, secret *corev1.Secret) {
 			profile.Namespace = "other"
 			secret.Namespace = "other"
@@ -1554,6 +1557,31 @@ func TestResolveCredentialRejectsMalformedForeignAndWrongNamespaceSecrets(t *tes
 				t.Fatalf("resolve = (%#v, %q, %v), want reason %q", credential, reason, err, test.reason)
 			}
 		})
+	}
+}
+
+func TestResolveCredentialRejectsForeignMetadataWithoutReadingSecretData(t *testing.T) {
+	run := &platformv1alpha1.Run{
+		ObjectMeta: metav1.ObjectMeta{Name: "r", Namespace: "ns", UID: "run-uid"},
+		Spec:       platformv1alpha1.RunSpec{Agent: "test", CredentialProfileRef: "profile"},
+		Status: platformv1alpha1.RunStatus{CredentialProfileRef: &platformv1alpha1.RunCredentialProfileReference{
+			Name: "profile", UID: "profile-uid",
+		}},
+	}
+	profile, secret := credentialProfileAndSecret(run, []byte("!!FOREIGN-METADATA-KEY-FIXTURE!!"))
+	secret.OwnerReferences[0].UID = "foreign-profile"
+	r := reconciler(t, &scriptedAdapter{}, run)
+	base := fake.NewClientBuilder().WithScheme(r.Scheme).WithObjects(profile, secret).Build()
+	secretValueReads := 0
+	r.APIReader = interceptor.NewClient(base, interceptor.Funcs{Get: func(ctx context.Context, underlying client.WithWatch, key client.ObjectKey, object client.Object, options ...client.GetOption) error {
+		if _, ok := object.(*corev1.Secret); ok {
+			secretValueReads++
+		}
+		return underlying.Get(ctx, key, object, options...)
+	}})
+	credential, reason, err := r.resolveCredential(context.Background(), run)
+	if credential != nil || err == nil || reason != "ForeignSecret" || secretValueReads != 0 {
+		t.Fatalf("resolve = (%#v, %q, %v), Secret value reads = %d", credential, reason, err, secretValueReads)
 	}
 }
 

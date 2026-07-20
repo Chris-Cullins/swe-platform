@@ -418,8 +418,18 @@ func (r *RunReconciler) resolveCredential(ctx context.Context, run *platformv1al
 	if profile.Spec.CredentialType != platformv1alpha1.AgentCredentialTypeAPIKey {
 		return nil, "UnsupportedCredentialType", errors.New("credential profile type is unsupported")
 	}
-	var secret corev1.Secret
 	key := types.NamespacedName{Namespace: run.Namespace, Name: platformv1alpha1.AgentCredentialSecretName(profile.UID)}
+	metadata := &metav1.PartialObjectMetadata{TypeMeta: metav1.TypeMeta{APIVersion: corev1.SchemeGroupVersion.String(), Kind: "Secret"}}
+	if err := r.apiReader().Get(ctx, key, metadata); err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil, "SecretNotReady", errors.New("credential secret is not ready")
+		}
+		return nil, "", err
+	}
+	if !exactCredentialSecretOwner(&profile, metadata) {
+		return nil, "ForeignSecret", errors.New("credential secret is not controlled by the bound profile")
+	}
+	var secret corev1.Secret
 	if err := r.apiReader().Get(ctx, key, &secret); err != nil {
 		if apierrors.IsNotFound(err) {
 			return nil, "SecretNotReady", errors.New("credential secret is not ready")
@@ -431,8 +441,10 @@ func (r *RunReconciler) resolveCredential(ctx context.Context, run *platformv1al
 			clear(value)
 		}
 	}()
-	owner := metav1.GetControllerOf(&secret)
-	if owner == nil || owner.APIVersion != platformv1alpha1.GroupVersion.String() || owner.Kind != "AgentCredentialProfile" || owner.Name != profile.Name || owner.UID != profile.UID {
+	if secret.UID != metadata.UID || secret.ResourceVersion != metadata.ResourceVersion {
+		return nil, "SecretNotReady", errors.New("credential secret changed during validation")
+	}
+	if !exactCredentialSecretOwner(&profile, &secret) {
 		return nil, "ForeignSecret", errors.New("credential secret is not controlled by the bound profile")
 	}
 	value, ok := secret.Data[platformv1alpha1.AgentCredentialAPIKeySecretKey]
@@ -440,6 +452,12 @@ func (r *RunReconciler) resolveCredential(ctx context.Context, run *platformv1al
 		return nil, "MalformedSecret", errors.New("credential secret is malformed")
 	}
 	return &AdapterCredential{Type: platformv1alpha1.AgentCredentialTypeAPIKey, APIKey: append([]byte(nil), value...)}, "", nil
+}
+
+func exactCredentialSecretOwner(profile *platformv1alpha1.AgentCredentialProfile, object metav1.Object) bool {
+	owner := metav1.GetControllerOf(object)
+	return len(object.GetOwnerReferences()) == 1 && owner != nil && owner.APIVersion == platformv1alpha1.GroupVersion.String() &&
+		owner.Kind == "AgentCredentialProfile" && owner.Name == profile.Name && owner.UID == profile.UID
 }
 
 func bytesContainNUL(value []byte) bool {
