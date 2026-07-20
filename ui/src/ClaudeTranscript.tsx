@@ -1,6 +1,9 @@
-import type { TranscriptRenderItem } from './Transcript'
+import { memo } from 'react'
+import { LazyJSONDetails, LazyTextDetails } from './LazyDetails'
+import type { TranscriptRenderItem } from './TranscriptTimeline'
 
 export const CLAUDE_PROCESS_OUTPUT_KEY = 'claude-code:claude-code.process-output'
+export const MAX_PARTIAL_RECORD_BYTES = 256 * 1024
 
 type JSONRecord = Record<string, unknown>
 
@@ -46,6 +49,7 @@ interface StreamState {
   lineParts: Uint8Array[]
   lineLength: number
   lineOffset?: number
+  discardingLine: boolean
   reportedGaps: Set<string>
 }
 
@@ -117,7 +121,20 @@ function parseProcessOutput(value: unknown): ProcessOutput | string {
 }
 
 function newStreamState(): StreamState {
-  return { segments: [], lineParts: [], lineLength: 0, reportedGaps: new Set() }
+  return { segments: [], lineParts: [], lineLength: 0, discardingLine: false, reportedGaps: new Set() }
+}
+
+function cloneRendererState(state: RendererState): RendererState {
+  return {
+    currentExecution: state.currentExecution,
+    executions: new Set(state.executions),
+    streams: new Map([...state.streams].map(([key, stream]) => [key, {
+      ...stream,
+      segments: stream.segments.map(segment => ({ ...segment, chunks: [...segment.chunks] })),
+      lineParts: [...stream.lineParts],
+      reportedGaps: new Set(stream.reportedGaps),
+    }])),
+  }
 }
 
 function compareAccepted(state: StreamState, start: number, bytes: Uint8Array): { status: 'equal' | 'unknown' } | { status: 'conflict'; offset: number } {
@@ -167,6 +184,23 @@ function clearLine(state: StreamState) {
   state.lineOffset = undefined
 }
 
+function appendLinePart(state: StreamState, stream: 'stdout' | 'stderr', offset: number, part: Uint8Array, presentation: ClaudeEventPresentation) {
+  if (part.length === 0 || state.discardingLine) return
+  if (state.lineLength + part.length > MAX_PARTIAL_RECORD_BYTES) {
+    presentation.parts.push({
+      kind: 'diagnostic',
+      severity: 'warning',
+      message: `${stream} record beginning at byte ${state.lineOffset ?? offset} exceeded ${MAX_PARTIAL_RECORD_BYTES} buffered bytes; discarded until newline or EOF`,
+    })
+    clearLine(state)
+    state.discardingLine = true
+    return
+  }
+  if (state.lineLength === 0) state.lineOffset = offset
+  state.lineParts.push(part)
+  state.lineLength += part.length
+}
+
 function finishLine(state: StreamState, stream: 'stdout' | 'stderr', presentation: ClaudeEventPresentation) {
   if (state.lineLength === 0) {
     clearLine(state)
@@ -198,23 +232,25 @@ function processBytes(state: StreamState, stream: 'stdout' | 'stderr', start: nu
   for (let index = 0; index < bytes.length; index += 1) {
     if (bytes[index] !== 0x0a) continue
     const part = bytes.subarray(partStart, index)
-    if (part.length > 0) {
-      if (state.lineLength === 0) state.lineOffset = start + partStart
-      state.lineParts.push(part)
-      state.lineLength += part.length
+    appendLinePart(state, stream, start + partStart, part, presentation)
+    if (state.discardingLine) {
+      clearLine(state)
+      state.discardingLine = false
+    } else {
+      finishLine(state, stream, presentation)
     }
-    finishLine(state, stream, presentation)
     partStart = index + 1
   }
   const remainder = bytes.subarray(partStart)
-  if (remainder.length > 0) {
-    if (state.lineLength === 0) state.lineOffset = start + partStart
-    state.lineParts.push(remainder)
-    state.lineLength += remainder.length
-  }
+  appendLinePart(state, stream, start + partStart, remainder, presentation)
 }
 
 function discardPartialLine(state: StreamState, stream: 'stdout' | 'stderr', presentation: ClaudeEventPresentation, reason: string) {
+  if (state.discardingLine) {
+    state.discardingLine = false
+    clearLine(state)
+    return
+  }
   if (state.lineLength === 0) return
   const offset = state.lineOffset ?? 0
   presentation.parts.push({
@@ -290,59 +326,91 @@ function processOutput(output: ProcessOutput, state: StreamState, presentation: 
     processBytes(state, output.stream, novelOffset, novel, presentation)
     state.expected = novelOffset + novel.length
   }
-  if (output.eof && state.lineLength > 0) finishLine(state, output.stream, presentation)
+  if (output.eof && state.discardingLine) {
+    state.discardingLine = false
+    clearLine(state)
+  } else if (output.eof && state.lineLength > 0) {
+    finishLine(state, output.stream, presentation)
+  }
 }
 
-// Replays only the mounted Transcript's ordered timeline. No adapter state is shared
-// between Runs, namespaces, component mounts, or EventSource reconnects.
-// eslint-disable-next-line react-refresh/only-export-components
-export function reduceClaudeTranscript(timeline: readonly TranscriptRenderItem[]): ReadonlyMap<string, ClaudeEventPresentation> {
+function processItem(state: RendererState, result: Map<string, ClaudeEventPresentation>, item: TranscriptRenderItem) {
+  if (item.kind === 'gap' || item.kind === 'client-gap') {
+    state.streams.clear()
+    return
+  }
+  const { entry } = item
+  if (`${entry.source ?? ''}:${entry.type ?? ''}` !== CLAUDE_PROCESS_OUTPUT_KEY) return
+  const presentation: ClaudeEventPresentation = { parts: [] }
+  result.set(entry.id, presentation)
+  const output = parseProcessOutput(entry.data)
+  if (typeof output === 'string') {
+    presentation.parts.push({ kind: 'diagnostic', severity: 'error', message: `Invalid Claude Code process envelope: ${output}` })
+    return
+  }
+  Object.assign(presentation, {
+    executionId: output.executionId,
+    stream: output.stream,
+    offset: output.offset,
+    nextOffset: output.nextOffset,
+  })
+  if (!state.executions.has(output.executionId)) {
+    state.executions.add(output.executionId)
+    if (state.currentExecution !== undefined) {
+      presentation.parts.push({
+        kind: 'diagnostic',
+        severity: 'info',
+        message: `Claude Code execution changed from ${state.currentExecution} to ${output.executionId}; streams are assembled independently`,
+      })
+    }
+    state.currentExecution = output.executionId
+  }
+  const key = `${output.executionId}\u0000${output.stream}`
+  let stream = state.streams.get(key)
+  if (!stream) {
+    stream = newStreamState()
+    state.streams.set(key, stream)
+  }
+  processOutput(output, stream, presentation)
+}
+
+export interface ClaudeTranscriptReduction {
+  presentations: ReadonlyMap<string, ClaudeEventPresentation>
+  timeline: readonly TranscriptRenderItem[]
+  mode: 'append' | 'replay'
+  processedItems: number
+  state: RendererState
+}
+
+function replayClaudeTranscript(timeline: readonly TranscriptRenderItem[]): ClaudeTranscriptReduction {
   const result = new Map<string, ClaudeEventPresentation>()
   const state: RendererState = { streams: new Map(), executions: new Set() }
-  for (const item of timeline) {
-    if (item.kind === 'gap') {
-      state.streams.clear()
-      continue
-    }
-    const { entry } = item
-    if (`${entry.source ?? ''}:${entry.type ?? ''}` !== CLAUDE_PROCESS_OUTPUT_KEY) continue
-    const presentation: ClaudeEventPresentation = { parts: [] }
-    result.set(entry.id, presentation)
-    const output = parseProcessOutput(entry.data)
-    if (typeof output === 'string') {
-      presentation.parts.push({ kind: 'diagnostic', severity: 'error', message: `Invalid Claude Code process envelope: ${output}` })
-      continue
-    }
-    Object.assign(presentation, {
-      executionId: output.executionId,
-      stream: output.stream,
-      offset: output.offset,
-      nextOffset: output.nextOffset,
-    })
-    if (!state.executions.has(output.executionId)) {
-      state.executions.add(output.executionId)
-      if (state.currentExecution !== undefined) {
-        presentation.parts.push({
-          kind: 'diagnostic',
-          severity: 'info',
-          message: `Claude Code execution changed from ${state.currentExecution} to ${output.executionId}; streams are assembled independently`,
-        })
-      }
-      state.currentExecution = output.executionId
-    }
-    const key = `${output.executionId}\u0000${output.stream}`
-    let stream = state.streams.get(key)
-    if (!stream) {
-      stream = newStreamState()
-      state.streams.set(key, stream)
-    }
-    processOutput(output, stream, presentation)
-  }
-  return result
+  for (const item of timeline) processItem(state, result, item)
+  return { presentations: result, timeline, mode: 'replay', processedItems: timeline.length, state }
 }
 
-function formatJSON(value: unknown): string {
-  try { return JSON.stringify(value, null, 2) ?? String(value) } catch { return '[Unrenderable value]' }
+function isMonotonicSuffix(previous: readonly TranscriptRenderItem[], next: readonly TranscriptRenderItem[]): boolean {
+  if (next.length !== previous.length + 1) return false
+  for (let index = 0; index < previous.length; index += 1) {
+    if (next[index] !== previous[index]) return false
+  }
+  return next.at(-1)?.kind === 'event'
+}
+
+// Ordinary monotonic SSE appends process one item. Ordering changes, either gap
+// type, and client-window trims replay only the bounded retained timeline.
+// eslint-disable-next-line react-refresh/only-export-components
+export function updateClaudeTranscript(previous: ClaudeTranscriptReduction | undefined, timeline: readonly TranscriptRenderItem[]): ClaudeTranscriptReduction {
+  if (!previous || !isMonotonicSuffix(previous.timeline, timeline)) return replayClaudeTranscript(timeline)
+  const state = cloneRendererState(previous.state)
+  const result = new Map(previous.presentations)
+  processItem(state, result, timeline[timeline.length - 1])
+  return { presentations: result, timeline, mode: 'append', processedItems: 1, state }
+}
+
+// eslint-disable-next-line react-refresh/only-export-components
+export function reduceClaudeTranscript(timeline: readonly TranscriptRenderItem[]): ReadonlyMap<string, ClaudeEventPresentation> {
+  return replayClaudeTranscript(timeline).presentations
 }
 
 function stringField(record: JSONRecord, key: string): string | undefined {
@@ -359,20 +427,20 @@ function AssistantRecord({ record }: { record: JSONRecord }) {
     {content.length === 0 && <p className="claude-diagnostic warning">Assistant record has no directly displayable content.</p>}
     {content.map((block, index) => {
       if (typeof block === 'string') return <p className="claude-text" key={index}>{block}</p>
-      if (!isRecord(block)) return <pre className="claude-structured" key={index}>{formatJSON(block)}</pre>
+      if (!isRecord(block)) return <LazyJSONDetails key={index} summary="Unrecognized assistant content" value={block} />
       const type = stringField(block, 'type') ?? 'unknown'
       if (type === 'text' && typeof block.text === 'string') return <p className="claude-text" key={index}>{block.text}</p>
-      if (type === 'thinking' && typeof block.thinking === 'string') return <details key={index}><summary>Thinking</summary><pre>{block.thinking}</pre></details>
+      if (type === 'thinking' && typeof block.thinking === 'string') return <LazyTextDetails key={index} summary="Thinking" text={block.thinking} />
       if ((type === 'tool_use' || type === 'server_tool_use') && typeof block.name === 'string') return <section className="claude-tool" key={index}>
         <strong>{type === 'server_tool_use' ? 'Server tool' : 'Tool use'}: {block.name}</strong>
-        {'input' in block && <pre>{formatJSON(block.input)}</pre>}
+        {'input' in block && <LazyJSONDetails summary="Tool input" value={block.input} />}
       </section>
       return <section className="claude-diagnostic warning" key={index}>
         <strong>Unrecognized assistant content block: {type}</strong>
-        <pre>{formatJSON(block)}</pre>
+        <LazyJSONDetails summary="Content block JSON" value={block} />
       </section>
     })}
-    <details><summary>Claude record JSON</summary><pre>{formatJSON(record)}</pre></details>
+    <LazyJSONDetails summary="Claude record JSON" value={record} />
   </article>
 }
 
@@ -388,7 +456,7 @@ function SystemRecord({ record }: { record: JSONRecord }) {
     <h3>Claude system · {subtype}</h3>
     {facts.length > 0 && <dl>{facts.map(([label, value]) => <div key={label}><dt>{label}</dt><dd>{value}</dd></div>)}</dl>}
     {Array.isArray(record.tools) && <p className="claude-metadata">Tools: {record.tools.map(String).join(', ')}</p>}
-    <details><summary>Claude record JSON</summary><pre>{formatJSON(record)}</pre></details>
+    <LazyJSONDetails summary="Claude record JSON" value={record} />
   </article>
 }
 
@@ -405,25 +473,25 @@ function ResultRecord({ record }: { record: JSONRecord }) {
     <h3>Claude result · {subtype}</h3>
     {typeof record.result === 'string' && <p className="claude-text">{record.result}</p>}
     {facts.length > 0 && <dl>{facts.map(([label, value]) => <div key={label}><dt>{label}</dt><dd>{value}</dd></div>)}</dl>}
-    {'structured_output' in record && <details><summary>Structured output</summary><pre>{formatJSON(record.structured_output)}</pre></details>}
-    <details><summary>Claude record JSON</summary><pre>{formatJSON(record)}</pre></details>
+    {'structured_output' in record && <LazyJSONDetails summary="Structured output" value={record.structured_output} />}
+    <LazyJSONDetails summary="Claude record JSON" value={record} />
   </article>
 }
 
 function ClaudeRecord({ record, offset }: { record: unknown; offset: number }) {
   if (!isRecord(record)) return <section className="claude-diagnostic warning">
-    <strong>Unrecognized Claude record at stdout byte {offset}</strong><pre>{formatJSON(record)}</pre>
+    <strong>Unrecognized Claude record at stdout byte {offset}</strong><LazyJSONDetails summary="Claude record JSON" value={record} />
   </section>
   if (record.type === 'system') return <SystemRecord record={record} />
   if (record.type === 'assistant') return <AssistantRecord record={record} />
   if (record.type === 'result') return <ResultRecord record={record} />
   return <section className="claude-diagnostic warning">
     <strong>Unrecognized Claude record type: {typeof record.type === 'string' ? record.type : '(missing)'}</strong>
-    <pre>{formatJSON(record)}</pre>
+    <LazyJSONDetails summary="Claude record JSON" value={record} />
   </section>
 }
 
-export function ClaudeProcessOutput({ presentation }: { presentation: ClaudeEventPresentation }) {
+export const ClaudeProcessOutput = memo(function ClaudeProcessOutput({ presentation }: { presentation: ClaudeEventPresentation }) {
   const range = presentation.offset === undefined ? undefined : presentation.offset === presentation.nextOffset
     ? `byte ${presentation.offset}`
     : `bytes ${presentation.offset}-${presentation.nextOffset}`
@@ -435,9 +503,9 @@ export function ClaudeProcessOutput({ presentation }: { presentation: ClaudeEven
         <strong>Claude Code stderr · byte {part.offset}</strong><pre>{part.text}</pre>
       </section>
       return <section className={`claude-diagnostic ${part.severity}`} key={`${part.kind}:${index}`}>
-        <strong>Claude transcript diagnostic</strong><p>{part.message}</p>{part.detail !== undefined && <pre>{part.detail}</pre>}
+        <strong>Claude transcript diagnostic</strong><p>{part.message}</p>{part.detail !== undefined && <LazyTextDetails summary="Diagnostic detail" text={part.detail} />}
       </section>
     })}
     {presentation.parts.length === 0 && <p className="hint">Process chunk accepted; waiting for a complete record.</p>}
   </div>
-}
+})

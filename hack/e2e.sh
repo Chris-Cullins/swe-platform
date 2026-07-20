@@ -487,7 +487,13 @@ if ! grep -q 'e2e transcript event' /tmp/swe-platform-transcript.out; then
 	cat /tmp/swe-platform-transcript.out
 	exit 1
 fi
-if ! grep -oE '"data":"[A-Za-z0-9+/=]+"' /tmp/swe-platform-transcript.out | \
+if ! grep -F '"source":"claude-code"' /tmp/swe-platform-transcript.out | \
+	grep -F '"type":"claude-code.process-output"' \
+	>/tmp/swe-platform-claude-envelopes.out; then
+	echo "FAIL: deployed transcript transport did not retain the exact Claude Code source/type envelope"
+	exit 1
+fi
+if ! grep -oE '"data":"[A-Za-z0-9+/=]+"' /tmp/swe-platform-claude-envelopes.out | \
 	sed 's/^"data":"//; s/"$//' | \
 	while IFS= read -r encoded; do printf '%s' "$encoded" | base64 --decode || exit 1; done \
 	>/tmp/swe-platform-process-output.out; then

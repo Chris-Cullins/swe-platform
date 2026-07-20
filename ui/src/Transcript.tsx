@@ -1,25 +1,10 @@
-import { useEffect, useMemo, useState, type ReactNode } from 'react'
+import { memo, useEffect, useState, type ReactNode } from 'react'
 import { api } from './api'
-import { CLAUDE_PROCESS_OUTPUT_KEY, ClaudeProcessOutput, reduceClaudeTranscript } from './ClaudeTranscript'
+import { CLAUDE_PROCESS_OUTPUT_KEY, ClaudeProcessOutput, updateClaudeTranscript, type ClaudeTranscriptReduction } from './ClaudeTranscript'
+import { LazyJSONDetails } from './LazyDetails'
+import { appendTimelineItem, type TranscriptEntry, type TranscriptGap, type TranscriptRenderItem } from './TranscriptTimeline'
 
-export interface TranscriptEntry {
-  id: string
-  sequence: number
-  source?: string
-  type?: string
-  data: unknown
-  raw: unknown
-}
-
-export interface TranscriptGap {
-  resumeAfter: string
-  earliestSequence?: number
-  latestSequence?: number
-}
-
-export type TranscriptRenderItem =
-  | { kind: 'event'; entry: TranscriptEntry; position: number }
-  | { kind: 'gap'; gap: TranscriptGap; position: number }
+export type { TranscriptEntry, TranscriptGap, TranscriptRenderItem } from './TranscriptTimeline'
 
 type Renderer = (data: unknown) => ReactNode
 const opaque: Renderer = data => {
@@ -27,6 +12,10 @@ const opaque: Renderer = data => {
   if (data === null || typeof data === 'number' || typeof data === 'boolean') return String(data)
   try { return JSON.stringify(data, null, 2) } catch { return '[Unrenderable event data]' }
 }
+
+const OpaqueEvent = memo(function OpaqueEvent({ data }: { data: unknown }) {
+  return <pre>{opaque(data)}</pre>
+})
 
 function parseEntry(event: MessageEvent): TranscriptEntry | undefined {
   let value: unknown
@@ -71,39 +60,77 @@ function GapNotice({ gap }: { gap: TranscriptGap }) {
   </p><p>Adapter stream assembly restarts after this boundary; partial records from before it are not joined to later bytes.</p></li>
 }
 
+function ClientGapNotice({ item }: { item: Extract<TranscriptRenderItem, { kind: 'client-gap' }> }) {
+  return <li className="client-gap"><strong>Client display history limit</strong><p>
+    This browser dropped {item.droppedItems} older timeline {item.droppedItems === 1 ? 'item' : 'items'}
+    {' '}(approximately {item.droppedRawBytes.toLocaleString()} raw bytes) to keep the console bounded.
+    This is separate from any server transcript gap. Adapter stream assembly restarted at this boundary.
+  </p></li>
+}
+
 function RawTransportEvent({ entry }: { entry: TranscriptEntry }) {
-  return <details className="raw-event"><summary>Raw transport event</summary><pre>{opaque(entry.raw)}</pre></details>
+  return <LazyJSONDetails className="raw-event" summary="Raw transport event" value={entry.raw} />
+}
+
+interface TranscriptState {
+  timeline: TranscriptRenderItem[]
+  claude: ClaudeTranscriptReduction
+}
+
+function emptyTranscriptState(): TranscriptState {
+  const timeline: TranscriptRenderItem[] = []
+  return { timeline, claude: updateClaudeTranscript(undefined, timeline) }
 }
 
 export function Transcript({ namespace, run }: { namespace: string; run: string }) {
   const [status, setStatus] = useState('Connecting')
-  const [timeline, setTimeline] = useState<TranscriptRenderItem[]>([])
+  const [transcript, setTranscript] = useState<TranscriptState>(emptyTranscriptState)
   useEffect(() => {
-    setTimeline([])
+    setTranscript(emptyTranscriptState())
     setStatus('Connecting')
     const url = api.transcriptUrl(namespace, run)
     let stream: EventSource | undefined
     let disposed = false
     let freshRecoveryUsed = false
-    const onTranscript = (raw: Event) => {
-      const entry = parseEntry(raw as MessageEvent)
-      if (!entry) return
-      setTimeline(current => {
-        if (current.some(item => item.kind === 'event' && (item.entry.id === entry.id || item.entry.sequence === entry.sequence))) return current
-        const next: TranscriptRenderItem = { kind: 'event', entry, position: entry.sequence }
-        return [...current, next].sort((a, b) => a.position - b.position || (a.kind === 'gap' ? -1 : 1))
+    let queuedTimeline: TranscriptRenderItem[] = []
+    let frame: number | undefined
+    let timer: number | undefined
+    const flushTimeline = () => {
+      frame = undefined
+      timer = undefined
+      const timeline = queuedTimeline
+      setTranscript(current => {
+        if (timeline === current.timeline) return current
+        return { timeline, claude: updateClaudeTranscript(current.claude, timeline) }
       })
     }
+    const scheduleTimelineFlush = () => {
+      if (frame !== undefined || timer !== undefined) return
+      if (typeof window.requestAnimationFrame === 'function') {
+        frame = window.requestAnimationFrame(flushTimeline)
+      } else {
+        timer = window.setTimeout(flushTimeline, 16)
+      }
+    }
+    const onTranscript = (raw: Event) => {
+      if (disposed) return
+      const entry = parseEntry(raw as MessageEvent)
+      if (!entry) return
+      if (queuedTimeline.some(item => item.kind === 'event' && (item.entry.id === entry.id || item.entry.sequence === entry.sequence))) return
+      const next: TranscriptRenderItem = { kind: 'event', entry, position: entry.sequence, rawBytes: (raw as MessageEvent).data.length }
+      queuedTimeline = appendTimelineItem(queuedTimeline, next)
+      scheduleTimelineFlush()
+    }
     const onGap = (raw: Event) => {
+      if (disposed) return
       const gap = parseGap(raw as MessageEvent)
       if (!gap) return
-      setTimeline(current => {
-        if (current.some(item => item.kind === 'gap' && item.gap.resumeAfter === gap.resumeAfter && item.gap.earliestSequence === gap.earliestSequence && item.gap.latestSequence === gap.latestSequence)) return current
-        const lastPosition = current.reduce((latest, item) => Math.max(latest, item.position), 0)
-        const position = gap.earliestSequence ?? lastPosition + 0.5
-        const next: TranscriptRenderItem = { kind: 'gap', gap, position }
-        return [...current, next].sort((a, b) => a.position - b.position || (a.kind === 'gap' ? -1 : 1))
-      })
+      if (queuedTimeline.some(item => item.kind === 'gap' && item.gap.resumeAfter === gap.resumeAfter && item.gap.earliestSequence === gap.earliestSequence && item.gap.latestSequence === gap.latestSequence)) return
+      const lastPosition = queuedTimeline.reduce((latest, item) => Math.max(latest, item.position), 0)
+      const position = gap.earliestSequence ?? lastPosition + 0.5
+      const next: TranscriptRenderItem = { kind: 'gap', gap, position, rawBytes: (raw as MessageEvent).data.length }
+      queuedTimeline = appendTimelineItem(queuedTimeline, next)
+      scheduleTimelineFlush()
     }
     const connect = () => {
       const next = new EventSource(url)
@@ -145,21 +172,24 @@ export function Transcript({ namespace, run }: { namespace: string; run: string 
     connect()
     return () => {
       disposed = true
+      if (frame !== undefined) window.cancelAnimationFrame(frame)
+      if (timer !== undefined) window.clearTimeout(timer)
       stream?.close()
     }
   }, [namespace, run])
-  const claude = useMemo(() => reduceClaudeTranscript(timeline), [timeline])
+  const { timeline, claude } = transcript
   return <section><p role="status" aria-live="polite">Transcript: {status}</p>
     {!timeline.length ? <p>No transcript events yet.</p> : <ol className="transcript">
       {timeline.map(item => {
         if (item.kind === 'gap') return <GapNotice key={`gap:${item.gap.resumeAfter}:${item.gap.earliestSequence}:${item.gap.latestSequence}`} gap={item.gap} />
+        if (item.kind === 'client-gap') return <ClientGapNotice key={`client-gap:${item.droppedItems}:${item.droppedRawBytes}`} item={item} />
         const { entry } = item
         const key = `${entry.source || ''}:${entry.type || ''}`
-        const presentation = claude.get(entry.id)
+        const presentation = claude.presentations.get(entry.id)
         return <li key={`event:${entry.id}`}><span>{[entry.source, entry.type].filter(Boolean).join(' / ') || 'Event'}</span>
           {key === CLAUDE_PROCESS_OUTPUT_KEY && presentation
             ? <ClaudeProcessOutput presentation={presentation} />
-            : <pre>{opaque(entry.data)}</pre>}
+            : <OpaqueEvent data={entry.data} />}
           <RawTransportEvent entry={entry} />
         </li>
       })}
