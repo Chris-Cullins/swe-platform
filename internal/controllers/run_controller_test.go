@@ -3,7 +3,9 @@ package controllers
 import (
 	"context"
 	"errors"
+	"fmt"
 	"reflect"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -27,6 +29,7 @@ import (
 type scriptedAdapter struct {
 	observations          []AdapterObservation
 	accepted, cancelled   int
+	acceptErr             error
 	onCancel              func()
 	cancelErr             error
 	acceptedCredentials   [][]byte
@@ -94,7 +97,7 @@ func (a *scriptedAdapter) EnsureAccepted(_ context.Context, _ AdapterTask, _ Ada
 		a.acceptedCredentials = append(a.acceptedCredentials, append([]byte(nil), credential.APIKey...))
 		a.retainedCredentialKey = credential.APIKey
 	}
-	return nil
+	return a.acceptErr
 }
 func (a *scriptedAdapter) Cancel(context.Context, AdapterTask, AdapterSandbox) error {
 	a.cancelled++
@@ -685,6 +688,22 @@ func TestAdapterShapesPauseResumeAndStatus(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestPermanentAdapterAcceptanceRejectionFailsRun(t *testing.T) {
+	run := &platformv1alpha1.Run{ObjectMeta: metav1.ObjectMeta{Name: "r", Namespace: "ns", UID: "uid", Finalizers: []string{runFinalizer}}, Spec: platformv1alpha1.RunSpec{Agent: "test"}, Status: platformv1alpha1.RunStatus{
+		State:          platformv1alpha1.RunStateEnvironmentReady,
+		EnvironmentRef: &platformv1alpha1.RunEnvironmentReference{Name: "e", UID: "euid", Ownership: platformv1alpha1.EnvironmentOwnershipOwned},
+		Conditions:     []metav1.Condition{{Type: runConditionAdapterAcceptanceAttempted, Status: metav1.ConditionTrue}},
+	}}
+	env := &platformv1alpha1.Environment{ObjectMeta: metav1.ObjectMeta{Name: "e", Namespace: "ns", UID: "euid"}, Status: platformv1alpha1.EnvironmentStatus{Phase: platformv1alpha1.EnvironmentPhaseReady}}
+	adapter := &scriptedAdapter{acceptErr: fmt.Errorf("%w: unsupported task configuration", ErrAdapterTaskRejected)}
+	r := reconciler(t, adapter, run, env)
+	got := reconcileRun(t, r, run.Name)
+	condition := apiMeta.FindStatusCondition(got.Status.Conditions, runConditionAdapterAccepted)
+	if got.Status.State != platformv1alpha1.RunStateFailed || condition == nil || condition.Status != metav1.ConditionFalse || condition.Reason != "AdapterRejected" || !strings.Contains(condition.Message, "unsupported task configuration") || adapter.accepted != 1 {
+		t.Fatalf("Run status = %#v, AdapterAccepted = %#v, accepts = %d", got.Status, condition, adapter.accepted)
 	}
 }
 

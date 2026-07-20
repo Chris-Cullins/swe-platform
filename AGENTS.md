@@ -22,8 +22,9 @@ browser sessions backed by repeated Kubernetes TokenReview/SAR authorization, an
 Run/Environment resource APIs for the console.
 Remaining gaps are marked `TODO(P0/P1/P2)` in code — most notably secure agent credential
 injection, additional agent adapters, GitHub App–scoped git tokens, and egress/portal
-networking. The first `claude-code` adapter is registered and uses sandboxd managed
-processes; tests use a fake process service and require no credentials.
+networking. The `claude-code` (default) and `amp` adapters are registered and use sandboxd
+managed processes; Amp's `AMP_API_KEY` delivery remains an unmet prerequisite and adapter
+tests use a fake process service with no credentials.
 
 ## Architecture invariants — do not violate these
 
@@ -128,7 +129,8 @@ runs both via `make` targets:
   its pinned tmux with `images/env-base/tmux-control-output-drain.patch`; keep the
   source checksum and patch synchronized when upgrading tmux. Its `terminal-test`
   target runs the patched-runtime terminal regression during `hack/e2e.sh`. The image
-  also includes a version-pinned Claude Code CLI for the default adapter.
+  also includes version-pinned Claude Code (the default adapter) and Amp CLIs. Amp image
+  installs must retain `AMP_SKIP_UPDATE_CHECK=1` and the pinned npm integrity check.
 - **Publish images:** pushes to `main` and `v*` tags publish multi-architecture operator
   and env-base images to GHCR via `.github/workflows/publish-images.yaml`.
 

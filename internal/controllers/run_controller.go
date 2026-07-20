@@ -45,6 +45,10 @@ var ErrAdapterCancellationPending = errors.New("adapter cancellation is pending"
 // an adapter event. Retrying the same event cannot make progress.
 var ErrAdapterEventRejected = errors.New("adapter event permanently rejected")
 
+// ErrAdapterTaskRejected means an adapter permanently rejected the immutable
+// task intent. Retrying acceptance cannot make progress.
+var ErrAdapterTaskRejected = errors.New("adapter task permanently rejected")
+
 const (
 	runConditionEnvironmentReady           = "EnvironmentReady"
 	runConditionCredentialProfileBound     = "CredentialProfileBound"
@@ -103,8 +107,9 @@ type AdapterSandbox struct {
 
 // AdapterLifecycle translates one agent's execution model into normalized Run
 // lifecycle events. Every operation must be idempotent. EnsureAccepted may be
-// repeated after an uncertain response or environment resume; Cancel succeeds
-// when work is already absent or terminal and returns
+// repeated after an uncertain response or environment resume and may wrap
+// ErrAdapterTaskRejected for permanent intent rejection; Cancel succeeds when
+// work is already absent or terminal and returns
 // ErrAdapterCancellationPending while its execution tree is still stopping.
 type AdapterLifecycle interface {
 	EnsureAccepted(context.Context, AdapterTask, AdapterSandbox, *AdapterCredential) error
@@ -281,6 +286,9 @@ func (r *RunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.R
 			defer clear(credential.APIKey)
 		}
 		if err := adapter.EnsureAccepted(ctx, adapterTask(&run), r.adapterSandbox(&run, env), credential); err != nil {
+			if errors.Is(err, ErrAdapterTaskRejected) {
+				return ctrl.Result{}, r.setRunState(ctx, &run, platformv1alpha1.RunStateFailed, "AdapterRejected", err.Error(), true)
+			}
 			return ctrl.Result{}, err
 		}
 		return ctrl.Result{Requeue: true}, r.setRunState(ctx, &run, platformv1alpha1.RunStateAdapterAccepted, "AdapterAccepted", "adapter accepted the task", true)
