@@ -289,6 +289,46 @@ subjects:
     name: e2e-console
     namespace: default
 EOF
+cat <<'EOF' | kubectl apply -f -
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: e2e-console-other
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: e2e-console
+  namespace: e2e-console-other
+rules:
+  - apiGroups: ["swe.dev"]
+    resources: ["runs"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: e2e-console
+  namespace: e2e-console-other
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: e2e-console
+subjects:
+  - kind: ServiceAccount
+    name: e2e-console
+    namespace: default
+---
+apiVersion: swe.dev/v1alpha1
+kind: Run
+metadata:
+  name: e2e-other-namespace-run
+  namespace: e2e-console-other
+spec:
+  templateRef: unavailable
+  agent: e2e
+  prompt: namespace navigation acceptance
+EOF
 CONSOLE_TOKEN=$(kubectl create token e2e-console --audience=swe-platform)
 
 echo "==> verifying live transcript stream through the control plane"
@@ -308,9 +348,12 @@ ROOT_STATUS=$(curl --silent --dump-header /tmp/swe-platform-console-root.headers
 SPA_STATUS=$(curl --silent --dump-header /tmp/swe-platform-console-spa.headers \
 	--output /tmp/swe-platform-console-spa.html --write-out '%{http_code}' \
 	"http://127.0.0.1:18080/namespaces/default/runs/${RUN_NAME}/overview")
+OTHER_NAMESPACE_SPA_STATUS=$(curl --silent --output /tmp/swe-platform-console-other-spa.html \
+	--write-out '%{http_code}' http://127.0.0.1:18080/namespaces/e2e-console-other/runs)
 ASSET_PATH=$(grep -oE 'src="/assets/[^"]+"' /tmp/swe-platform-console-root.html | head -1 | cut -d'"' -f2 || true)
-if [[ "$ROOT_STATUS" != "200" || "$SPA_STATUS" != "200" || -z "$ASSET_PATH" ]] || \
+if [[ "$ROOT_STATUS" != "200" || "$SPA_STATUS" != "200" || "$OTHER_NAMESPACE_SPA_STATUS" != "200" || -z "$ASSET_PATH" ]] || \
 	! cmp -s /tmp/swe-platform-console-root.html /tmp/swe-platform-console-spa.html || \
+	! cmp -s /tmp/swe-platform-console-root.html /tmp/swe-platform-console-other-spa.html || \
 	! tr -d '\r' < /tmp/swe-platform-console-root.headers | grep -Eiq '^Cache-Control: no-store$' || \
 	! grep -Eiq '^Content-Security-Policy: ' /tmp/swe-platform-console-root.headers; then
 	echo "FAIL: control-plane image did not serve the secured SPA entry point and client-route fallback"
@@ -348,11 +391,20 @@ fi
 SESSION_GET_STATUS=$(curl --silent --output /dev/null --write-out '%{http_code}' \
 	--cookie "$COOKIE_JAR" http://127.0.0.1:18080/api/v1/session)
 RUN_LIST_STATUS=$(curl --silent --output /tmp/swe-platform-runs.json --write-out '%{http_code}' \
-	--cookie "$COOKIE_JAR" 'http://127.0.0.1:18080/api/v1/namespaces/default/runs?limit=1')
+	--cookie "$COOKIE_JAR" 'http://127.0.0.1:18080/api/v1/namespaces/default/runs?limit=200')
+OTHER_RUN_LIST_STATUS=$(curl --silent --output /tmp/swe-platform-other-runs.json --write-out '%{http_code}' \
+	--cookie "$COOKIE_JAR" 'http://127.0.0.1:18080/api/v1/namespaces/e2e-console-other/runs?limit=200')
 ENV_GET_STATUS=$(curl --silent --output /tmp/swe-platform-environment.json --write-out '%{http_code}' \
 	--cookie "$COOKIE_JAR" "http://127.0.0.1:18080/api/v1/namespaces/default/environments/${ENV_NAME}")
-if [[ "$SESSION_GET_STATUS" != "200" || "$RUN_LIST_STATUS" != "200" || "$ENV_GET_STATUS" != "200" ]]; then
-	echo "FAIL: typed read API statuses session=${SESSION_GET_STATUS} runs=${RUN_LIST_STATUS} environment=${ENV_GET_STATUS}"
+if [[ "$SESSION_GET_STATUS" != "200" || "$RUN_LIST_STATUS" != "200" || "$OTHER_RUN_LIST_STATUS" != "200" || "$ENV_GET_STATUS" != "200" ]]; then
+	echo "FAIL: typed read API statuses session=${SESSION_GET_STATUS} runs=${RUN_LIST_STATUS} other-runs=${OTHER_RUN_LIST_STATUS} environment=${ENV_GET_STATUS}"
+	exit 1
+fi
+if ! grep -Fq '"name":"e2e-other-namespace-run"' /tmp/swe-platform-other-runs.json || \
+	grep -Fq '"name":"e2e-other-namespace-run"' /tmp/swe-platform-runs.json || \
+	! grep -Fq "\"name\":\"${RUN_NAME}\"" /tmp/swe-platform-runs.json || \
+	grep -Fq "\"name\":\"${RUN_NAME}\"" /tmp/swe-platform-other-runs.json; then
+	echo "FAIL: browser-session Run feeds were not isolated by namespace"
 	exit 1
 fi
 API_RUN_BODY='{"name":"e2e-api-run","selector":{"template":"small"},"agent":"e2e","prompt":"resource API acceptance"}'
