@@ -1,0 +1,29 @@
+apiVersion: skaffold/v4beta14
+kind: Config
+metadata:
+  name: swe-platform
+build:
+  local:
+    push: false
+  artifacts:
+    - image: ghcr.io/chris-cullins/swe-platform/operator
+      docker:
+        dockerfile: images/operator/Dockerfile
+    - image: ghcr.io/chris-cullins/swe-platform/control-plane
+      docker:
+        dockerfile: images/control-plane/Dockerfile
+deploy:
+  helm:
+    releases:
+      - name: swe-platform
+        chartPath: charts/swe-platform
+        namespace: default
+        valuesFiles:
+          - charts/swe-platform/values-kind.yaml
+        setValues:
+          environmentTemplates[0].spec.runtimeClass: gvisor
+        setValueTemplates:
+          image.repository: "{{.IMAGE_REPO_ghcr_io_chris_cullins_swe_platform_operator}}"
+          image.tag: "{{.IMAGE_TAG_ghcr_io_chris_cullins_swe_platform_operator}}@{{.IMAGE_DIGEST_ghcr_io_chris_cullins_swe_platform_operator}}"
+          controlPlane.image.repository: "{{.IMAGE_REPO_ghcr_io_chris_cullins_swe_platform_control_plane}}"
+          controlPlane.image.tag: "{{.IMAGE_TAG_ghcr_io_chris_cullins_swe_platform_control_plane}}@{{.IMAGE_DIGEST_ghcr_io_chris_cullins_swe_platform_control_plane}}"

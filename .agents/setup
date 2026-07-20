@@ -3,6 +3,7 @@ set -euo pipefail
 
 GO_VERSION=1.26.5
 HELM_VERSION=v4.2.3
+SKAFFOLD_VERSION=v2.23.0
 NODE_VERSION=24.18.0
 NPM_VERSION=11.16.0
 
@@ -40,4 +41,10 @@ if ! command -v helm >/dev/null 2>&1 || [[ "$(helm version --short)" != *"${HELM
 	tar -C /tmp -xzf /tmp/helm.tar.gz
 	install "/tmp/linux-${TOOL_ARCH}/helm" "$HOME/.local/bin/helm"
 	rm -rf /tmp/helm.tar.gz "/tmp/linux-${TOOL_ARCH}"
+fi
+
+if ! command -v skaffold >/dev/null 2>&1 || [[ "$(skaffold version)" != "${SKAFFOLD_VERSION}" ]]; then
+	curl -fsSL "https://storage.googleapis.com/skaffold/releases/${SKAFFOLD_VERSION}/skaffold-linux-${TOOL_ARCH}" -o /tmp/skaffold
+	install /tmp/skaffold "$HOME/.local/bin/skaffold"
+	rm -f /tmp/skaffold
 fi
