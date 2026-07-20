@@ -180,6 +180,15 @@ upgrade CRDs from a chart's `crds/` directory, so apply CRD changes separately w
 `kubectl --context "kind-${KIND_CLUSTER:-swe-dev}" apply --server-side --force-conflicts -f
 config/crd/bases`.
 
+For the separate Argo mirror created by `make argocd-up`, run `make argocd-ui` in a
+foreground terminal and open `http://127.0.0.1:18080/`. The helper explicitly targets
+`kind-swe-argo`, binds only to loopback, and reconnects the Service port-forward after an
+Argo rollout replaces the selected control-plane pod. Override the cluster with
+`KIND_ARGO_CLUSTER` or the local port with `ARGO_UI_PORT`. Stopping the helper also stops
+only its own `kubectl` child. Existing SSE or WebSocket connections still disconnect during
+a rollout and must reconnect, and a control-plane replacement invalidates its process-local
+browser sessions.
+
 Create runs with an explicit template, or reference a `Project` to use its default
 template:
 

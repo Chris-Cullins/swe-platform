@@ -118,8 +118,9 @@ runs both via `make` targets:
   cluster running Argo CD + the Image Updater (`hack/argocd/`,
   `values-argocd.yaml` preset). It syncs the chart from `origin/main` and rolls
   the operator/control plane on new `:latest` digests — only pushed commits
-  take effect. Keep it isolated from `swe-dev`; two operators must never
-  reconcile the same custom resources.
+  take effect. `make argocd-ui` keeps a foreground, loopback-only control-plane
+  Service forward alive across those rollouts. Keep it isolated from `swe-dev`;
+  two operators must never reconcile the same custom resources.
 - **Production Helm presets:** `charts/swe-platform/values-{k3s,gke,eks}.yaml`; CI lints
   and renders every preset, verifies all rendered production images use the coordinated
   chart `appVersion`, and rejects `latest`/`dev`. Provider assumptions are documented in

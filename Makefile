@@ -55,6 +55,7 @@ check-build-output: ## Verify all built binaries land in bin/
 test: ## Run unit tests in both modules
 	go test ./...
 	cd sandboxd && go test ./...
+	./hack/argocd-port-forward_test.sh
 
 .PHONY: vet
 vet: ## Run go vet in both modules
@@ -124,6 +125,10 @@ kind-down: ## Delete the kind dev cluster
 .PHONY: argocd-up
 argocd-up: ## Create the Argo CD cluster tracking origin/main
 	./hack/argocd-up.sh
+
+.PHONY: argocd-ui
+argocd-ui: ## Keep the Argo mirror console reachable across rollouts
+	./hack/argocd-port-forward.sh
 
 .PHONY: argocd-down
 argocd-down: ## Delete the Argo CD cluster
