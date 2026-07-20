@@ -257,8 +257,9 @@ Cluster '$CLUSTER' is ready with RuntimeClass/gvisor and snapshot-capable
 StorageClass/csi-hostpath-sc.
 
 Next steps:
-  make docker-build
-  kind load docker-image ghcr.io/chris-cullins/swe-platform/operator:dev ghcr.io/chris-cullins/swe-platform/control-plane:dev ghcr.io/chris-cullins/swe-platform/env-base:dev --name $CLUSTER
-  helm upgrade --install swe-platform charts/swe-platform -n default -f charts/swe-platform/values-kind.yaml --set-string 'environmentTemplates[0].spec.runtimeClass=gvisor'
+  make docker-build-env-base
+  kind load docker-image ghcr.io/chris-cullins/swe-platform/env-base:dev --name $CLUSTER
+  make dev KIND_CLUSTER=$CLUSTER
+  make build-cli
   bin/swe run "fix the flaky tests" -t small
 EOF

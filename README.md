@@ -160,6 +160,25 @@ Run the acceptance suite against the bootstrapped cluster with gVisor enabled:
 KIND_CLUSTER=swe-dev E2E_USE_EXISTING_CLUSTER=true E2E_RUNTIME_CLASS=gvisor ./hack/e2e.sh
 ```
 
+For the controller inner loop, this repository uses Skaffold v2.23.0 rather than Tilt: its
+native Docker, kind image-loading, and Helm support map directly onto the existing build
+and `values-kind.yaml` workflow without adding a cluster-side development service. After
+installing Skaffold and Helm and running `make kind-up`, start the watch loop with:
+
+```sh
+make dev
+```
+
+Skaffold builds and loads the operator and control-plane images, installs or upgrades the
+`swe-platform` Helm release with `values-kind.yaml`, and repeats that cycle when relevant
+source, chart template, or values files change. `make dev` always targets the
+`kind-swe-dev` context (or `kind-$KIND_CLUSTER` when overridden) and refuses the Argo mirror
+cluster named by `KIND_ARGO_CLUSTER` (default `swe-argo`). The environment base image is
+outside this controller loop; build and load it separately before starting Runs that need a
+fresh environment. Helm does not upgrade CRDs from a chart's `crds/` directory, so apply
+CRD changes separately with `kubectl --context "kind-${KIND_CLUSTER:-swe-dev}" apply
+--server-side --force-conflicts -f config/crd/bases`.
+
 Create runs with an explicit template, or reference a `Project` to use its default
 template:
 
