@@ -106,11 +106,27 @@ sleep 5
 printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"result":"fake Claude Code completed"}'
 EOF
 chmod 0755 "$FAKE_ENV_CONTEXT/claude"
+cat > "$FAKE_ENV_CONTEXT/amp" <<'EOF'
+#!/bin/sh
+set -eu
+test "$#" -eq 4
+test "$1" = '--execute=fake Amp lifecycle smoke test'
+test "$2" = '--stream-json'
+test "$3" = '--no-ide'
+test "$4" = '--no-notifications'
+test -z "${AMP_API_KEY+x}"
+printf '%s\n' '{"type":"assistant","message":{"content":[{"type":"text","text":"fake-amp-stdout-marker"}]}}'
+printf '%s\n' 'fake-amp-stderr-marker' >&2
+sleep 5
+printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"result":"fake Amp completed"}'
+EOF
+chmod 0755 "$FAKE_ENV_CONTEXT/amp"
 cat > "$FAKE_ENV_CONTEXT/Dockerfile" <<'EOF'
 ARG BASE_IMAGE
 FROM ${BASE_IMAGE}
 USER root
 COPY claude /usr/local/bin/claude
+COPY amp /usr/local/bin/amp
 USER swe
 EOF
 docker build --build-arg BASE_IMAGE="$ENV_IMAGE" -t "$E2E_ENV_IMAGE" "$FAKE_ENV_CONTEXT" >/dev/null
@@ -727,6 +743,36 @@ if contains_e2e_key /tmp/swe-platform-resumed-workspace.tar; then
 	exit 1
 fi
 kubectl delete run "$RESUME_RUN_NAME" --wait=true >/dev/null
+
+echo "==> verifying fake Amp real Run lifecycle without credentials or network"
+AMP_RUN_NAME=e2e-fake-amp-run
+bin/swe run "fake Amp lifecycle smoke test" --name "$AMP_RUN_NAME" --environment "$ENV_NAME" \
+	--agent amp --wait=false
+kubectl wait --for=jsonpath='{.status.state}'=Running run/"$AMP_RUN_NAME" --timeout=3m
+kubectl wait --for=jsonpath='{.status.state}'=Succeeded run/"$AMP_RUN_NAME" --timeout=3m
+set +e
+curl --silent --no-buffer --max-time 2 \
+	-H "Authorization: Bearer ${E2E_BOOTSTRAP_TOKEN}" \
+	"http://127.0.0.1:18080/api/v1/namespaces/default/runs/${AMP_RUN_NAME}/transcript" \
+	> /tmp/swe-platform-amp-transcript.out
+AMP_TRANSCRIPT_STATUS=$?
+set -e
+if [[ "$AMP_TRANSCRIPT_STATUS" != "0" && "$AMP_TRANSCRIPT_STATUS" != "28" ]]; then
+	echo "FAIL: Amp transcript read failed with curl status ${AMP_TRANSCRIPT_STATUS}"
+	exit 1
+fi
+grep -F '"source":"amp"' /tmp/swe-platform-amp-transcript.out | \
+	grep -F '"type":"amp.process-output"' | \
+	grep -oE '"data":"[A-Za-z0-9+/=]+"' | sed 's/^"data":"//; s/"$//' | \
+	while IFS= read -r encoded; do printf '%s' "$encoded" | base64 --decode || exit 1; done \
+	> /tmp/swe-platform-amp-process-output.out
+if ! grep -Fq 'fake-amp-stdout-marker' /tmp/swe-platform-amp-process-output.out || \
+	! grep -Fq 'fake-amp-stderr-marker' /tmp/swe-platform-amp-process-output.out; then
+	echo "FAIL: Amp transcript did not retain both output stream markers"
+	cat /tmp/swe-platform-amp-process-output.out
+	exit 1
+fi
+kubectl delete run "$AMP_RUN_NAME" --wait=true >/dev/null
 
 echo "==> verifying idle pause and terminal wake through the control plane"
 PRE_IDLE_POD_UID=$(kubectl get pod "$POD_NAME" -o jsonpath='{.metadata.uid}')

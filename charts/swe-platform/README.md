@@ -1,5 +1,11 @@
 # swe-platform Helm chart
 
+The bundled environment image provides the default `claude-code` adapter and the explicitly
+selected `amp` adapter (`swe run --agent amp ...`). Amp's `AMP_API_KEY` is not injected by the
+chart or operator yet; secure runtime delivery remains deferred to issue #9. Do not place Amp
+credentials in chart values, Project configuration, or a custom image. The image only pins the
+public Amp CLI and disables its update check.
+
 This chart installs the swe-platform CRDs, operator, and the first control-plane API.
 The control plane accepts adapter-owned transcript events and streams them over SSE.
 Its bounded transcript store is currently process-local, so the chart requires one control-plane

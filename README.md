@@ -221,6 +221,26 @@ Non-success results, non-zero exits, missing executables, malformed/missing fina
 events, and permanent transcript rejection map to `Failed`. Transcript storage is currently
 process-local to one control-plane replica.
 
+### Amp adapter
+
+Select Amp explicitly with `swe run --agent amp ...`; `claude-code` remains the default.
+The coordinated environment image pins `@ampcode/cli@0.0.1784492094-g5d18e2` and disables
+its update check. The adapter starts `amp --execute=<prompt> --stream-json --no-ide
+--no-notifications` as a Run-UID-keyed sandboxd managed process. It forwards bounded,
+gap-aware stdout/stderr as opaque `amp.process-output` events and requires both an exit-zero
+process and Amp's final Claude-compatible JSONL `result` event with `subtype: "success"` and
+`is_error: false`. Consumers reconstruct each stream by its absolute offsets rather than event
+append order; an operator restart can replay an overlapping range because output cursors are
+process-local, while retrying an uncertain append within one operator process resends the exact
+same event and idempotency key.
+
+`AMP_API_KEY` is currently an unmet runtime prerequisite: secure Amp key delivery is deferred
+to issue #9. The platform does not mount user Amp configuration, add ambient credentials, or
+accept a credential profile for this adapter. Consequently the stock image cannot run Amp
+against its service without separately solving that prerequisite; tests use a fake executable.
+Abrupt cancellation stops only the Run-owned local process tree, but Amp's public contract does
+not guarantee that remote/server-backed thread work has also stopped.
+
 `--name` is the create idempotency key: retry an uncertain request with the same name and
 immutable task arguments. The CLI returns the existing Run only when its intent matches;
 the controller creates or claims the Environment server-side.

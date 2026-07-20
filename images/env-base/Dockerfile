@@ -35,6 +35,23 @@ FROM node:24-bookworm-slim AS claude-code
 ARG CLAUDE_CODE_VERSION=2.1.215
 RUN npm install -g "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}"
 
+FROM node:24-bookworm-slim AS amp
+ARG AMP_VERSION=0.0.1784492094-g5d18e2
+ARG TARGETARCH
+RUN case "$TARGETARCH" in \
+		amd64) package=cli-linux-x64; integrity='sha512-63OLnzbYy7iZhHcw1TaEaTOcdr18XouL2RtxLTH9T8BBGOvnFVMxBTHQzl3H4sQj2X5NVnxVEsLFvODBfJD4yg==' ;; \
+		arm64) package=cli-linux-arm64; integrity='sha512-URIOwVZ6XI1fe/iH0xTAVi7KQ16xUKFlyF++fv4x8aCNKQhhR4v01RuAs4ePp8Trqt3vckLkaAPmYQY0eMkUaw==' ;; \
+		*) echo "unsupported TARGETARCH: $TARGETARCH" >&2; exit 1 ;; \
+	esac \
+	&& wrapper="$(npm pack "@ampcode/cli@${AMP_VERSION}" --silent)" \
+	&& node -e 'const [file, want] = process.argv.slice(1); const fs = require("fs"), crypto = require("crypto"); const got = "sha512-" + crypto.createHash("sha512").update(fs.readFileSync(file)).digest("base64"); if (got !== want) { throw new Error(`integrity mismatch for ${file}`) }' "$wrapper" 'sha512-uLTXtnFeA5ZNHe55NFuvFUS9q3o46hM8njiIF7CInzlrT+xhWnR6RcoFTjCqF6ZtXbJl2anQeK2LDpJpN1UvbQ==' \
+	&& archive="$(npm pack "@ampcode/${package}@${AMP_VERSION}" --silent)" \
+	&& node -e 'const [file, want] = process.argv.slice(1); const fs = require("fs"), crypto = require("crypto"); const got = "sha512-" + crypto.createHash("sha512").update(fs.readFileSync(file)).digest("base64"); if (got !== want) { throw new Error(`integrity mismatch for ${file}`) }' "$archive" "$integrity" \
+	&& tar -xzf "$archive" package/amp --strip-components=1 \
+	&& install -m 0755 amp /usr/local/bin/amp \
+	&& rm "$wrapper" "$archive" amp \
+	&& test "$(/usr/local/bin/amp --version | awk '{print $1}')" = "${AMP_VERSION}"
+
 # Base image for environments.
 FROM debian:12-slim AS environment
 
@@ -50,7 +67,10 @@ COPY --from=build /out/sandboxd /usr/local/bin/sandboxd
 COPY --from=tmux-build /src/tmux /usr/bin/tmux
 COPY --from=claude-code /usr/local/lib/node_modules/@anthropic-ai /usr/local/lib/node_modules/@anthropic-ai
 COPY --from=claude-code /usr/local/bin/claude /usr/local/bin/claude
-RUN claude --version
+COPY --from=amp /usr/local/bin/amp /usr/local/bin/amp
+ENV AMP_SKIP_UPDATE_CHECK=1
+RUN claude --version \
+	&& test "$(amp --version | awk '{print $1}')" = "0.0.1784492094-g5d18e2"
 
 USER swe
 WORKDIR /workspace
