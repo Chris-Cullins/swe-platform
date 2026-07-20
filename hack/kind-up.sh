@@ -87,13 +87,17 @@ for node in "${NODES[@]}"; do
 		docker exec "$node" install -m 0755 "/tmp/$binary" "/usr/local/bin/$binary"
 	done
 	if ! docker exec "$node" grep -Fq 'containerd.runtimes.runsc]' /etc/containerd/config.toml; then
-		if ! docker exec "$node" grep -Eq '^[[:space:]]*version[[:space:]]*=[[:space:]]*2[[:space:]]*$' /etc/containerd/config.toml; then
-			echo "unsupported containerd config in $node: expected version = 2" >&2
+		if docker exec "$node" grep -Eq '^[[:space:]]*version[[:space:]]*=[[:space:]]*2[[:space:]]*$' /etc/containerd/config.toml; then
+			RUNTIME_PLUGIN=io.containerd.grpc.v1.cri
+		elif docker exec "$node" grep -Eq '^[[:space:]]*version[[:space:]]*=[[:space:]]*3[[:space:]]*$' /etc/containerd/config.toml; then
+			RUNTIME_PLUGIN=io.containerd.cri.v1.runtime
+		else
+			echo "unsupported containerd config in $node: expected version 2 or 3" >&2
 			exit 1
 		fi
-		docker exec -i "$node" sh -c 'cat >> /etc/containerd/config.toml' <<'EOF'
+		docker exec -i "$node" sh -c 'cat >> /etc/containerd/config.toml' <<EOF
 
-[plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runsc]
+[plugins."$RUNTIME_PLUGIN".containerd.runtimes.runsc]
   runtime_type = "io.containerd.runsc.v1"
 EOF
 	fi
