@@ -18,6 +18,7 @@ import (
 
 	platformv1alpha1 "github.com/Chris-Cullins/swe-platform/api/v1alpha1"
 	"github.com/Chris-Cullins/swe-platform/internal/adapters/claudecode"
+	"github.com/Chris-Cullins/swe-platform/internal/adapters/pi"
 	"github.com/Chris-Cullins/swe-platform/internal/controllers"
 	"github.com/Chris-Cullins/swe-platform/internal/transcriptclient"
 )
@@ -127,5 +128,8 @@ func main() {
 }
 
 func registeredAdapters() map[string]controllers.AdapterLifecycle {
-	return map[string]controllers.AdapterLifecycle{"claude-code": &claudecode.Adapter{}}
+	return map[string]controllers.AdapterLifecycle{
+		"claude-code": &claudecode.Adapter{},
+		"pi":          &pi.Adapter{},
+	}
 }

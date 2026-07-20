@@ -35,8 +35,17 @@ FROM node:24-bookworm-slim AS claude-code
 ARG CLAUDE_CODE_VERSION=2.1.215
 RUN npm install -g "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}"
 
+FROM node:24-bookworm-slim AS pi
+ARG PI_CODING_AGENT_VERSION=0.80.10
+ARG PI_CODING_AGENT_INTEGRITY=sha512-aL4apbupCHiVLSXASXvRzH4Q2vmtfrDa+0s909CJuVu/GgGylbDzr7oyF1mPmip5E+VxYYxKWmph4hV04wUcQg==
+WORKDIR /tmp/pi
+RUN npm pack "@earendil-works/pi-coding-agent@${PI_CODING_AGENT_VERSION}" --json > pack.json \
+	&& test "$(node -p 'JSON.parse(require("fs").readFileSync("pack.json"))[0].integrity')" = "${PI_CODING_AGENT_INTEGRITY}" \
+	&& npm install -g "./$(node -p 'JSON.parse(require("fs").readFileSync("pack.json"))[0].filename')" \
+	&& test "$(pi --version)" = "${PI_CODING_AGENT_VERSION}"
+
 # Base image for environments.
-FROM debian:12-slim AS environment
+FROM node:24-bookworm-slim AS environment
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
 		git ca-certificates curl tmux jq ripgrep \
@@ -50,7 +59,9 @@ COPY --from=build /out/sandboxd /usr/local/bin/sandboxd
 COPY --from=tmux-build /src/tmux /usr/bin/tmux
 COPY --from=claude-code /usr/local/lib/node_modules/@anthropic-ai /usr/local/lib/node_modules/@anthropic-ai
 COPY --from=claude-code /usr/local/bin/claude /usr/local/bin/claude
-RUN claude --version
+COPY --from=pi /usr/local/lib/node_modules/@earendil-works /usr/local/lib/node_modules/@earendil-works
+COPY --from=pi /usr/local/bin/pi /usr/local/bin/pi
+RUN claude --version && pi --version
 
 USER swe
 WORKDIR /workspace

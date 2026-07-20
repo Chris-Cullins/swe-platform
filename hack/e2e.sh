@@ -99,8 +99,34 @@ printf '%s\n' '{"type":"assistant","session_id":"fake-e2e","message":{"id":"msg-
 sleep 5
 printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"result":"fake Claude Code completed"}'
 EOF
-chmod +x "$PROJECT_WORKTREE/bin/claude"
-git -C "$PROJECT_WORKTREE" add .agents/setup .agents/resume bin/claude
+cat > "$PROJECT_WORKTREE/bin/pi" <<'EOF'
+#!/bin/sh
+if [ "$#" -ne 10 ] ||
+	[ "$1" != "--mode" ] || [ "$2" != "json" ] ||
+	[ "$3" != "--no-session" ] || [ "$4" != "--no-approve" ] ||
+	[ "$5" != "--no-extensions" ] || [ "$6" != "--no-skills" ] ||
+	[ "$7" != "--no-prompt-templates" ] || [ "$8" != "--no-themes" ] ||
+	[ "$9" != "--offline" ] || [ "${10}" != '
+--fake-pi-e2e' ]; then
+	printf '%s\n' 'fake Pi received unsafe or interactive arguments' >&2
+	exit 64
+fi
+case "${PI_CODING_AGENT_DIR:-}" in
+	/tmp/swe-platform/pi/*) ;;
+	*) printf '%s\n' 'fake Pi received a shared config directory' >&2; exit 65 ;;
+esac
+run_dir=${PI_CODING_AGENT_DIR#/tmp/swe-platform/pi/}
+if [ -z "$run_dir" ] || [ "$run_dir" != "${run_dir#*/}" ]; then
+	printf '%s\n' 'fake Pi config directory is not scoped to one Run UID' >&2
+	exit 66
+fi
+printf '%s\n' '{"type":"agent_start"}'
+printf '%s\n' 'fake Pi diagnostic' >&2
+sleep 5
+printf '%s\n' '{"type":"agent_end","messages":[{"role":"assistant","content":[{"type":"text","text":"fake Pi is working"}],"stopReason":"stop"}]}'
+EOF
+chmod +x "$PROJECT_WORKTREE/bin/claude" "$PROJECT_WORKTREE/bin/pi"
+git -C "$PROJECT_WORKTREE" add .agents/setup .agents/resume bin/claude bin/pi
 git -C "$PROJECT_WORKTREE" commit -m "Add e2e lifecycle hooks" >/dev/null
 git -C "$PROJECT_WORKTREE" bundle create "$PROJECT_REPO/repo.bundle" main
 kubectl create configmap e2e-git-repo --from-file="$PROJECT_REPO/repo.bundle"
@@ -203,6 +229,23 @@ for _ in $(seq 1 60); do
 done
 if [[ -z "${REPLACEMENT_NAME:-}" || "$REPLACEMENT_NAME" == "$ENV_NAME" || "${REPLACEMENT_PHASE:-}" != "Ready" ]]; then
 	echo "FAIL: warm pool was not replenished after claim"
+	exit 1
+fi
+
+echo "==> exercising Pi through the real Run controller with a fake executable"
+PI_RUN_NAME=e2e-pi
+bin/swe run --name "$PI_RUN_NAME" --agent pi --environment "$ENV_NAME" --wait=false -- "--fake-pi-e2e"
+kubectl wait --for=jsonpath='{.status.state}'=Running run/"$PI_RUN_NAME" --timeout=2m
+kubectl wait --for=jsonpath='{.status.state}'=Succeeded run/"$PI_RUN_NAME" --timeout=2m
+for _ in $(seq 1 60); do
+	PI_CLAIM_UID=$(kubectl get environment "$ENV_NAME" -o jsonpath='{.status.claimedBy.uid}' 2>/dev/null || true)
+	if [[ -z "$PI_CLAIM_UID" ]]; then
+		break
+	fi
+	sleep 1
+done
+if [[ -n "${PI_CLAIM_UID:-}" ]]; then
+	echo "FAIL: terminal Pi Run did not release its Environment claim"
 	exit 1
 fi
 
@@ -504,6 +547,41 @@ if ! grep -Fq '"type":"assistant"' /tmp/swe-platform-process-output.out || \
 	! grep -Fq '"text":"fake Claude Code is working"' /tmp/swe-platform-process-output.out; then
 	echo "FAIL: deployed transcript transport did not retain the realistic Claude assistant record"
 	cat /tmp/swe-platform-process-output.out
+	exit 1
+fi
+
+echo "==> verifying fake Pi output through the deployed transcript transport"
+curl --fail --silent --no-buffer --max-time 10 \
+	-H "Authorization: Bearer ${E2E_BOOTSTRAP_TOKEN}" \
+	"http://127.0.0.1:18080/api/v1/namespaces/default/runs/${PI_RUN_NAME}/transcript" \
+	>/tmp/swe-platform-pi-transcript.out &
+PI_STREAM_PID=$!
+for _ in $(seq 1 30); do
+	if grep -Fq '"type":"pi.process-output"' /tmp/swe-platform-pi-transcript.out; then
+		break
+	fi
+	sleep 1
+done
+kill "$PI_STREAM_PID" >/dev/null 2>&1 || true
+wait "$PI_STREAM_PID" >/dev/null 2>&1 || true
+if ! grep -F '"source":"pi"' /tmp/swe-platform-pi-transcript.out | \
+	grep -F '"type":"pi.process-output"' \
+	>/tmp/swe-platform-pi-envelopes.out; then
+	echo "FAIL: deployed transcript transport did not retain the exact Pi source/type envelope"
+	exit 1
+fi
+if ! grep -oE '"data":"[A-Za-z0-9+/=]+"' /tmp/swe-platform-pi-envelopes.out | \
+	sed 's/^"data":"//; s/"$//' | \
+	while IFS= read -r encoded; do printf '%s' "$encoded" | base64 --decode || exit 1; done \
+	>/tmp/swe-platform-pi-output.out; then
+	echo "FAIL: Pi process output was not valid base64 in the deployed transcript transport"
+	exit 1
+fi
+if ! grep -Fq '"type":"agent_end"' /tmp/swe-platform-pi-output.out || \
+	! grep -Fq '"text":"fake Pi is working"' /tmp/swe-platform-pi-output.out || \
+	! grep -Fq 'fake Pi diagnostic' /tmp/swe-platform-pi-output.out; then
+	echo "FAIL: deployed transcript transport did not retain opaque Pi stdout and stderr"
+	cat /tmp/swe-platform-pi-output.out
 	exit 1
 fi
 
