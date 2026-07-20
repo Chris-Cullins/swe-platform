@@ -30,6 +30,7 @@ type fakeResources struct {
 	calls                             []string
 	createErr, errorGet, collisionErr error
 	created, existing                 Run
+	createdRequest                    CreateRunRequest
 	cancel                            Run
 	listPage                          RunList
 	environment                       Environment
@@ -44,6 +45,7 @@ func (f *fakeResources) ListRuns(_ context.Context, n string, l int64, c string)
 }
 func (f *fakeResources) CreateRun(_ context.Context, n string, r CreateRunRequest) (Run, error) {
 	f.calls = append(f.calls, "create")
+	f.createdRequest = r
 	return f.created, f.createErr
 }
 func (f *fakeResources) ResolveRunCreateCollision(_ context.Context, n string, r CreateRunRequest) (Run, error) {
@@ -135,8 +137,8 @@ func TestRunListQueryValidation(t *testing.T) {
 }
 
 func TestCreateRunValidation(t *testing.T) {
-	valid := `{"name":"r","selector":{"template":"small"},"agent":"amp","prompt":"go"}`
-	cases := []string{"{", valid + " {}", `{"name":"r","selector":{"template":"small"},"agent":"amp","prompt":"go","x":1}`, `{"name":"r","selector":{"template":"small","x":1},"agent":"amp","prompt":"go"}`, `{"name":"r","selector":{},"agent":"amp","prompt":"go"}`, `{"name":"r","selector":{"environment":"e","project":"p"},"agent":"amp","prompt":"go"}`, `{"name":"BAD NAME","selector":{"template":"small"},"agent":"amp","prompt":"go"}`, `{"name":"r","selector":{"template":"BAD NAME"},"agent":"amp","prompt":"go"}`, `{"name":"r","selector":{"template":"small"},"agent":"","prompt":"go"}`, `{"name":"r","selector":{"template":"small"},"agent":"` + strings.Repeat("a", 129) + `","prompt":"go"}`, `{"name":"r","selector":{"template":"small"},"agent":"amp","prompt":""}`}
+	valid := `{"name":"r","selector":{"template":"small"},"agent":"amp","prompt":"go","credentialProfile":"amp-production"}`
+	cases := []string{"{", valid + " {}", `{"name":"r","selector":{"template":"small"},"agent":"amp","prompt":"go","x":1}`, `{"name":"r","selector":{"template":"small","x":1},"agent":"amp","prompt":"go"}`, `{"name":"r","selector":{},"agent":"amp","prompt":"go"}`, `{"name":"r","selector":{"environment":"e","project":"p"},"agent":"amp","prompt":"go"}`, `{"name":"BAD NAME","selector":{"template":"small"},"agent":"amp","prompt":"go"}`, `{"name":"r","selector":{"template":"BAD NAME"},"agent":"amp","prompt":"go"}`, `{"name":"r","selector":{"template":"small"},"agent":"amp","prompt":"go","credentialProfile":"BAD PROFILE"}`, `{"name":"r","selector":{"template":"small"},"agent":"","prompt":"go"}`, `{"name":"r","selector":{"template":"small"},"agent":"` + strings.Repeat("a", 129) + `","prompt":"go"}`, `{"name":"r","selector":{"template":"small"},"agent":"amp","prompt":""}`}
 	for i, body := range cases {
 		f := &fakeResources{}
 		w := resourceRequest(NewServer(nil, ServerOptions{Access: &recordingAccess{}, Resources: f}), "POST", "/api/v1/namespaces/ns/runs", body, "")
@@ -153,6 +155,9 @@ func TestCreateRunValidation(t *testing.T) {
 	w = resourceRequest(NewServer(nil, ServerOptions{Access: &recordingAccess{}, Resources: f}), "POST", "/api/v1/namespaces/ns/runs", valid, "")
 	if w.Code != 201 || !strings.Contains(w.Body.String(), `"name":"r"`) {
 		t.Errorf("success=%d %s", w.Code, w.Body.String())
+	}
+	if f.createdRequest.CredentialProfile != "amp-production" {
+		t.Fatalf("profile create request = %#v", f.createdRequest)
 	}
 }
 

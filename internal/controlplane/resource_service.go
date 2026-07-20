@@ -90,13 +90,14 @@ func (s *KubernetesResourceService) GetRun(ctx context.Context, namespace, name 
 
 func desiredRunSpec(request CreateRunRequest) platformv1alpha1.RunSpec {
 	return platformv1alpha1.RunSpec{
-		EnvironmentRef: request.Selector.Environment,
-		ProjectRef:     request.Selector.Project,
-		TemplateRef:    request.Selector.Template,
-		Agent:          request.Agent,
-		Prompt:         request.Prompt,
-		Notify:         nil,
-		ParentRef:      "",
+		EnvironmentRef:       request.Selector.Environment,
+		ProjectRef:           request.Selector.Project,
+		TemplateRef:          request.Selector.Template,
+		Agent:                request.Agent,
+		Prompt:               request.Prompt,
+		CredentialProfileRef: request.CredentialProfile,
+		Notify:               nil,
+		ParentRef:            "",
 	}
 }
 
@@ -136,9 +137,10 @@ func runDTO(run *platformv1alpha1.Run) Run {
 		UID:       string(run.UID),
 		CreatedAt: run.CreationTimestamp.Time,
 		Intent: RunIntent{
-			Selector: RunSelector{Environment: run.Spec.EnvironmentRef, Project: run.Spec.ProjectRef, Template: run.Spec.TemplateRef},
-			Agent:    run.Spec.Agent,
-			Prompt:   run.Spec.Prompt,
+			Selector:          RunSelector{Environment: run.Spec.EnvironmentRef, Project: run.Spec.ProjectRef, Template: run.Spec.TemplateRef},
+			Agent:             run.Spec.Agent,
+			Prompt:            run.Spec.Prompt,
+			CredentialProfile: run.Spec.CredentialProfileRef,
 		},
 		CancelRequested: run.Spec.Cancel,
 		State:           string(run.Status.State),

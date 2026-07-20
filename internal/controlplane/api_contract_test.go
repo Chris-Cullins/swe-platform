@@ -21,16 +21,20 @@ func TestAPIContractFixturesAreCanonicalHandlerAndMapperOutput(t *testing.T) {
 	lastActive := metav1.NewTime(mustContractTime(t, "2026-07-19T18:14:13Z"))
 	run := &platformv1alpha1.Run{
 		ObjectMeta: metav1.ObjectMeta{Name: "fix-flaky-42", UID: "eb7e3ff7-8117-4caf-912d-167b70eaee21", CreationTimestamp: metav1.NewTime(created)},
-		Spec:       platformv1alpha1.RunSpec{ProjectRef: "org-repo", TemplateRef: "small", Agent: "claude-code", Prompt: "Fix the flaky test"},
+		Spec:       platformv1alpha1.RunSpec{ProjectRef: "org-repo", TemplateRef: "small", CredentialProfileRef: "claude-production", Agent: "claude-code", Prompt: "Fix the flaky test"},
 		Status: platformv1alpha1.RunStatus{
 			State:          platformv1alpha1.RunStateRunning,
 			EnvironmentRef: &platformv1alpha1.RunEnvironmentReference{Name: "run-fix-flaky-42", Ownership: platformv1alpha1.EnvironmentOwnershipOwned},
-			Branch:         "swe/fix-flaky-42",
-			Usage:          platformv1alpha1.RunUsage{CPUSeconds: 42, TokensIn: 1200, TokensOut: 340},
+			CredentialProfileRef: &platformv1alpha1.RunCredentialProfileReference{
+				Name: "claude-production", UID: "profile-uid-must-not-be-exposed",
+			},
+			Branch: "swe/fix-flaky-42",
+			Usage:  platformv1alpha1.RunUsage{CPUSeconds: 42, TokensIn: 1200, TokensOut: 340},
 		},
 	}
 	listRun := run.DeepCopy()
 	listRun.Spec.TemplateRef = ""
+	listRun.Spec.CredentialProfileRef = ""
 	listRun.Status = platformv1alpha1.RunStatus{State: platformv1alpha1.RunStateAllocating}
 	environmentCreated := mustContractTime(t, "2026-07-19T18:04:14Z")
 	environment := &platformv1alpha1.Environment{

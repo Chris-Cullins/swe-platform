@@ -211,6 +211,7 @@ func decodeCreateRun(w http.ResponseWriter, r *http.Request) (CreateRunRequest, 
 		return CreateRunRequest{}, fmt.Errorf("name must be a Kubernetes DNS subdomain: %s", strings.Join(problems, ", "))
 	}
 	for field, value := range map[string]string{
+		"credentialProfile":    request.CredentialProfile,
 		"selector.environment": request.Selector.Environment,
 		"selector.project":     request.Selector.Project,
 		"selector.template":    request.Selector.Template,

@@ -1,9 +1,6 @@
 package v1alpha1
 
-import (
-	corev1 "k8s.io/api/core/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-)
+import metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 // ChangesWorkflow selects what happens to a run's changes by default.
 // +kubebuilder:validation:Enum=branch-pr;ship-to-main
@@ -26,10 +23,6 @@ type ProjectSpec struct {
 	// TemplateRef is the default EnvironmentTemplate for this project.
 	// +optional
 	TemplateRef string `json:"templateRef,omitempty"`
-
-	// SecretRef points at the Secret holding project credentials and env vars.
-	// +optional
-	SecretRef *corev1.LocalObjectReference `json:"secretRef,omitempty"`
 
 	// ChangesWorkflow selects the default action for finished runs.
 	// +kubebuilder:default=branch-pr

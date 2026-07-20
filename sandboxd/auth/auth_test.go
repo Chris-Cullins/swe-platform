@@ -168,6 +168,12 @@ func TestTLSAndCapabilityInterceptorsEndToEnd(t *testing.T) {
 	if _, err := sandboxdv1.NewProcessServiceClient(dial(t, serverName, processToken)).Start(context.Background(), &sandboxdv1.StartProcessRequest{}); err != nil {
 		t.Fatalf("process credential Process call: %v", err)
 	}
+	if _, err := sandboxdv1.NewProcessServiceClient(dial(t, serverName, processToken)).StartWithLaunchMaterial(context.Background(), &sandboxdv1.StartProcessWithLaunchMaterialRequest{}); err != nil {
+		t.Fatalf("process credential launch-material call: %v", err)
+	}
+	if _, err := sandboxdv1.NewProcessServiceClient(dial(t, serverName, token)).StartWithLaunchMaterial(context.Background(), &sandboxdv1.StartProcessWithLaunchMaterialRequest{}); status.Code(err) != codes.PermissionDenied {
+		t.Fatalf("terminal credential launch-material status = %v, want PermissionDenied", err)
+	}
 	if _, err := sandboxdv1.NewProcessServiceClient(dial(t, serverName, token)).Start(context.Background(), &sandboxdv1.StartProcessRequest{}); status.Code(err) != codes.PermissionDenied {
 		t.Fatalf("terminal credential Process status = %v, want PermissionDenied", err)
 	}
@@ -211,6 +217,10 @@ type authorizationTestProcessServer struct {
 }
 
 func (authorizationTestProcessServer) Start(context.Context, *sandboxdv1.StartProcessRequest) (*sandboxdv1.Process, error) {
+	return &sandboxdv1.Process{}, nil
+}
+
+func (authorizationTestProcessServer) StartWithLaunchMaterial(context.Context, *sandboxdv1.StartProcessWithLaunchMaterialRequest) (*sandboxdv1.Process, error) {
 	return &sandboxdv1.Process{}, nil
 }
 

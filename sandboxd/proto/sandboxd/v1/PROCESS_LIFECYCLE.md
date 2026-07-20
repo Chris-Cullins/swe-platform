@@ -60,9 +60,26 @@ and a discarded tail is reported by a final zero-data gap chunk before exit.
 
 Empty/`INHERIT` mode means daemon environment plus deterministic key-sorted overrides;
 `REPLACE` means only the sorted supplied map. CWD defaults to workspace. Environment
-values are opaque; sandboxd neither detects credentials nor injects any automatically.
-Credential provisioning is an external environment-layer concern.
-No shell is implied. Invalid environment names and unknown modes/controls are rejected.
+values in the public spec are opaque; sandboxd neither detects credentials nor treats
+those values as secret. No shell is implied. Invalid environment names and unknown
+modes/controls are rejected.
+
+`StartWithLaunchMaterial` is a distinct, write-only launch path. Its `secret_env`
+values are bytes and are merged into the child environment, but only the normalized
+public `ProcessSpec` and a private launch-mode bit are retained. Values, fingerprints,
+and digests never appear in process records, status, output added by sandboxd, or
+errors. A retry with the same key and public spec returns the existing secret-launched
+process without comparing (possibly rotated) material. Reusing a key across plain and
+secret launch modes fails, as does changing the public spec.
+
+Launch material is limited to 64 entries, 256 bytes per name, 64 KiB per value, and
+256 KiB total name-and-value bytes. Names use the portable
+`[A-Za-z_][A-Za-z0-9_]*` form and must be valid UTF-8; names and values cannot contain
+NUL. On Windows names are case-insensitive, so case-folded duplicate secret names and
+conflicts with public environment overrides are rejected. Validation occurs before a
+process record is published. Temporary value buffers and the command environment are
+cleared after launch on a best-effort basis; callers must still treat their request
+and transport buffers as sensitive.
 
 ## Adapter shapes
 

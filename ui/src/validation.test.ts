@@ -20,6 +20,8 @@ describe('create run validation', () => {
     expect(validateCreateRun(valid({ name: 'good.-bad' }))).toMatch(/DNS/)
     expect(validateCreateRun(valid({ name: 'bad-.good' }))).toMatch(/DNS/)
     expect(validateCreateRun(valid({ selector: { project: 'Bad' } }))).toMatch(/Selector/)
+    expect(validateCreateRun(valid({ credentialProfile: 'Bad_Profile' }))).toMatch(/Credential profile/)
+    expect(validateCreateRun(valid({ credentialProfile: 'claude-production' }))).toBeUndefined()
   })
   it('enforces agent and UTF-8 prompt limits', () => {
     expect(validateCreateRun(valid({ agent: '' }))).toMatch(/required/)

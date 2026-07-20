@@ -11,17 +11,26 @@ set -euo pipefail
 
 CLUSTER="${KIND_CLUSTER:-swe-e2e}"
 ENV_IMAGE="ghcr.io/chris-cullins/swe-platform/env-base:dev"
+E2E_ENV_IMAGE="ghcr.io/chris-cullins/swe-platform/env-base:e2e-credentials"
 OPERATOR_IMAGE="ghcr.io/chris-cullins/swe-platform/operator:dev"
 CONTROL_PLANE_IMAGE="ghcr.io/chris-cullins/swe-platform/control-plane:dev"
+E2E_AGENT_API_KEY='!!SWE-E2E-AGENT-API-KEY-DO-NOT-USE!!'
+E2E_ROTATED_AGENT_API_KEY='!!SWE-E2E-ROTATED-AGENT-API-KEY-DO-NOT-USE!!'
 PORT_FORWARD_PID=""
+SANDBOXD_PORT_FORWARD_PID=""
 WEB_TERMINAL_CLIENT=""
 PROJECT_REPO=""
 PROJECT_WORKTREE=""
+FAKE_ENV_CONTEXT=""
 
 cleanup() {
 	if [[ -n "$PORT_FORWARD_PID" ]]; then
 		kill "$PORT_FORWARD_PID" >/dev/null 2>&1 || true
 		wait "$PORT_FORWARD_PID" >/dev/null 2>&1 || true
+	fi
+	if [[ -n "$SANDBOXD_PORT_FORWARD_PID" ]]; then
+		kill "$SANDBOXD_PORT_FORWARD_PID" >/dev/null 2>&1 || true
+		wait "$SANDBOXD_PORT_FORWARD_PID" >/dev/null 2>&1 || true
 	fi
 	if [[ -n "$WEB_TERMINAL_CLIENT" ]]; then
 		rm -f "$WEB_TERMINAL_CLIENT"
@@ -32,11 +41,44 @@ cleanup() {
 	if [[ -n "$PROJECT_WORKTREE" ]]; then
 		rm -rf "$PROJECT_WORKTREE"
 	fi
+	if [[ -n "$FAKE_ENV_CONTEXT" ]]; then
+		rm -rf "$FAKE_ENV_CONTEXT"
+	fi
+	rm -f /tmp/swe-platform-sandboxd-cert-"$$" /tmp/swe-platform-sandboxd-token-"$$"
 	if [[ "${KEEP_CLUSTER:-false}" != "true" ]]; then
 		kind delete cluster --name "$CLUSTER" >/dev/null 2>&1 || true
 	fi
 }
 trap cleanup EXIT
+
+contains_e2e_key() {
+	grep -aFq -- "$E2E_AGENT_API_KEY" "$1" || grep -aFq -- "$E2E_ROTATED_AGENT_API_KEY" "$1"
+}
+
+check_sandboxd_process() {
+	local pod_name="$1"
+	local run_uid="$2"
+	local expected_key="$3"
+	local secret_name identity
+	secret_name=$(kubectl get pod "$pod_name" -o jsonpath='{.metadata.annotations.swe\.dev/sandboxd-secret-name}')
+	identity=$(kubectl get pod "$pod_name" -o jsonpath='{.metadata.annotations.swe\.dev/sandboxd-identity}')
+	kubectl get secret "$secret_name" -o jsonpath='{.data.tls\.crt}' | base64 --decode > /tmp/swe-platform-sandboxd-cert-"$$"
+	kubectl get secret "$secret_name" -o jsonpath='{.data.process-token}' | base64 --decode > /tmp/swe-platform-sandboxd-token-"$$"
+	kubectl port-forward pod/"$pod_name" 15051:50051 >/tmp/swe-platform-sandboxd-port-forward.log 2>&1 &
+	SANDBOXD_PORT_FORWARD_PID=$!
+	for _ in $(seq 1 30); do
+		if grep -q 'Forwarding from' /tmp/swe-platform-sandboxd-port-forward.log; then
+			break
+		fi
+		sleep 1
+	done
+	printf '%s' "$expected_key" | go run ./hack/e2e-process-check \
+		127.0.0.1:15051 "$identity" /tmp/swe-platform-sandboxd-cert-"$$" /tmp/swe-platform-sandboxd-token-"$$" "$run_uid"
+	kill "$SANDBOXD_PORT_FORWARD_PID" >/dev/null 2>&1 || true
+	wait "$SANDBOXD_PORT_FORWARD_PID" >/dev/null 2>&1 || true
+	SANDBOXD_PORT_FORWARD_PID=""
+	rm -f /tmp/swe-platform-sandboxd-cert-"$$" /tmp/swe-platform-sandboxd-token-"$$"
+}
 
 cd "$(dirname "$0")/.."
 
@@ -50,20 +92,55 @@ kind create cluster --name "$CLUSTER"
 echo "==> building platform images"
 make docker-build >/dev/null
 
+echo "==> building fake Claude credential-acceptance image"
+FAKE_ENV_CONTEXT="$(mktemp -d /tmp/swe-e2e-env-image-XXXXXX)"
+cat > "$FAKE_ENV_CONTEXT/claude" <<'EOF'
+#!/bin/sh
+if [ -z "${ANTHROPIC_API_KEY+x}" ] || [ -z "$ANTHROPIC_API_KEY" ]; then
+	exit 42
+fi
+printf '%s\n' credential-present >> /workspace/agent-credential-marker
+printf '%s\n' '{"type":"system","subtype":"init","session_id":"fake-e2e"}'
+printf '%s\n' '{"type":"assistant","session_id":"fake-e2e","message":{"id":"msg-fake-e2e","type":"message","role":"assistant","model":"claude-e2e","content":[{"type":"text","text":"fake Claude Code is working"},{"type":"tool_use","id":"tool-fake-e2e","name":"Read","input":{"file_path":"README.md"}}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":2}},"parent_tool_use_id":null}'
+sleep 5
+printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"result":"fake Claude Code completed"}'
+EOF
+chmod 0755 "$FAKE_ENV_CONTEXT/claude"
+cat > "$FAKE_ENV_CONTEXT/Dockerfile" <<'EOF'
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE}
+USER root
+COPY claude /usr/local/bin/claude
+USER swe
+EOF
+docker build --build-arg BASE_IMAGE="$ENV_IMAGE" -t "$E2E_ENV_IMAGE" "$FAKE_ENV_CONTEXT" >/dev/null
+rm -rf "$FAKE_ENV_CONTEXT"
+FAKE_ENV_CONTEXT=""
+
 echo "==> verifying terminal drain against patched env-base runtime"
 docker build --target terminal-test -t swe-platform-terminal-test -f images/env-base/Dockerfile . >/dev/null
 docker run --rm -e SWE_REQUIRE_PATCHED_TMUX=1 swe-platform-terminal-test \
 	-test.run '^TestTerminalDrains(OutputWhenShellExits|ImmediateOutputAfterFirstOpen)$' -test.count=1 -test.v
 
 echo "==> loading images into kind"
-kind load docker-image "$ENV_IMAGE" "$OPERATOR_IMAGE" "$CONTROL_PLANE_IMAGE" --name "$CLUSTER"
+kind load docker-image "$ENV_IMAGE" "$E2E_ENV_IMAGE" "$OPERATOR_IMAGE" "$CONTROL_PLANE_IMAGE" --name "$CLUSTER"
 
-echo "==> installing operator, CRDs, and kind template through Helm"
+echo "==> simulating a plain-Helm CRD upgrade from the pre-scoped-credentials schema"
+PRE_SCOPED_CREDENTIALS_SHA=d76e694521b18f1b3921311c7886f53e5a3c8806
+git fetch --depth=1 origin "$PRE_SCOPED_CREDENTIALS_SHA"
+for resource in environments environmenttemplates projects runs; do
+	git show FETCH_HEAD:"config/crd/bases/swe.dev_${resource}.yaml" | kubectl create -f -
+done
+kubectl apply --server-side --force-conflicts -f charts/swe-platform/crds
+kubectl get crd agentcredentialprofiles.swe.dev >/dev/null
+
+echo "==> installing operator and kind template through Helm with upgraded CRDs"
 E2E_BOOTSTRAP_TOKEN="$(openssl rand -hex 32)"
 kubectl create secret generic swe-platform-bootstrap --from-literal=token="$E2E_BOOTSTRAP_TOKEN"
 helm upgrade --install swe-platform charts/swe-platform \
 	--namespace default --values charts/swe-platform/values-kind.yaml \
 	--set controlPlane.auth.bootstrapTokenSecret.name=swe-platform-bootstrap \
+	--set-string "environmentTemplates[0].spec.image=$E2E_ENV_IMAGE" \
 	--wait --timeout 2m
 
 echo "==> waiting for warm environment"
@@ -76,31 +153,21 @@ fi
 WARM_POD_UID=$(kubectl get pod "env-${WARM_ENV_NAME}" -o jsonpath='{.metadata.uid}')
 
 echo "==> creating project configuration"
-kubectl create secret generic e2e-project-config \
-	--from-literal=SWE_E2E_PROJECT_CONFIG=project-config-ok \
-	--from-literal=PATH=/workspace/bin:/usr/local/bin:/usr/bin:/bin
 PROJECT_REPO="$(mktemp -d /tmp/swe-e2e-project-XXXXXX)"
 PROJECT_WORKTREE="$(mktemp -d /tmp/swe-e2e-worktree-XXXXXX)"
 git -C "$PROJECT_WORKTREE" init -b main >/dev/null
 git -C "$PROJECT_WORKTREE" config user.name "swe e2e"
 git -C "$PROJECT_WORKTREE" config user.email "swe-e2e@example.invalid"
 mkdir -p "$PROJECT_WORKTREE/.agents"
-mkdir -p "$PROJECT_WORKTREE/bin"
 cat > "$PROJECT_WORKTREE/.agents/setup" <<'EOF'
-printf '%s\n' "$SWE_E2E_PROJECT_CONFIG" >> setup-result
+if [ -n "${ANTHROPIC_API_KEY+x}" ]; then exit 43; fi
+printf '%s\n' credential-absent >> setup-result
 EOF
 cat > "$PROJECT_WORKTREE/.agents/resume" <<'EOF'
-printf '%s\n' "$SWE_E2E_PROJECT_CONFIG" >> resume-result
+if [ -n "${ANTHROPIC_API_KEY+x}" ]; then exit 44; fi
+printf '%s\n' credential-absent >> resume-result
 EOF
-cat > "$PROJECT_WORKTREE/bin/claude" <<'EOF'
-#!/bin/sh
-printf '%s\n' '{"type":"system","subtype":"init","session_id":"fake-e2e"}'
-printf '%s\n' '{"type":"assistant","session_id":"fake-e2e","message":{"id":"msg-fake-e2e","type":"message","role":"assistant","model":"claude-e2e","content":[{"type":"text","text":"fake Claude Code is working"},{"type":"tool_use","id":"tool-fake-e2e","name":"Read","input":{"file_path":"README.md"}}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":2}},"parent_tool_use_id":null}'
-sleep 5
-printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"result":"fake Claude Code completed"}'
-EOF
-chmod +x "$PROJECT_WORKTREE/bin/claude"
-git -C "$PROJECT_WORKTREE" add .agents/setup .agents/resume bin/claude
+git -C "$PROJECT_WORKTREE" add .agents/setup .agents/resume
 git -C "$PROJECT_WORKTREE" commit -m "Add e2e lifecycle hooks" >/dev/null
 git -C "$PROJECT_WORKTREE" bundle create "$PROJECT_REPO/repo.bundle" main
 kubectl create configmap e2e-git-repo --from-file="$PROJECT_REPO/repo.bundle"
@@ -159,15 +226,22 @@ spec:
   repositories:
     - git://e2e-git-server/e2e.git
   templateRef: small
-  secretRef:
-    name: e2e-project-config
 EOF
 
 echo "==> creating project environment + run intent via swe"
-bin/swe run "end-to-end smoke test" --project e2e --wait=false
+printf '%s' "$E2E_AGENT_API_KEY" | bin/swe credentials create e2e-claude --agent claude-code --api-key-stdin
+bin/swe run "end-to-end smoke test" --project e2e --credential-profile e2e-claude --wait=false
 RUN_NAME=$(kubectl get runs -o jsonpath='{.items[0].metadata.name}')
 kubectl wait --for=jsonpath='{.status.state}'=Running run/"$RUN_NAME" --timeout=3m
 kubectl wait --for=jsonpath='{.status.state}'=Succeeded run/"$RUN_NAME" --timeout=3m
+RUN_UID=$(kubectl get run "$RUN_NAME" -o jsonpath='{.metadata.uid}')
+PROFILE_UID=$(kubectl get agentcredentialprofile e2e-claude -o jsonpath='{.metadata.uid}')
+BOUND_PROFILE_NAME=$(kubectl get run "$RUN_NAME" -o jsonpath='{.status.credentialProfileRef.name}')
+BOUND_PROFILE_UID=$(kubectl get run "$RUN_NAME" -o jsonpath='{.status.credentialProfileRef.uid}')
+if [[ "$BOUND_PROFILE_NAME" != "e2e-claude" || -z "$PROFILE_UID" || "$BOUND_PROFILE_UID" != "$PROFILE_UID" ]]; then
+	echo "FAIL: Run did not retain the exact selected credential profile identity"
+	exit 1
+fi
 RUN_ENV_NAME=$(kubectl get run "$RUN_NAME" -o jsonpath='{.status.environmentRef.name}')
 RUN_ENV_OWNERSHIP=$(kubectl get run "$RUN_NAME" -o jsonpath='{.status.environmentRef.ownership}')
 if [[ "$RUN_ENV_NAME" != "$WARM_ENV_NAME" || "$RUN_ENV_OWNERSHIP" != "Claimed" ]]; then
@@ -180,6 +254,13 @@ if [[ "$RUN_POD_UID" == "$WARM_POD_UID" || "$RUN_POD_PROJECT" != "e2e" ]]; then
 	echo "FAIL: Run reached a terminal state before its claimed warm pod was replaced and configured for the Project"
 	exit 1
 fi
+RUN_POD_NAME=$(kubectl get environment "$RUN_ENV_NAME" -o jsonpath='{.status.podName}')
+if ! kubectl exec "$RUN_POD_NAME" -- sh -c \
+	'test "$(cat /workspace/setup-result)" = credential-absent && test "$(cat /workspace/agent-credential-marker)" = credential-present && test -z "${ANTHROPIC_API_KEY+x}" && ! tr "\000" "\n" < /proc/1/environ | grep -q "^ANTHROPIC_API_KEY="'; then
+	echo "FAIL: API key was not confined to the selected fake Claude process"
+	exit 1
+fi
+check_sandboxd_process "$RUN_POD_NAME" "$RUN_UID" "$E2E_AGENT_API_KEY"
 for _ in $(seq 1 60); do
 	CLAIM_UID=$(kubectl get environment "$RUN_ENV_NAME" -o jsonpath='{.status.claimedBy.uid}' 2>/dev/null || true)
 	if [[ -z "$CLAIM_UID" ]]; then
@@ -408,6 +489,12 @@ if ! grep -Fq '"name":"e2e-other-namespace-run"' /tmp/swe-platform-other-runs.js
 	echo "FAIL: browser-session Run feeds were not isolated by namespace"
 	exit 1
 fi
+if ! grep -Fq '"credentialProfile":"e2e-claude"' /tmp/swe-platform-runs.json || \
+	grep -Fq "$PROFILE_UID" /tmp/swe-platform-runs.json || \
+	contains_e2e_key /tmp/swe-platform-runs.json || contains_e2e_key /tmp/swe-platform-environment.json; then
+	echo "FAIL: typed APIs did not expose only the selected credential profile name"
+	exit 1
+fi
 API_RUN_BODY='{"name":"e2e-api-run","selector":{"template":"small"},"agent":"e2e","prompt":"resource API acceptance"}'
 API_CREATE_STATUS=$(curl --silent --output /tmp/swe-platform-api-run.json --write-out '%{http_code}' \
 	--cookie "$COOKIE_JAR" -H 'Origin: http://127.0.0.1:18080' -H 'Content-Type: application/json' \
@@ -506,6 +593,18 @@ if ! grep -Fq '"type":"assistant"' /tmp/swe-platform-process-output.out || \
 	cat /tmp/swe-platform-process-output.out
 	exit 1
 fi
+if contains_e2e_key /tmp/swe-platform-transcript.out || contains_e2e_key /tmp/swe-platform-process-output.out; then
+	echo "FAIL: transcript transport exposed the agent API key"
+	exit 1
+fi
+kubectl exec "$RUN_POD_NAME" -- tar -C /workspace -cf - . > /tmp/swe-platform-workspace.tar
+if contains_e2e_key /tmp/swe-platform-workspace.tar; then
+	echo "FAIL: retained workspace contains the agent API key"
+	exit 1
+fi
+
+echo "==> rotating the profile without restarting the existing process"
+printf '%s' "$E2E_ROTATED_AGENT_API_KEY" | bin/swe credentials rotate e2e-claude --api-key-stdin
 
 kubectl delete run "$RUN_NAME" --wait=true >/dev/null
 if ! kubectl get environment "$RUN_ENV_NAME" >/dev/null 2>&1; then
@@ -514,7 +613,7 @@ if ! kubectl get environment "$RUN_ENV_NAME" >/dev/null 2>&1; then
 fi
 
 echo "==> verifying shared terminal through swe attach"
-printf 'printf terminal-e2e-ok; printf "\\n%%s\\n" "$SWE_E2E_PROJECT_CONFIG"; exit\n' | \
+printf 'printf terminal-e2e-ok; if [ -n "${ANTHROPIC_API_KEY+x}" ]; then printf credential-present; else printf credential-absent; fi; exit\n' | \
 	SWE_CONTROL_PLANE_URL=http://127.0.0.1:18080 SWE_CONTROL_PLANE_TOKEN="$E2E_BOOTSTRAP_TOKEN" \
 	bin/swe attach "$ENV_NAME" > /tmp/swe-platform-terminal.out
 if ! grep -q 'terminal-e2e-ok' /tmp/swe-platform-terminal.out; then
@@ -522,14 +621,14 @@ if ! grep -q 'terminal-e2e-ok' /tmp/swe-platform-terminal.out; then
 	cat /tmp/swe-platform-terminal.out
 	exit 1
 fi
-if ! grep -q 'project-config-ok' /tmp/swe-platform-terminal.out; then
-	echo "FAIL: project Secret was not injected into the environment"
+if ! grep -q 'credential-absent' /tmp/swe-platform-terminal.out; then
+	echo "FAIL: shared terminal inherited the agent API key"
 	cat /tmp/swe-platform-terminal.out
 	exit 1
 fi
 POD_NAME=$(kubectl get environment "$ENV_NAME" -o jsonpath='{.status.podName}')
 PVC_NAME=$(kubectl get pod "$POD_NAME" -o jsonpath='{.spec.volumes[?(@.name=="workspace")].persistentVolumeClaim.claimName}')
-if ! kubectl exec "$POD_NAME" -- sh -c 'test "$(cat /workspace/setup-result)" = project-config-ok'; then
+if ! kubectl exec "$POD_NAME" -- sh -c 'test "$(cat /workspace/setup-result)" = credential-absent'; then
 	echo "FAIL: project repository checkout or .agents/setup did not complete"
 	exit 1
 fi
@@ -578,14 +677,56 @@ if [[ -z "$RESUMED_IMAGE_ID" || "$RESUMED_IMAGE_ID" != "$RESUMED_POD_IMAGE_ID" ]
 	echo "FAIL: resumed environment image ID '${RESUMED_IMAGE_ID:-<empty>}' does not match pod image ID '${RESUMED_POD_IMAGE_ID:-<empty>}'"
 	exit 1
 fi
-if ! kubectl exec "$POD_NAME" -- sh -c 'test "$(cat /workspace/resume-result)" = project-config-ok'; then
-	echo "FAIL: .agents/resume did not run with the project Secret"
+if ! kubectl exec "$POD_NAME" -- sh -c \
+	'test "$(cat /workspace/resume-result)" = credential-absent && test "$(wc -l < /workspace/agent-credential-marker)" -eq 1 && test -z "${ANTHROPIC_API_KEY+x}" && ! tr "\000" "\n" < /proc/1/environ | grep -q "^ANTHROPIC_API_KEY="'; then
+	echo "FAIL: resume hook or fresh sandboxd received the agent API key before agent launch"
 	exit 1
 fi
 if ! kubectl exec "$POD_NAME" -- sh -c 'test "$(wc -l < /workspace/setup-result)" -eq 1'; then
 	echo "FAIL: .agents/setup ran again while resuming"
 	exit 1
 fi
+
+echo "==> verifying the rotated key is materialized only for a fresh agent launch"
+RESUME_RUN_NAME=e2e-resume-credential-run
+bin/swe run "resume credential smoke test" --name "$RESUME_RUN_NAME" --environment "$ENV_NAME" \
+	--credential-profile e2e-claude --wait=false
+kubectl wait --for=jsonpath='{.status.state}'=Running run/"$RESUME_RUN_NAME" --timeout=3m
+kubectl wait --for=jsonpath='{.status.state}'=Succeeded run/"$RESUME_RUN_NAME" --timeout=3m
+RESUME_RUN_UID=$(kubectl get run "$RESUME_RUN_NAME" -o jsonpath='{.metadata.uid}')
+if ! kubectl exec "$POD_NAME" -- sh -c \
+	'test "$(wc -l < /workspace/agent-credential-marker)" -eq 2 && test -z "${ANTHROPIC_API_KEY+x}" && ! tr "\000" "\n" < /proc/1/environ | grep -q "^ANTHROPIC_API_KEY="'; then
+	echo "FAIL: fresh agent launch did not receive the rotated profile in isolation"
+	exit 1
+fi
+check_sandboxd_process "$POD_NAME" "$RESUME_RUN_UID" "$E2E_ROTATED_AGENT_API_KEY"
+set +e
+curl --silent --no-buffer --max-time 2 \
+	-H "Authorization: Bearer ${E2E_BOOTSTRAP_TOKEN}" \
+	"http://127.0.0.1:18080/api/v1/namespaces/default/runs/${RESUME_RUN_NAME}/transcript" \
+	> /tmp/swe-platform-resume-transcript.out
+RESUME_TRANSCRIPT_STATUS=$?
+set -e
+if [[ "$RESUME_TRANSCRIPT_STATUS" != "0" && "$RESUME_TRANSCRIPT_STATUS" != "28" ]]; then
+	echo "FAIL: resumed Run transcript read failed with curl status ${RESUME_TRANSCRIPT_STATUS}"
+	exit 1
+fi
+grep -F '"source":"claude-code"' /tmp/swe-platform-resume-transcript.out | \
+	grep -F '"type":"claude-code.process-output"' | \
+	grep -oE '"data":"[A-Za-z0-9+/=]+"' | sed 's/^"data":"//; s/"$//' | \
+	while IFS= read -r encoded; do printf '%s' "$encoded" | base64 --decode || exit 1; done \
+	> /tmp/swe-platform-resume-process-output.out
+if contains_e2e_key /tmp/swe-platform-resume-transcript.out || \
+	contains_e2e_key /tmp/swe-platform-resume-process-output.out; then
+	echo "FAIL: resumed Run transcript exposed the rotated agent API key"
+	exit 1
+fi
+kubectl exec "$POD_NAME" -- tar -C /workspace -cf - . > /tmp/swe-platform-resumed-workspace.tar
+if contains_e2e_key /tmp/swe-platform-resumed-workspace.tar; then
+	echo "FAIL: resumed workspace contains an agent API key"
+	exit 1
+fi
+kubectl delete run "$RESUME_RUN_NAME" --wait=true >/dev/null
 
 echo "==> verifying idle pause and terminal wake through the control plane"
 PRE_IDLE_POD_UID=$(kubectl get pod "$POD_NAME" -o jsonpath='{.metadata.uid}')

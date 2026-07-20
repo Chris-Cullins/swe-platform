@@ -73,6 +73,32 @@ port-forwarding is governed by `pods/portforward` RBAC rather than this policy.
 Certificates are valid for one year to avoid expiring a continuously running pod; normal pod
 recreation rotates them much earlier. Operators should recreate any pod approaching that limit.
 
+## Run-scoped agent API keys
+
+An `AgentCredentialProfile` binds an immutable adapter and `APIKey` credential type in one
+namespace. Its API key is stored in a same-namespace Secret whose name is derived from the
+profile UID and whose exact controller owner, type, sole `apiKey` entry, encoding, and bounded
+size are validated before use. A Run records the selected profile's name and UID in status
+before environment allocation; deleting and recreating a same-name profile cannot satisfy that
+historical binding. Missing profiles and backing Secrets receive bounded retries, while replaced
+profiles and malformed or foreign Secret collisions fail closed.
+
+The operator performs uncached, exact-name profile and Secret reads immediately before adapter
+acceptance, copies the key into a short-lived adapter credential, and best-effort clears the
+buffers after the call. The Claude Code adapter sends it only through sandboxd's distinct
+`StartWithLaunchMaterial` RPC as `ANTHROPIC_API_KEY`. It never falls back to the ordinary Start
+RPC if an old sandboxd server reports `Unimplemented`. sandboxd validates launch material before
+publishing a process, applies it only to the child environment, and stores and returns only the
+public process specification plus a private launch-mode bit used for idempotency fencing.
+
+This prevents automatic ambient delivery to setup/resume hooks, sandboxd, and unrelated child
+processes. It is not hard same-user process isolation: the selected agent and its descendants,
+repository wrappers left by setup, same-UID peers, or explicit output can disclose the key, and
+transcript redaction is not guaranteed. Anyone allowed to create a Run in a namespace can
+initially select any profile in that namespace; profile management requires separate Secret and
+CRD administration. OAuth/subscription files, refresh and writeback, leases, per-user ownership,
+Git/setup/service credentials, Amp login persistence, and stronger confinement remain deferred.
+
 ### Other environment backends
 
 TLS identity plus bearer service capabilities are backend-portable and do not use Kubernetes

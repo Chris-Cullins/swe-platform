@@ -85,7 +85,7 @@ func TestResourceServiceCreateRunIntentOnlyAndAlreadyExistsDoesNotGet(t *testing
 }
 
 func TestResourceServiceCreateCollisionComparesFullRunSpec(t *testing.T) {
-	request := CreateRunRequest{Name: "same", Selector: RunSelector{Template: "small"}, Agent: "agent", Prompt: "prompt"}
+	request := CreateRunRequest{Name: "same", Selector: RunSelector{Template: "small"}, Agent: "agent", Prompt: "prompt", CredentialProfile: "profile"}
 	for _, test := range []struct {
 		name   string
 		mutate func(*platformv1alpha1.RunSpec)
@@ -97,6 +97,7 @@ func TestResourceServiceCreateCollisionComparesFullRunSpec(t *testing.T) {
 		{name: "parent conflicts", mutate: func(spec *platformv1alpha1.RunSpec) { spec.ParentRef = "parent" }, want: errRunIntentConflict},
 		{name: "notify conflicts", mutate: func(spec *platformv1alpha1.RunSpec) { spec.Notify = []string{"parent"} }, want: errRunIntentConflict},
 		{name: "selector conflicts", mutate: func(spec *platformv1alpha1.RunSpec) { spec.TemplateRef = "other" }, want: errRunIntentConflict},
+		{name: "credential profile conflicts", mutate: func(spec *platformv1alpha1.RunSpec) { spec.CredentialProfileRef = "other" }, want: errRunIntentConflict},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			spec := desiredRunSpec(request)

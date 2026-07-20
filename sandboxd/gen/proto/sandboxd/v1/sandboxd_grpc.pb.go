@@ -123,10 +123,11 @@ var ExecService_ServiceDesc = grpc.ServiceDesc{
 }
 
 const (
-	ProcessService_Start_FullMethodName      = "/sandboxd.v1.ProcessService/Start"
-	ProcessService_Get_FullMethodName        = "/sandboxd.v1.ProcessService/Get"
-	ProcessService_Stop_FullMethodName       = "/sandboxd.v1.ProcessService/Stop"
-	ProcessService_ReadOutput_FullMethodName = "/sandboxd.v1.ProcessService/ReadOutput"
+	ProcessService_Start_FullMethodName                   = "/sandboxd.v1.ProcessService/Start"
+	ProcessService_StartWithLaunchMaterial_FullMethodName = "/sandboxd.v1.ProcessService/StartWithLaunchMaterial"
+	ProcessService_Get_FullMethodName                     = "/sandboxd.v1.ProcessService/Get"
+	ProcessService_Stop_FullMethodName                    = "/sandboxd.v1.ProcessService/Stop"
+	ProcessService_ReadOutput_FullMethodName              = "/sandboxd.v1.ProcessService/ReadOutput"
 )
 
 // ProcessServiceClient is the client API for ProcessService service.
@@ -140,6 +141,9 @@ type ProcessServiceClient interface {
 	// Start is detached from the RPC context. Repeating the same key and spec
 	// returns the existing process; the same key with a different spec fails.
 	Start(ctx context.Context, in *StartProcessRequest, opts ...grpc.CallOption) (*Process, error)
+	// StartWithLaunchMaterial supplies write-only data used only to construct the
+	// child environment. It is never retained in or returned by a Process.
+	StartWithLaunchMaterial(ctx context.Context, in *StartProcessWithLaunchMaterialRequest, opts ...grpc.CallOption) (*Process, error)
 	// Get returns running and retained terminal state in this sandboxd epoch.
 	Get(ctx context.Context, in *GetProcessRequest, opts ...grpc.CallOption) (*Process, error)
 	// Stop is idempotent, including when the key is absent or already terminal.
@@ -159,6 +163,16 @@ func (c *processServiceClient) Start(ctx context.Context, in *StartProcessReques
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(Process)
 	err := c.cc.Invoke(ctx, ProcessService_Start_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *processServiceClient) StartWithLaunchMaterial(ctx context.Context, in *StartProcessWithLaunchMaterialRequest, opts ...grpc.CallOption) (*Process, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(Process)
+	err := c.cc.Invoke(ctx, ProcessService_StartWithLaunchMaterial_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -206,6 +220,9 @@ type ProcessServiceServer interface {
 	// Start is detached from the RPC context. Repeating the same key and spec
 	// returns the existing process; the same key with a different spec fails.
 	Start(context.Context, *StartProcessRequest) (*Process, error)
+	// StartWithLaunchMaterial supplies write-only data used only to construct the
+	// child environment. It is never retained in or returned by a Process.
+	StartWithLaunchMaterial(context.Context, *StartProcessWithLaunchMaterialRequest) (*Process, error)
 	// Get returns running and retained terminal state in this sandboxd epoch.
 	Get(context.Context, *GetProcessRequest) (*Process, error)
 	// Stop is idempotent, including when the key is absent or already terminal.
@@ -223,6 +240,9 @@ type UnimplementedProcessServiceServer struct{}
 
 func (UnimplementedProcessServiceServer) Start(context.Context, *StartProcessRequest) (*Process, error) {
 	return nil, status.Error(codes.Unimplemented, "method Start not implemented")
+}
+func (UnimplementedProcessServiceServer) StartWithLaunchMaterial(context.Context, *StartProcessWithLaunchMaterialRequest) (*Process, error) {
+	return nil, status.Error(codes.Unimplemented, "method StartWithLaunchMaterial not implemented")
 }
 func (UnimplementedProcessServiceServer) Get(context.Context, *GetProcessRequest) (*Process, error) {
 	return nil, status.Error(codes.Unimplemented, "method Get not implemented")
@@ -268,6 +288,24 @@ func _ProcessService_Start_Handler(srv interface{}, ctx context.Context, dec fun
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(ProcessServiceServer).Start(ctx, req.(*StartProcessRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _ProcessService_StartWithLaunchMaterial_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(StartProcessWithLaunchMaterialRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ProcessServiceServer).StartWithLaunchMaterial(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: ProcessService_StartWithLaunchMaterial_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ProcessServiceServer).StartWithLaunchMaterial(ctx, req.(*StartProcessWithLaunchMaterialRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -336,6 +374,10 @@ var ProcessService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "Start",
 			Handler:    _ProcessService_Start_Handler,
+		},
+		{
+			MethodName: "StartWithLaunchMaterial",
+			Handler:    _ProcessService_StartWithLaunchMaterial_Handler,
 		},
 		{
 			MethodName: "Get",

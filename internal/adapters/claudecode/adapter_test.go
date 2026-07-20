@@ -11,22 +11,40 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
+	platformv1alpha1 "github.com/Chris-Cullins/swe-platform/api/v1alpha1"
 	"github.com/Chris-Cullins/swe-platform/internal/controllers"
 	sandboxdv1 "github.com/Chris-Cullins/swe-platform/sandboxd/gen/proto/sandboxd/v1"
 )
 
 type fakeProcessClient struct {
-	process      *sandboxdv1.Process
-	stdout       []byte
-	stderr       []byte
-	startCalls   int
-	launches     int
-	startedKey   *sandboxdv1.ProcessKey
-	startedSpec  *sandboxdv1.ProcessSpec
-	stoppedKey   *sandboxdv1.ProcessKey
-	stopMode     sandboxdv1.StopMode
-	getErr       error
-	readRequests []*sandboxdv1.ReadOutputRequest
+	process       *sandboxdv1.Process
+	stdout        []byte
+	stderr        []byte
+	startCalls    int
+	launches      int
+	startedKey    *sandboxdv1.ProcessKey
+	startedSpec   *sandboxdv1.ProcessSpec
+	stoppedKey    *sandboxdv1.ProcessKey
+	stopMode      sandboxdv1.StopMode
+	getErr        error
+	readRequests  []*sandboxdv1.ReadOutputRequest
+	launchRequest *sandboxdv1.StartProcessWithLaunchMaterialRequest
+	launchValue   []byte
+	launchCalls   int
+	launchErr     error
+}
+
+func (f *fakeProcessClient) StartWithLaunchMaterial(_ context.Context, request *sandboxdv1.StartProcessWithLaunchMaterialRequest, _ ...grpc.CallOption) (*sandboxdv1.Process, error) {
+	f.launchCalls++
+	f.launchRequest = request
+	f.launchValue = append([]byte(nil), request.GetLaunchMaterial().GetSecretEnv()["ANTHROPIC_API_KEY"]...)
+	if f.launchErr != nil {
+		return nil, f.launchErr
+	}
+	if f.process == nil {
+		f.process = &sandboxdv1.Process{Key: request.Key, Spec: request.Spec, State: sandboxdv1.ProcessState_PROCESS_STATE_RUNNING, ExecutionId: "execution-1"}
+	}
+	return f.process, nil
 }
 
 func (f *fakeProcessClient) Start(_ context.Context, request *sandboxdv1.StartProcessRequest, _ ...grpc.CallOption) (*sandboxdv1.Process, error) {
@@ -88,7 +106,7 @@ func TestAcceptanceIsDuplicateSafeAndResumeKeepsTaskIdentity(t *testing.T) {
 	adapter := &Adapter{Executable: "fake-claude"}
 	firstEpoch := &fakeProcessClient{}
 	for range 2 {
-		if err := adapter.EnsureAccepted(context.Background(), task, sandboxFor(firstEpoch)); err != nil {
+		if err := adapter.EnsureAccepted(context.Background(), task, sandboxFor(firstEpoch), nil); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -103,7 +121,7 @@ func TestAcceptanceIsDuplicateSafeAndResumeKeepsTaskIdentity(t *testing.T) {
 	}
 
 	secondEpoch := &fakeProcessClient{}
-	if err := adapter.EnsureAccepted(context.Background(), task, sandboxFor(secondEpoch)); err != nil {
+	if err := adapter.EnsureAccepted(context.Background(), task, sandboxFor(secondEpoch), nil); err != nil {
 		t.Fatal(err)
 	}
 	if secondEpoch.launches != 1 || secondEpoch.startedKey.OwnerId != task.ID {
@@ -115,6 +133,44 @@ func TestPromptIsSeparatedFromClaudeFlags(t *testing.T) {
 	spec := (&Adapter{}).processSpec(controllers.AdapterTask{Prompt: "--version"})
 	if got := spec.Argv[len(spec.Argv)-2:]; !reflect.DeepEqual(got, []string{"--", "--version"}) {
 		t.Fatalf("argv suffix = %#v, want flag terminator and prompt", got)
+	}
+}
+
+func TestAPIKeyUsesLaunchMaterialOnly(t *testing.T) {
+	client := &fakeProcessClient{}
+	key := []byte("!!CLAUDE-API-KEY-FIXTURE!!")
+	err := (&Adapter{}).EnsureAccepted(context.Background(), controllers.AdapterTask{ID: "run", Prompt: "task"}, sandboxFor(client), &controllers.AdapterCredential{Type: platformv1alpha1.AgentCredentialTypeAPIKey, APIKey: key})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if client.launchCalls != 1 || client.startCalls != 0 || string(client.launchValue) != string(key) {
+		t.Fatalf("launch/plain calls = %d/%d, delivered value = %q", client.launchCalls, client.startCalls, client.launchValue)
+	}
+	if client.launchRequest == nil || !reflect.DeepEqual(client.launchRequest.LaunchMaterial.SecretEnv["ANTHROPIC_API_KEY"], make([]byte, len(key))) {
+		t.Fatal("adapter did not clear its temporary launch-material copy")
+	}
+	if client.launchRequest.Spec == nil || len(client.launchRequest.Spec.Env) != 0 {
+		t.Fatalf("public process spec contains credential material: %#v", client.launchRequest.Spec)
+	}
+}
+
+func TestLaunchMaterialUnimplementedDoesNotFallback(t *testing.T) {
+	client := &fakeProcessClient{launchErr: status.Error(codes.Unimplemented, "old sandboxd")}
+	err := (&Adapter{}).EnsureAccepted(context.Background(), controllers.AdapterTask{ID: "run"}, sandboxFor(client), &controllers.AdapterCredential{Type: platformv1alpha1.AgentCredentialTypeAPIKey, APIKey: []byte("key")})
+	if status.Code(err) != codes.Unimplemented || client.startCalls != 0 {
+		t.Fatalf("error/start calls = %v/%d", err, client.startCalls)
+	}
+}
+
+func TestUnsupportedCredentialTypeFailsBeforeDial(t *testing.T) {
+	dials := 0
+	sandbox := controllers.AdapterSandbox{DialProcess: func(context.Context) (sandboxdv1.ProcessServiceClient, func() error, error) {
+		dials++
+		return &fakeProcessClient{}, func() error { return nil }, nil
+	}}
+	err := (&Adapter{}).EnsureAccepted(context.Background(), controllers.AdapterTask{ID: "run"}, sandbox, &controllers.AdapterCredential{Type: "FutureType", APIKey: []byte("!!UNUSED-KEY-FIXTURE!!")})
+	if err == nil || dials != 0 {
+		t.Fatalf("unsupported credential = error %v, dials %d", err, dials)
 	}
 }
 
@@ -172,7 +228,7 @@ func TestUnavailableAndAbsentExecution(t *testing.T) {
 	sandbox := controllers.AdapterSandbox{DialProcess: func(context.Context) (sandboxdv1.ProcessServiceClient, func() error, error) {
 		return nil, nil, dialError
 	}}
-	if err := (&Adapter{}).EnsureAccepted(context.Background(), controllers.AdapterTask{ID: "run"}, sandbox); !errors.Is(err, dialError) {
+	if err := (&Adapter{}).EnsureAccepted(context.Background(), controllers.AdapterTask{ID: "run"}, sandbox, nil); !errors.Is(err, dialError) {
 		t.Fatalf("EnsureAccepted() error = %v", err)
 	}
 	client := &fakeProcessClient{getErr: status.Error(codes.NotFound, "absent")}

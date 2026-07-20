@@ -9,7 +9,7 @@ import type { Environment, Run } from './contracts'
 
 const run: Run = {
   name: 'repair-ui', uid: 'run-uid', createdAt: '2026-07-19T12:00:00Z',
-  intent: { selector: { project: 'platform', template: 'small' }, agent: 'amp', prompt: 'Repair UI' },
+  intent: { selector: { project: 'platform', template: 'small' }, agent: 'amp', prompt: 'Repair UI', credentialProfile: 'amp-production' },
   cancelRequested: false, state: 'Running', environment: { name: 'repair-env', ownership: 'Owned' }, branch: 'agent/repair',
   usage: { cpuSeconds: 12.5, tokensIn: 101, tokensOut: 202 },
 }
@@ -218,6 +218,7 @@ describe('App frozen API integration', () => {
     await userEvent.type(screen.getByLabelText('Name'), 'repair-ui')
     await userEvent.clear(screen.getByLabelText('Agent'))
     await userEvent.type(screen.getByLabelText('Agent'), 'amp')
+    await userEvent.type(screen.getByLabelText('Credential profile'), '  amp-production  ')
     await userEvent.type(screen.getByLabelText('Prompt / task'), '  Repair UI  ')
     await userEvent.type(screen.getByLabelText('Project reference'), 'platform')
     await userEvent.type(screen.getByLabelText('Template reference'), 'small')
@@ -225,7 +226,7 @@ describe('App frozen API integration', () => {
     await waitFor(() => expect(fetch.mock.calls.some(call => call[0] === '/api/v1/namespaces/default/runs' && call[1]?.method === 'POST')).toBe(true))
     const createInit = fetch.mock.calls.find(call => call[0] === '/api/v1/namespaces/default/runs' && call[1]?.method === 'POST')?.[1]
     expect(JSON.parse(String(createInit?.body))).toEqual({
-      name: 'repair-ui', selector: { project: 'platform', template: 'small' }, agent: 'amp', prompt: '  Repair UI  ',
+      name: 'repair-ui', selector: { project: 'platform', template: 'small' }, agent: 'amp', prompt: '  Repair UI  ', credentialProfile: 'amp-production',
     })
     expect(invalidate).toHaveBeenCalledWith({ queryKey: ['runs', 'default'] })
     expect(await screen.findByRole('heading', { name: 'repair-ui' })).toBeInTheDocument()

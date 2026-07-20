@@ -1,1 +1,1 @@
-{"name":"fix-flaky-42","selector":{"project":"org-repo","template":"small"},"agent":"claude-code","prompt":"Fix the flaky test"}
+{"name":"fix-flaky-42","selector":{"project":"org-repo","template":"small"},"agent":"claude-code","prompt":"Fix the flaky test","credentialProfile":"claude-production"}

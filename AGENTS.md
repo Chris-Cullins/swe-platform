@@ -95,8 +95,8 @@ runs both via `make` targets:
   followed by `make build-control-plane-production`; the tagged build embeds `ui/dist`,
   while ordinary Go builds intentionally work without generated assets. The control-plane
   image performs both stages in one multi-stage build.
-- **Windows portability:** CI runs focused sandboxd process, Exec, and filesystem tests
-  on `windows-latest`; keep OS-specific tests behind build tags.
+- **Windows portability:** CI runs focused sandboxd process, launch-material, Exec, and
+  filesystem tests on `windows-latest`; keep OS-specific tests behind build tags.
 - **Regenerate deepcopy:** `make generate` · **CRDs + RBAC:** `make manifests`
   (`manifests` synchronizes chart CRDs; CI fails on a diff). Use `make check-chart-crds`
   to verify the checked-in Helm CRDs independently.
@@ -116,10 +116,14 @@ runs both via `make` targets:
   and all three image digests.
 - **E2E acceptance:** `./hack/e2e.sh` — full kind + operator + `swe run` pass with the
   env-base image built and loaded locally (no registry credentials needed). It also verifies
+  the documented server-side CRD upgrade from the pre-scoped-credentials schema,
   control-plane TokenReview/SAR scoping, opaque browser session exchange/logout and CSRF,
   the embedded console entry point/SPA fallback/static assets, typed Run
-  list/get/create/retry/cancel, Environment get, transcript SSE, and terminal attach.
+  list/get/create/retry/cancel, Environment get, transcript SSE, terminal attach, and
+  process-scoped fake API-key delivery without ambient setup/resume/sandboxd exposure.
   Runs in CI as the `e2e` workflow on relevant PRs and via `workflow_dispatch`.
+- **CRD installation/upgrades:** `make install-crds` uses server-side apply with force-conflicts;
+  plain Helm upgrades must apply the chart's `crds/` directory before `helm upgrade`.
 - **Images:** `make docker-build` (operator + env-base). The env-base image builds
   its pinned tmux with `images/env-base/tmux-control-output-drain.patch`; keep the
   source checksum and patch synchronized when upgrading tmux. Its `terminal-test`

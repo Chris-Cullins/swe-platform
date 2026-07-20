@@ -42,6 +42,7 @@ export function validateCreateRun(value: CreateRun): string | undefined {
   if (refs.some(([, ref]) => ref.length > 253 || !DNS_SUBDOMAIN.test(ref) || ref.split('.').some(part => part.length > 63 || !DNS_LABEL.test(part)))) {
     return 'Selector references must be valid DNS subdomains with at most 253 characters.'
   }
+  if (value.credentialProfile && (value.credentialProfile.length > 253 || !DNS_SUBDOMAIN.test(value.credentialProfile) || value.credentialProfile.split('.').some(part => part.length > 63 || !DNS_LABEL.test(part)))) return 'Credential profile must be a valid DNS subdomain with at most 253 characters.'
   if (new TextEncoder().encode(JSON.stringify(value)).length > MAX_CREATE_BODY_BYTES) return 'Create request must be at most 1 MiB.'
 }
 
@@ -150,12 +151,12 @@ function RunList() {
   </main>
 }
 
-type RunForm = { name: string; agent: string; prompt: string; environment: string; project: string; template: string }
+type RunForm = { name: string; agent: string; prompt: string; credentialProfile: string; environment: string; project: string; template: string }
 function NewRun() {
   const { namespace = '' } = useParams()
   const navigate = useNavigate()
   const queryClient = useQueryClient()
-  const [form, setForm] = React.useState<RunForm>({ name: '', agent: 'claude-code', prompt: '', environment: '', project: '', template: '' })
+  const [form, setForm] = React.useState<RunForm>({ name: '', agent: 'claude-code', prompt: '', credentialProfile: '', environment: '', project: '', template: '' })
   const [validation, setValidation] = React.useState('')
   const mutation = useMutation({
     mutationFn: (value: CreateRun) => api.createRun(namespace, value),
@@ -170,12 +171,13 @@ function NewRun() {
     event.preventDefault()
     const selector: Selector = {}
     for (const key of ['environment', 'project', 'template'] as const) if (form[key].trim()) selector[key] = form[key].trim()
-    const value = { name: form.name.trim(), agent: form.agent.trim(), prompt: form.prompt, selector }
+    const credentialProfile = form.credentialProfile.trim()
+    const value: CreateRun = { name: form.name.trim(), agent: form.agent.trim(), prompt: form.prompt, selector, ...(credentialProfile ? { credentialProfile } : {}) }
     const error = validateCreateRun(value)
     setValidation(error || '')
     if (!error) mutation.mutate(value, { onSuccess: run => navigate(`/namespaces/${encodeURIComponent(namespace)}/runs/${encodeURIComponent(run.name)}/overview`) })
   }}>
-    {field('name', 'Name')}{field('agent', 'Agent')}{field('prompt', 'Prompt / task', true)}
+    {field('name', 'Name')}{field('agent', 'Agent')}{field('credentialProfile', 'Credential profile')}{field('prompt', 'Prompt / task', true)}
     {field('project', 'Project reference')}{field('template', 'Template reference')}{field('environment', 'Existing environment reference')}
     <p className="hint">Use an existing environment alone, or provide a project and/or template.</p>
     {validation && <p role="alert">{validation}</p>}{mutation.isError && <Failure error={mutation.error} />}
@@ -221,7 +223,7 @@ function Overview() {
   })
   const env = environment.data
   return <section>
-    <dl className="facts"><dt>State</dt><dd>{run.state}</dd><dt>Agent</dt><dd>{run.intent.agent}</dd><dt>Prompt</dt><dd>{run.intent.prompt}</dd><dt>Created</dt><dd>{run.createdAt}</dd><dt>UID</dt><dd>{run.uid}</dd><dt>Branch</dt><dd>{run.branch || '—'}</dd></dl>
+    <dl className="facts"><dt>State</dt><dd>{run.state}</dd><dt>Agent</dt><dd>{run.intent.agent}</dd><dt>Credential profile</dt><dd>{run.intent.credentialProfile || '—'}</dd><dt>Prompt</dt><dd>{run.intent.prompt}</dd><dt>Created</dt><dd>{run.createdAt}</dd><dt>UID</dt><dd>{run.uid}</dd><dt>Branch</dt><dd>{run.branch || '—'}</dd></dl>
     <h2>Usage</h2><dl className="facts"><dt>CPU seconds</dt><dd>{run.usage.cpuSeconds}</dd><dt>Tokens in</dt><dd>{run.usage.tokensIn}</dd><dt>Tokens out</dt><dd>{run.usage.tokensOut}</dd></dl>
     <h2>Operational conditions</h2><table><thead><tr><th>Exposed fact</th><th>Status</th></tr></thead><tbody>
       <tr><td>Cancellation requested</td><td>{run.cancelRequested ? 'Yes' : 'No'}</td></tr>
