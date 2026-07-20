@@ -203,6 +203,13 @@ open `http://127.0.0.1:8080/`:
 kubectl port-forward service/swe-platform-swe-platform-control-plane 8080:80
 ```
 
+For the Argo kind mirror, use `make argocd-ui` instead and open
+`http://127.0.0.1:18080/`. That foreground helper targets the `kind-swe-argo` context and
+restarts its loopback-only Service forward when a rollout replaces the selected pod. Set
+`KIND_ARGO_CLUSTER` or `ARGO_UI_PORT` to override its cluster or local port. A reconnect
+restores the URL and all control-plane routes, but cannot preserve an open SSE/WebSocket TCP
+connection or a process-local browser session across control-plane replacement.
+
 The kind preset permits HTTP browser sessions for this local flow. Production browser sessions
 still require HTTPS. To build the embedded binary outside the image build, run `make ui-build`
 followed by `make build-control-plane-production`; ordinary Go builds intentionally omit the UI

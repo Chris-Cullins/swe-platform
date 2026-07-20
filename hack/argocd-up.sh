@@ -78,7 +78,7 @@ Argo CD UI:
   password: \$(${KUBECTL[*]} -n $ARGOCD_NAMESPACE get secret argocd-initial-admin-secret -o jsonpath='{.data.password}' | base64 -d)
 
 Drive it with the swe CLI:
-  ${KUBECTL[*]} -n $APP_NAMESPACE port-forward svc/swe-platform-swe-platform-control-plane 18080:80
+  KIND_ARGO_CLUSTER=$CLUSTER make argocd-ui
   export SWE_CONTROL_PLANE_URL=http://127.0.0.1:18080
   export SWE_CONTROL_PLANE_TOKEN=\$(${KUBECTL[*]} -n $APP_NAMESPACE get secret $BOOTSTRAP_SECRET -o jsonpath='{.data.token}' | base64 -d)
   bin/swe run "fix the flaky tests" -t small
