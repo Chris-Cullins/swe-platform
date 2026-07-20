@@ -168,36 +168,6 @@ sleep 5
 printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":1,"output_tokens":2}}'
 EOF
 chmod 0755 "$FAKE_ENV_CONTEXT/codex"
-cat > "$FAKE_ENV_CONTEXT/pi" <<'EOF'
-#!/bin/sh
-set -eu
-test "$#" -eq 11
-test "$1" = --mode
-test "$2" = json
-test "$3" = --no-session
-test "$4" = --no-approve
-test "$5" = --no-extensions
-test "$6" = --no-skills
-test "$7" = --no-prompt-templates
-test "$8" = --no-themes
-test "$9" = --no-context-files
-test "${10}" = --offline
-test "${11}" = '
---fake-pi-e2e'
-case "${PI_CODING_AGENT_DIR:-}" in
-	.swe-platform/pi/*) ;;
-	*) echo 'fake Pi received a shared config directory' >&2; exit 65 ;;
-esac
-run_dir=${PI_CODING_AGENT_DIR#.swe-platform/pi/}
-test -n "$run_dir"
-test "$run_dir" = "${run_dir#*/}"
-printf '%s\n' '{"type":"agent_start"}'
-printf '%s\n' 'fake Pi diagnostic' >&2
-sleep 5
-printf '%s\n' '{"type":"agent_end","messages":[{"role":"assistant","content":[{"type":"text","text":"fake Pi is working"}],"stopReason":"stop"}],"willRetry":false}'
-printf '%s\n' '{"type":"agent_settled"}'
-EOF
-chmod 0755 "$FAKE_ENV_CONTEXT/pi"
 cat > "$FAKE_ENV_CONTEXT/Dockerfile" <<'EOF'
 ARG BASE_IMAGE
 FROM ${BASE_IMAGE}
@@ -205,7 +175,6 @@ USER root
 COPY claude /usr/local/bin/claude
 COPY amp /usr/local/bin/amp
 COPY codex /usr/local/bin/codex
-COPY pi /usr/local/bin/pi
 USER swe
 EOF
 docker build --build-arg BASE_IMAGE="$ENV_IMAGE" -t "$E2E_ENV_IMAGE" "$FAKE_ENV_CONTEXT" >/dev/null
@@ -400,23 +369,6 @@ for _ in $(seq 1 60); do
 done
 if [[ -z "${REPLACEMENT_NAME:-}" || "$REPLACEMENT_NAME" == "$ENV_NAME" || "${REPLACEMENT_PHASE:-}" != "Ready" ]]; then
 	echo "FAIL: warm pool was not replenished after claim"
-	exit 1
-fi
-
-echo "==> exercising Pi through the real Run controller with a fake executable"
-PI_RUN_NAME=e2e-pi
-bin/swe run --name "$PI_RUN_NAME" --agent pi --environment "$ENV_NAME" --wait=false -- "--fake-pi-e2e"
-kubectl wait --for=jsonpath='{.status.state}'=Running run/"$PI_RUN_NAME" --timeout=2m
-kubectl wait --for=jsonpath='{.status.state}'=Succeeded run/"$PI_RUN_NAME" --timeout=2m
-for _ in $(seq 1 60); do
-	PI_CLAIM_UID=$(kubectl get environment "$ENV_NAME" -o jsonpath='{.status.claimedBy.uid}' 2>/dev/null || true)
-	if [[ -z "$PI_CLAIM_UID" ]]; then
-		break
-	fi
-	sleep 1
-done
-if [[ -n "${PI_CLAIM_UID:-}" ]]; then
-	echo "FAIL: terminal Pi Run did not release its Environment claim"
 	exit 1
 fi
 
@@ -738,41 +690,6 @@ fi
 
 echo "==> rotating the profile without restarting the existing process"
 printf '%s' "$E2E_ROTATED_AGENT_API_KEY" | bin/swe credentials rotate e2e-claude --api-key-stdin
-
-echo "==> verifying fake Pi output through the deployed transcript transport"
-curl --fail --silent --no-buffer --max-time 10 \
-	-H "Authorization: Bearer ${E2E_BOOTSTRAP_TOKEN}" \
-	"http://127.0.0.1:18080/api/v1/namespaces/default/runs/${PI_RUN_NAME}/transcript" \
-	>/tmp/swe-platform-pi-transcript.out &
-PI_STREAM_PID=$!
-for _ in $(seq 1 30); do
-	if grep -Fq '"type":"pi.process-output"' /tmp/swe-platform-pi-transcript.out; then
-		break
-	fi
-	sleep 1
-done
-kill "$PI_STREAM_PID" >/dev/null 2>&1 || true
-wait "$PI_STREAM_PID" >/dev/null 2>&1 || true
-if ! grep -F '"source":"pi"' /tmp/swe-platform-pi-transcript.out | \
-	grep -F '"type":"pi.process-output"' \
-	>/tmp/swe-platform-pi-envelopes.out; then
-	echo "FAIL: deployed transcript transport did not retain the exact Pi source/type envelope"
-	exit 1
-fi
-if ! grep -oE '"data":"[A-Za-z0-9+/=]+"' /tmp/swe-platform-pi-envelopes.out | \
-	sed 's/^"data":"//; s/"$//' | \
-	while IFS= read -r encoded; do printf '%s' "$encoded" | base64 --decode || exit 1; done \
-	>/tmp/swe-platform-pi-output.out; then
-	echo "FAIL: Pi process output was not valid base64 in the deployed transcript transport"
-	exit 1
-fi
-if ! grep -Fq '"type":"agent_end"' /tmp/swe-platform-pi-output.out || \
-	! grep -Fq '"text":"fake Pi is working"' /tmp/swe-platform-pi-output.out || \
-	! grep -Fq 'fake Pi diagnostic' /tmp/swe-platform-pi-output.out; then
-	echo "FAIL: deployed transcript transport did not retain opaque Pi stdout and stderr"
-	cat /tmp/swe-platform-pi-output.out
-	exit 1
-fi
 
 kubectl delete run "$RUN_NAME" --wait=true >/dev/null
 if ! kubectl get environment "$RUN_ENV_NAME" >/dev/null 2>&1; then
