@@ -187,7 +187,10 @@ Argo rollout replaces the selected control-plane pod. Override the cluster with
 `KIND_ARGO_CLUSTER` or the local port with `ARGO_UI_PORT`. Stopping the helper also stops
 only its own `kubectl` child. Existing SSE or WebSocket connections still disconnect during
 a rollout and must reconnect, and a control-plane replacement invalidates its process-local
-browser sessions.
+browser sessions. The bootstrap requires one kind node with at least 5 CPUs and 6 GiB
+allocatable so the Argo/system workload and two 1-CPU/2-GiB `tiny` Environments fit while a
+warm member is claimed and replaced. Increase the container runtime's capacity before
+running `make argocd-up`; the script checks this before installing Argo.
 
 Create runs with an explicit template, or reference a `Project` to use its default
 template:

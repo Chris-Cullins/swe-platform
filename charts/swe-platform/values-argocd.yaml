@@ -27,8 +27,10 @@ environmentTemplates:
   - name: small
     spec:
       image: ghcr.io/chris-cullins/swe-platform/env-base:latest
-      # Leave room for the claimed environment and its immediate pool replacement
-      # on kind's single control-plane node.
+      # The Argo bootstrap requires a node with at least 5 CPUs/6 GiB allocatable
+      # so this ready member and its immediate replacement fit during a claim.
+      # Setting min to 0 lowers peak capacity, but every Run then pays environment
+      # provisioning and image-pull cold-start latency.
       size: tiny
       idleTimeout: 15m
       diskSize: 5Gi

@@ -63,7 +63,7 @@ digest-pinned installation overrides.
 | Preset | Assumptions |
 |---|---|
 | `values-kind.yaml` | Local kind development with `:dev` images; explicitly permits insecure HTTP browser sessions. `make kind-up` installs gVisor and snapshot-capable CSI; pass the printed `environmentTemplates[0].spec.runtimeClass=gvisor` override when installing the chart. |
-| `values-argocd.yaml` | Local Argo CD mirror with mutable `:latest` images and an out-of-band bootstrap Secret; explicitly permits insecure HTTP browser sessions. |
+| `values-argocd.yaml` | Local Argo CD mirror with mutable `:latest` images and an out-of-band bootstrap Secret; explicitly permits insecure HTTP browser sessions. `hack/argocd-up.sh` requires one kind node with at least 5 CPUs and 6 GiB allocatable. |
 | `values-k3s.yaml` | A default CSI-backed StorageClass is available. Uses one operator replica and the default OCI runtime because k3s does not ship gVisor. |
 | `values-gke.yaml` | GKE Sandbox is enabled on every node that can host environments. Sets `runtimeClass: gvisor` and runs two operator replicas with leader election. |
 | `values-eks.yaml` | A default EBS CSI StorageClass is available. Runs two operator replicas with leader election. EKS does not provide a standard gVisor RuntimeClass, so environments use the cluster default unless you override `environmentTemplates[].spec.runtimeClass`. |
@@ -82,7 +82,15 @@ lifecycle and backend requirements.
 For local development, use `values-kind.yaml`; it references locally loaded `:dev`
 images and disables leader election. `values-argocd.yaml` is the preset for the
 local Argo CD mirror (`hack/argocd-up.sh`): it tracks the mutable `:latest` images
-published from main and references an out-of-band bootstrap token Secret.
+published from main and references an out-of-band bootstrap token Secret. Its `tiny`
+template requests 1 CPU and 2 GiB per Environment. The configured warm minimum of one
+therefore needs capacity for two Environments while a claimed member and its replacement
+overlap. The bootstrap checks for at least 5 CPUs and 6 GiB allocatable on one node before
+installing Argo, leaving the capacity beyond the Environments' 2 CPUs/4 GiB for Kubernetes,
+Argo CD, the Image Updater, the operator, and the control plane. If local capacity is more
+important than warm starts, explicitly set `environmentTemplates[0].spec.warmPool.min=0`;
+that removes replacement overlap but makes every Run wait for environment provisioning and
+the `env-base` image pull.
 
 ## Control-plane authentication and authorization
 
