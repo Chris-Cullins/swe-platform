@@ -51,11 +51,24 @@ func RequestWakeForReason(ctx context.Context, kube client.Client, key types.Nam
 	})
 }
 
-// RequestSuspend publishes a requested execution fence without changing hold policy.
-func RequestSuspend(ctx context.Context, kube client.Client, key types.NamespacedName, expectedUID types.UID, policyRevision int64, requestID string) error {
+// RequestSuspend publishes a requested execution fence without changing hold
+// policy. Sequence must increase for each logical suspension request targeting
+// one Environment incarnation.
+func RequestSuspend(ctx context.Context, kube client.Client, key types.NamespacedName, expectedUID types.UID, policyRevision int64, requestID string, sequence int64) error {
+	if sequence < 1 {
+		return fmt.Errorf("suspension request sequence must be positive")
+	}
 	return patchIntent(ctx, kube, key, expectedUID, policyRevision, func(environment *platformv1alpha1.Environment) {
-		environment.Spec.Lifecycle.Suspend = &platformv1alpha1.EnvironmentLifecycleRequest{
-			ID: requestID, EnvironmentUID: expectedUID, HoldPolicyRevision: policyRevision,
+		current := environment.Spec.Lifecycle.Suspend
+		if sequence <= environment.Status.Lifecycle.LastSuspendRequestSequence ||
+			current != nil && (current.Sequence >= sequence || current.ID == requestID) {
+			return
+		}
+		environment.Spec.Lifecycle.Suspend = &platformv1alpha1.EnvironmentSuspendRequest{
+			EnvironmentLifecycleRequest: platformv1alpha1.EnvironmentLifecycleRequest{
+				ID: requestID, EnvironmentUID: expectedUID, HoldPolicyRevision: policyRevision,
+			},
+			Sequence: sequence,
 		}
 	})
 }

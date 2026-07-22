@@ -185,8 +185,9 @@ func (r *EnvironmentReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		}
 		return ctrl.Result{Requeue: true}, nil
 	}
-	if request := env.Spec.Lifecycle.Suspend; request != nil && env.Status.Lifecycle.PendingSuspendRequestID != request.ID &&
-		(request.ID == env.Status.Lifecycle.LastSuspendRequestID || !validLifecycleRequest(&env, request)) {
+	if request := env.Spec.Lifecycle.Suspend; request != nil &&
+		(env.Status.Lifecycle.PendingSuspendRequestID != request.ID || env.Status.Lifecycle.LastSuspendRequestSequence != request.Sequence) &&
+		(request.Sequence <= env.Status.Lifecycle.LastSuspendRequestSequence || request.ID == env.Status.Lifecycle.LastSuspendRequestID || !validLifecycleRequest(&env, &request.EnvironmentLifecycleRequest)) {
 		before := env.DeepCopy()
 		env.Spec.Lifecycle.Suspend = nil
 		if err := r.Patch(ctx, &env, client.MergeFromWithOptions(before, client.MergeFromWithOptimisticLock{})); err != nil {
@@ -289,7 +290,8 @@ func (r *EnvironmentReconciler) reconcileLifecycleIntent(ctx context.Context, en
 	activityRequests := lifecycle.ActivityRequests(env)
 	if env.Spec.Lifecycle.Hold == nil && env.Spec.Lifecycle.Wake == nil && env.Spec.Lifecycle.Suspend == nil && len(activityRequests) == 0 &&
 		!env.Status.Lifecycle.Suspended && env.Status.Lifecycle.Epoch == 0 && env.Status.Lifecycle.ObservedHoldPolicyRevision == 0 &&
-		env.Status.Lifecycle.LastWakeRequestID == "" && env.Status.Lifecycle.LastSuspendRequestID == "" && env.Status.Lifecycle.PendingSuspendRequestID == "" && len(env.Status.Lifecycle.ActivityReceipts) == 0 {
+		env.Status.Lifecycle.LastWakeRequestID == "" && env.Status.Lifecycle.LastSuspendRequestID == "" && env.Status.Lifecycle.LastSuspendRequestSequence == 0 &&
+		env.Status.Lifecycle.PendingSuspendRequestID == "" && len(env.Status.Lifecycle.ActivityReceipts) == 0 {
 		return false, nil
 	}
 	policyRevision := int64(0)
@@ -317,12 +319,14 @@ func (r *EnvironmentReconciler) reconcileLifecycleIntent(ctx context.Context, en
 		}
 	}
 
-	suspendValid := valid(env.Spec.Lifecycle.Suspend)
+	suspend := env.Spec.Lifecycle.Suspend
+	suspendValid := suspend != nil && valid(&suspend.EnvironmentLifecycleRequest)
 	suspendInFlight := lifecycleStatus.PendingSuspendRequestID != ""
-	suspendNew := suspendValid && !suspendInFlight && env.Spec.Lifecycle.Suspend.ID != lifecycleStatus.LastSuspendRequestID
+	suspendNew := suspendValid && !suspendInFlight && suspend.Sequence > lifecycleStatus.LastSuspendRequestSequence && suspend.ID != lifecycleStatus.LastSuspendRequestID
 	if suspendNew {
-		lifecycleStatus.LastSuspendRequestID = env.Spec.Lifecycle.Suspend.ID
-		lifecycleStatus.PendingSuspendRequestID = env.Spec.Lifecycle.Suspend.ID
+		lifecycleStatus.LastSuspendRequestID = suspend.ID
+		lifecycleStatus.LastSuspendRequestSequence = suspend.Sequence
+		lifecycleStatus.PendingSuspendRequestID = suspend.ID
 	}
 	wake := env.Spec.Lifecycle.Wake
 	wakeNew := wake != nil && valid(&wake.EnvironmentLifecycleRequest) && wake.ID != lifecycleStatus.LastWakeRequestID

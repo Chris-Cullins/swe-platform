@@ -2356,7 +2356,10 @@ func TestLegacyWakeDuringRequestedFenceIsRefusedAndSuspendReplayIsIgnored(t *tes
 	if err := platformv1alpha1.AddToScheme(scheme); err != nil {
 		t.Fatal(err)
 	}
-	suspend := &platformv1alpha1.EnvironmentLifecycleRequest{ID: "suspend-1", EnvironmentUID: "env-uid"}
+	suspend := &platformv1alpha1.EnvironmentSuspendRequest{
+		EnvironmentLifecycleRequest: platformv1alpha1.EnvironmentLifecycleRequest{ID: "suspend-1", EnvironmentUID: "env-uid"},
+		Sequence:                    1,
+	}
 	env := &platformv1alpha1.Environment{
 		ObjectMeta: metav1.ObjectMeta{Name: "shared", Namespace: "default", UID: "env-uid", Finalizers: []string{environmentFinalizer}},
 		Spec: platformv1alpha1.EnvironmentSpec{Lifecycle: platformv1alpha1.EnvironmentLifecycleSpec{
@@ -2447,6 +2450,132 @@ func TestLegacyWakeDuringRequestedFenceIsRefusedAndSuspendReplayIsIgnored(t *tes
 	}
 }
 
+func TestConsumedSuspendSequenceRejectsABAReplay(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		pending bool
+	}{
+		{name: "after newer request was acknowledged and resumed"},
+		{name: "while newer request is pending", pending: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			scheme := runtime.NewScheme()
+			if err := platformv1alpha1.AddToScheme(scheme); err != nil {
+				t.Fatal(err)
+			}
+			environment := &platformv1alpha1.Environment{
+				ObjectMeta: metav1.ObjectMeta{Name: "shared", Namespace: "default", UID: "env-uid", Finalizers: []string{environmentFinalizer}},
+				Spec: platformv1alpha1.EnvironmentSpec{Lifecycle: platformv1alpha1.EnvironmentLifecycleSpec{
+					Suspend: &platformv1alpha1.EnvironmentSuspendRequest{
+						EnvironmentLifecycleRequest: platformv1alpha1.EnvironmentLifecycleRequest{ID: "suspend-a", EnvironmentUID: "env-uid"},
+						Sequence:                    1,
+					},
+				}},
+				Status: platformv1alpha1.EnvironmentStatus{
+					Phase: platformv1alpha1.EnvironmentPhaseReady,
+					Lifecycle: platformv1alpha1.EnvironmentLifecycleStatus{
+						Epoch: 2, LastSuspendRequestID: "suspend-b", LastSuspendRequestSequence: 2,
+					},
+				},
+			}
+			if test.pending {
+				environment.Status.Lifecycle.Suspended = true
+				environment.Status.Lifecycle.SuspensionReason = platformv1alpha1.EnvironmentSuspensionReasonRequested
+				environment.Status.Lifecycle.SuspensionRequestID = "suspend-b"
+				environment.Status.Lifecycle.PendingSuspendRequestID = "suspend-b"
+			}
+			kubeClient := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(environment).WithObjects(environment).Build()
+			reconciler := &EnvironmentReconciler{Client: kubeClient, Scheme: scheme}
+			key := client.ObjectKeyFromObject(environment)
+
+			if _, err := reconciler.Reconcile(context.Background(), ctrl.Request{NamespacedName: key}); err != nil {
+				t.Fatal(err)
+			}
+			var current platformv1alpha1.Environment
+			if err := kubeClient.Get(context.Background(), key, &current); err != nil {
+				t.Fatal(err)
+			}
+			if current.Spec.Lifecycle.Suspend != nil {
+				t.Fatalf("ABA replay remained in spec: %#v", current.Spec.Lifecycle.Suspend)
+			}
+			if current.Status.Lifecycle.LastSuspendRequestID != "suspend-b" || current.Status.Lifecycle.LastSuspendRequestSequence != 2 || current.Status.Lifecycle.PendingSuspendRequestID != environment.Status.Lifecycle.PendingSuspendRequestID || current.Status.Lifecycle.Epoch != 2 {
+				t.Fatalf("ABA replay changed lifecycle status: %#v", current.Status.Lifecycle)
+			}
+		})
+	}
+}
+
+func TestSuspendSequenceAdvancesAfterPendingFenceAcknowledgement(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	if err := platformv1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	environment := &platformv1alpha1.Environment{
+		ObjectMeta: metav1.ObjectMeta{Name: "shared", Namespace: "default", UID: "env-uid"},
+		Spec: platformv1alpha1.EnvironmentSpec{Lifecycle: platformv1alpha1.EnvironmentLifecycleSpec{
+			Suspend: &platformv1alpha1.EnvironmentSuspendRequest{
+				EnvironmentLifecycleRequest: platformv1alpha1.EnvironmentLifecycleRequest{ID: "suspend-b", EnvironmentUID: "env-uid"},
+				Sequence:                    2,
+			},
+		}},
+		Status: platformv1alpha1.EnvironmentStatus{Lifecycle: platformv1alpha1.EnvironmentLifecycleStatus{
+			LastSuspendRequestID: "suspend-a", LastSuspendRequestSequence: 1,
+		}},
+	}
+	kubeClient := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(environment).WithObjects(environment).Build()
+	reconciler := &EnvironmentReconciler{Client: kubeClient, Scheme: scheme}
+	key := client.ObjectKeyFromObject(environment)
+
+	if _, err := reconciler.reconcileLifecycleIntent(context.Background(), environment); err != nil {
+		t.Fatal(err)
+	}
+	var current platformv1alpha1.Environment
+	if err := kubeClient.Get(context.Background(), key, &current); err != nil {
+		t.Fatal(err)
+	}
+	if current.Status.Lifecycle.LastSuspendRequestID != "suspend-b" || current.Status.Lifecycle.LastSuspendRequestSequence != 2 || current.Status.Lifecycle.PendingSuspendRequestID != "suspend-b" {
+		t.Fatalf("second request was not accepted: %#v", current.Status.Lifecycle)
+	}
+	current.Spec.Lifecycle.Suspend = &platformv1alpha1.EnvironmentSuspendRequest{
+		EnvironmentLifecycleRequest: platformv1alpha1.EnvironmentLifecycleRequest{ID: "suspend-c", EnvironmentUID: "env-uid"},
+		Sequence:                    3,
+	}
+	if err := kubeClient.Update(context.Background(), &current); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reconciler.reconcileLifecycleIntent(context.Background(), &current); err != nil {
+		t.Fatal(err)
+	}
+	if err := kubeClient.Get(context.Background(), key, &current); err != nil {
+		t.Fatal(err)
+	}
+	if current.Status.Lifecycle.LastSuspendRequestID != "suspend-b" || current.Status.Lifecycle.LastSuspendRequestSequence != 2 || current.Status.Lifecycle.PendingSuspendRequestID != "suspend-b" {
+		t.Fatalf("new request preempted pending fence: %#v", current.Status.Lifecycle)
+	}
+	current.Status.Phase = platformv1alpha1.EnvironmentPhasePaused
+	if err := kubeClient.Status().Update(context.Background(), &current); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reconciler.reconcilePaused(context.Background(), &current); err != nil {
+		t.Fatal(err)
+	}
+	if err := kubeClient.Get(context.Background(), key, &current); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reconciler.reconcileLifecycleIntent(context.Background(), &current); err != nil {
+		t.Fatal(err)
+	}
+	if err := kubeClient.Get(context.Background(), key, &current); err != nil {
+		t.Fatal(err)
+	}
+	if current.Status.Lifecycle.LastSuspendRequestID != "suspend-c" || current.Status.Lifecycle.LastSuspendRequestSequence != 3 || current.Status.Lifecycle.PendingSuspendRequestID != "suspend-c" {
+		t.Fatalf("new request was not accepted after acknowledgement: %#v", current.Status.Lifecycle)
+	}
+}
+
 func TestReconcileIdleSchedulesRemainingTimeout(t *testing.T) {
 	now := time.Date(2026, time.July, 19, 12, 0, 0, 0, time.UTC)
 	lastActive := metav1.NewTime(now)
@@ -2518,7 +2647,10 @@ func TestIdleScopedWakeRacingSuspendRemainsRequestedAfterAcknowledgement(t *test
 	environment := &platformv1alpha1.Environment{
 		ObjectMeta: metav1.ObjectMeta{Name: "shared", Namespace: "default", UID: "env-uid", Finalizers: []string{environmentFinalizer}},
 		Spec: platformv1alpha1.EnvironmentSpec{Lifecycle: platformv1alpha1.EnvironmentLifecycleSpec{
-			Suspend: &platformv1alpha1.EnvironmentLifecycleRequest{ID: "suspend-1", EnvironmentUID: "env-uid"},
+			Suspend: &platformv1alpha1.EnvironmentSuspendRequest{
+				EnvironmentLifecycleRequest: platformv1alpha1.EnvironmentLifecycleRequest{ID: "suspend-1", EnvironmentUID: "env-uid"},
+				Sequence:                    1,
+			},
 			Wake: &platformv1alpha1.EnvironmentWakeRequest{
 				EnvironmentLifecycleRequest: platformv1alpha1.EnvironmentLifecycleRequest{ID: "terminal-wake", EnvironmentUID: "env-uid"},
 				ExpectedSuspensionReason:    platformv1alpha1.EnvironmentSuspensionReasonIdle,
@@ -2568,7 +2700,10 @@ func TestRequestedScopedWakeWaitsForFenceAcknowledgementThenResumes(t *testing.T
 	environment := &platformv1alpha1.Environment{
 		ObjectMeta: metav1.ObjectMeta{Name: "shared", Namespace: "default", UID: "env-uid"},
 		Spec: platformv1alpha1.EnvironmentSpec{Lifecycle: platformv1alpha1.EnvironmentLifecycleSpec{
-			Suspend: &platformv1alpha1.EnvironmentLifecycleRequest{ID: "suspend-1", EnvironmentUID: "env-uid"},
+			Suspend: &platformv1alpha1.EnvironmentSuspendRequest{
+				EnvironmentLifecycleRequest: platformv1alpha1.EnvironmentLifecycleRequest{ID: "suspend-1", EnvironmentUID: "env-uid"},
+				Sequence:                    1,
+			},
 			Wake: &platformv1alpha1.EnvironmentWakeRequest{
 				EnvironmentLifecycleRequest: platformv1alpha1.EnvironmentLifecycleRequest{ID: "run-wake", EnvironmentUID: "env-uid"},
 				ExpectedSuspensionReason:    platformv1alpha1.EnvironmentSuspensionReasonRequested,
@@ -2576,7 +2711,7 @@ func TestRequestedScopedWakeWaitsForFenceAcknowledgementThenResumes(t *testing.T
 		}},
 		Status: platformv1alpha1.EnvironmentStatus{Lifecycle: platformv1alpha1.EnvironmentLifecycleStatus{
 			Suspended: true, SuspensionReason: platformv1alpha1.EnvironmentSuspensionReasonRequested, Epoch: 1,
-			LastSuspendRequestID: "suspend-1", PendingSuspendRequestID: "suspend-1", SuspensionRequestID: "suspend-1",
+			LastSuspendRequestID: "suspend-1", LastSuspendRequestSequence: 1, PendingSuspendRequestID: "suspend-1", SuspensionRequestID: "suspend-1",
 		}},
 	}
 	kubeClient := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(environment).WithObjects(environment).Build()
@@ -2785,7 +2920,7 @@ func TestHoldAcceptsSuspendFenceAndAllowsRunCleanupInEitherOrdering(t *testing.T
 			requestRevision: 1,
 			status: platformv1alpha1.EnvironmentLifecycleStatus{
 				Suspended: true, SuspensionReason: platformv1alpha1.EnvironmentSuspensionReasonRequested, Epoch: 1,
-				LastSuspendRequestID: "cleanup-fence", PendingSuspendRequestID: "cleanup-fence", SuspensionRequestID: "cleanup-fence",
+				LastSuspendRequestID: "cleanup-fence", LastSuspendRequestSequence: 1, PendingSuspendRequestID: "cleanup-fence", SuspensionRequestID: "cleanup-fence",
 			},
 		},
 	} {
@@ -2811,8 +2946,11 @@ func TestHoldAcceptsSuspendFenceAndAllowsRunCleanupInEitherOrdering(t *testing.T
 			environment := &platformv1alpha1.Environment{
 				ObjectMeta: metav1.ObjectMeta{Name: "shared", Namespace: "default", UID: "env-uid", Finalizers: []string{environmentFinalizer}},
 				Spec: platformv1alpha1.EnvironmentSpec{Lifecycle: platformv1alpha1.EnvironmentLifecycleSpec{
-					Hold:    &platformv1alpha1.EnvironmentHoldPolicy{Enabled: true, Revision: 2},
-					Suspend: &platformv1alpha1.EnvironmentLifecycleRequest{ID: "cleanup-fence", EnvironmentUID: "env-uid", HoldPolicyRevision: test.requestRevision},
+					Hold: &platformv1alpha1.EnvironmentHoldPolicy{Enabled: true, Revision: 2},
+					Suspend: &platformv1alpha1.EnvironmentSuspendRequest{
+						EnvironmentLifecycleRequest: platformv1alpha1.EnvironmentLifecycleRequest{ID: "cleanup-fence", EnvironmentUID: "env-uid", HoldPolicyRevision: test.requestRevision},
+						Sequence:                    1,
+					},
 				}},
 				Status: platformv1alpha1.EnvironmentStatus{
 					Phase:     platformv1alpha1.EnvironmentPhaseReady,

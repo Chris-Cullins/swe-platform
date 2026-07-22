@@ -1271,11 +1271,11 @@ func TestAcceptedUnreachableOwnedTerminalCleanupWaitsForFence(t *testing.T) {
 	}
 }
 
-func TestOwnedEnvironmentFenceUsesNextLifecycleEpoch(t *testing.T) {
+func TestOwnedEnvironmentFenceUsesNextSuspendSequence(t *testing.T) {
 	environment := &platformv1alpha1.Environment{
 		ObjectMeta: metav1.ObjectMeta{Name: "owned", Namespace: "ns", UID: "env-uid"},
 		Status: platformv1alpha1.EnvironmentStatus{Lifecycle: platformv1alpha1.EnvironmentLifecycleStatus{
-			Epoch: 1, LastSuspendRequestID: "environment/env-uid/fence/1",
+			Epoch: 1, LastSuspendRequestID: "environment/env-uid/fence/4", LastSuspendRequestSequence: 4,
 		}},
 	}
 	r := reconciler(t, &scriptedAdapter{}, environment)
@@ -1287,7 +1287,7 @@ func TestOwnedEnvironmentFenceUsesNextLifecycleEpoch(t *testing.T) {
 	if err := r.Get(context.Background(), client.ObjectKeyFromObject(environment), &updated); err != nil {
 		t.Fatal(err)
 	}
-	if updated.Spec.Lifecycle.Suspend == nil || updated.Spec.Lifecycle.Suspend.ID != "environment/env-uid/fence/2" {
+	if updated.Spec.Lifecycle.Suspend == nil || updated.Spec.Lifecycle.Suspend.ID != "environment/env-uid/fence/5" || updated.Spec.Lifecycle.Suspend.Sequence != 5 {
 		t.Fatalf("next fence request = %#v", updated.Spec.Lifecycle.Suspend)
 	}
 	if _, err := r.requestEnvironmentFence(context.Background(), &updated); err != nil {
@@ -1297,7 +1297,7 @@ func TestOwnedEnvironmentFenceUsesNextLifecycleEpoch(t *testing.T) {
 	if err := r.Get(context.Background(), client.ObjectKeyFromObject(environment), &replay); err != nil {
 		t.Fatal(err)
 	}
-	if replay.Spec.Lifecycle.Suspend == nil || replay.Spec.Lifecycle.Suspend.ID != "environment/env-uid/fence/2" {
+	if replay.Spec.Lifecycle.Suspend == nil || replay.Spec.Lifecycle.Suspend.ID != "environment/env-uid/fence/5" || replay.Spec.Lifecycle.Suspend.Sequence != 5 {
 		t.Fatalf("retried fence request = %#v", replay.Spec.Lifecycle.Suspend)
 	}
 }

@@ -121,7 +121,7 @@ func TestWakeAndSuspendRequestsCarryExactFences(t *testing.T) {
 	if err := RequestWake(context.Background(), kubeClient, key, environment.UID, 7, "wake-7"); err != nil {
 		t.Fatal(err)
 	}
-	if err := RequestSuspend(context.Background(), kubeClient, key, environment.UID, 7, "suspend-7"); err != nil {
+	if err := RequestSuspend(context.Background(), kubeClient, key, environment.UID, 7, "suspend-7", 1); err != nil {
 		t.Fatal(err)
 	}
 	var updated platformv1alpha1.Environment
@@ -131,8 +131,80 @@ func TestWakeAndSuspendRequestsCarryExactFences(t *testing.T) {
 	if updated.Spec.Lifecycle.Wake == nil || updated.Spec.Lifecycle.Wake.EnvironmentUID != environment.UID || updated.Spec.Lifecycle.Wake.HoldPolicyRevision != 7 || updated.Spec.Lifecycle.Wake.ID != "wake-7" || updated.Spec.Lifecycle.Wake.ExpectedSuspensionReason != platformv1alpha1.EnvironmentSuspensionReasonIdle {
 		t.Fatalf("wake = %#v", updated.Spec.Lifecycle.Wake)
 	}
-	if updated.Spec.Lifecycle.Suspend == nil || updated.Spec.Lifecycle.Suspend.EnvironmentUID != environment.UID || updated.Spec.Lifecycle.Suspend.HoldPolicyRevision != 7 || updated.Spec.Lifecycle.Suspend.ID != "suspend-7" {
+	if updated.Spec.Lifecycle.Suspend == nil || updated.Spec.Lifecycle.Suspend.EnvironmentUID != environment.UID || updated.Spec.Lifecycle.Suspend.HoldPolicyRevision != 7 || updated.Spec.Lifecycle.Suspend.ID != "suspend-7" || updated.Spec.Lifecycle.Suspend.Sequence != 1 {
 		t.Fatalf("suspend = %#v", updated.Spec.Lifecycle.Suspend)
+	}
+}
+
+func TestRequestSuspendPreservesSequenceHighWatermark(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := platformv1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	environment := &platformv1alpha1.Environment{}
+	environment.Name = "environment"
+	environment.Namespace = "project"
+	environment.UID = "env-uid"
+	environment.Spec.Lifecycle.Suspend = &platformv1alpha1.EnvironmentSuspendRequest{
+		EnvironmentLifecycleRequest: platformv1alpha1.EnvironmentLifecycleRequest{ID: "suspend-2", EnvironmentUID: environment.UID},
+		Sequence:                    2,
+	}
+	environment.Status.Lifecycle.LastSuspendRequestSequence = 1
+	kubeClient := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(environment).WithObjects(environment).Build()
+	key := client.ObjectKeyFromObject(environment)
+
+	for _, request := range []struct {
+		id       string
+		sequence int64
+	}{
+		{id: "suspend-1", sequence: 1},
+		{id: "different-at-2", sequence: 2},
+		{id: "suspend-2", sequence: 3},
+	} {
+		if err := RequestSuspend(context.Background(), kubeClient, key, environment.UID, 0, request.id, request.sequence); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var unchanged platformv1alpha1.Environment
+	if err := kubeClient.Get(context.Background(), key, &unchanged); err != nil {
+		t.Fatal(err)
+	}
+	if unchanged.Spec.Lifecycle.Suspend == nil || unchanged.Spec.Lifecycle.Suspend.ID != "suspend-2" || unchanged.Spec.Lifecycle.Suspend.Sequence != 2 {
+		t.Fatalf("older, equal, or reused-ID request replaced high watermark: %#v", unchanged.Spec.Lifecycle.Suspend)
+	}
+
+	if err := RequestSuspend(context.Background(), kubeClient, key, environment.UID, 0, "suspend-3", 3); err != nil {
+		t.Fatal(err)
+	}
+	var advanced platformv1alpha1.Environment
+	if err := kubeClient.Get(context.Background(), key, &advanced); err != nil {
+		t.Fatal(err)
+	}
+	if advanced.Spec.Lifecycle.Suspend == nil || advanced.Spec.Lifecycle.Suspend.ID != "suspend-3" || advanced.Spec.Lifecycle.Suspend.Sequence != 3 {
+		t.Fatalf("new request did not advance high watermark: %#v", advanced.Spec.Lifecycle.Suspend)
+	}
+	advanced.Spec.Lifecycle.Suspend = nil
+	if err := kubeClient.Update(context.Background(), &advanced); err != nil {
+		t.Fatal(err)
+	}
+	if err := kubeClient.Get(context.Background(), key, &advanced); err != nil {
+		t.Fatal(err)
+	}
+	advanced.Status.Lifecycle.LastSuspendRequestSequence = 3
+	if err := kubeClient.Status().Update(context.Background(), &advanced); err != nil {
+		t.Fatal(err)
+	}
+	if err := RequestSuspend(context.Background(), kubeClient, key, environment.UID, 0, "suspend-2-replay", 2); err != nil {
+		t.Fatal(err)
+	}
+	if err := kubeClient.Get(context.Background(), key, &advanced); err != nil {
+		t.Fatal(err)
+	}
+	if advanced.Spec.Lifecycle.Suspend != nil {
+		t.Fatalf("status high watermark allowed an older request: %#v", advanced.Spec.Lifecycle.Suspend)
+	}
+	if err := RequestSuspend(context.Background(), kubeClient, key, environment.UID, 0, "invalid", 0); err == nil {
+		t.Fatal("RequestSuspend accepted a nonpositive sequence")
 	}
 }
 

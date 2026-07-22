@@ -71,7 +71,10 @@ func TestSetEnvironmentHoldRetriesConflictAndPreservesConcurrentLifecycleIntents
 			if err := underlying.Get(ctx, key, &concurrent); err != nil {
 				return err
 			}
-			concurrent.Spec.Lifecycle.Suspend = &platformv1alpha1.EnvironmentLifecycleRequest{ID: "suspend-concurrent", EnvironmentUID: concurrent.UID}
+			concurrent.Spec.Lifecycle.Suspend = &platformv1alpha1.EnvironmentSuspendRequest{
+				EnvironmentLifecycleRequest: platformv1alpha1.EnvironmentLifecycleRequest{ID: "suspend-concurrent", EnvironmentUID: concurrent.UID},
+				Sequence:                    1,
+			}
 			if err := underlying.Update(ctx, &concurrent); err != nil {
 				return err
 			}

@@ -800,12 +800,12 @@ func (r *RunReconciler) markAcceptanceAttempted(ctx context.Context, run *platfo
 
 func (r *RunReconciler) requestEnvironmentFence(ctx context.Context, env *platformv1alpha1.Environment) (ctrl.Result, error) {
 	if !environmentSuspended(env) {
-		nextEpoch := env.Status.Lifecycle.Epoch + 1
-		requestID := fmt.Sprintf("environment/%s/fence/%d", env.UID, nextEpoch)
+		nextSequence := max(env.Status.Lifecycle.Epoch, env.Status.Lifecycle.LastSuspendRequestSequence) + 1
+		requestID := fmt.Sprintf("environment/%s/fence/%d", env.UID, nextSequence)
 		if env.Status.ClaimedBy != nil {
-			requestID = fmt.Sprintf("run/%s/fence/%d", env.Status.ClaimedBy.UID, nextEpoch)
+			requestID = fmt.Sprintf("run/%s/fence/%d", env.Status.ClaimedBy.UID, nextSequence)
 		}
-		if err := lifecycle.RequestSuspend(ctx, r.Client, client.ObjectKeyFromObject(env), env.UID, lifecycle.HoldPolicyRevision(env), requestID); err != nil {
+		if err := lifecycle.RequestSuspend(ctx, r.Client, client.ObjectKeyFromObject(env), env.UID, lifecycle.HoldPolicyRevision(env), requestID, nextSequence); err != nil {
 			return ctrl.Result{}, err
 		}
 	}

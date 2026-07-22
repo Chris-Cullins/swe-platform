@@ -51,6 +51,16 @@ type EnvironmentLifecycleRequest struct {
 	HoldPolicyRevision int64 `json:"holdPolicyRevision"`
 }
 
+// EnvironmentSuspendRequest is an ordered execution-fence intent. Sequence is
+// a publisher-owned monotonic counter within one Environment incarnation, so a
+// previously acknowledged ID cannot become actionable again after a newer ID.
+type EnvironmentSuspendRequest struct {
+	EnvironmentLifecycleRequest `json:",inline"`
+
+	// +kubebuilder:validation:Minimum=1
+	Sequence int64 `json:"sequence"`
+}
+
 // EnvironmentWakeRequest is an ordinary wake intent scoped to the observed
 // suspension reason. This prevents an Idle wake racing a cleanup fence from
 // resuming Requested suspension after teardown completes.
@@ -90,6 +100,7 @@ type EnvironmentHoldPolicy struct {
 // EnvironmentLifecycleSpec contains policy and bounded caller-owned intent.
 // Only the lifecycle controller turns these requests into observed transitions.
 // +kubebuilder:validation:XValidation:rule="!has(oldSelf.hold) || has(self.hold)",message="hold policy cannot be removed; disable it at a higher revision"
+// +kubebuilder:validation:XValidation:rule="!has(oldSelf.suspend) || !has(self.suspend) || self.suspend == oldSelf.suspend || self.suspend.sequence > oldSelf.suspend.sequence",message="suspend requests must preserve or increase sequence"
 type EnvironmentLifecycleSpec struct {
 	// Hold is explicit policy and is never cleared by ordinary wake traffic.
 	// +optional
@@ -102,7 +113,7 @@ type EnvironmentLifecycleSpec struct {
 	// Suspend requests a backend fence without creating an explicit hold. Run
 	// cleanup uses this to preserve a workspace after accepted work stops.
 	// +optional
-	Suspend *EnvironmentLifecycleRequest `json:"suspend,omitempty"`
+	Suspend *EnvironmentSuspendRequest `json:"suspend,omitempty"`
 
 	// Activity contains legacy source-keyed activity requests. New activity
 	// publishers use bounded metadata slots so heartbeats do not advance the
@@ -147,6 +158,12 @@ type EnvironmentLifecycleStatus struct {
 	// replay of an acknowledged request idempotent after a later wake.
 	// +optional
 	LastSuspendRequestID string `json:"lastSuspendRequestID,omitempty"`
+
+	// LastSuspendRequestSequence is the greatest suspension sequence accepted,
+	// including a request whose backend fence is still pending.
+	// +kubebuilder:validation:Minimum=0
+	// +optional
+	LastSuspendRequestSequence int64 `json:"lastSuspendRequestSequence,omitempty"`
 
 	// PendingSuspendRequestID identifies the accepted request whose backend
 	// teardown has not yet been acknowledged. It remains authoritative across

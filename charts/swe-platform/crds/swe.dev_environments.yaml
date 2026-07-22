@@ -148,10 +148,15 @@ spec:
                         maxLength: 128
                         minLength: 1
                         type: string
+                      sequence:
+                        format: int64
+                        minimum: 1
+                        type: integer
                     required:
                     - environmentUID
                     - holdPolicyRevision
                     - id
+                    - sequence
                     type: object
                     x-kubernetes-validations:
                     - message: environmentUID must not be empty
@@ -197,6 +202,9 @@ spec:
                 x-kubernetes-validations:
                 - message: hold policy cannot be removed; disable it at a higher revision
                   rule: '!has(oldSelf.hold) || has(self.hold)'
+                - message: suspend requests must preserve or increase sequence
+                  rule: '!has(oldSelf.suspend) || !has(self.suspend) || self.suspend
+                    == oldSelf.suspend || self.suspend.sequence > oldSelf.suspend.sequence'
               paused:
                 description: |-
                   Paused is a deprecated compatibility input. The lifecycle controller
@@ -365,6 +373,13 @@ spec:
                       LastSuspendRequestID is the latest suspension request accepted. It keeps
                       replay of an acknowledged request idempotent after a later wake.
                     type: string
+                  lastSuspendRequestSequence:
+                    description: |-
+                      LastSuspendRequestSequence is the greatest suspension sequence accepted,
+                      including a request whose backend fence is still pending.
+                    format: int64
+                    minimum: 0
+                    type: integer
                   lastWakeRequestID:
                     description: |-
                       LastWakeRequestID is the latest valid wake consumed, including a wake
