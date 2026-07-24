@@ -1005,6 +1005,15 @@ func (r *RunReconciler) setRunState(ctx context.Context, run *platformv1alpha1.R
 	before := run.Status.DeepCopy()
 	run.Status.State = state
 	run.Status.ObservedGeneration = run.Generation
+	adapterAccepted := runAccepted(run) || state == platformv1alpha1.RunStateAdapterAccepted || state == platformv1alpha1.RunStateRunning || state == platformv1alpha1.RunStateNeedsInput || state == platformv1alpha1.RunStateSucceeded || (state == platformv1alpha1.RunStateFailed && reason == string(AdapterObservationFailed))
+	if adapterAccepted && run.Status.StartedAt == nil {
+		startedAt := metav1.Now()
+		run.Status.StartedAt = &startedAt
+	}
+	if terminalRunState(state) && run.Status.FinishedAt == nil {
+		finishedAt := metav1.Now()
+		run.Status.FinishedAt = &finishedAt
+	}
 	environmentReason, environmentMessage := reason, message
 	if environmentReady {
 		environmentReason, environmentMessage = "EnvironmentReady", "sandboxd is ready"
@@ -1012,7 +1021,6 @@ func (r *RunReconciler) setRunState(ctx context.Context, run *platformv1alpha1.R
 	apiMeta.SetStatusCondition(&run.Status.Conditions, metav1.Condition{
 		Type: runConditionEnvironmentReady, Status: boolConditionStatus(environmentReady), Reason: environmentReason, Message: environmentMessage, ObservedGeneration: run.Generation,
 	})
-	adapterAccepted := runAccepted(run) || state == platformv1alpha1.RunStateAdapterAccepted || state == platformv1alpha1.RunStateRunning || state == platformv1alpha1.RunStateNeedsInput || state == platformv1alpha1.RunStateSucceeded || (state == platformv1alpha1.RunStateFailed && reason == string(AdapterObservationFailed))
 	apiMeta.SetStatusCondition(&run.Status.Conditions, metav1.Condition{
 		Type: runConditionAdapterAccepted, Status: boolConditionStatus(adapterAccepted), Reason: reason, Message: message, ObservedGeneration: run.Generation,
 	})

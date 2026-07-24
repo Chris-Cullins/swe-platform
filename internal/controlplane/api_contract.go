@@ -67,6 +67,8 @@ type Run struct {
 	Intent            RunIntent       `json:"intent"`
 	CancelRequested   bool            `json:"cancelRequested"`
 	State             string          `json:"state"`
+	StartedAt         *time.Time      `json:"startedAt,omitempty"`
+	FinishedAt        *time.Time      `json:"finishedAt,omitempty"`
 	Environment       *RunEnvironment `json:"environment,omitempty"`
 	TerminalAvailable bool            `json:"terminalAvailable,omitempty"`
 	Branch            string          `json:"branch,omitempty"`

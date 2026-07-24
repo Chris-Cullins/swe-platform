@@ -117,6 +117,23 @@ type RunStatus struct {
 	// +optional
 	State RunState `json:"state,omitempty"`
 
+	// StartedAt records when the controller first confirmed adapter
+	// acceptance or execution for this Run — set once when the Run enters
+	// AdapterAccepted, Running, NeedsInput, Succeeded, or adapter-observed
+	// Failed, and not overwritten by later pause/resume cycles or retries
+	// within the same Run incarnation. It is nil for Runs that never reached
+	// acceptance (e.g. failed during allocation, rejected by the adapter, or
+	// cancelled before acceptance). Wall time is derivable as
+	// FinishedAt - StartedAt; this is lifecycle wall time and includes any
+	// Paused or NeedsInput intervals.
+	// +optional
+	StartedAt *metav1.Time `json:"startedAt,omitempty"`
+
+	// FinishedAt records when the controller first observed the Run in a
+	// terminal state (Succeeded, Failed, or Cancelled). It is set once.
+	// +optional
+	FinishedAt *metav1.Time `json:"finishedAt,omitempty"`
+
 	// EnvironmentRef is the exact owned or claimed Environment incarnation. It
 	// remains as historical identity after terminal cleanup.
 	// +optional

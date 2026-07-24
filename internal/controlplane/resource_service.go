@@ -241,6 +241,12 @@ func runDTO(run *platformv1alpha1.Run) Run {
 			TokensOut:  run.Status.Usage.TokensOut,
 		},
 	}
+	if run.Status.StartedAt != nil {
+		result.StartedAt = &run.Status.StartedAt.Time
+	}
+	if run.Status.FinishedAt != nil {
+		result.FinishedAt = &run.Status.FinishedAt.Time
+	}
 	if run.Status.EnvironmentRef != nil {
 		result.Environment = &RunEnvironment{
 			Name:      run.Status.EnvironmentRef.Name,
