@@ -3,6 +3,12 @@
 # release. The gvisor RuntimeClass must exist before environments run.
 replicaCount: 2
 
+controlPlane:
+  transcripts:
+    postgresSecret:
+      # Create this Secret out of band before installing the production preset.
+      name: swe-platform-postgres
+
 resources:
   requests:
     cpu: 100m

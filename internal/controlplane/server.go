@@ -327,6 +327,9 @@ func (s *Server) appendTranscript(w http.ResponseWriter, r *http.Request, run Ru
 		Data:           request.Data,
 	})
 	if err != nil {
+		if !isTranscriptContractError(err) {
+			s.log.Error("append transcript event", "namespace", run.Namespace, "runUID", run.UID, "error", err)
+		}
 		writeTranscriptStoreError(w, err)
 		return
 	}
@@ -356,6 +359,9 @@ func (s *Server) streamTranscript(w http.ResponseWriter, r *http.Request, run Ru
 
 	subscription, err := s.store.Subscribe(r.Context(), run, cursor)
 	if err != nil {
+		if !isTranscriptContractError(err) {
+			s.log.Error("subscribe to transcript", "namespace", run.Namespace, "runUID", run.UID, "error", err)
+		}
 		writeTranscriptStoreError(w, err)
 		return
 	}
@@ -419,7 +425,7 @@ func (s *Server) streamTranscript(w http.ResponseWriter, r *http.Request, run Ru
 				return
 			}
 		case <-subscription.Dropped:
-			s.log.Warn("closing slow transcript subscriber", "namespace", run.Namespace, "runUID", run.UID)
+			s.log.Warn("closing dropped transcript subscriber", "namespace", run.Namespace, "runUID", run.UID)
 			return
 		case <-heartbeats.C:
 			if err := write(": ping\n\n"); err != nil {

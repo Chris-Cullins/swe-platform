@@ -13,6 +13,27 @@ import (
 	"github.com/gorilla/websocket"
 )
 
+func TestTranscriptStoreFromEnvironmentUsesMemoryFallback(t *testing.T) {
+	t.Setenv("SWE_POSTGRES_URL", "")
+	store, closeStore, err := transcriptStoreFromEnvironment(context.Background(), slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeStore()
+	if store == nil {
+		t.Fatal("memory fallback returned a nil transcript store")
+	}
+}
+
+func TestTranscriptStoreFromEnvironmentRejectsInvalidOptionsBeforeConnecting(t *testing.T) {
+	t.Setenv("SWE_POSTGRES_URL", "postgres://unused.invalid/test")
+	t.Setenv("SWE_TRANSCRIPT_MAX_EVENTS_PER_RUN", "zero")
+	_, _, err := transcriptStoreFromEnvironment(context.Background(), slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err == nil || err.Error() != "SWE_TRANSCRIPT_MAX_EVENTS_PER_RUN must be a positive integer" {
+		t.Fatalf("configuration error = %v", err)
+	}
+}
+
 func TestRunHTTPServerWaitsForHijackedHandlerCleanup(t *testing.T) {
 	requestStarted := make(chan struct{})
 	requestCanceled := make(chan struct{})

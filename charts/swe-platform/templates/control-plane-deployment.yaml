@@ -1,6 +1,6 @@
 {{- if .Values.controlPlane.enabled }}
 {{- if ne (int .Values.controlPlane.replicaCount) 1 }}
-{{- fail "controlPlane.replicaCount must be 1 while the process-local transcript store is enabled" }}
+{{- fail "controlPlane.replicaCount must remain 1 until full control-plane HA is supported" }}
 {{- end }}
 apiVersion: apps/v1
 kind: Deployment
@@ -52,6 +52,25 @@ spec:
                   name: {{ . | quote }}
                   key: {{ $.Values.controlPlane.auth.bootstrapTokenSecret.key | quote }}
             {{- end }}
+            {{- with .Values.controlPlane.transcripts.postgresSecret.name }}
+            - name: SWE_POSTGRES_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ . | quote }}
+                  key: {{ $.Values.controlPlane.transcripts.postgresSecret.key | quote }}
+            {{- end }}
+            - name: SWE_TRANSCRIPT_MAX_EVENTS_PER_RUN
+              value: {{ int .Values.controlPlane.transcripts.maxEventsPerRun | quote }}
+            - name: SWE_TRANSCRIPT_MAX_BYTES_PER_RUN
+              value: {{ int .Values.controlPlane.transcripts.maxBytesPerRun | quote }}
+            - name: SWE_TRANSCRIPT_MAX_REPLAY_EVENTS
+              value: {{ int .Values.controlPlane.transcripts.maxReplayEvents | quote }}
+            - name: SWE_TRANSCRIPT_MAX_SUBSCRIBERS
+              value: {{ int .Values.controlPlane.transcripts.maxSubscribers | quote }}
+            - name: SWE_TRANSCRIPT_SUBSCRIBER_BUFFER
+              value: {{ int .Values.controlPlane.transcripts.subscriberBuffer | quote }}
+            - name: SWE_TRANSCRIPT_POLL_INTERVAL
+              value: {{ .Values.controlPlane.transcripts.pollInterval | quote }}
           ports:
             - name: http
               containerPort: 8080

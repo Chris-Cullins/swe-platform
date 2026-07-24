@@ -17,8 +17,9 @@ architectural. If it's missing, ask the maintainer instead of guessing at design
 P0 scaffold is in place: CRD types, environment controller, `sandboxd` (exec/fs/ports/
 health and a shared tmux terminal), CLI (`run`/`logs`/`attach`), kind acceptance, CI,
 and a Helm chart for the operator, control plane, and CRDs. The control plane currently
-provides bounded in-memory transcript ingestion and SSE streaming, opaque process-local
-browser sessions backed by repeated Kubernetes TokenReview/SAR authorization, and typed
+provides PostgreSQL-backed durable transcript ingestion and database-polled SSE streaming with
+a development-only bounded memory fallback, opaque process-local browser sessions backed by
+repeated Kubernetes TokenReview/SAR authorization, and typed
 Run/Environment resource APIs for the console.
 Remaining gaps are marked `TODO(P0/P1/P2)` in code — most notably secure agent credential
 injection, additional agent adapters, GitHub App–scoped git tokens, and egress/portal
@@ -91,7 +92,8 @@ runs both via `make` targets:
   `$HOME/.local` when they are unavailable.
 
 - **Build all binaries:** `make build` (outputs operator, control plane, CLI, and sandboxd to `bin/`, gitignored)
-- **Unit tests:** `make test` · **Vet:** `make vet`
+- **Unit tests:** `make test` · **Vet:** `make vet`. PostgreSQL transcript integration tests
+  run when `SWE_TEST_POSTGRES_URL` points to a disposable database; CI supplies PostgreSQL 17.
 - **Operations console:** from `ui/`, install with `npm ci`; use `npm run lint`,
   `npm run typecheck`, `npm test -- --run`, and `npm run build`. Start the standalone
   Vite development server with `npm run dev`. Production uses `make ui-build`

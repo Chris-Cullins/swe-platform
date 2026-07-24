@@ -12,9 +12,10 @@ key in chart values, Project configuration, or custom-image ambient environment 
 
 This chart installs the swe-platform CRDs, operator, and the first control-plane API.
 The control plane accepts adapter-owned transcript events and streams them over SSE.
-Its bounded transcript store is currently process-local, so the chart requires one control-plane
-replica and uses a non-overlapping `Recreate` deployment. A durable shared store and portal
-proxying are not implemented yet.
+Production installs must configure the PostgreSQL transcript store described below. The chart
+still requires one control-plane replica and uses a non-overlapping `Recreate` deployment:
+durable transcripts remove replay loss, but process-local browser sessions and other control-plane
+HA concerns remain. Portal proxying is not implemented yet.
 
 The operator reconciles each `Run` as the single task intent and allocates or claims its
 `Environment`; clients must not create the two resources independently. Its RBAC permits
@@ -26,10 +27,18 @@ remains behind the environment's portable sandboxd contract rather than Kubernet
 Choose the values preset for the target cluster and install into a dedicated namespace:
 
 ```sh
+kubectl create namespace swe-platform-system --dry-run=client -o yaml | kubectl apply -f -
+kubectl -n swe-platform-system create secret generic swe-platform-postgres \
+  --from-literal=url='postgres://swe:REDACTED@postgres.example:5432/swe?sslmode=require'
 helm upgrade --install swe-platform ./charts/swe-platform \
   --namespace swe-platform-system --create-namespace \
   --values ./charts/swe-platform/values-k3s.yaml
 ```
+
+The k3s, GKE, and EKS production presets require that out-of-band Secret name by default. A
+missing Secret keeps the control-plane pod from starting rather than silently selecting the
+development memory store. Override `controlPlane.transcripts.postgresSecret.name` when your
+installation uses a different coordinated Secret name.
 
 ## Upgrade
 
@@ -135,9 +144,9 @@ unmeasured.
 |---|---|
 | `values-kind.yaml` | Local kind development with `:dev` images; explicitly permits insecure HTTP browser sessions. `make kind-up` installs gVisor and snapshot-capable CSI; pass the printed `environmentTemplates[0].spec.runtimeClass=gvisor` override when installing the chart. |
 | `values-argocd.yaml` | Local Argo CD mirror with mutable `:latest` images and an out-of-band bootstrap Secret; explicitly permits insecure HTTP browser sessions. `hack/argocd-up.sh` requires one kind node with at least 5 CPUs and 6 GiB allocatable. |
-| `values-k3s.yaml` | A default CSI-backed StorageClass is available. Uses one operator replica and the default OCI runtime because k3s does not ship gVisor. |
-| `values-gke.yaml` | GKE Sandbox is enabled on every node that can host environments. Sets `runtimeClass: gvisor` and runs two operator replicas with leader election. |
-| `values-eks.yaml` | A default EBS CSI StorageClass is available. Runs two operator replicas with leader election. EKS does not provide a standard gVisor RuntimeClass, so environments use the cluster default unless you override `environmentTemplates[].spec.runtimeClass`. |
+| `values-k3s.yaml` | A default CSI-backed StorageClass and the out-of-band `swe-platform-postgres` Secret are available. Uses one operator replica and the default OCI runtime because k3s does not ship gVisor. |
+| `values-gke.yaml` | GKE Sandbox is enabled on every node that can host environments, and the out-of-band `swe-platform-postgres` Secret is available. Sets `runtimeClass: gvisor` and runs two operator replicas with leader election. |
+| `values-eks.yaml` | A default EBS CSI StorageClass and the out-of-band `swe-platform-postgres` Secret are available. Runs two operator replicas with leader election. EKS does not provide a standard gVisor RuntimeClass, so environments use the cluster default unless you override `environmentTemplates[].spec.runtimeClass`. |
 
 The RuntimeClass applies to environment pods, not the operator. A preset that names a
 RuntimeClass will leave environments Pending unless that RuntimeClass is installed and
@@ -162,6 +171,59 @@ Argo CD, the Image Updater, the operator, and the control plane. If local capaci
 important than warm starts, explicitly set `environmentTemplates[0].spec.warmPool.min=0`;
 that removes replacement overlap but makes every Run wait for environment provisioning and
 the `env-base` image pull.
+
+## Durable transcript storage
+
+The production presets set `controlPlane.transcripts.postgresSecret.name` to
+`swe-platform-postgres`. The named, out-of-band Secret must contain a PostgreSQL connection URL
+under the configured key (default `url`). Do not put the URL or password directly in values:
+
+```sh
+kubectl create namespace swe-platform-system --dry-run=client -o yaml | kubectl apply -f -
+kubectl -n swe-platform-system create secret generic swe-platform-postgres \
+  --from-literal=url='postgres://swe:REDACTED@postgres.example:5432/swe?sslmode=require'
+helm upgrade --install swe-platform ./charts/swe-platform \
+  --namespace swe-platform-system --create-namespace \
+  --values ./charts/swe-platform/values-k3s.yaml
+```
+
+The control plane connects and applies ordered embedded migrations under a PostgreSQL advisory
+lock before listening. Migration or connection failure fails startup; an append is acknowledged
+only after its event, per-Run sequence, retention changes, and retained-window idempotency record
+commit in one transaction. Back up the database before upgrades and grant the database role
+`CREATE`/`ALTER` rights on its dedicated schema for migrations plus ordinary table DML. There is
+currently no separate migration job or schema-name setting. Pre-create a role-owned application
+schema, fix the connection's `search_path` to it, and revoke `CREATE` on that schema from
+untrusted roles. Applied migration files are immutable; upgrades add a new ordered file.
+
+`maxEventsPerRun` (10,000) and `maxBytesPerRun` (64 MiB) bound retained data independently for
+each immutable `(namespace, Run UID)`. Eviction removes the event and its idempotency key in the
+same append transaction, preserving the existing retained-window idempotency contract. Replay is
+bounded by `maxReplayEvents` (1,000). `subscriberBuffer`, `maxSubscribers`, and `pollInterval`
+bound process-local SSE polling resources. Database replay/polling is correctness truth; no
+notification facility is required. A subscriber overtaken by retention is disconnected and its
+normal SSE reconnect receives the existing explicit cursor-gap response.
+
+With no PostgreSQL Secret (including the checked-in kind and Argo development presets), the
+control plane logs a warning and uses the bounded process-local memory store. That mode loses
+transcripts and invalidates cursors on restart and is not supported for production. To exercise
+the PostgreSQL integration tests locally, provide a disposable database:
+
+```sh
+SWE_TEST_POSTGRES_URL='postgres://postgres:postgres@localhost:5432/swe_test?sslmode=disable' \
+  go test ./internal/controlplane -run TestPostgresTranscriptStoreContract -count=1
+```
+
+PostgreSQL makes replay and idempotency durable across restart, but this release deliberately
+keeps `controlPlane.replicaCount=1`; it does not claim multi-replica control-plane HA.
+
+Per-Run event and byte limits do not bound total database size across Run churn. Deleting a Run
+does not yet reclaim its UID-fenced transcript rows automatically, because completion, deletion,
+and Project-offboarding retention policy depends on the lifecycle decisions tracked in
+[#101](https://github.com/Chris-Cullins/swe-platform/issues/101) and #11. Until that work ships,
+operators must monitor and provision the dedicated transcript database for accumulated history.
+Manual deletion should be exceptional: take a backup and target the exact namespace and immutable
+Run UID so a same-name replacement Run's transcript cannot be removed.
 
 ## Control-plane authentication and authorization
 
@@ -360,15 +422,15 @@ The platform envelope owns transport metadata only:
   idempotency entries, replay size, subscriber count, and subscriber buffers. Capacity
   failures are explicit; a slow subscriber is disconnected rather than blocking producers.
 
-`TranscriptStore` is the durability boundary. Every durable implementation must make append
+`TranscriptStore` is the durability boundary. The PostgreSQL implementation makes append
 linearizable per Run (idempotency check, sequence allocation, persistence, and publication are
-one operation) and make subscription an atomic replay/live cut. All replicas must use that
-same store and fan-out mechanism, so replay and live delivery require no sticky sessions.
-Store generations and cursors must survive restart and rolling deployment. The current memory
-implementation deliberately changes generation and signing key on restart, making old cursors
-explicitly `400 invalid_cursor` instead of silently skipping events; it does not provide durable replay.
-Idempotency is correspondingly retained-window idempotency: after an event is evicted, its key
-may be reused and creates a new event.
+one transaction). A repeatable-read replay snapshot records the live cut, then database polling
+continues strictly after it. Polling—not process notification—is correctness truth, so restart
+and rollout require no sticky transcript routing; clients reconnect with the last SSE event ID.
+The store generation and cursor signing key live in PostgreSQL and survive process replacement.
+The memory implementation deliberately changes both on restart, making old cursors explicitly
+`400 invalid_cursor` instead of silently skipping events. Both stores use retained-window
+idempotency: after an event is evicted, its key may be reused and creates a new event.
 
 ## Validate
 

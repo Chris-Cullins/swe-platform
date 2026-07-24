@@ -27,6 +27,18 @@ controlPlane:
     bootstrapTokenSecret:
       name: ""
       key: token
+  transcripts:
+    # Production must reference an out-of-band Secret containing a PostgreSQL URL.
+    # Empty retains the development-only process-local store.
+    postgresSecret:
+      name: ""
+      key: url
+    maxEventsPerRun: 10000
+    maxBytesPerRun: 67108864
+    maxReplayEvents: 1000
+    maxSubscribers: 1024
+    subscriberBuffer: 64
+    pollInterval: 500ms
   resources:
     requests:
       cpu: 100m
