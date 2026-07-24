@@ -403,6 +403,31 @@ SWE_CONTROL_PLANE_URL=https://swe.example.com \
 SWE_CONTROL_PLANE_TOKEN="$TOKEN" swe attach my-environment
 ```
 
+### Terminal operations console
+
+`swe tui` is a keyboard-first, agent-neutral operations console for one namespace. It uses
+the same typed Run and Environment APIs, transcript SSE stream, and WebSocket terminal bridge
+as the browser console; it does not access Kubernetes or sandboxd directly and does not run an
+agent itself. Supply the control-plane URL and bearer credential used by `swe attach` (the
+credential is never persisted or displayed):
+
+```sh
+SWE_CONTROL_PLANE_URL=https://swe.example.com \
+SWE_CONTROL_PLANE_TOKEN="$TOKEN" swe tui --namespace my-project
+```
+
+Use Up/Down (or `j`/`k`) and Enter to browse Run details, `c` to create a Run, `x` to request
+confirmed cancellation, `t` to attach to the selected Run's allocated Environment, `r` to
+refresh, and `q` to quit. The create form accepts a free-form agent adapter name and uses Tab
+to move between fields and Ctrl-S to submit. Esc returns or closes a form; Ctrl-] detaches an
+attached terminal and restores the dashboard. Run details show normalized status and usage,
+Environment readiness/pause state, and a bounded raw transcript view. Transcript source, type,
+payload, and retention gaps are displayed generically; adapter-owned payloads are not parsed as
+a common event schema.
+
+For a non-interactive authentication/connectivity check (including CI), use `swe tui --check`.
+It validates namespaced Run-list access without starting a terminal UI or printing credentials.
+
 Run transcripts use the same explicit control-plane URL and bearer credential:
 
 ```sh

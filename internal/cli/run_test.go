@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -120,6 +122,72 @@ func TestAttachTerminalReturnsWhenContextIsCancelled(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("attachTerminal did not return after context cancellation")
 	}
+}
+
+func TestAttachTerminalDetachStopsInputAtControlBracket(t *testing.T) {
+	serverResult := make(chan error, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		connection, err := (&websocket.Upgrader{}).Upgrade(w, r, nil)
+		if err != nil {
+			serverResult <- err
+			return
+		}
+		defer connection.Close()
+		if _, _, err := connection.ReadMessage(); err != nil {
+			serverResult <- err
+			return
+		}
+		messageType, input, err := connection.ReadMessage()
+		if err != nil || messageType != websocket.BinaryMessage || string(input) != "before" {
+			serverResult <- errors.New("detach did not send exactly the input before Ctrl-]")
+			return
+		}
+		_, _, err = connection.ReadMessage()
+		if !websocket.IsCloseError(err, websocket.CloseNormalClosure) {
+			serverResult <- fmt.Errorf("detach close = %v", err)
+			return
+		}
+		serverResult <- nil
+	}))
+	defer server.Close()
+
+	command := &cobra.Command{}
+	command.SetContext(context.Background())
+	command.SetIn(strings.NewReader("before\x1dafter"))
+	command.SetOut(io.Discard)
+	if err := attachTerminal(command, server.URL, "terminal-token", "default", "env-1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-serverResult; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestAttachTerminalRejectsUnjoinableInputReader(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		connection, err := (&websocket.Upgrader{}).Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer connection.Close()
+		_, _, _ = connection.ReadMessage()
+	}))
+	defer server.Close()
+
+	command := &cobra.Command{}
+	command.SetContext(context.Background())
+	command.SetIn(panicBlockingReader{})
+	command.SetOut(io.Discard)
+	err := attachTerminal(command, server.URL, "terminal-token", "default", "env-1")
+	if err == nil || !strings.Contains(err.Error(), "standard input or a finite in-memory reader") {
+		t.Fatalf("error = %v", err)
+	}
+}
+
+type panicBlockingReader struct{}
+
+func (panicBlockingReader) Read([]byte) (int, error) {
+	panic("unjoinable input reader must not be started")
 }
 
 type uncertainCreateClient struct {

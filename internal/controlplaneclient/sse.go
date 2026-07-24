@@ -33,9 +33,21 @@ type SSEEvent struct {
 // the first successful connection. The initial cursor is sent as ?after=; a
 // reconnect carries the last completely committed event ID in Last-Event-ID.
 func (c *Client) StreamSSE(ctx context.Context, endpoint, cursor string, handle func(SSEEvent) error) error {
+	return c.StreamSSEWithReconnectCheck(ctx, endpoint, cursor, nil, handle)
+}
+
+// StreamSSEWithReconnectCheck is StreamSSE with a check immediately before
+// every connection attempt. Callers can use it to fence a name-based endpoint
+// to an immutable resource identity across reconnects.
+func (c *Client) StreamSSEWithReconnectCheck(ctx context.Context, endpoint, cursor string, check func(context.Context) error, handle func(SSEEvent) error) error {
 	connected := false
 	reconnectWait := c.reconnectWait
 	for {
+		if check != nil {
+			if err := check(ctx); err != nil {
+				return err
+			}
+		}
 		requestEndpoint, err := streamEndpoint(endpoint, cursor, connected)
 		if err != nil {
 			return err
@@ -79,6 +91,15 @@ func (c *Client) StreamSSE(ctx context.Context, endpoint, cursor string, handle 
 		if parseErr != nil || response.StatusCode != http.StatusOK || mediaType != "text/event-stream" {
 			response.Body.Close()
 			return fmt.Errorf("control plane returned %s with Content-Type %q, want 200 text/event-stream", response.Status, response.Header.Get("Content-Type"))
+		}
+		// The response headers prove the server has resolved and bound the
+		// stream. Recheck name-based identity after that binding and before any
+		// event can reach the consumer, closing the check/request race.
+		if check != nil {
+			if err := check(ctx); err != nil {
+				response.Body.Close()
+				return err
+			}
 		}
 		connected = true
 		streamRetry := time.Duration(-1)

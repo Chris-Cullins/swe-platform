@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"mime"
@@ -72,8 +73,8 @@ func parseBaseURL(baseURL string) (*url.URL, error) {
 		return nil, fmt.Errorf("parse control-plane URL: %w", err)
 	}
 	parsed.Scheme = strings.ToLower(parsed.Scheme)
-	if parsed.Host == "" || parsed.RawQuery != "" || parsed.Fragment != "" {
-		return nil, fmt.Errorf("control-plane URL must be an HTTP(S) base URL without a query or fragment")
+	if parsed.Host == "" || parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" {
+		return nil, fmt.Errorf("control-plane URL must be an HTTP(S) base URL without user information, a query, or a fragment")
 	}
 	if parsed.Scheme != "http" && parsed.Scheme != "https" {
 		return nil, fmt.Errorf("control-plane URL scheme must be http or https")
@@ -120,6 +121,14 @@ func (c *Client) Do(request *http.Request) (*http.Response, error) {
 	if readErr == nil && mediaType == "application/problem+json" {
 		_ = json.Unmarshal(body, &problem)
 	}
+	// A conforming server never reflects credentials, but error strings are a
+	// user-visible boundary. Redact defensively before callers can render them.
+	if c.token != "" {
+		redacted := []byte("[REDACTED]")
+		body = bytes.ReplaceAll(body, []byte(c.token), redacted)
+		problem.Title = strings.ReplaceAll(problem.Title, c.token, string(redacted))
+		problem.Detail = strings.ReplaceAll(problem.Detail, c.token, string(redacted))
+	}
 	problem.Status = response.StatusCode
 	return nil, &ProblemError{
 		Status:     response.Status,
@@ -146,6 +155,30 @@ type ProblemError struct {
 	ReadErr error
 	// Retain only the reconnect hint, not arbitrary response headers.
 	retryAfter string
+}
+
+// TranscriptRecovery is the server-issued boundary for a cursor whose missing
+// range can no longer be replayed.
+type TranscriptRecovery struct {
+	ResumeAfter string          `json:"resumeAfter"`
+	Available   json.RawMessage `json:"available"`
+}
+
+// TranscriptCursorRecovery extracts a safe resume boundary from a cursor
+// expiration or replay-limit problem.
+func TranscriptCursorRecovery(err error) (TranscriptRecovery, bool) {
+	var problem *ProblemError
+	if !errors.As(err, &problem) {
+		return TranscriptRecovery{}, false
+	}
+	if !strings.HasSuffix(problem.Problem.Type, "/cursor_expired") && !strings.HasSuffix(problem.Problem.Type, "/replay_limit_exceeded") {
+		return TranscriptRecovery{}, false
+	}
+	var recovery TranscriptRecovery
+	if json.Unmarshal(problem.Body, &recovery) != nil || recovery.ResumeAfter == "" {
+		return TranscriptRecovery{}, false
+	}
+	return recovery, true
 }
 
 func (e *ProblemError) Error() string {
