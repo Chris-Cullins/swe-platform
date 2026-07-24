@@ -121,7 +121,13 @@ func (c *Client) Do(request *http.Request) (*http.Response, error) {
 		_ = json.Unmarshal(body, &problem)
 	}
 	problem.Status = response.StatusCode
-	return nil, &ProblemError{Status: response.Status, Problem: problem, Body: bytes.TrimSpace(body), ReadErr: readErr}
+	return nil, &ProblemError{
+		Status:     response.Status,
+		Problem:    problem,
+		Body:       bytes.TrimSpace(body),
+		ReadErr:    readErr,
+		retryAfter: response.Header.Get("Retry-After"),
+	}
 }
 
 // Problem is an RFC problem response. Extra endpoint-specific fields remain in Body.
@@ -138,6 +144,8 @@ type ProblemError struct {
 	Problem Problem
 	Body    []byte
 	ReadErr error
+	// Retain only the reconnect hint, not arbitrary response headers.
+	retryAfter string
 }
 
 func (e *ProblemError) Error() string {

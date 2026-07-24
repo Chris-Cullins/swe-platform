@@ -14,7 +14,13 @@ import (
 	"time"
 )
 
-const maxSSELineSize = 2 << 20
+const (
+	// The server accepts JSON request bodies up to 1 MiB. json.Marshal may expand
+	// each HTML-sensitive byte to a six-byte Unicode escape in the SSE envelope;
+	// 8 MiB leaves room for that worst case plus transport metadata.
+	maxSSELineSize   = 8 << 20
+	maxReconnectWait = 30 * time.Second
+)
 
 // SSEEvent is one decoded Server-Sent Event. Data remains application-owned.
 type SSEEvent struct {
@@ -45,10 +51,22 @@ func (c *Client) StreamSSE(ctx context.Context, endpoint, cursor string, handle 
 		response, err := c.Do(request)
 		if err != nil {
 			var problem *ProblemError
-			if !connected || ctx.Err() != nil || errors.As(err, &problem) {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			if !connected {
 				return err
 			}
-			if err := waitForReconnect(ctx, reconnectWait); err != nil {
+			wait := reconnectWait
+			if errors.As(err, &problem) {
+				if !retryableHTTPStatus(problem.Problem.Status) {
+					return err
+				}
+				if hinted, ok := parseRetryAfter(problem.retryAfter, time.Now()); ok {
+					wait = hinted
+				}
+			}
+			if err := waitForReconnect(ctx, boundedReconnectWait(wait)); err != nil {
 				return err
 			}
 			continue
@@ -76,10 +94,38 @@ func (c *Client) StreamSSE(ctx context.Context, endpoint, cursor string, handle 
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
-		if err := waitForReconnect(ctx, reconnectWait); err != nil {
+		if err := waitForReconnect(ctx, boundedReconnectWait(reconnectWait)); err != nil {
 			return err
 		}
 	}
+}
+
+func retryableHTTPStatus(status int) bool {
+	return status == http.StatusRequestTimeout || status == http.StatusTooManyRequests || status >= 500 && status <= 599
+}
+
+func parseRetryAfter(value string, now time.Time) (time.Duration, bool) {
+	if seconds, err := strconv.ParseUint(strings.TrimSpace(value), 10, 31); err == nil {
+		return time.Duration(seconds) * time.Second, true
+	}
+	when, err := http.ParseTime(value)
+	if err != nil {
+		return 0, false
+	}
+	if delay := when.Sub(now); delay > 0 {
+		return delay, true
+	}
+	return 0, true
+}
+
+func boundedReconnectWait(delay time.Duration) time.Duration {
+	if delay < 0 {
+		return 0
+	}
+	if delay > maxReconnectWait {
+		return maxReconnectWait
+	}
+	return delay
 }
 
 func streamEndpoint(endpoint, cursor string, reconnect bool) (string, error) {

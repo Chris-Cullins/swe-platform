@@ -1,7 +1,9 @@
 package controlplaneclient
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
@@ -54,6 +56,7 @@ func TestClientBuildsEscapedAuthenticatedRequest(t *testing.T) {
 func TestClientReturnsProblemResponse(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/problem+json; charset=utf-8")
+		w.Header().Set("Retry-After", "7")
 		w.WriteHeader(http.StatusGone)
 		_, _ = io.WriteString(w, `{"type":"https://swe-platform.dev/problems/cursor_expired","title":"transcript cursor expired","status":400,"resumeAfter":"next"}`)
 	}))
@@ -69,7 +72,7 @@ func TestClientReturnsProblemResponse(t *testing.T) {
 	if !errors.As(err, &problem) {
 		t.Fatalf("Do() error = %v, want ProblemError", err)
 	}
-	if problem.Problem.Status != http.StatusGone || problem.Problem.Title != "transcript cursor expired" || !strings.Contains(string(problem.Body), `"resumeAfter":"next"`) {
+	if problem.Problem.Status != http.StatusGone || problem.Problem.Title != "transcript cursor expired" || problem.retryAfter != "7" || !strings.Contains(string(problem.Body), `"resumeAfter":"next"`) {
 		t.Fatalf("problem = %#v, body = %s", problem.Problem, problem.Body)
 	}
 }
@@ -143,6 +146,55 @@ func TestConsumeSSEDoesNotCommitIDWhenHandlerFails(t *testing.T) {
 	})
 	if err == nil || !errors.Is(err, sentinel) || cursor != "previous" {
 		t.Fatalf("cursor/error = %q/%v", cursor, err)
+	}
+}
+
+func TestStreamSSEAcceptsWorstCaseEscapedServerEnvelope(t *testing.T) {
+	text := strings.Repeat("<", 350<<10)
+	requestBody := []byte(`{"type":"output","data":{"text":"` + text + `"}}`)
+	if !json.Valid(requestBody) || len(requestBody) >= 1<<20 {
+		t.Fatalf("request fixture size/validity = %d/%t", len(requestBody), json.Valid(requestBody))
+	}
+	envelope, err := json.Marshal(struct {
+		Data json.RawMessage `json:"data"`
+	}{Data: json.RawMessage(`{"text":"` + text + `"}`)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(envelope) <= 2<<20 || len(envelope) >= maxSSELineSize {
+		t.Fatalf("escaped envelope size = %d, want between old and new limits", len(envelope))
+	}
+	var stream bytes.Buffer
+	stream.WriteString("id: large-cursor\nevent: transcript\ndata: ")
+	stream.Write(envelope)
+	stream.WriteString("\n\n")
+
+	requests := 0
+	dispatches := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		if requests == 1 {
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = w.Write(stream.Bytes())
+			return
+		}
+		if r.Header.Get("Last-Event-ID") != "large-cursor" {
+			t.Errorf("Last-Event-ID = %q", r.Header.Get("Last-Event-ID"))
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+	client, _ := New(server.URL, "token", server.Client())
+	client.reconnectWait = time.Millisecond
+	err = client.StreamSSE(context.Background(), server.URL, "", func(event SSEEvent) error {
+		dispatches++
+		if event.ID != "large-cursor" || !bytes.Equal(event.Data, envelope) {
+			t.Fatalf("large event ID/data size = %q/%d", event.ID, len(event.Data))
+		}
+		return nil
+	})
+	if err != nil || dispatches != 1 || requests != 2 {
+		t.Fatalf("error/dispatches/requests = %v/%d/%d", err, dispatches, requests)
 	}
 }
 
@@ -246,6 +298,7 @@ func TestStreamSSEStatusAndProtocolHandling(t *testing.T) {
 		{name: "no content", status: http.StatusNoContent, wantNil: true},
 		{name: "invalid cursor", status: http.StatusBadRequest, contentType: "application/problem+json", body: `{"type":"https://swe-platform.dev/problems/invalid_cursor","title":"invalid transcript cursor","status":400}`, wantProblem: true},
 		{name: "expired cursor", status: http.StatusGone, contentType: "application/problem+json", body: `{"type":"https://swe-platform.dev/problems/cursor_expired","title":"transcript cursor expired","status":410}`, wantProblem: true},
+		{name: "initial unavailable", status: http.StatusServiceUnavailable, contentType: "application/problem+json", body: `{"title":"unavailable","status":503}`, wantProblem: true},
 		{name: "non SSE success", status: http.StatusOK, contentType: "application/json", body: `{}`},
 		{name: "other success", status: http.StatusAccepted, contentType: "text/event-stream"},
 	}
@@ -296,6 +349,26 @@ func TestStreamSSEDoesNotRetryInitialTransportFailure(t *testing.T) {
 	}
 }
 
+func TestRetryableHTTPStatus(t *testing.T) {
+	for _, test := range []struct {
+		status int
+		want   bool
+	}{
+		{http.StatusBadRequest, false},
+		{http.StatusRequestTimeout, true},
+		{http.StatusGone, false},
+		{http.StatusTooManyRequests, true},
+		{499, false},
+		{http.StatusInternalServerError, true},
+		{599, true},
+		{600, false},
+	} {
+		if got := retryableHTTPStatus(test.status); got != test.want {
+			t.Errorf("retryableHTTPStatus(%d) = %t, want %t", test.status, got, test.want)
+		}
+	}
+}
+
 type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (f roundTripFunc) RoundTrip(request *http.Request) (*http.Response, error) { return f(request) }
@@ -342,6 +415,70 @@ func TestStreamSSEReconnectsAfterBodyReadFailure(t *testing.T) {
 	}
 	if requests != 2 {
 		t.Fatalf("requests = %d", requests)
+	}
+}
+
+func TestStreamSSERetriesTransientHTTPAfterEstablishment(t *testing.T) {
+	requests := 0
+	dispatches := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		if requests > 1 && r.Header.Get("Last-Event-ID") != "cursor-1" {
+			t.Errorf("request %d Last-Event-ID = %q", requests, r.Header.Get("Last-Event-ID"))
+		}
+		switch requests {
+		case 1:
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = io.WriteString(w, "id: cursor-1\nevent: transcript\ndata: {}\n\n")
+		case 2:
+			w.Header().Set("Content-Type", "application/problem+json")
+			w.Header().Set("Retry-After", "0")
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = io.WriteString(w, `{"title":"subscriber capacity","status":503}`)
+		case 3:
+			w.WriteHeader(http.StatusBadGateway)
+		case 4:
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			t.Errorf("unexpected request %d", requests)
+		}
+	}))
+	defer server.Close()
+	client, _ := New(server.URL, "token", server.Client())
+	client.reconnectWait = time.Millisecond
+	err := client.StreamSSE(context.Background(), server.URL, "", func(SSEEvent) error {
+		dispatches++
+		return nil
+	})
+	if err != nil || requests != 4 || dispatches != 1 {
+		t.Fatalf("error/requests/dispatches = %v/%d/%d", err, requests, dispatches)
+	}
+}
+
+func TestStreamSSEReconnectCursorErrorsRemainTerminal(t *testing.T) {
+	for _, status := range []int{http.StatusBadRequest, http.StatusGone} {
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			requests := 0
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				requests++
+				if requests == 1 {
+					w.Header().Set("Content-Type", "text/event-stream")
+					_, _ = io.WriteString(w, "id: cursor-1\nevent: transcript\ndata: {}\n\n")
+					return
+				}
+				w.Header().Set("Content-Type", "application/problem+json")
+				w.WriteHeader(status)
+				_, _ = io.WriteString(w, `{"title":"cursor rejected"}`)
+			}))
+			defer server.Close()
+			client, _ := New(server.URL, "token", server.Client())
+			client.reconnectWait = time.Millisecond
+			err := client.StreamSSE(context.Background(), server.URL, "", func(SSEEvent) error { return nil })
+			var problem *ProblemError
+			if !errors.As(err, &problem) || problem.Problem.Status != status || requests != 2 {
+				t.Fatalf("error/requests = %#v/%d", err, requests)
+			}
+		})
 	}
 }
 
@@ -440,5 +577,35 @@ func TestStreamSSECancellationInterruptsRetryWait(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("StreamSSE did not cancel during retry wait")
+	}
+}
+
+func TestStreamSSECancellationInterruptsHTTPRetryWait(t *testing.T) {
+	retryResponse := make(chan struct{})
+	requests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		requests++
+		if requests == 1 {
+			w.Header().Set("Content-Type", "text/event-stream")
+			return
+		}
+		w.Header().Set("Retry-After", "30")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		close(retryResponse)
+	}))
+	defer server.Close()
+	client, _ := New(server.URL, "token", server.Client())
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- client.StreamSSE(ctx, server.URL, "", func(SSEEvent) error { return nil }) }()
+	<-retryResponse
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) || requests != 2 {
+			t.Fatalf("error/requests = %v/%d", err, requests)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("StreamSSE did not cancel during HTTP retry wait")
 	}
 }
