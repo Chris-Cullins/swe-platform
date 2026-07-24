@@ -5,15 +5,12 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"net/http"
-	"net/url"
 	"os"
 	"os/signal"
-	"path"
-	"strings"
 	"syscall"
 	"time"
 
+	"github.com/Chris-Cullins/swe-platform/internal/controlplaneclient"
 	"github.com/gorilla/websocket"
 	"github.com/spf13/cobra"
 	"golang.org/x/term"
@@ -38,15 +35,12 @@ func newAttachCommand() *cobra.Command {
 }
 
 func attachTerminal(cmd *cobra.Command, controlPlaneURL, token, namespace, envName string) error {
-	endpoint, err := terminalGatewayURL(controlPlaneURL, namespace, envName)
+	client, err := controlplaneclient.New(controlPlaneURL, token, nil)
 	if err != nil {
 		return err
 	}
-	if token == "" {
-		return fmt.Errorf("control-plane token is required (set --token or SWE_CONTROL_PLANE_TOKEN)")
-	}
-	header := http.Header{"Authorization": []string{"Bearer " + token}}
-	connection, response, err := websocket.DefaultDialer.DialContext(cmd.Context(), endpoint, header)
+	endpoint := client.WebSocketEndpoint("api", "v1", "namespaces", namespace, "environments", envName, "terminal")
+	connection, response, err := websocket.DefaultDialer.DialContext(cmd.Context(), endpoint, client.AuthorizationHeader())
 	if err != nil {
 		if response != nil {
 			return fmt.Errorf("connect to environment terminal: control plane returned %s", response.Status)
@@ -58,26 +52,7 @@ func attachTerminal(cmd *cobra.Command, controlPlaneURL, token, namespace, envNa
 }
 
 func terminalGatewayURL(baseURL, namespace, environment string) (string, error) {
-	if baseURL == "" {
-		return "", fmt.Errorf("control-plane URL is required (set --control-plane or SWE_CONTROL_PLANE_URL)")
-	}
-	parsed, err := url.Parse(baseURL)
-	if err != nil {
-		return "", fmt.Errorf("parse control-plane URL: %w", err)
-	}
-	if parsed.Host == "" || parsed.RawQuery != "" || parsed.Fragment != "" {
-		return "", fmt.Errorf("control-plane URL must be an HTTP(S) base URL without a query or fragment")
-	}
-	switch strings.ToLower(parsed.Scheme) {
-	case "http":
-		parsed.Scheme = "ws"
-	case "https":
-		parsed.Scheme = "wss"
-	default:
-		return "", fmt.Errorf("control-plane URL scheme must be http or https")
-	}
-	parsed.Path = path.Join(parsed.Path, "api/v1/namespaces", namespace, "environments", environment, "terminal")
-	return parsed.String(), nil
+	return controlplaneclient.WebSocketEndpoint(baseURL, "api", "v1", "namespaces", namespace, "environments", environment, "terminal")
 }
 
 func bridgeTerminal(ctx context.Context, connection *websocket.Conn, input io.Reader, output io.Writer) error {

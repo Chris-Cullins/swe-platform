@@ -403,6 +403,29 @@ SWE_CONTROL_PLANE_URL=https://swe.example.com \
 SWE_CONTROL_PLANE_TOKEN="$TOKEN" swe attach my-environment
 ```
 
+Run transcripts use the same explicit control-plane URL and bearer credential:
+
+```sh
+SWE_CONTROL_PLANE_URL=https://swe.example.com \
+SWE_CONTROL_PLANE_TOKEN="$TOKEN" swe logs --run fix-flaky-42
+```
+
+`swe logs --run RUN` selects that exact Run in `--namespace` and emits one NDJSON
+record per SSE event:
+`{"event":"transcript","id":"<opaque cursor>","data":<server envelope>}`. The
+`data` value remains opaque, adapter-owned JSON; the CLI does not interpret it as a
+shared transcript schema. Retention loss is explicit in records whose `event` is
+`transcript-gap`. Use `--after <opaque cursor>` to resume explicitly. After a
+successfully opened stream drops, the CLI reconnects with the event ID from the last
+complete block successfully emitted. Invalid and expired cursors are reported rather
+than silently skipped.
+
+For compatibility, `swe logs <environment>` is not deprecated and still follows the
+current Environment pod's `environment` container using kubeconfig authentication. It
+does not read a Run transcript, and the CLI never infers a Run from a reusable
+Environment. The current transcript store is bounded and process-local, so transcript
+mode does not promise durable history or replay across a control-plane restart.
+
 ## Contributing
 
 Too early for code contributions — but design feedback and use-case descriptions are

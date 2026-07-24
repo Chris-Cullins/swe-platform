@@ -26,6 +26,7 @@ func TestTerminalGatewayURL(t *testing.T) {
 	}{
 		{base: "http://control.example", want: "ws://control.example/api/v1/namespaces/project-a/environments/env-1/terminal"},
 		{base: "https://control.example/platform/", want: "wss://control.example/platform/api/v1/namespaces/project-a/environments/env-1/terminal"},
+		{base: "HTTPS://control.example", want: "wss://control.example/api/v1/namespaces/project-a/environments/env-1/terminal"},
 	}
 	for _, test := range tests {
 		got, err := terminalGatewayURL(test.base, "project-a", "env-1")
