@@ -112,8 +112,11 @@ jobs:
           for preset in kind argocd k3s gke eks; do
             values="charts/swe-platform/values-${preset}.yaml"
             helm lint charts/swe-platform --values "$values"
-            helm template swe-platform charts/swe-platform \
-              --namespace swe-platform-system --values "$values" >/dev/null
+            rendered=$(helm template swe-platform charts/swe-platform \
+              --namespace swe-platform-system --values "$values")
+            if [[ "$preset" =~ ^(k3s|gke|eks)$ ]]; then
+              printf '%s\n' "$rendered" | grep -A5 'name: SWE_POSTGRES_URL' | grep -q 'name: "swe-platform-postgres"'
+            fi
           done
           rendered=$(helm template swe-platform charts/swe-platform \
             --namespace swe-platform-system \

@@ -2,6 +2,12 @@
 # coordinated release. k3s does not include gVisor, so this preset uses the
 # cluster's default OCI runtime for environment pods.
 
+controlPlane:
+  transcripts:
+    postgresSecret:
+      # Create this Secret out of band before installing the production preset.
+      name: swe-platform-postgres
+
 resources:
   requests:
     cpu: 100m

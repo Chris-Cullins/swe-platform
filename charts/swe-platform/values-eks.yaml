@@ -3,6 +3,12 @@
 # standard gVisor RuntimeClass; configure one explicitly if installed.
 replicaCount: 2
 
+controlPlane:
+  transcripts:
+    postgresSecret:
+      # Create this Secret out of band before installing the production preset.
+      name: swe-platform-postgres
+
 resources:
   requests:
     cpu: 100m

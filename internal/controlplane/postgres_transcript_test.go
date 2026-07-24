@@ -99,6 +99,13 @@ func TestPostgresTranscriptStoreContract(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
+		sameStoreRetry, err := store.Append(ctx, run, input)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !sameStoreRetry.Replayed || sameStoreRetry.Event.CreatedAt != first.Event.CreatedAt {
+			t.Fatalf("same-store retry CreatedAt = %s, want exactly %s", sameStoreRetry.Event.CreatedAt, first.Event.CreatedAt)
+		}
 		restarted, err := NewPostgresTranscriptStore(ctx, databaseURL, options)
 		if err != nil {
 			t.Fatal(err)
@@ -110,6 +117,9 @@ func TestPostgresTranscriptStoreContract(t *testing.T) {
 		}
 		if !retry.Replayed || retry.Event.ID != first.Event.ID || retry.Event.Sequence != 1 {
 			t.Fatalf("durable retry = %#v, want original event", retry)
+		}
+		if retry.Event.CreatedAt != first.Event.CreatedAt {
+			t.Fatalf("restarted-store retry CreatedAt = %s, want exactly %s", retry.Event.CreatedAt, first.Event.CreatedAt)
 		}
 		subscription, err := restarted.Subscribe(ctx, run, first.Event.ID)
 		if err != nil {

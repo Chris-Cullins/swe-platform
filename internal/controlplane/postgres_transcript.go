@@ -233,7 +233,7 @@ func (s *PostgresTranscriptStore) Append(ctx context.Context, run RunIdentity, i
 		return AppendTranscriptResult{}, ErrTranscriptCapacity
 	}
 	sequence := highWater + 1
-	createdAt := time.Now().UTC()
+	createdAt := time.Now().UTC().Truncate(time.Microsecond)
 	var sourceSequence any
 	if input.SourceSequence != nil {
 		sourceSequence = strconv.FormatUint(*input.SourceSequence, 10)
@@ -267,6 +267,7 @@ func queryIdempotentEvent(ctx context.Context, query postgresQuery, run RunIdent
 	if err != nil {
 		return TranscriptEvent{}, false, fmt.Errorf("read transcript idempotency record: %w", err)
 	}
+	event.CreatedAt = event.CreatedAt.UTC()
 	event.Sequence = uint64(databaseSequence)
 	event.Source = string(sourceBytes)
 	event.Type = string(typeBytes)
@@ -381,6 +382,7 @@ func queryTranscriptEvents(ctx context.Context, query postgresRows, run RunIdent
 		if err := rows.Scan(&databaseSequence, &sourceBytes, &sourceSequence, &typeBytes, &data, &event.CreatedAt); err != nil {
 			return nil, fmt.Errorf("scan transcript event: %w", err)
 		}
+		event.CreatedAt = event.CreatedAt.UTC()
 		event.Sequence = uint64(databaseSequence)
 		event.Source = string(sourceBytes)
 		event.Type = string(typeBytes)

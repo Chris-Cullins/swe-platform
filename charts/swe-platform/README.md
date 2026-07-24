@@ -27,10 +27,18 @@ remains behind the environment's portable sandboxd contract rather than Kubernet
 Choose the values preset for the target cluster and install into a dedicated namespace:
 
 ```sh
+kubectl create namespace swe-platform-system --dry-run=client -o yaml | kubectl apply -f -
+kubectl -n swe-platform-system create secret generic swe-platform-postgres \
+  --from-literal=url='postgres://swe:REDACTED@postgres.example:5432/swe?sslmode=require'
 helm upgrade --install swe-platform ./charts/swe-platform \
   --namespace swe-platform-system --create-namespace \
   --values ./charts/swe-platform/values-k3s.yaml
 ```
+
+The k3s, GKE, and EKS production presets require that out-of-band Secret name by default. A
+missing Secret keeps the control-plane pod from starting rather than silently selecting the
+development memory store. Override `controlPlane.transcripts.postgresSecret.name` when your
+installation uses a different coordinated Secret name.
 
 ## Upgrade
 
@@ -136,9 +144,9 @@ unmeasured.
 |---|---|
 | `values-kind.yaml` | Local kind development with `:dev` images; explicitly permits insecure HTTP browser sessions. `make kind-up` installs gVisor and snapshot-capable CSI; pass the printed `environmentTemplates[0].spec.runtimeClass=gvisor` override when installing the chart. |
 | `values-argocd.yaml` | Local Argo CD mirror with mutable `:latest` images and an out-of-band bootstrap Secret; explicitly permits insecure HTTP browser sessions. `hack/argocd-up.sh` requires one kind node with at least 5 CPUs and 6 GiB allocatable. |
-| `values-k3s.yaml` | A default CSI-backed StorageClass and an external PostgreSQL Secret are available. Uses one operator replica and the default OCI runtime because k3s does not ship gVisor. |
-| `values-gke.yaml` | GKE Sandbox is enabled on every node that can host environments, and an external PostgreSQL Secret is available. Sets `runtimeClass: gvisor` and runs two operator replicas with leader election. |
-| `values-eks.yaml` | A default EBS CSI StorageClass and an external PostgreSQL Secret are available. Runs two operator replicas with leader election. EKS does not provide a standard gVisor RuntimeClass, so environments use the cluster default unless you override `environmentTemplates[].spec.runtimeClass`. |
+| `values-k3s.yaml` | A default CSI-backed StorageClass and the out-of-band `swe-platform-postgres` Secret are available. Uses one operator replica and the default OCI runtime because k3s does not ship gVisor. |
+| `values-gke.yaml` | GKE Sandbox is enabled on every node that can host environments, and the out-of-band `swe-platform-postgres` Secret is available. Sets `runtimeClass: gvisor` and runs two operator replicas with leader election. |
+| `values-eks.yaml` | A default EBS CSI StorageClass and the out-of-band `swe-platform-postgres` Secret are available. Runs two operator replicas with leader election. EKS does not provide a standard gVisor RuntimeClass, so environments use the cluster default unless you override `environmentTemplates[].spec.runtimeClass`. |
 
 The RuntimeClass applies to environment pods, not the operator. A preset that names a
 RuntimeClass will leave environments Pending unless that RuntimeClass is installed and
@@ -166,17 +174,17 @@ the `env-base` image pull.
 
 ## Durable transcript storage
 
-Set `controlPlane.transcripts.postgresSecret.name` in every production installation. The named,
-out-of-band Secret must contain a PostgreSQL connection URL under the configured key (default
-`url`). Do not put the URL or password directly in values:
+The production presets set `controlPlane.transcripts.postgresSecret.name` to
+`swe-platform-postgres`. The named, out-of-band Secret must contain a PostgreSQL connection URL
+under the configured key (default `url`). Do not put the URL or password directly in values:
 
 ```sh
+kubectl create namespace swe-platform-system --dry-run=client -o yaml | kubectl apply -f -
 kubectl -n swe-platform-system create secret generic swe-platform-postgres \
   --from-literal=url='postgres://swe:REDACTED@postgres.example:5432/swe?sslmode=require'
 helm upgrade --install swe-platform ./charts/swe-platform \
   --namespace swe-platform-system --create-namespace \
-  --values ./charts/swe-platform/values-k3s.yaml \
-  --set controlPlane.transcripts.postgresSecret.name=swe-platform-postgres
+  --values ./charts/swe-platform/values-k3s.yaml
 ```
 
 The control plane connects and applies ordered embedded migrations under a PostgreSQL advisory
@@ -208,6 +216,14 @@ SWE_TEST_POSTGRES_URL='postgres://postgres:postgres@localhost:5432/swe_test?sslm
 
 PostgreSQL makes replay and idempotency durable across restart, but this release deliberately
 keeps `controlPlane.replicaCount=1`; it does not claim multi-replica control-plane HA.
+
+Per-Run event and byte limits do not bound total database size across Run churn. Deleting a Run
+does not yet reclaim its UID-fenced transcript rows automatically, because completion, deletion,
+and Project-offboarding retention policy depends on the lifecycle decisions tracked in
+[#101](https://github.com/Chris-Cullins/swe-platform/issues/101) and #11. Until that work ships,
+operators must monitor and provision the dedicated transcript database for accumulated history.
+Manual deletion should be exceptional: take a backup and target the exact namespace and immutable
+Run UID so a same-name replacement Run's transcript cannot be removed.
 
 ## Control-plane authentication and authorization
 
