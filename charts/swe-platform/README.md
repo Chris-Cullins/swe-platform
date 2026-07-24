@@ -60,6 +60,77 @@ Each image publish run emits a `swe-platform-release-*` artifact containing the 
 version, app version, and the registry digest of every image for incident diagnosis and
 digest-pinned installation overrides.
 
+### Environment image footprint
+
+The coordinated image remains the default instead of selecting a different image per agent.
+The following measurement was recorded on 2026-07-21 from images published by the existing
+`linux/amd64,linux/arm64` workflow. Size is the sum of the compressed layer payload sizes in
+each platform's OCI manifest; it excludes the image config, index, manifests, attestations,
+and transfer overhead. Build time is the observed wall time of the workflow's `Build and push`
+step, including both architectures and registry export.
+
+| Bundled CLIs | Commit/SHA tag | amd64 layer payload | arm64 layer payload | Multi-arch build and push |
+|---|---|---:|---:|---:|
+| Claude Code | `ea9e5af` / `sha-ea9e5af` | 243,209,510 B (231.94 MiB) | 241,177,665 B (230.00 MiB) | 63 s |
+| + Amp | `70968da` / `sha-70968da` | 286,284,455 B (273.02 MiB) | 283,060,674 B (269.95 MiB) | 103 s |
+| + Codex | `bfeab4f` / `sha-bfeab4f` | 418,687,171 B (399.29 MiB) | 408,239,734 B (389.33 MiB) | 198 s |
+| + Pi (historical; reverted by PR #93) | `c9daef7` / `sha-c9daef7` | 494,042,178 B (471.16 MiB) | 483,574,399 B (461.17 MiB) | 257 s |
+
+Pi was reverted by PR #93 pending provenance and security review. Current `main` contains
+Claude Code, Amp, and Codex and therefore ends at the three-CLI row above; this historical
+four-CLI measurement does not reinstate Pi or change its review status.
+
+Relative to Claude Code alone, all four CLIs added 250,832,668 compressed bytes on amd64
+(103.1%) and 242,396,734 bytes on arm64 (100.5%); the observed publish step was 194 seconds
+longer (4.08x total). The sequential image additions were 43,074,945/41,883,009 bytes for Amp,
+132,402,716/125,179,060 bytes for Codex, and 75,355,007/75,334,665 bytes for Pi
+(amd64/arm64). These are measured image deltas, not standalone CLI package sizes: in
+particular, the Pi revision changed the final base from Debian slim to Node slim to satisfy its
+runtime requirement.
+
+These observations still favor retaining one coordinated image as the lower-complexity default:
+the largest measured compressed layer payload remains below 500 MB, the corresponding release
+step completed in under five minutes, nodes can reuse one image across Runs, and a warm
+Environment contains the binaries for every currently registered adapter (Claude Code, Amp,
+and Codex). Per-agent images could avoid some unused bytes on a cold pull, but would multiply
+release artifacts and require agent-specific template/image and warm-pool selection. Per-agent
+images and startup latency were not measured, so the data does not establish a performance
+advantage for the coordinated image; it shows no reason to add that operational dimension yet.
+Revisit the decision if production pull latency or node storage data shows the overhead is
+material.
+
+Reproduce the registry measurement with
+[`crane`](https://github.com/google/go-containerregistry/tree/main/cmd/crane) v0.20.6 (repeat
+for each tag and platform):
+
+```sh
+image=ghcr.io/chris-cullins/swe-platform/env-base
+index=sha256:dcc5c8c6f6c867bd48d3e95504432ec21b1503c992daa1392a4dad69aab33a93
+arch=amd64
+digest=$(crane manifest "$image@$index" |
+  jq -r --arg arch "$arch" '.manifests[] |
+    select(.platform.os == "linux" and .platform.architecture == $arch) | .digest')
+crane manifest "$image@$digest" | jq '[.layers[].size] | add'
+```
+
+For all four rows, the index digests as resolved and recorded on 2026-07-21 are, in table
+order: `sha256:11c12d7aa9903d71644816f846616c62c21df2543453e403c7ce94dd3e9e47dc`,
+`sha256:2491095b62972dbbe64b9bc6b1e08a0d66d6b0d8cd7f6314f9e1da28f6a8e987`,
+`sha256:92212fd083af5ee2c79f0ffa17fe3f73417bf704553f67d1265461b15b817899`, and
+`sha256:dcc5c8c6f6c867bd48d3e95504432ec21b1503c992daa1392a4dad69aab33a93`.
+Use these immutable digests rather than assuming the convenience SHA tags cannot be moved.
+
+The build timings are available from the public Actions runs for
+[`ea9e5af`](https://github.com/Chris-Cullins/swe-platform/actions/runs/29715892572),
+[`70968da`](https://github.com/Chris-Cullins/swe-platform/actions/runs/29718546229),
+[`bfeab4f`](https://github.com/Chris-Cullins/swe-platform/actions/runs/29725763660), and
+[`c9daef7`](https://github.com/Chris-Cullins/swe-platform/actions/runs/29731010260). They are
+real publish observations, but not controlled cold-build benchmarks: BuildKit's shared GitHub
+Actions cache and network/runner variation were not disabled. A local rebuild was unavailable
+because this orb has no Docker-compatible builder; registry manifests provide measured evidence
+for both production architectures, while architecture-specific local build CPU cost remains
+unmeasured.
+
 | Preset | Assumptions |
 |---|---|
 | `values-kind.yaml` | Local kind development with `:dev` images; explicitly permits insecure HTTP browser sessions. `make kind-up` installs gVisor and snapshot-capable CSI; pass the printed `environmentTemplates[0].spec.runtimeClass=gvisor` override when installing the chart. |
