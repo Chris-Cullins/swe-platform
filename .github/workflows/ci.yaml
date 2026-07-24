@@ -55,6 +55,21 @@ jobs:
 
   build-test:
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_DB: swe_platform_test
+          POSTGRES_PASSWORD: test-only-password
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d swe_platform_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      SWE_TEST_POSTGRES_URL: postgres://postgres:test-only-password@localhost:5432/swe_platform_test?sslmode=disable
     steps:
       - uses: actions/checkout@v4
 
@@ -100,6 +115,10 @@ jobs:
             helm template swe-platform charts/swe-platform \
               --namespace swe-platform-system --values "$values" >/dev/null
           done
+          rendered=$(helm template swe-platform charts/swe-platform \
+            --namespace swe-platform-system \
+            --set controlPlane.transcripts.postgresSecret.name=test-postgres)
+          printf '%s\n' "$rendered" | grep -A5 'name: SWE_POSTGRES_URL' | grep -q 'name: "test-postgres"'
 
       - name: Production images are immutable and coordinated
         run: |

@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -66,7 +67,12 @@ func main() {
 		Sessions:       sessions,
 	}
 	resources := &controlplane.KubernetesResourceService{Client: kubeClient}
-	transcripts := controlplane.NewMemoryTranscriptStore(controlplane.DefaultMemoryTranscriptStoreOptions())
+	transcripts, closeTranscripts, err := transcriptStoreFromEnvironment(context.Background(), log)
+	if err != nil {
+		log.Error("initialize transcript store", "error", err)
+		os.Exit(1)
+	}
+	defer closeTranscripts()
 	streamLifecycle, cancelStreams := context.WithCancel(context.Background())
 	defer cancelStreams()
 	server := &http.Server{
@@ -98,6 +104,49 @@ func main() {
 		log.Error("control-plane API stopped", "error", err)
 		os.Exit(1)
 	}
+}
+
+func transcriptStoreFromEnvironment(ctx context.Context, log *slog.Logger) (controlplane.TranscriptStore, func(), error) {
+	databaseURL := strings.TrimSpace(os.Getenv("SWE_POSTGRES_URL"))
+	if databaseURL == "" {
+		log.Warn("using development-only process-local transcript store; set SWE_POSTGRES_URL for durable transcripts")
+		return controlplane.NewMemoryTranscriptStore(controlplane.DefaultMemoryTranscriptStoreOptions()), func() {}, nil
+	}
+	options := controlplane.DefaultPostgresTranscriptStoreOptions()
+	values := []struct {
+		name   string
+		target *int
+	}{
+		{"SWE_TRANSCRIPT_MAX_EVENTS_PER_RUN", &options.MaxEventsPerRun},
+		{"SWE_TRANSCRIPT_MAX_BYTES_PER_RUN", &options.MaxBytesPerRun},
+		{"SWE_TRANSCRIPT_MAX_REPLAY_EVENTS", &options.MaxReplayEvents},
+		{"SWE_TRANSCRIPT_MAX_SUBSCRIBERS", &options.MaxSubscribers},
+		{"SWE_TRANSCRIPT_SUBSCRIBER_BUFFER", &options.SubscriberBuffer},
+	}
+	for _, value := range values {
+		raw := strings.TrimSpace(os.Getenv(value.name))
+		if raw == "" {
+			continue
+		}
+		parsed, err := strconv.Atoi(raw)
+		if err != nil || parsed <= 0 {
+			return nil, nil, fmt.Errorf("%s must be a positive integer", value.name)
+		}
+		*value.target = parsed
+	}
+	if raw := strings.TrimSpace(os.Getenv("SWE_TRANSCRIPT_POLL_INTERVAL")); raw != "" {
+		parsed, err := time.ParseDuration(raw)
+		if err != nil || parsed <= 0 {
+			return nil, nil, errors.New("SWE_TRANSCRIPT_POLL_INTERVAL must be a positive duration")
+		}
+		options.PollInterval = parsed
+	}
+	store, err := controlplane.NewPostgresTranscriptStore(ctx, databaseURL, options)
+	if err != nil {
+		return nil, nil, err
+	}
+	log.Info("using durable PostgreSQL transcript store")
+	return store, store.Close, nil
 }
 
 func runHTTPServer(ctx context.Context, log *slog.Logger, server *http.Server, listener net.Listener, drainTimeout time.Duration, cancelStreams context.CancelFunc) error {

@@ -391,21 +391,28 @@ func (e *TranscriptCursorError) Error() string { return e.Err.Error() }
 func (e *TranscriptCursorError) Unwrap() error { return e.Err }
 
 func writeTranscriptStoreError(w http.ResponseWriter, err error) {
-	status := http.StatusInternalServerError
-	code := "transcript_store_error"
+	status := http.StatusServiceUnavailable
+	code := "transcript_store_unavailable"
+	title := "transcript store is unavailable"
 	switch {
 	case errors.Is(err, ErrIdempotencyConflict):
 		status, code = http.StatusConflict, "idempotency_conflict"
+		title = err.Error()
 	case errors.Is(err, ErrInvalidCursor):
 		status, code = http.StatusBadRequest, "invalid_cursor"
+		title = err.Error()
 	case errors.Is(err, ErrExpiredCursor):
 		status, code = http.StatusGone, "cursor_expired"
+		title = err.Error()
 	case errors.Is(err, ErrReplayLimit):
 		status, code = http.StatusConflict, "replay_limit_exceeded"
+		title = err.Error()
 	case errors.Is(err, ErrSubscriberCapacity):
 		status, code = http.StatusServiceUnavailable, "subscriber_capacity"
+		title = err.Error()
 	case errors.Is(err, ErrTranscriptCapacity):
 		status, code = http.StatusInsufficientStorage, "transcript_capacity"
+		title = err.Error()
 	}
 	var cursorError *TranscriptCursorError
 	problem := struct {
@@ -414,7 +421,7 @@ func writeTranscriptStoreError(w http.ResponseWriter, err error) {
 		Status      int            `json:"status"`
 		ResumeAfter string         `json:"resumeAfter,omitempty"`
 		Available   *TranscriptGap `json:"available,omitempty"`
-	}{Type: "https://swe-platform.dev/problems/" + code, Title: err.Error(), Status: status}
+	}{Type: "https://swe-platform.dev/problems/" + code, Title: title, Status: status}
 	if errors.As(err, &cursorError) && cursorError.Gap != nil {
 		problem.ResumeAfter = cursorError.Gap.ResumeAfter
 		problem.Available = cursorError.Gap
@@ -435,6 +442,12 @@ func writeTranscriptProblem(w http.ResponseWriter, status int, code, title strin
 		Title  string `json:"title"`
 		Status int    `json:"status"`
 	}{Type: "https://swe-platform.dev/problems/" + code, Title: title, Status: status})
+}
+
+func isTranscriptContractError(err error) bool {
+	return errors.Is(err, ErrIdempotencyConflict) || errors.Is(err, ErrTranscriptCapacity) ||
+		errors.Is(err, ErrSubscriberCapacity) || errors.Is(err, ErrReplayLimit) ||
+		errors.Is(err, ErrInvalidCursor) || errors.Is(err, ErrExpiredCursor)
 }
 
 func equalAppendInput(event TranscriptEvent, input AppendTranscriptInput) bool {

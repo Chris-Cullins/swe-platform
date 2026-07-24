@@ -5,7 +5,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"sort"
+	"strings"
 	"sync"
 	"testing"
 
@@ -88,6 +91,17 @@ func TestMemoryTranscriptStoreIdempotencyAndConcurrentOrder(t *testing.T) {
 		if want := index + 2; sequence != want {
 			t.Fatalf("ordered sequence[%d] = %d, want %d", index, sequence, want)
 		}
+	}
+}
+
+func TestTranscriptStoreInternalErrorsAreGenericAndRetriable(t *testing.T) {
+	response := httptest.NewRecorder()
+	writeTranscriptStoreError(response, errors.New("connect postgres.internal as private-user: schema detail"))
+	if response.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want %d", response.Code, http.StatusServiceUnavailable)
+	}
+	if body := response.Body.String(); strings.Contains(body, "postgres.internal") || strings.Contains(body, "private-user") || !strings.Contains(body, "transcript store is unavailable") {
+		t.Fatalf("unsafe internal store problem response: %s", body)
 	}
 }
 

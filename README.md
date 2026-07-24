@@ -218,8 +218,9 @@ foreground terminal and open `http://127.0.0.1:18080/`. The helper explicitly ta
 Argo rollout replaces the selected control-plane pod. Override the cluster with
 `KIND_ARGO_CLUSTER` or the local port with `ARGO_UI_PORT`. Stopping the helper also stops
 only its own `kubectl` child. Existing SSE or WebSocket connections still disconnect during
-a rollout and must reconnect, and a control-plane replacement invalidates its process-local
-browser sessions. The bootstrap requires one kind node with at least 5 CPUs and 6 GiB
+a rollout and must reconnect. PostgreSQL-backed transcript streams replay from their last event
+ID; a control-plane replacement still invalidates its process-local browser sessions. The
+bootstrap requires one kind node with at least 5 CPUs and 6 GiB
 allocatable so the Argo/system workload and two 1-CPU/2-GiB `tiny` Environments fit while a
 warm member is claimed and replaced. Increase the container runtime's capacity before
 running `make argocd-up`; the script checks this before installing Argo.
@@ -291,8 +292,8 @@ prompt or Project configuration.
 Current limitations: Claude print mode has no live input continuation channel, so an exit-zero
 successful result remains `Succeeded` even when its history contains permission denials.
 Non-success results, non-zero exits, missing executables, malformed/missing final result
-events, and permanent transcript rejection map to `Failed`. Transcript storage is currently
-process-local to one control-plane replica.
+events, and permanent transcript rejection map to `Failed`. Production transcript persistence
+requires the chart's PostgreSQL configuration; local presets retain the process-local store.
 
 ### Amp adapter
 
