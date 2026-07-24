@@ -70,7 +70,7 @@ func TestAPIContractFixturesAreCanonicalHandlerAndMapperOutput(t *testing.T) {
 			NewServer(nil, ServerOptions{Access: &recordingAccess{}, Resources: resources}).Handler().ServeHTTP(w, request)
 		}},
 		{name: "run list handler and mapper", fixture: "run-list.json", status: http.StatusOK, contentType: "application/json", write: func(w http.ResponseWriter) {
-			resources := &fakeResources{listPage: RunList{Items: []Run{runDTO(listRun)}, Continue: "opaque-kubernetes-list-cursor"}}
+			resources := &fakeResources{listPage: RunList{Items: []Run{runDTO(listRun)}, Continue: "opaque-kubernetes-list-cursor", ResourceVersion: "fixture-rv"}}
 			request := httptest.NewRequest(http.MethodGet, "/api/v1/namespaces/default/runs", nil)
 			request.Header.Set("Authorization", "Bearer fixture")
 			NewServer(nil, ServerOptions{Access: &recordingAccess{}, Resources: resources}).Handler().ServeHTTP(w, request)
