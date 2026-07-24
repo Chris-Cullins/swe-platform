@@ -117,11 +117,13 @@ type RunStatus struct {
 	// +optional
 	State RunState `json:"state,omitempty"`
 
-	// StartedAt records when the controller first observed the Run in the
-	// Running state. It is set once and is not overwritten by later
-	// pause/resume cycles or retries within the same Run incarnation. It is
-	// nil for Runs that never started executing (e.g. failed during
-	// allocation or cancelled before acceptance). Wall time is derivable as
+	// StartedAt records when the controller first confirmed adapter
+	// acceptance or execution for this Run — set once when the Run enters
+	// AdapterAccepted, Running, NeedsInput, Succeeded, or adapter-observed
+	// Failed, and not overwritten by later pause/resume cycles or retries
+	// within the same Run incarnation. It is nil for Runs that never reached
+	// acceptance (e.g. failed during allocation, rejected by the adapter, or
+	// cancelled before acceptance). Wall time is derivable as
 	// FinishedAt - StartedAt; this is lifecycle wall time and includes any
 	// Paused or NeedsInput intervals.
 	// +optional
