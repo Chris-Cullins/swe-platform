@@ -202,9 +202,14 @@ func (r *EnvironmentReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	if changed {
 		return ctrl.Result{Requeue: true}, nil
 	}
+	if invalidProvisioningFenceStarted(&env) {
+		if result, handled, err := r.reconcileInvalidProvisioningFence(ctx, &env); handled || err != nil {
+			return result, err
+		}
+	}
 	project, projectErr := r.resolveEnvironmentProject(ctx, &env)
 	if project != nil && len(project.Spec.EgressAllowlist) != 0 {
-		return r.reconcileInvalidProjectConfiguration(ctx, &env, unsupportedEgressAllowlistMessage(project.Name))
+		return r.reconcileInvalidProvisioningConfiguration(ctx, &env, unsupportedEgressAllowlistMessage(project.Name))
 	}
 	// Fencing must not depend on a still-readable template or successful setup.
 	// Cancellation/finalization can therefore stop an execution domain even after
@@ -219,26 +224,26 @@ func (r *EnvironmentReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	if projectErr != nil {
 		var terminal *terminalEnvironmentError
 		if stderrors.As(projectErr, &terminal) {
-			return r.reconcileInvalidProjectConfiguration(ctx, &env, projectErr.Error())
+			return r.reconcileInvalidProvisioningConfiguration(ctx, &env, projectErr.Error())
 		}
 		return ctrl.Result{}, r.fail(ctx, &env, projectErr)
 	}
 	if err := validateEnvironmentProject(project); err != nil {
 		return ctrl.Result{}, r.fail(ctx, &env, err)
 	}
-	if result, handled, err := r.reconcilePendingPodRecovery(ctx, &env); handled || err != nil {
-		return result, err
-	}
 	if strings.TrimSpace(env.Spec.TemplateRef) == "" {
-		return ctrl.Result{}, r.fail(ctx, &env, terminalEnvironment(fmt.Errorf("environment templateRef must not be blank")))
+		return r.reconcileInvalidProvisioningConfiguration(ctx, &env, "environment templateRef must not be blank")
 	}
 	var tmpl platformv1alpha1.EnvironmentTemplate
 	if err := r.Get(ctx, types.NamespacedName{Namespace: env.Namespace, Name: env.Spec.TemplateRef}, &tmpl); err != nil {
 		wrapped := fmt.Errorf("get template %q: %w", env.Spec.TemplateRef, err)
 		if errors.IsNotFound(err) {
-			wrapped = terminalEnvironment(wrapped)
+			return r.reconcileInvalidProvisioningConfiguration(ctx, &env, wrapped.Error())
 		}
 		return ctrl.Result{}, r.fail(ctx, &env, wrapped)
+	}
+	if result, handled, err := r.reconcilePendingPodRecovery(ctx, &env); handled || err != nil {
+		return result, err
 	}
 	backend := platformv1alpha1.EffectiveEnvironmentBackend(&env, &tmpl)
 	if backend != platformv1alpha1.EnvironmentBackendPod {
@@ -549,11 +554,12 @@ func (r *EnvironmentReconciler) now() time.Time {
 	return time.Now()
 }
 
-// reconcileInvalidProjectConfiguration withdraws the published connection
-// before fencing an execution domain whose Project configuration cannot be
-// safely established. The workspace and ingress policy are retained, and
-// credentials are revoked only after the exact Environment-owned Pod is gone.
-func (r *EnvironmentReconciler) reconcileInvalidProjectConfiguration(ctx context.Context, env *platformv1alpha1.Environment, message string) (ctrl.Result, error) {
+// reconcileInvalidProvisioningConfiguration withdraws the published
+// connection before fencing an execution domain whose referenced provisioning
+// configuration cannot be safely established. The workspace and ingress policy
+// are retained, and credentials are revoked only after the exact
+// Environment-owned Pod is gone.
+func (r *EnvironmentReconciler) reconcileInvalidProvisioningConfiguration(ctx context.Context, env *platformv1alpha1.Environment, message string) (ctrl.Result, error) {
 	hadPublishedConnection := env.Status.PodName != "" || env.Status.Endpoints.Sandboxd != "" || platformv1alpha1.IsEnvironmentReady(env)
 	if err := r.setEnvironmentStatus(ctx, env, platformv1alpha1.EnvironmentPhaseFailed, "", "", "InvalidConfiguration", message); err != nil {
 		return ctrl.Result{}, err
@@ -561,32 +567,42 @@ func (r *EnvironmentReconciler) reconcileInvalidProjectConfiguration(ctx context
 	if hadPublishedConnection {
 		return ctrl.Result{Requeue: true}, nil
 	}
+	result, _, err := r.reconcileInvalidProvisioningFence(ctx, env)
+	return result, err
+}
 
+func invalidProvisioningFenceStarted(env *platformv1alpha1.Environment) bool {
+	ready := apimeta.FindStatusCondition(env.Status.Conditions, platformv1alpha1.EnvironmentConditionReady)
+	return env.Status.Phase == platformv1alpha1.EnvironmentPhaseFailed && ready != nil &&
+		ready.Status == metav1.ConditionFalse && ready.Reason == "InvalidConfiguration"
+}
+
+func (r *EnvironmentReconciler) reconcileInvalidProvisioningFence(ctx context.Context, env *platformv1alpha1.Environment) (ctrl.Result, bool, error) {
 	var pod corev1.Pod
 	if err := r.Get(ctx, types.NamespacedName{Namespace: env.Namespace, Name: envPodName(env)}, &pod); err == nil {
 		if exactControllerOwner(&pod, platformv1alpha1.GroupVersion.String(), "Environment", env.Name, env.UID) {
 			if err := r.deleteObservedChild(ctx, &pod); err != nil && !errors.IsNotFound(err) {
-				return ctrl.Result{}, fmt.Errorf("delete pod for invalid Project configuration: %w", err)
+				return ctrl.Result{}, true, fmt.Errorf("delete pod for invalid provisioning configuration: %w", err)
 			}
-			return ctrl.Result{Requeue: true}, nil
+			return ctrl.Result{Requeue: true}, true, nil
 		}
 	} else if !errors.IsNotFound(err) {
-		return ctrl.Result{}, err
+		return ctrl.Result{}, true, err
 	}
 
 	var credentials corev1.Secret
 	if err := r.Get(ctx, types.NamespacedName{Namespace: env.Namespace, Name: envCredentialName(env)}, &credentials); err == nil {
 		if !exactControllerOwner(&credentials, platformv1alpha1.GroupVersion.String(), "Environment", env.Name, env.UID) {
-			return ctrl.Result{}, nil
+			return ctrl.Result{}, false, nil
 		}
 		if err := r.deleteObservedChild(ctx, &credentials); err != nil && !errors.IsNotFound(err) {
-			return ctrl.Result{}, fmt.Errorf("revoke credentials for invalid Project configuration: %w", err)
+			return ctrl.Result{}, true, fmt.Errorf("revoke credentials for invalid provisioning configuration: %w", err)
 		}
-		return ctrl.Result{Requeue: true}, nil
+		return ctrl.Result{Requeue: true}, true, nil
 	} else if !errors.IsNotFound(err) {
-		return ctrl.Result{}, err
+		return ctrl.Result{}, true, err
 	}
-	return ctrl.Result{}, nil
+	return ctrl.Result{}, false, nil
 }
 
 // reconcileUnsupportedBackend withdraws the published connection identity
@@ -756,11 +772,17 @@ func (r *EnvironmentReconciler) reconcileDeleting(ctx context.Context, env *plat
 
 // reconcilePaused deletes the pod (if any) and keeps the workspace volume.
 func (r *EnvironmentReconciler) reconcilePaused(ctx context.Context, env *platformv1alpha1.Environment) (ctrl.Result, error) {
+	if env.Status.PodName != "" || env.Status.Endpoints.Sandboxd != "" || platformv1alpha1.IsEnvironmentReady(env) {
+		if err := r.setEnvironmentStatus(ctx, env, platformv1alpha1.EnvironmentPhaseIdle, "", "", "PauseRequested", "environment suspension is fencing the current execution domain"); err != nil {
+			return ctrl.Result{}, err
+		}
+		return ctrl.Result{Requeue: true}, nil
+	}
 	podName := envPodName(env)
 	var pod corev1.Pod
 	err := r.Get(ctx, types.NamespacedName{Namespace: env.Namespace, Name: podName}, &pod)
 	if err == nil {
-		if !metav1.IsControlledBy(&pod, env) {
+		if !exactControllerOwner(&pod, platformv1alpha1.GroupVersion.String(), "Environment", env.Name, env.UID) {
 			return ctrl.Result{}, &childOwnershipCollisionError{kind: "Pod", name: podName}
 		}
 		if delErr := r.deleteObservedChild(ctx, &pod); delErr != nil && !errors.IsNotFound(delErr) {
@@ -772,7 +794,7 @@ func (r *EnvironmentReconciler) reconcilePaused(ctx context.Context, env *platfo
 	}
 	var credentials corev1.Secret
 	if err := r.Get(ctx, types.NamespacedName{Namespace: env.Namespace, Name: envCredentialName(env)}, &credentials); err == nil {
-		if !metav1.IsControlledBy(&credentials, env) {
+		if !exactControllerOwner(&credentials, platformv1alpha1.GroupVersion.String(), "Environment", env.Name, env.UID) {
 			return ctrl.Result{}, &childOwnershipCollisionError{kind: "Secret", name: credentials.Name}
 		}
 		if err := r.deleteObservedChild(ctx, &credentials); err != nil && !errors.IsNotFound(err) {
