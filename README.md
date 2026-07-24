@@ -423,8 +423,9 @@ than silently skipped.
 For compatibility, `swe logs <environment>` is not deprecated and still follows the
 current Environment pod's `environment` container using kubeconfig authentication. It
 does not read a Run transcript, and the CLI never infers a Run from a reusable
-Environment. The current transcript store is bounded and process-local, so transcript
-mode does not promise durable history or replay across a control-plane restart.
+Environment. Production transcript durability and replay across control-plane restarts
+require the chart's PostgreSQL configuration. The default, kind, and Argo development
+presets retain bounded process-local storage and cannot promise restart replay.
 
 ## Contributing
 
