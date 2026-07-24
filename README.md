@@ -465,6 +465,41 @@ a common event schema.
 For a non-interactive authentication/connectivity check (including CI), use `swe tui --check`.
 It validates namespaced Run-list access without starting a terminal UI or printing credentials.
 
+### Local MCP server
+
+`swe mcp` runs a local stdio MCP server as the current authenticated control-plane user. It
+uses the same explicit URL and bearer credential as `swe attach`, fixes every tool call to one
+`--namespace`, and never contacts Kubernetes or `sandboxd` directly. Configure an MCP host to
+launch the CLI while inheriting `SWE_CONTROL_PLANE_URL` and `SWE_CONTROL_PLANE_TOKEN`; do not
+write the token into a checked-in MCP configuration. For example, the server entry in a host
+that supports command/argument configuration is:
+
+```json
+{
+  "command": "swe",
+  "args": ["mcp", "--namespace", "my-project"]
+}
+```
+
+The initial tool surface is deliberately finite:
+
+- `create_run` requires a stable Run `name`, a prompt of at most 128 KiB, and an Environment,
+  Project, or Template selector. It returns a concise reference containing the exact namespace,
+  Run name, and immutable Run UID. The control plane authorizes `create` on Runs and, when an
+  exact-intent same-name retry is recovered while that Run still exists, `get` on that exact Run.
+- `read_transcript` requires both the Run name and expected Run UID. It checks that identity
+  before and after every SSE connection is bound, accepts an opaque `after` cursor, and returns
+  at most 100 events, 128 KiB of adapter-owned event JSON, and 256 KiB of encoded structured
+  output after a wait of at most 10 seconds.
+  `dataJSON` is the unmodified JSON text, not a platform transcript schema. This tool requires
+  `get` on the exact Run and `get` on its `transcript` subresource.
+
+Interactive `attach` is intentionally not an MCP tool in this slice. The existing endpoint is a
+bidirectional shared terminal with wake and activity side effects, not a bounded request/result
+operation. Returning a terminal URL would also require exposing a bearer credential, while
+keeping a hidden session would add a second state and trust model. Use `swe attach` or `swe tui`
+for terminal access until an explicit noninteractive, capability-safe session contract exists.
+
 ### Run resource watches
 
 Authenticated consoles obtain a fully paginated Run summary snapshot from
