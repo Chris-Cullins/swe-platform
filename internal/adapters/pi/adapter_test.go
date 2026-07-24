@@ -97,7 +97,7 @@ func TestTerminalContract(t *testing.T) {
 		{"length", `{"type":"agent_end","messages":[{"role":"assistant","stopReason":"length"}]}`, true},
 		{"last assistant before trailing tool", `{"type":"agent_end","messages":[{"role":"assistant","stopReason":"stop"},{"role":"toolResult"}]}`, true},
 		{"retry uses final agent end", `{"type":"agent_end","messages":[{"role":"assistant","stopReason":"error"}]}` + "\n" + `{"type":"auto_retry_start","attempt":1,"maxAttempts":3,"delayMs":1,"errorMessage":"retry"}` + "\n" + `{"type":"agent_start"}` + "\n" + `{"type":"auto_retry_end","success":true,"attempt":1}` + "\n" + `{"type":"agent_end","messages":[{"role":"assistant","stopReason":"stop"}]}`, true},
-		{"compaction continuation uses final agent end", `{"type":"agent_end","messages":[{"role":"assistant","stopReason":"error"}]}` + "\n" + `{"type":"compaction_start","reason":"overflow"}` + "\n" + `{"type":"compaction_end","reason":"overflow","aborted":false}` + "\n" + `{"type":"agent_end","messages":[{"role":"assistant","stopReason":"stop"}]}`, true},
+		{"compaction continuation uses final agent end", `{"type":"agent_end","messages":[{"role":"assistant","stopReason":"error"}]}` + "\n" + `{"type":"compaction_start","reason":"overflow"}` + "\n" + `{"type":"compaction_end","reason":"overflow","aborted":false,"willRetry":true}` + "\n" + `{"type":"agent_end","messages":[{"role":"assistant","stopReason":"stop"}]}`, true},
 		{"typed event after final end", `{"type":"agent_end","messages":[{"role":"assistant","stopReason":"stop"}]}` + "\n" + `{"type":"auto_retry_end","success":true,"attempt":1}`, true},
 		{"malformed", `{`, false},
 		{"missing event type", `{}`, false},
