@@ -456,8 +456,9 @@ Use Up/Down (or `j`/`k`) and Enter to browse Run details, `c` to create a Run, `
 confirmed cancellation, `t` to attach to the selected Run's allocated Environment, `r` to
 refresh, and `q` to quit. The create form accepts a free-form agent adapter name and uses Tab
 to move between fields and Ctrl-S to submit. Esc returns or closes a form; Ctrl-] detaches an
-attached terminal and restores the dashboard. Run details show normalized status and usage,
-Environment readiness/pause state, and a bounded raw transcript view. Transcript source, type,
+attached terminal and restores the dashboard. Run details show normalized status, lifecycle
+wall-time timestamps (started/finished), and usage, Environment readiness/pause state, and a
+bounded raw transcript view. Transcript source, type,
 payload, and retention gaps are displayed generically; adapter-owned payloads are not parsed as
 a common event schema.
 

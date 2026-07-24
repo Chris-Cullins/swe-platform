@@ -10,7 +10,7 @@ import type { Environment, Run } from './contracts'
 const run: Run = {
   name: 'repair-ui', uid: 'run-uid', generation: 1, createdAt: '2026-07-19T12:00:00Z',
   intent: { selector: { project: 'platform', template: 'small' }, agent: 'amp', prompt: 'Repair UI', credentialProfile: 'amp-production' },
-  cancelRequested: false, state: 'Running', environment: { name: 'repair-env', ownership: 'Owned' }, branch: 'agent/repair',
+  cancelRequested: false, state: 'Running', startedAt: '2026-07-19T12:01:00Z', environment: { name: 'repair-env', ownership: 'Owned' }, branch: 'agent/repair',
   usage: { cpuSeconds: 12.5, tokensIn: 101, tokensOut: 202 },
 }
 const environment: Environment = { name: 'repair-env', uid: 'env-uid', createdAt: '2026-07-19T12:00:01Z', project: 'platform', template: 'small', backend: 'pod', paused: false, phase: 'Running', ready: true }
@@ -264,6 +264,7 @@ describe('App frozen API integration', () => {
     expect(screen.getByText('12.5')).toBeInTheDocument()
     expect(screen.getByText('101')).toBeInTheDocument()
     expect(screen.getByText('202')).toBeInTheDocument()
+    expect(screen.getByText('2026-07-19T12:01:00Z')).toBeInTheDocument()
     expect(screen.getByText('Owned')).toBeInTheDocument()
     expect(screen.queryByRole('link', { name: /changes/i })).not.toBeInTheDocument()
   })

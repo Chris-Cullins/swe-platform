@@ -244,6 +244,41 @@ func TestResourceServiceGetRunPublishesOnlyExactAttachableEnvironmentUID(t *test
 	}
 }
 
+func TestResourceServiceRunDTOMapsLifecycleTimestamps(t *testing.T) {
+	startedAt := metav1.NewTime(time.Date(2026, 7, 19, 18, 5, 0, 0, time.UTC))
+	finishedAt := metav1.NewTime(time.Date(2026, 7, 19, 18, 10, 0, 0, time.UTC))
+	run := &platformv1alpha1.Run{
+		ObjectMeta: metav1.ObjectMeta{Name: "run", Namespace: "ns", UID: "run-uid"},
+		Status:     platformv1alpha1.RunStatus{State: platformv1alpha1.RunStateSucceeded, StartedAt: &startedAt, FinishedAt: &finishedAt},
+	}
+	service := &KubernetesResourceService{Client: fake.NewClientBuilder().WithScheme(resourceScheme(t)).WithObjects(run).Build()}
+	got, err := service.GetRun(context.Background(), "ns", "run")
+	if err != nil {
+		t.Fatalf("GetRun: %v", err)
+	}
+	if got.StartedAt == nil || !got.StartedAt.Equal(startedAt.Time) {
+		t.Fatalf("StartedAt = %v, want %v", got.StartedAt, startedAt.Time)
+	}
+	if got.FinishedAt == nil || !got.FinishedAt.Equal(finishedAt.Time) {
+		t.Fatalf("FinishedAt = %v, want %v", got.FinishedAt, finishedAt.Time)
+	}
+}
+
+func TestResourceServiceRunDTONilTimestampsOmitted(t *testing.T) {
+	run := &platformv1alpha1.Run{
+		ObjectMeta: metav1.ObjectMeta{Name: "run", Namespace: "ns", UID: "run-uid"},
+		Status:     platformv1alpha1.RunStatus{State: platformv1alpha1.RunStateAllocating},
+	}
+	service := &KubernetesResourceService{Client: fake.NewClientBuilder().WithScheme(resourceScheme(t)).WithObjects(run).Build()}
+	got, err := service.GetRun(context.Background(), "ns", "run")
+	if err != nil {
+		t.Fatalf("GetRun: %v", err)
+	}
+	if got.StartedAt != nil || got.FinishedAt != nil {
+		t.Fatalf("StartedAt = %v, FinishedAt = %v; both should be nil for Allocating", got.StartedAt, got.FinishedAt)
+	}
+}
+
 func TestResourceServiceEnvironmentReadinessDefaultAndRedaction(t *testing.T) {
 	now := metav1.NewTime(time.Now())
 	env := &platformv1alpha1.Environment{
