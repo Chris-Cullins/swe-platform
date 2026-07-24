@@ -27,9 +27,9 @@ func TestResourceClientUsesAuthenticatedTypedEndpoints(t *testing.T) {
 		w.Header().Set("Content-Type", "application/json")
 		switch {
 		case r.Method == http.MethodGet && r.URL.Path == "/api/v1/namespaces/team-a/runs" && r.URL.Query().Get("continue") == "":
-			_, _ = io.WriteString(w, `{"items":[{"name":"one","uid":"uid-one","createdAt":"2026-07-24T00:00:00Z","intent":{"selector":{"template":"small"},"agent":"future-agent","prompt":"task"},"cancelRequested":false,"state":"Running","usage":{"cpuSeconds":0,"tokensIn":0,"tokensOut":0}}],"continue":"next"}`)
+			_, _ = io.WriteString(w, `{"items":[{"name":"one","uid":"uid-one","createdAt":"2026-07-24T00:00:00Z","agent":"future-agent","promptPreview":"task","cancelRequested":false,"state":"Running"}],"continue":"next"}`)
 		case r.Method == http.MethodGet && r.URL.Path == "/api/v1/namespaces/team-a/runs" && r.URL.Query().Get("continue") == "next":
-			_, _ = io.WriteString(w, `{"items":[{"name":"two","uid":"uid-two","createdAt":"2026-07-24T00:00:00Z","intent":{"selector":{"project":"repo"},"agent":"another-agent","prompt":"task"},"cancelRequested":false,"state":"Succeeded","usage":{"cpuSeconds":0,"tokensIn":0,"tokensOut":0}}]}`)
+			_, _ = io.WriteString(w, `{"items":[{"name":"two","uid":"uid-two","createdAt":"2026-07-24T00:00:00Z","agent":"another-agent","promptPreview":"task","cancelRequested":false,"state":"Succeeded"}]}`)
 		case r.Method == http.MethodGet && r.URL.Path == "/api/v1/namespaces/team-a/runs/run-one":
 			writeTestRun(w, "run-one", false)
 		case r.Method == http.MethodPost && r.URL.Path == "/api/v1/namespaces/team-a/runs":
@@ -45,8 +45,9 @@ func TestResourceClientUsesAuthenticatedTypedEndpoints(t *testing.T) {
 			}
 			writeTestRun(w, "run-one", false)
 		case r.Method == http.MethodPost && r.URL.Path == "/api/v1/namespaces/team-a/runs/run-one/cancel":
-			if r.ContentLength > 0 {
-				t.Errorf("cancel body length = %d", r.ContentLength)
+			var request controlplane.CancelRunRequest
+			if err := json.NewDecoder(r.Body).Decode(&request); err != nil || request.RunUID != "uid-one" {
+				t.Errorf("cancel request = %#v, %v", request, err)
 			}
 			writeTestRun(w, "run-one", true)
 		case r.Method == http.MethodGet && r.URL.Path == "/api/v1/namespaces/team-a/environments/env-one":
@@ -61,9 +62,9 @@ func TestResourceClientUsesAuthenticatedTypedEndpoints(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	runs, err := client.ListRuns(context.Background(), "team-a")
-	if err != nil || len(runs) != 2 || runs[0].Intent.Agent != "future-agent" {
-		t.Fatalf("ListRuns() = %#v, %v", runs, err)
+	runs, err := client.ListRunSummaries(context.Background(), "team-a")
+	if err != nil || len(runs) != 2 || runs[0].Agent != "future-agent" {
+		t.Fatalf("ListRunSummaries() = %#v, %v", runs, err)
 	}
 	if _, err := client.GetRun(context.Background(), "team-a", "run-one"); err != nil {
 		t.Fatal(err)
@@ -72,7 +73,7 @@ func TestResourceClientUsesAuthenticatedTypedEndpoints(t *testing.T) {
 	if _, err := client.CreateRun(context.Background(), "team-a", request); err != nil {
 		t.Fatal(err)
 	}
-	cancelled, err := client.CancelRun(context.Background(), "team-a", "run-one")
+	cancelled, err := client.CancelRun(context.Background(), "team-a", "run-one", "uid-one")
 	if err != nil || !cancelled.CancelRequested {
 		t.Fatalf("CancelRun() = %#v, %v", cancelled, err)
 	}
@@ -97,7 +98,7 @@ func TestResourceClientSurfacesAPIStatusesWithoutCredentialDisclosure(t *testing
 			}))
 			defer server.Close()
 			client, _ := New(server.URL, token, server.Client())
-			_, err := client.ListRuns(context.Background(), "default")
+			_, err := client.ListRunSummaries(context.Background(), "default")
 			var problem *ProblemError
 			if !errors.As(err, &problem) || problem.Problem.Status != status {
 				t.Fatalf("error = %#v", err)
@@ -116,7 +117,7 @@ func TestListRunsRejectsRepeatedPaginationCursor(t *testing.T) {
 	}))
 	defer server.Close()
 	client, _ := New(server.URL, "token", server.Client())
-	_, err := client.ListRuns(context.Background(), "default")
+	_, err := client.ListRunSummaries(context.Background(), "default")
 	if err == nil || !strings.Contains(err.Error(), "repeated") {
 		t.Fatalf("error = %v", err)
 	}
@@ -150,8 +151,39 @@ func TestListRunsEscapesContinuation(t *testing.T) {
 	}))
 	defer server.Close()
 	client, _ := New(server.URL, "token", server.Client())
-	_, err := client.ListRuns(context.Background(), "default")
+	_, err := client.ListRunSummaries(context.Background(), "default")
 	if err != nil || len(queries) != 2 || !reflect.DeepEqual(queries[1]["continue"], []string{"a&b"}) {
 		t.Fatalf("queries/error = %#v/%v", queries, err)
+	}
+}
+
+func TestListRunSummariesPaginatesWithoutFullNearMiBPrompt(t *testing.T) {
+	fullPrompt := `<script>&` + strings.Repeat("界", 340000)
+	requests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		if r.URL.Query().Get("view") != "summary" || r.URL.Query().Get("limit") != "200" {
+			t.Errorf("query = %s", r.URL.RawQuery)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if requests == 1 {
+			_, _ = io.WriteString(w, `{"items":[{"name":"one","promptPreview":"\u003cscript\u003e\u0026"}],"continue":"next"}`)
+			return
+		}
+		if r.URL.Query().Get("continue") != "next" {
+			t.Errorf("continuation = %q", r.URL.Query().Get("continue"))
+		}
+		_, _ = io.WriteString(w, `{"items":[{"name":"two","promptPreview":"done"}]}`)
+	}))
+	defer server.Close()
+	client, _ := New(server.URL, "token", server.Client())
+	items, err := client.ListRunSummaries(context.Background(), "ns")
+	if err != nil || requests != 2 || len(items) != 2 || items[0].PromptPreview != "<script>&" {
+		t.Fatalf("items/requests/error = %#v/%d/%v", items, requests, err)
+	}
+	for _, item := range items {
+		if item.PromptPreview == fullPrompt || len(item.PromptPreview) > 1024 {
+			t.Fatalf("received full prompt: %d bytes", len(item.PromptPreview))
+		}
 	}
 }

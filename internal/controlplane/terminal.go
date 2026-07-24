@@ -7,10 +7,12 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/gorilla/websocket"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -31,9 +33,15 @@ const (
 
 var errTerminalEnvironmentIncarnationChanged = errors.New("environment incarnation changed")
 
+const (
+	RunUIDHeader         = "SWE-Run-UID"
+	EnvironmentUIDHeader = "SWE-Environment-UID"
+)
+
 // TerminalDialer resolves an Environment and connects to its sandboxd API.
 type TerminalDialer interface {
 	DialTerminal(context.Context, string, string) (sandboxdv1.TerminalServiceClient, sandboxdv1.HealthServiceClient, io.Closer, error)
+	DialRunTerminal(context.Context, string, RunTerminalAssociation) (sandboxdv1.TerminalServiceClient, sandboxdv1.HealthServiceClient, io.Closer, error)
 }
 
 // KubernetesTerminalDialer resolves environment pods through the Kubernetes API.
@@ -93,11 +101,24 @@ func (l *terminalConnectionLease) Close() error {
 // requests an authenticated sandboxd connection through the environment
 // connector. Backend transport details stay out of terminal feature code.
 func (d KubernetesTerminalDialer) DialTerminal(ctx context.Context, namespace, name string) (sandboxdv1.TerminalServiceClient, sandboxdv1.HealthServiceClient, io.Closer, error) {
+	return d.dialTerminal(ctx, namespace, name, nil)
+}
+
+func (d KubernetesTerminalDialer) DialRunTerminal(ctx context.Context, namespace string, association RunTerminalAssociation) (sandboxdv1.TerminalServiceClient, sandboxdv1.HealthServiceClient, io.Closer, error) {
+	return d.dialTerminal(ctx, namespace, association.EnvironmentName, &association)
+}
+
+func (d KubernetesTerminalDialer) dialTerminal(ctx context.Context, namespace, name string, association *RunTerminalAssociation) (sandboxdv1.TerminalServiceClient, sandboxdv1.HealthServiceClient, io.Closer, error) {
 	var environment platformv1alpha1.Environment
 	if err := d.Client.Get(ctx, types.NamespacedName{Namespace: namespace, Name: name}, &environment); err != nil {
 		return nil, nil, nil, fmt.Errorf("get environment: %w", err)
 	}
 	expectedUID := environment.UID
+	if association != nil {
+		if err := d.validateRunTerminalAssociation(ctx, namespace, association, &environment); err != nil {
+			return nil, nil, nil, err
+		}
+	}
 	policyRevision := lifecycle.HoldPolicyRevision(&environment)
 	if err := terminalAccessPolicyError(&environment); err != nil {
 		return nil, nil, nil, err
@@ -117,12 +138,17 @@ func (d KubernetesTerminalDialer) DialTerminal(ctx context.Context, namespace, n
 		}
 	}()
 	connectionLease := &terminalConnectionLease{}
-	go d.heartbeatActivity(heartbeatContext, types.NamespacedName{Namespace: namespace, Name: name}, expectedUID, policyRevision, heartbeatInterval, func() { _ = connectionLease.Close() })
+	go d.heartbeatActivity(heartbeatContext, types.NamespacedName{Namespace: namespace, Name: name}, expectedUID, policyRevision, heartbeatInterval, association, func() { _ = connectionLease.Close() })
 	if err := d.Client.Get(ctx, types.NamespacedName{Namespace: namespace, Name: name}, &environment); err != nil {
 		return nil, nil, nil, fmt.Errorf("refresh environment lifecycle: %w", err)
 	}
 	if environment.UID != expectedUID {
 		return nil, nil, nil, errTerminalEnvironmentIncarnationChanged
+	}
+	if association != nil {
+		if err := d.validateRunTerminalAssociation(ctx, namespace, association, &environment); err != nil {
+			return nil, nil, nil, err
+		}
 	}
 	if err := terminalAccessPolicyError(&environment); err != nil {
 		return nil, nil, nil, err
@@ -151,6 +177,12 @@ func (d KubernetesTerminalDialer) DialTerminal(ctx context.Context, namespace, n
 	terminal, health, closeConnection, err := (sandboxclient.Connector{Reader: d.Client}).DialTerminal(ctx, namespace, name, expectedUID)
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("connect to sandboxd: %w", err)
+	}
+	if association != nil {
+		if err := d.validateRunTerminalAssociation(ctx, namespace, association, nil); err != nil {
+			closeConnection()
+			return nil, nil, nil, err
+		}
 	}
 	if !connectionLease.attach(closeFunc(closeConnection)) {
 		return nil, nil, nil, fmt.Errorf("environment became explicitly held while opening terminal")
@@ -190,7 +222,7 @@ func (d KubernetesTerminalDialer) activityHeartbeatInterval(ctx context.Context,
 	return timeout / 2, nil
 }
 
-func (d KubernetesTerminalDialer) heartbeatActivity(ctx context.Context, key types.NamespacedName, expectedUID types.UID, policyRevision int64, interval time.Duration, revoke func()) {
+func (d KubernetesTerminalDialer) heartbeatActivity(ctx context.Context, key types.NamespacedName, expectedUID types.UID, policyRevision int64, interval time.Duration, association *RunTerminalAssociation, revoke func()) {
 	retryInterval := interval / 4
 	if retryInterval <= 0 || retryInterval > time.Second {
 		retryInterval = time.Second
@@ -204,6 +236,15 @@ func (d KubernetesTerminalDialer) heartbeatActivity(ctx context.Context, key typ
 		case <-ctx.Done():
 			return
 		case <-policyTicker.C:
+			if association != nil {
+				if err := d.validateRunTerminalAssociation(ctx, key.Namespace, association, nil); err != nil {
+					if errors.Is(err, errRunTerminalAssociation) || errors.Is(err, errRunUIDConflict) {
+						revoke()
+						return
+					}
+					continue
+				}
+			}
 			revision, held, err := d.readHoldPolicy(ctx, key, expectedUID)
 			if err != nil {
 				if errors.Is(err, errTerminalEnvironmentIncarnationChanged) {
@@ -253,6 +294,36 @@ func (d KubernetesTerminalDialer) heartbeatActivity(ctx context.Context, key typ
 			}
 		}
 	}
+}
+
+func (d KubernetesTerminalDialer) validateRunTerminalAssociation(ctx context.Context, namespace string, association *RunTerminalAssociation, knownEnvironment *platformv1alpha1.Environment) error {
+	var environment platformv1alpha1.Environment
+	if knownEnvironment == nil {
+		if err := d.Client.Get(ctx, types.NamespacedName{Namespace: namespace, Name: association.EnvironmentName}, &environment); err != nil {
+			if apierrors.IsNotFound(err) {
+				return fmt.Errorf("%w: environment no longer exists", errRunTerminalAssociation)
+			}
+			return err
+		}
+		knownEnvironment = &environment
+	}
+	if string(knownEnvironment.UID) != association.EnvironmentUID {
+		return fmt.Errorf("%w: environment incarnation changed", errRunTerminalAssociation)
+	}
+	var run platformv1alpha1.Run
+	if err := d.Client.Get(ctx, types.NamespacedName{Namespace: namespace, Name: association.RunName}, &run); err != nil {
+		if apierrors.IsNotFound(err) {
+			return fmt.Errorf("%w: Run no longer exists", errRunTerminalAssociation)
+		}
+		return err
+	}
+	if string(run.UID) != association.RunUID {
+		return errRunUIDConflict
+	}
+	if !runOwnsOrClaimsEnvironment(&run, knownEnvironment) || run.Status.EnvironmentRef == nil || string(run.Status.EnvironmentRef.Ownership) != association.EnvironmentOwnership {
+		return errRunTerminalAssociation
+	}
+	return nil
 }
 
 func (d KubernetesTerminalDialer) holdPolicyPollInterval() time.Duration {
@@ -346,6 +417,52 @@ func (s *Server) handleTerminal(w http.ResponseWriter, r *http.Request, namespac
 		writeAccessError(w, err)
 		return
 	}
+	s.serveTerminal(w, r, namespace, environment, func(ctx context.Context) (sandboxdv1.TerminalServiceClient, sandboxdv1.HealthServiceClient, io.Closer, error) {
+		return s.terminalDialer.DialTerminal(ctx, namespace, environment)
+	})
+}
+
+func (s *Server) handleRunTerminal(w http.ResponseWriter, r *http.Request, namespace, runName string) {
+	if s.access == nil {
+		writeAccessError(w, errUnauthenticated)
+		return
+	}
+	if err := s.access.Authorize(r, ResourceAccess{Namespace: namespace, Verb: "get", Resource: "runs", Name: runName}, true); err != nil {
+		writeAccessError(w, err)
+		return
+	}
+	expectedRunUID := strings.TrimSpace(r.Header.Get(RunUIDHeader))
+	expectedEnvironmentUID := strings.TrimSpace(r.Header.Get(EnvironmentUIDHeader))
+	if expectedRunUID == "" || expectedEnvironmentUID == "" || len(expectedRunUID) > 128 || len(expectedEnvironmentUID) > 128 {
+		writeProblem(w, http.StatusBadRequest, "terminal-identity-required", "Terminal identity required", "exact Run and Environment UIDs are required")
+		return
+	}
+	if s.resources == nil || s.terminalDialer == nil {
+		writeProblem(w, http.StatusServiceUnavailable, "terminal-gateway-unavailable", "Terminal gateway unavailable", "Run terminal resources are not configured")
+		return
+	}
+	association, err := s.resources.ResolveRunTerminal(r.Context(), namespace, runName, expectedRunUID, expectedEnvironmentUID)
+	if err != nil {
+		if errors.Is(err, errRunUIDConflict) || errors.Is(err, errRunTerminalAssociation) {
+			writeProblem(w, http.StatusConflict, "run-terminal-association-conflict", "Run terminal association changed", "the exact Run no longer owns or claims the exact Environment")
+			return
+		}
+		s.writeResourceError(w, "resolve Run terminal", namespace, runName, err)
+		return
+	}
+	// Preserve the existing exact Environment terminal authorization tuple.
+	if err := s.access.Authorize(r, ResourceAccess{Namespace: namespace, Verb: "get", Resource: "environments", Subresource: "terminal", Name: association.EnvironmentName}, true); err != nil {
+		writeAccessError(w, err)
+		return
+	}
+	s.serveTerminal(w, r, namespace, association.EnvironmentName, func(ctx context.Context) (sandboxdv1.TerminalServiceClient, sandboxdv1.HealthServiceClient, io.Closer, error) {
+		return s.terminalDialer.DialRunTerminal(ctx, namespace, association)
+	})
+}
+
+type terminalBackendDial func(context.Context) (sandboxdv1.TerminalServiceClient, sandboxdv1.HealthServiceClient, io.Closer, error)
+
+func (s *Server) serveTerminal(w http.ResponseWriter, r *http.Request, namespace, environment string, dial terminalBackendDial) {
 	if !websocket.IsWebSocketUpgrade(r) {
 		http.Error(w, "websocket upgrade is required", http.StatusBadRequest)
 		return
@@ -361,7 +478,7 @@ func (s *Server) handleTerminal(w http.ResponseWriter, r *http.Request, namespac
 	r, cancelStream := s.withStreamLifecycle(r)
 	defer cancelStream()
 
-	terminal, health, closer, err := s.terminalDialer.DialTerminal(r.Context(), namespace, environment)
+	terminal, health, closer, err := dial(r.Context())
 	if err != nil {
 		s.log.Warn("resolve terminal backend", "namespace", namespace, "environment", environment, "error", err)
 		http.Error(w, "environment terminal is unavailable", http.StatusBadGateway)

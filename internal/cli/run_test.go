@@ -12,6 +12,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Chris-Cullins/swe-platform/internal/controlplane"
+	"github.com/Chris-Cullins/swe-platform/internal/controlplaneclient"
 	"github.com/gorilla/websocket"
 	"github.com/spf13/cobra"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -90,6 +92,40 @@ func TestAttachTerminalUsesAuthenticatedGateway(t *testing.T) {
 	}
 	if output.String() != "terminal output" {
 		t.Fatalf("terminal output = %q", output.String())
+	}
+}
+
+func TestAttachRunTerminalCarriesExactAssociation(t *testing.T) {
+	serverErrors := make(chan error, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v1/namespaces/project-a/runs/run-1/terminal" || r.Header.Get("Authorization") != "Bearer terminal-token" ||
+			r.Header.Get(controlplane.RunUIDHeader) != "run-uid" || r.Header.Get(controlplane.EnvironmentUIDHeader) != "env-uid" {
+			serverErrors <- fmt.Errorf("gateway request identity = %s/%q/%q", r.URL.Path, r.Header.Get(controlplane.RunUIDHeader), r.Header.Get(controlplane.EnvironmentUIDHeader))
+			http.Error(w, "bad request", http.StatusBadRequest)
+			return
+		}
+		connection, err := (&websocket.Upgrader{}).Upgrade(w, r, nil)
+		if err != nil {
+			serverErrors <- err
+			return
+		}
+		defer connection.Close()
+		if _, _, err := connection.ReadMessage(); err != nil {
+			serverErrors <- err
+			return
+		}
+		serverErrors <- connection.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""), time.Now().Add(time.Second))
+	}))
+	defer server.Close()
+	client, err := controlplaneclient.New(server.URL, "terminal-token", server.Client())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := attachRunTerminalWithClient(context.Background(), client, "project-a", "run-1", "run-uid", "env-uid", strings.NewReader(""), io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-serverErrors; err != nil {
+		t.Fatal(err)
 	}
 }
 

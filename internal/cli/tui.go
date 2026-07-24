@@ -51,9 +51,10 @@ type tuiModel struct {
 	envInFlight      bool
 	mutationInFlight bool
 	mutationID       uint64
+	cancelIdentity   runIdentity
 	status           string
 	err              string
-	runs             []controlplane.Run
+	runs             []controlplane.RunSummary
 	cursor           int
 	run              *controlplane.Run
 	env              *controlplane.Environment
@@ -78,7 +79,7 @@ type runIdentity struct {
 }
 
 type runsLoadedMsg struct {
-	runs []controlplane.Run
+	runs []controlplane.RunSummary
 	err  error
 }
 
@@ -133,7 +134,7 @@ control-plane API. Credentials are used only for requests and are never shown.`,
 				return err
 			}
 			if check {
-				runs, err := client.ListRuns(cmd.Context(), namespace)
+				runs, err := client.ListRunSummaries(cmd.Context(), namespace)
 				if err != nil {
 					return fmt.Errorf("check terminal console API: %w", err)
 				}
@@ -263,10 +264,10 @@ func (m *tuiModel) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.identity != m.currentIdentity() || msg.identity != m.streamID || msg.generation != m.streamGeneration {
 			return m, nil
 		}
-		if msg.event.ID != "" && msg.event.ID == m.streamCursor {
+		if msg.event.Event != "transcript-gap" && msg.event.ID != "" && msg.event.ID == m.streamCursor {
 			return m, nil
 		}
-		if msg.event.ID != "" {
+		if msg.event.Event != "transcript-gap" && msg.event.ID != "" {
 			m.streamCursor = msg.event.ID
 		}
 		m.appendTranscript(formatTranscriptEvent(msg.event))
@@ -299,6 +300,7 @@ func (m *tuiModel) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.mutationInFlight = false
+		m.cancelIdentity = runIdentity{}
 		m.loading = false
 		if msg.err != nil {
 			m.err = safeError(msg.err)
@@ -340,9 +342,10 @@ func (m *tuiModel) handleKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.loading = true
 			m.mutationInFlight = true
 			m.mutationID++
-			return m, m.cancelRun(m.mutationID)
+			return m, m.cancelRun(m.cancelIdentity, m.mutationID)
 		case "n", "N", "esc":
 			m.mode = tuiDetail
+			m.cancelIdentity = runIdentity{}
 		}
 		return m, nil
 	}
@@ -385,14 +388,14 @@ func (m *tuiModel) handleKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 			}
 		case "enter":
 			if len(m.runs) != 0 {
-				run := m.runs[m.cursor]
-				m.run = &run
+				summary := m.runs[m.cursor]
+				m.run = &controlplane.Run{Name: summary.Name, UID: summary.UID}
 				m.mode = tuiDetail
 				m.loading = true
 				m.err, m.status = "", ""
 				m.streamBlocked = false
 				m.streamRecoveryCount = 0
-				return m, m.loadRun(run.Name)
+				return m, m.loadRun(summary.Name)
 			}
 		}
 		return m, nil
@@ -401,11 +404,12 @@ func (m *tuiModel) handleKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 		switch key.String() {
 		case "x":
 			if !isTerminalRun(m.run.State) && !m.run.CancelRequested {
+				m.cancelIdentity = m.currentIdentity()
 				m.mode = tuiConfirmCancel
 			}
 		case "t":
-			if m.run.Environment != nil {
-				command := &terminalExec{ctx: m.ctx, client: m.client, namespace: m.namespace, environment: m.run.Environment.Name}
+			if m.canAttachTerminal() {
+				command := &terminalExec{ctx: m.ctx, client: m.client, namespace: m.namespace, runName: m.run.Name, runUID: m.run.UID, environmentUID: m.run.Environment.UID}
 				return m, tea.Exec(command, func(err error) tea.Msg { return attachDoneMsg{err: err} })
 			}
 		}
@@ -505,7 +509,7 @@ func (m *tuiModel) renderList(body *strings.Builder, width int) {
 			environment = run.Environment.Name
 		}
 		age := shortAge(time.Since(run.CreatedAt))
-		line := fmt.Sprintf("%s%-22s %-14s %-14s %-8s %-20s %s", marker, safeText(run.Name), safeText(run.State), safeText(run.Intent.Agent), age, safeText(environment), safeText(promptPreview(run.Intent.Prompt)))
+		line := fmt.Sprintf("%s%-22s %-14s %-14s %-8s %-20s %s", marker, safeText(run.Name), safeText(run.State), safeText(run.Agent), age, safeText(environment), safeText(run.PromptPreview))
 		body.WriteString(truncate(line, width))
 		body.WriteByte('\n')
 	}
@@ -545,7 +549,11 @@ func (m *tuiModel) renderDetail(body *strings.Builder, width int) {
 		body.WriteString(truncate(line, width))
 		body.WriteByte('\n')
 	}
-	body.WriteString("Esc back • x cancel • t attach • c create • r refresh • q quit")
+	body.WriteString("Esc back • x cancel")
+	if m.canAttachTerminal() {
+		body.WriteString(" • t attach")
+	}
+	body.WriteString(" • c create • r refresh • q quit")
 }
 
 func (m *tuiModel) loadRuns() tea.Cmd {
@@ -554,7 +562,7 @@ func (m *tuiModel) loadRuns() tea.Cmd {
 	}
 	m.listInFlight = true
 	return func() tea.Msg {
-		runs, err := m.client.ListRuns(m.ctx, m.namespace)
+		runs, err := m.client.ListRunSummaries(m.ctx, m.namespace)
 		return runsLoadedMsg{runs: runs, err: err}
 	}
 }
@@ -627,10 +635,9 @@ func (m *tuiModel) createRun(request controlplane.CreateRunRequest, id uint64) t
 	}
 }
 
-func (m *tuiModel) cancelRun(id uint64) tea.Cmd {
-	name := m.run.Name
+func (m *tuiModel) cancelRun(identity runIdentity, id uint64) tea.Cmd {
 	return func() tea.Msg {
-		run, err := m.client.CancelRun(m.ctx, m.namespace, name)
+		run, err := m.client.CancelRun(m.ctx, identity.namespace, identity.name, identity.uid)
 		return mutationDoneMsg{run: run, id: id, err: err}
 	}
 }
@@ -689,6 +696,11 @@ func (m *tuiModel) currentIdentity() runIdentity {
 	return runIdentity{namespace: m.namespace, name: m.run.Name, uid: m.run.UID}
 }
 
+func (m *tuiModel) canAttachTerminal() bool {
+	return m.run != nil && m.run.TerminalAvailable && m.run.Environment != nil && m.run.Environment.UID != "" && m.env != nil &&
+		m.env.Name == m.run.Environment.Name && m.env.UID == m.run.Environment.UID
+}
+
 func (m *tuiModel) selectedRunName() string {
 	if len(m.runs) == 0 || m.cursor < 0 || m.cursor >= len(m.runs) {
 		return ""
@@ -709,18 +721,21 @@ func pollAfter() tea.Cmd {
 }
 
 type terminalExec struct {
-	ctx                    context.Context
-	client                 *controlplaneclient.Client
-	namespace, environment string
-	stdin                  io.Reader
-	stdout, stderr         io.Writer
+	ctx            context.Context
+	client         *controlplaneclient.Client
+	namespace      string
+	runName        string
+	runUID         string
+	environmentUID string
+	stdin          io.Reader
+	stdout, stderr io.Writer
 }
 
 func (c *terminalExec) SetStdin(reader io.Reader)  { c.stdin = reader }
 func (c *terminalExec) SetStdout(writer io.Writer) { c.stdout = writer }
 func (c *terminalExec) SetStderr(writer io.Writer) { c.stderr = writer }
 func (c *terminalExec) Run() error {
-	return attachTerminalWithClient(c.ctx, c.client, c.namespace, c.environment, c.stdin, c.stdout)
+	return attachRunTerminalWithClient(c.ctx, c.client, c.namespace, c.runName, c.runUID, c.environmentUID, c.stdin, c.stdout)
 }
 
 func formatTranscriptEvent(event controlplaneclient.SSEEvent) string {
@@ -778,10 +793,6 @@ func truncate(value string, width int) string {
 	return string([]rune(value)[:width-1]) + "…"
 }
 
-func promptPreview(value string) string {
-	return truncate(strings.Join(strings.Fields(safeText(value)), " "), 48)
-}
-
 func shortAge(age time.Duration) string {
 	if age < 0 {
 		age = 0
@@ -815,7 +826,7 @@ func isTerminalRun(state string) bool {
 	return state == "Succeeded" || state == "Failed" || state == "Cancelled"
 }
 
-func indexRun(runs []controlplane.Run, name string) int {
+func indexRun(runs []controlplane.RunSummary, name string) int {
 	for i := range runs {
 		if runs[i].Name == name {
 			return i

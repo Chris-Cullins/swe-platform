@@ -47,6 +47,7 @@ type RunIntent struct {
 // exposing infrastructure endpoints or implementation details.
 type RunEnvironment struct {
 	Name      string `json:"name"`
+	UID       string `json:"uid,omitempty"`
 	Ownership string `json:"ownership"`
 }
 
@@ -59,15 +60,16 @@ type RunUsage struct {
 
 // Run is the stable HTTP representation of a Run CRD.
 type Run struct {
-	Name            string          `json:"name"`
-	UID             string          `json:"uid"`
-	CreatedAt       time.Time       `json:"createdAt"`
-	Intent          RunIntent       `json:"intent"`
-	CancelRequested bool            `json:"cancelRequested"`
-	State           string          `json:"state"`
-	Environment     *RunEnvironment `json:"environment,omitempty"`
-	Branch          string          `json:"branch,omitempty"`
-	Usage           RunUsage        `json:"usage"`
+	Name              string          `json:"name"`
+	UID               string          `json:"uid"`
+	CreatedAt         time.Time       `json:"createdAt"`
+	Intent            RunIntent       `json:"intent"`
+	CancelRequested   bool            `json:"cancelRequested"`
+	State             string          `json:"state"`
+	Environment       *RunEnvironment `json:"environment,omitempty"`
+	TerminalAvailable bool            `json:"terminalAvailable,omitempty"`
+	Branch            string          `json:"branch,omitempty"`
+	Usage             RunUsage        `json:"usage"`
 }
 
 // RunList is a bounded page of Runs. Continue is opaque and may be supplied to
@@ -75,6 +77,41 @@ type Run struct {
 type RunList struct {
 	Items    []Run  `json:"items"`
 	Continue string `json:"continue,omitempty"`
+}
+
+// RunSummary is the bounded representation used by operations-console lists.
+// Full prompts remain available from the exact Run detail endpoint.
+type RunSummary struct {
+	Name            string          `json:"name"`
+	UID             string          `json:"uid"`
+	CreatedAt       time.Time       `json:"createdAt"`
+	Agent           string          `json:"agent"`
+	PromptPreview   string          `json:"promptPreview"`
+	CancelRequested bool            `json:"cancelRequested"`
+	State           string          `json:"state"`
+	Environment     *RunEnvironment `json:"environment,omitempty"`
+}
+
+// RunSummaryList is a bounded page of Run list summaries.
+type RunSummaryList struct {
+	Items    []RunSummary `json:"items"`
+	Continue string       `json:"continue,omitempty"`
+}
+
+// CancelRunRequest optionally fences cancellation to one immutable Run.
+// An empty request remains supported for existing browser clients.
+type CancelRunRequest struct {
+	RunUID string `json:"runUID,omitempty"`
+}
+
+// RunTerminalAssociation is the exact server-validated Run-to-Environment
+// relationship required by the Run-scoped terminal gateway.
+type RunTerminalAssociation struct {
+	RunName              string
+	RunUID               string
+	EnvironmentName      string
+	EnvironmentUID       string
+	EnvironmentOwnership string
 }
 
 // EnvironmentClaim identifies the Run holding a reusable Environment. The UID

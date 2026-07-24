@@ -12,21 +12,32 @@ import (
 	"github.com/Chris-Cullins/swe-platform/internal/controlplane"
 )
 
-const maxRunListPages = 100
+const (
+	maxRunListPages = 100
+	// A server page has at most 200 summaries; every caller-controlled field is
+	// length-bounded and each prompt preview has at most 160 runes. This leaves
+	// ample room for JSON's worst-case escaping without accepting unbounded data.
+	maxRunSummaryResponse = 2 << 20
+	// Create accepts at most 1 MiB of JSON. Go's HTML-safe response encoding can
+	// expand one-byte prompt characters sixfold, so exact resources need more
+	// than 6 MiB while remaining bounded.
+	maxExactResourceResponse = 8 << 20
+)
 
-// ListRuns returns every Run in a namespace using bounded API pagination.
-func (c *Client) ListRuns(ctx context.Context, namespace string) ([]controlplane.Run, error) {
-	items := make([]controlplane.Run, 0)
+// ListRunSummaries returns every bounded Run summary in a namespace using
+// bounded API pagination. Full prompts are fetched only from exact Run detail.
+func (c *Client) ListRunSummaries(ctx context.Context, namespace string) ([]controlplane.RunSummary, error) {
+	items := make([]controlplane.RunSummary, 0)
 	seen := make(map[string]struct{})
 	continuation := ""
 	for pageNumber := 0; pageNumber < maxRunListPages; pageNumber++ {
 		endpoint := c.Endpoint("api", "v1", "namespaces", namespace, "runs")
-		query := url.Values{"limit": {"200"}}
+		query := url.Values{"limit": {"200"}, "view": {"summary"}}
 		if continuation != "" {
 			query.Set("continue", continuation)
 		}
-		var page controlplane.RunList
-		if err := c.getJSON(ctx, endpoint+"?"+query.Encode(), &page); err != nil {
+		var page controlplane.RunSummaryList
+		if err := c.getJSONLimit(ctx, endpoint+"?"+query.Encode(), &page, maxRunSummaryResponse); err != nil {
 			return nil, err
 		}
 		items = append(items, page.Items...)
@@ -58,9 +69,13 @@ func (c *Client) CreateRun(ctx context.Context, namespace string, value controlp
 }
 
 // CancelRun requests idempotent cancellation of an exact namespaced Run.
-func (c *Client) CancelRun(ctx context.Context, namespace, name string) (controlplane.Run, error) {
+func (c *Client) CancelRun(ctx context.Context, namespace, name, expectedUID string) (controlplane.Run, error) {
 	var run controlplane.Run
-	err := c.sendJSON(ctx, http.MethodPost, c.Endpoint("api", "v1", "namespaces", namespace, "runs", name, "cancel"), nil, &run)
+	var body any
+	if expectedUID != "" {
+		body = controlplane.CancelRunRequest{RunUID: expectedUID}
+	}
+	err := c.sendJSON(ctx, http.MethodPost, c.Endpoint("api", "v1", "namespaces", namespace, "runs", name, "cancel"), body, &run)
 	return run, err
 }
 
@@ -72,6 +87,10 @@ func (c *Client) GetEnvironment(ctx context.Context, namespace, name string) (co
 }
 
 func (c *Client) getJSON(ctx context.Context, endpoint string, destination any) error {
+	return c.getJSONLimit(ctx, endpoint, destination, maxExactResourceResponse)
+}
+
+func (c *Client) getJSONLimit(ctx context.Context, endpoint string, destination any, limit int64) error {
 	request, err := c.NewRequest(ctx, http.MethodGet, endpoint, nil)
 	if err != nil {
 		return err
@@ -82,7 +101,7 @@ func (c *Client) getJSON(ctx context.Context, endpoint string, destination any) 
 		return err
 	}
 	defer response.Body.Close()
-	return decodeJSON(response.Body, destination)
+	return decodeJSON(response.Body, destination, limit)
 }
 
 func (c *Client) sendJSON(ctx context.Context, method, endpoint string, value, destination any) error {
@@ -107,11 +126,11 @@ func (c *Client) sendJSON(ctx context.Context, method, endpoint string, value, d
 		return err
 	}
 	defer response.Body.Close()
-	return decodeJSON(response.Body, destination)
+	return decodeJSON(response.Body, destination, maxExactResourceResponse)
 }
 
-func decodeJSON(reader io.Reader, destination any) error {
-	decoder := json.NewDecoder(io.LimitReader(reader, 2<<20))
+func decodeJSON(reader io.Reader, destination any, limit int64) error {
+	decoder := json.NewDecoder(io.LimitReader(reader, limit))
 	if err := decoder.Decode(destination); err != nil {
 		return fmt.Errorf("decode control-plane response: %w", err)
 	}

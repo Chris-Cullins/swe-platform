@@ -5,12 +5,14 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"os/signal"
 	"strings"
 	"syscall"
 	"time"
 
+	"github.com/Chris-Cullins/swe-platform/internal/controlplane"
 	"github.com/Chris-Cullins/swe-platform/internal/controlplaneclient"
 	"github.com/gorilla/websocket"
 	"github.com/muesli/cancelreader"
@@ -49,7 +51,22 @@ func attachTerminalWithClient(ctx context.Context, client *controlplaneclient.Cl
 		return err
 	}
 	endpoint := client.WebSocketEndpoint("api", "v1", "namespaces", namespace, "environments", environment, "terminal")
-	connection, response, err := websocket.DefaultDialer.DialContext(ctx, endpoint, client.AuthorizationHeader())
+	return dialAndBridgeTerminal(ctx, endpoint, client.AuthorizationHeader(), input, output)
+}
+
+func attachRunTerminalWithClient(ctx context.Context, client *controlplaneclient.Client, namespace, runName, runUID, environmentUID string, input io.Reader, output io.Writer) error {
+	if err := validateTerminalInput(input); err != nil {
+		return err
+	}
+	endpoint := client.WebSocketEndpoint("api", "v1", "namespaces", namespace, "runs", runName, "terminal")
+	header := client.AuthorizationHeader()
+	header.Set(controlplane.RunUIDHeader, runUID)
+	header.Set(controlplane.EnvironmentUIDHeader, environmentUID)
+	return dialAndBridgeTerminal(ctx, endpoint, header, input, output)
+}
+
+func dialAndBridgeTerminal(ctx context.Context, endpoint string, header http.Header, input io.Reader, output io.Writer) error {
+	connection, response, err := websocket.DefaultDialer.DialContext(ctx, endpoint, header)
 	if err != nil {
 		if response != nil {
 			return fmt.Errorf("connect to environment terminal: control plane returned %s", response.Status)

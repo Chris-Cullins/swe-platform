@@ -391,7 +391,7 @@ func TestTerminalHeartbeatRecoversAfterTransientGetFailure(t *testing.T) {
 	dialer := KubernetesTerminalDialer{Client: transient}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go dialer.heartbeatActivity(ctx, client.ObjectKeyFromObject(environment), environment.UID, 0, 5*time.Millisecond, func() {})
+	go dialer.heartbeatActivity(ctx, client.ObjectKeyFromObject(environment), environment.UID, 0, 5*time.Millisecond, nil, func() {})
 
 	deadline := time.Now().Add(time.Second)
 	for time.Now().Before(deadline) {
@@ -423,7 +423,7 @@ func TestTerminalHeartbeatAdoptsNewerDisabledHoldRevision(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	revoked := atomic.Bool{}
-	go dialer.heartbeatActivity(ctx, client.ObjectKeyFromObject(environment), environment.UID, 1, 20*time.Millisecond, func() { revoked.Store(true) })
+	go dialer.heartbeatActivity(ctx, client.ObjectKeyFromObject(environment), environment.UID, 1, 20*time.Millisecond, nil, func() { revoked.Store(true) })
 
 	var updated platformv1alpha1.Environment
 	if err := kubeClient.Get(context.Background(), client.ObjectKeyFromObject(environment), &updated); err != nil {
@@ -460,7 +460,7 @@ func TestTerminalHeartbeatRevokesConnectionWhenHoldEnabled(t *testing.T) {
 	if !lease.attach(closeFunc(func() error { close(closed); return nil })) {
 		t.Fatal("failed to attach test terminal connection")
 	}
-	go dialer.heartbeatActivity(ctx, client.ObjectKeyFromObject(environment), environment.UID, 1, time.Hour, func() { _ = lease.Close() })
+	go dialer.heartbeatActivity(ctx, client.ObjectKeyFromObject(environment), environment.UID, 1, time.Hour, nil, func() { _ = lease.Close() })
 
 	var updated platformv1alpha1.Environment
 	if err := kubeClient.Get(context.Background(), client.ObjectKeyFromObject(environment), &updated); err != nil {
@@ -498,7 +498,7 @@ func TestTerminalPolicyPollRetriesTransientFailuresAndRevokesRecoveredHold(t *te
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	closed := make(chan struct{})
-	go dialer.heartbeatActivity(ctx, client.ObjectKeyFromObject(environment), environment.UID, 1, time.Hour, func() { close(closed) })
+	go dialer.heartbeatActivity(ctx, client.ObjectKeyFromObject(environment), environment.UID, 1, time.Hour, nil, func() { close(closed) })
 
 	for range 2 {
 		select {
@@ -542,7 +542,7 @@ func TestTerminalHeartbeatRevokesConnectionForReplacementUID(t *testing.T) {
 	if !lease.attach(closeFunc(func() error { close(closed); return nil })) {
 		t.Fatal("failed to attach test terminal connection")
 	}
-	go dialer.heartbeatActivity(ctx, client.ObjectKeyFromObject(environment), environment.UID, 0, time.Hour, func() { _ = lease.Close() })
+	go dialer.heartbeatActivity(ctx, client.ObjectKeyFromObject(environment), environment.UID, 0, time.Hour, nil, func() { _ = lease.Close() })
 
 	if err := kubeClient.Delete(context.Background(), environment); err != nil {
 		t.Fatal(err)
@@ -562,6 +562,93 @@ func TestTerminalHeartbeatRevokesConnectionForReplacementUID(t *testing.T) {
 	}
 	if requests := lifecycle.ActivityRequests(&retained); len(requests) != 0 {
 		t.Fatalf("replacement received stale terminal activity: %#v", requests)
+	}
+}
+
+func TestResolveRunTerminalRequiresExactCurrentAssociation(t *testing.T) {
+	controller := true
+	newObjects := func() (*platformv1alpha1.Run, *platformv1alpha1.Environment) {
+		run := &platformv1alpha1.Run{
+			ObjectMeta: metav1.ObjectMeta{Name: "run", Namespace: "ns", UID: "run-uid"},
+			Status:     platformv1alpha1.RunStatus{EnvironmentRef: &platformv1alpha1.RunEnvironmentReference{Name: "env", UID: "env-uid", Ownership: platformv1alpha1.EnvironmentOwnershipClaimed}},
+		}
+		environment := &platformv1alpha1.Environment{
+			ObjectMeta: metav1.ObjectMeta{Name: "env", Namespace: "ns", UID: "env-uid"},
+			Status:     platformv1alpha1.EnvironmentStatus{ClaimedBy: &platformv1alpha1.RunReference{Name: "run", UID: "run-uid"}},
+		}
+		return run, environment
+	}
+	for _, test := range []struct {
+		name           string
+		runUID         string
+		environmentUID string
+		mutate         func(*platformv1alpha1.Run, *platformv1alpha1.Environment)
+		want           error
+	}{
+		{name: "exact claimed", runUID: "run-uid", environmentUID: "env-uid"},
+		{name: "same-name Run replacement", runUID: "old-run-uid", environmentUID: "env-uid", want: errRunUIDConflict},
+		{name: "same-name Environment replacement", runUID: "run-uid", environmentUID: "old-env-uid", want: errRunTerminalAssociation},
+		{name: "Run retains replaced Environment UID", runUID: "run-uid", environmentUID: "env-uid", mutate: func(r *platformv1alpha1.Run, _ *platformv1alpha1.Environment) {
+			r.Status.EnvironmentRef.UID = "old-env-uid"
+		}, want: errRunTerminalAssociation},
+		{name: "released claim", runUID: "run-uid", environmentUID: "env-uid", mutate: func(_ *platformv1alpha1.Run, e *platformv1alpha1.Environment) { e.Status.ClaimedBy = nil }, want: errRunTerminalAssociation},
+		{name: "reclaimed by another Run", runUID: "run-uid", environmentUID: "env-uid", mutate: func(_ *platformv1alpha1.Run, e *platformv1alpha1.Environment) {
+			e.Status.ClaimedBy = &platformv1alpha1.RunReference{Name: "other", UID: "other-uid"}
+		}, want: errRunTerminalAssociation},
+		{name: "foreign owner", runUID: "run-uid", environmentUID: "env-uid", mutate: func(r *platformv1alpha1.Run, e *platformv1alpha1.Environment) {
+			r.Status.EnvironmentRef.Ownership = platformv1alpha1.EnvironmentOwnershipOwned
+			e.Status.ClaimedBy = nil
+			e.OwnerReferences = []metav1.OwnerReference{{APIVersion: platformv1alpha1.GroupVersion.String(), Kind: "Run", Name: "other", UID: "other-uid", Controller: &controller}}
+		}, want: errRunTerminalAssociation},
+		{name: "exact owned", runUID: "run-uid", environmentUID: "env-uid", mutate: func(r *platformv1alpha1.Run, e *platformv1alpha1.Environment) {
+			r.Status.EnvironmentRef.Ownership = platformv1alpha1.EnvironmentOwnershipOwned
+			e.Status.ClaimedBy = nil
+			e.OwnerReferences = []metav1.OwnerReference{{APIVersion: platformv1alpha1.GroupVersion.String(), Kind: "Run", Name: "run", UID: "run-uid", Controller: &controller}}
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			run, environment := newObjects()
+			if test.mutate != nil {
+				test.mutate(run, environment)
+			}
+			service := &KubernetesResourceService{Client: fake.NewClientBuilder().WithScheme(resourceScheme(t)).WithObjects(run, environment).Build()}
+			association, err := service.ResolveRunTerminal(context.Background(), "ns", "run", test.runUID, test.environmentUID)
+			if !errors.Is(err, test.want) || (test.want == nil && (err != nil || association.RunUID != "run-uid" || association.EnvironmentUID != "env-uid")) {
+				t.Fatalf("association = %#v, error = %v, want %v", association, err, test.want)
+			}
+		})
+	}
+}
+
+func TestRunTerminalHeartbeatRevokesAfterAssociationLoss(t *testing.T) {
+	run := &platformv1alpha1.Run{
+		ObjectMeta: metav1.ObjectMeta{Name: "run", Namespace: "ns", UID: "run-uid"},
+		Status:     platformv1alpha1.RunStatus{EnvironmentRef: &platformv1alpha1.RunEnvironmentReference{Name: "env", UID: "env-uid", Ownership: platformv1alpha1.EnvironmentOwnershipClaimed}},
+	}
+	environment := &platformv1alpha1.Environment{
+		ObjectMeta: metav1.ObjectMeta{Name: "env", Namespace: "ns", UID: "env-uid"},
+		Status:     platformv1alpha1.EnvironmentStatus{ClaimedBy: &platformv1alpha1.RunReference{Name: "run", UID: "run-uid"}},
+	}
+	kubeClient := fake.NewClientBuilder().WithScheme(resourceScheme(t)).WithStatusSubresource(environment, run).WithObjects(run, environment).Build()
+	dialer := KubernetesTerminalDialer{Client: kubeClient, policyPollInterval: time.Millisecond}
+	association := &RunTerminalAssociation{RunName: "run", RunUID: "run-uid", EnvironmentName: "env", EnvironmentUID: "env-uid", EnvironmentOwnership: string(platformv1alpha1.EnvironmentOwnershipClaimed)}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	revoked := make(chan struct{})
+	go dialer.heartbeatActivity(ctx, client.ObjectKeyFromObject(environment), environment.UID, 0, time.Hour, association, func() { close(revoked) })
+
+	var updated platformv1alpha1.Environment
+	if err := kubeClient.Get(context.Background(), client.ObjectKeyFromObject(environment), &updated); err != nil {
+		t.Fatal(err)
+	}
+	updated.Status.ClaimedBy = &platformv1alpha1.RunReference{Name: "other", UID: "other-uid"}
+	if err := kubeClient.Status().Update(context.Background(), &updated); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-revoked:
+	case <-time.After(time.Second):
+		t.Fatal("association loss did not revoke active Run terminal")
 	}
 }
 
@@ -1141,6 +1228,10 @@ func (d *terminalTestDialer) DialTerminal(_ context.Context, namespace, environm
 		closer = io.NopCloser(strings.NewReader(""))
 	}
 	return d.client, health, closer, nil
+}
+
+func (d *terminalTestDialer) DialRunTerminal(ctx context.Context, namespace string, association RunTerminalAssociation) (sandboxdv1.TerminalServiceClient, sandboxdv1.HealthServiceClient, io.Closer, error) {
+	return d.DialTerminal(ctx, namespace, association.EnvironmentName)
 }
 
 type terminalTestServer struct {

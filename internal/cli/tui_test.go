@@ -24,8 +24,8 @@ func TestTUIModelListDetailCancelAndFreeFormCreate(t *testing.T) {
 		Name: "run-one", UID: "uid-one", State: "Running", CreatedAt: time.Now(),
 		Intent: controlplane.RunIntent{Agent: "agent-added-next-year", Prompt: "do work", Selector: controlplane.RunSelector{Template: "small"}},
 	}
-	_, _ = model.Update(runsLoadedMsg{runs: []controlplane.Run{run}})
-	if len(model.runs) != 1 || model.runs[0].Intent.Agent != "agent-added-next-year" {
+	_, _ = model.Update(runsLoadedMsg{runs: []controlplane.RunSummary{{Name: run.Name, UID: run.UID, Agent: run.Intent.Agent, PromptPreview: run.Intent.Prompt, State: run.State}}})
+	if len(model.runs) != 1 || model.runs[0].Agent != "agent-added-next-year" {
 		t.Fatalf("runs = %#v", model.runs)
 	}
 	_, command := model.Update(keyMessage("enter"))
@@ -156,6 +156,45 @@ func TestTUIResumesAtServerCursorAndMakesRetentionLossVisible(t *testing.T) {
 		t.Fatalf("poll restarted blocked recovery: cancel %v, command %v", model.streamCancel, pollRestart)
 	}
 	model.stopStream()
+}
+
+func TestTUIRendersGapAtCurrentCursorWithoutAdvancingIt(t *testing.T) {
+	model := newTUIModel(context.Background(), nil, "team-a")
+	identity := runIdentity{namespace: "team-a", name: "run", uid: "uid"}
+	model.mode, model.run, model.streamID = tuiDetail, &controlplane.Run{Name: "run", UID: "uid"}, identity
+	model.streamCursor = "cursor"
+	_, _ = model.Update(transcriptMsg{identity: identity, generation: model.streamGeneration, event: controlplaneclient.SSEEvent{ID: "cursor", Event: "transcript-gap", Data: []byte(`{"dropped":2}`)}})
+	if model.streamCursor != "cursor" || len(model.transcript) != 1 || !strings.Contains(model.transcript[0], "TRANSCRIPT GAP") {
+		t.Fatalf("cursor/transcript = %q/%#v", model.streamCursor, model.transcript)
+	}
+}
+
+func TestTUIConfirmationCapturesImmutableRunUID(t *testing.T) {
+	model := newTUIModel(context.Background(), nil, "team-a")
+	model.mode = tuiDetail
+	model.run = &controlplane.Run{Name: "same", UID: "old", State: "Running"}
+	_, _ = model.Update(keyMessage("x"))
+	model.run = &controlplane.Run{Name: "same", UID: "replacement", State: "Running"}
+	if model.cancelIdentity != (runIdentity{namespace: "team-a", name: "same", uid: "old"}) {
+		t.Fatalf("captured identity = %#v", model.cancelIdentity)
+	}
+	_, command := model.Update(keyMessage("y"))
+	if command == nil || model.cancelIdentity.uid != "old" {
+		t.Fatalf("confirmation command/identity = %v/%#v", command, model.cancelIdentity)
+	}
+}
+
+func TestTUIAdvertisesTerminalOnlyForExactEnvironmentIncarnation(t *testing.T) {
+	model := newTUIModel(context.Background(), nil, "team-a")
+	model.run = &controlplane.Run{Name: "run", UID: "run-uid", TerminalAvailable: true, Environment: &controlplane.RunEnvironment{Name: "env", UID: "env-uid"}}
+	model.env = &controlplane.Environment{Name: "env", UID: "replacement-uid"}
+	if model.canAttachTerminal() {
+		t.Fatal("replacement Environment was attachable")
+	}
+	model.env.UID = "env-uid"
+	if !model.canAttachTerminal() {
+		t.Fatal("exact Environment association was not attachable")
+	}
 }
 
 func TestTUITranscriptStreamStopsWithContext(t *testing.T) {

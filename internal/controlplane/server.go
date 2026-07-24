@@ -175,6 +175,10 @@ func (s *Server) handleNamespacedAPI(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
+	if resource == "runs" && name != "" && subresource == "terminal" && r.Method == http.MethodGet {
+		s.handleRunTerminal(w, r, namespace, name)
+		return
+	}
 	if resource == "environments" && name != "" && subresource == "" {
 		if r.Method == http.MethodGet {
 			s.handleGetEnvironment(w, r, namespace, name)
