@@ -56,6 +56,16 @@ non-empty values and fences any existing Environment execution rather than runni
 unenforced allowlist. Empty or omitted allowlists do not restrict environment egress, which is
 subject to the cluster's network configuration.
 
+When an EnvironmentTemplate explicitly names a RuntimeClass, the operator verifies that the
+cluster-scoped RuntimeClass object exists before execution and fences exact-owned execution if
+it is removed or replaced under the same name. Environment pods pin the RuntimeClass UID; the
+first operator upgrade containing this check therefore replaces legacy pods using named
+RuntimeClasses while retaining their workspace PVCs. This is a fail-closed prerequisite check,
+not runtime capability discovery: it does not verify the configured handler, eligible-node
+installation, or the isolation properties of that runtime. The chart does not own provider
+RuntimeClasses; cluster operators must install and test them separately. An omitted RuntimeClass
+intentionally uses the cluster default runtime.
+
 ### Credential lifecycle
 
 1. **Bootstrap:** before creating a pod, the operator generates a new certificate, private key,

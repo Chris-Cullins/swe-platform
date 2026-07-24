@@ -21,6 +21,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
+	nodev1 "k8s.io/api/node/v1"
 	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	"k8s.io/apimachinery/pkg/api/errors"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
@@ -51,16 +52,18 @@ var sizePresets = map[string]corev1.ResourceList{
 }
 
 const (
-	defaultDiskSize    = "40Gi"
-	defaultIdleTimeout = 15 * time.Minute
-	projectHookTimeout = "30m"
-	hookKillAfter      = "5s"
-	podRecoveryLimit   = int32(3)
-	podRecoveryDelay   = 5 * time.Second
-	templateRefField   = "spec.templateRef"
-	projectRefField    = "spec.projectRef"
-	warmPoolLabel      = "swe.dev/warm-pool"
-	projectAnnotation  = "swe.dev/project"
+	defaultDiskSize           = "40Gi"
+	defaultIdleTimeout        = 15 * time.Minute
+	projectHookTimeout        = "30m"
+	hookKillAfter             = "5s"
+	podRecoveryLimit          = int32(3)
+	podRecoveryDelay          = 5 * time.Second
+	templateRefField          = "spec.templateRef"
+	projectRefField           = "spec.projectRef"
+	runtimeClassField         = "spec.runtimeClass"
+	warmPoolLabel             = "swe.dev/warm-pool"
+	projectAnnotation         = "swe.dev/project"
+	runtimeClassUIDAnnotation = "swe.dev/runtime-class-uid"
 )
 
 var (
@@ -145,6 +148,7 @@ type EnvironmentReconciler struct {
 // +kubebuilder:rbac:groups="",resources=persistentvolumeclaims,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=secrets,verbs=get;create;update;delete
 // +kubebuilder:rbac:groups=networking.k8s.io,resources=networkpolicies,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=node.k8s.io,resources=runtimeclasses,verbs=get;list;watch
 
 // Reconcile drives an Environment toward its desired state:
 // pod + PVC present when active, pod deleted (PVC retained) when paused.
@@ -249,6 +253,28 @@ func (r *EnvironmentReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	if backend != platformv1alpha1.EnvironmentBackendPod {
 		return r.reconcileUnsupportedBackend(ctx, &env, backend)
 	}
+	runtimeClassUID := types.UID("")
+	if tmpl.Spec.RuntimeClass != "" {
+		var runtimeClass nodev1.RuntimeClass
+		if err := r.Get(ctx, types.NamespacedName{Name: tmpl.Spec.RuntimeClass}, &runtimeClass); err != nil {
+			wrapped := fmt.Errorf("get RuntimeClass %q required by template %q: %w", tmpl.Spec.RuntimeClass, tmpl.Name, err)
+			if errors.IsNotFound(err) {
+				return r.reconcileInvalidProvisioningConfiguration(ctx, &env, wrapped.Error())
+			}
+			return ctrl.Result{}, r.fail(ctx, &env, wrapped)
+		}
+		runtimeClassUID = runtimeClass.UID
+		var pod corev1.Pod
+		if err := r.Get(ctx, types.NamespacedName{Namespace: env.Namespace, Name: envPodName(&env)}, &pod); err == nil {
+			if exactControllerOwner(&pod, platformv1alpha1.GroupVersion.String(), "Environment", env.Name, env.UID) &&
+				pod.Annotations[runtimeClassUIDAnnotation] != string(runtimeClassUID) {
+				message := fmt.Sprintf("environment pod RuntimeClass %q incarnation does not match the current RuntimeClass; execution must be replaced", tmpl.Spec.RuntimeClass)
+				return r.reconcileInvalidProvisioningConfiguration(ctx, &env, message)
+			}
+		} else if !errors.IsNotFound(err) {
+			return ctrl.Result{}, r.fail(ctx, &env, fmt.Errorf("get environment pod before RuntimeClass validation: %w", err))
+		}
+	}
 
 	pvcReady, err := r.ensureWorkspacePVC(ctx, &env, &tmpl)
 	if err != nil {
@@ -271,7 +297,7 @@ func (r *EnvironmentReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		return ctrl.Result{Requeue: true}, r.setPhase(ctx, &env, platformv1alpha1.EnvironmentPhaseResuming, "", "")
 	}
 
-	pod, err := r.ensurePodForProject(ctx, &env, &tmpl, project)
+	pod, err := r.ensurePodForProject(ctx, &env, &tmpl, project, runtimeClassUID)
 	if stderrors.Is(err, errPodReplacing) {
 		return ctrl.Result{Requeue: true}, nil
 	}
@@ -917,7 +943,15 @@ func (r *EnvironmentReconciler) ensurePod(ctx context.Context, env *platformv1al
 	if err := validateEnvironmentProject(project); err != nil {
 		return nil, err
 	}
-	return r.ensurePodForProject(ctx, env, tmpl, project)
+	runtimeClassUID := types.UID("")
+	if tmpl.Spec.RuntimeClass != "" {
+		var runtimeClass nodev1.RuntimeClass
+		if err := r.Get(ctx, types.NamespacedName{Name: tmpl.Spec.RuntimeClass}, &runtimeClass); err != nil {
+			return nil, err
+		}
+		runtimeClassUID = runtimeClass.UID
+	}
+	return r.ensurePodForProject(ctx, env, tmpl, project, runtimeClassUID)
 }
 
 func (r *EnvironmentReconciler) resolveEnvironmentProject(ctx context.Context, env *platformv1alpha1.Environment) (*platformv1alpha1.Project, error) {
@@ -946,7 +980,7 @@ func unsupportedEgressAllowlistMessage(projectName string) string {
 	return fmt.Sprintf("project %q has a non-empty egressAllowlist, which is unsupported until GitHub issue #68 is implemented", projectName)
 }
 
-func (r *EnvironmentReconciler) ensurePodForProject(ctx context.Context, env *platformv1alpha1.Environment, tmpl *platformv1alpha1.EnvironmentTemplate, project *platformv1alpha1.Project) (*corev1.Pod, error) {
+func (r *EnvironmentReconciler) ensurePodForProject(ctx context.Context, env *platformv1alpha1.Environment, tmpl *platformv1alpha1.EnvironmentTemplate, project *platformv1alpha1.Project, runtimeClassUID types.UID) (*corev1.Pod, error) {
 	podName := envPodName(env)
 	var pod corev1.Pod
 	err := r.Get(ctx, types.NamespacedName{Namespace: env.Namespace, Name: podName}, &pod)
@@ -1122,6 +1156,7 @@ func (r *EnvironmentReconciler) ensurePodForProject(ctx context.Context, env *pl
 	}
 	if tmpl.Spec.RuntimeClass != "" {
 		pod.Spec.RuntimeClassName = &tmpl.Spec.RuntimeClass
+		pod.Annotations[runtimeClassUIDAnnotation] = string(runtimeClassUID)
 	}
 	if project != nil {
 		repository := project.Spec.Repositories[0]
@@ -1779,6 +1814,14 @@ func environmentProjectRefIndex(object client.Object) []string {
 	return []string{environment.Spec.ProjectRef}
 }
 
+func templateRuntimeClassIndex(object client.Object) []string {
+	template := object.(*platformv1alpha1.EnvironmentTemplate)
+	if template.Spec.RuntimeClass == "" {
+		return nil
+	}
+	return []string{template.Spec.RuntimeClass}
+}
+
 func (r *EnvironmentReconciler) environmentReferenceRequests(ctx context.Context, namespace, field, name string) []reconcile.Request {
 	var environments platformv1alpha1.EnvironmentList
 	if err := r.List(ctx, &environments, client.InNamespace(namespace), client.MatchingFields{field: name}); err != nil {
@@ -1792,6 +1835,20 @@ func (r *EnvironmentReconciler) environmentReferenceRequests(ctx context.Context
 	return requests
 }
 
+func (r *EnvironmentReconciler) runtimeClassReferenceRequests(ctx context.Context, name string) []reconcile.Request {
+	var templates platformv1alpha1.EnvironmentTemplateList
+	if err := r.List(ctx, &templates, client.MatchingFields{runtimeClassField: name}); err != nil {
+		log.FromContext(ctx).Error(err, "list templates for RuntimeClass", "runtimeClass", name)
+		return nil
+	}
+	var requests []reconcile.Request
+	for i := range templates.Items {
+		template := &templates.Items[i]
+		requests = append(requests, r.environmentReferenceRequests(ctx, template.Namespace, templateRefField, template.Name)...)
+	}
+	return requests
+}
+
 // SetupWithManager registers the controller with the manager.
 func (r *EnvironmentReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	if err := mgr.GetFieldIndexer().IndexField(context.Background(), &platformv1alpha1.Environment{}, templateRefField, environmentTemplateRefIndex); err != nil {
@@ -1799,6 +1856,9 @@ func (r *EnvironmentReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	}
 	if err := mgr.GetFieldIndexer().IndexField(context.Background(), &platformv1alpha1.Environment{}, projectRefField, environmentProjectRefIndex); err != nil {
 		return fmt.Errorf("index environments by project: %w", err)
+	}
+	if err := mgr.GetFieldIndexer().IndexField(context.Background(), &platformv1alpha1.EnvironmentTemplate{}, runtimeClassField, templateRuntimeClassIndex); err != nil {
+		return fmt.Errorf("index templates by RuntimeClass: %w", err)
 	}
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&platformv1alpha1.Environment{}).
@@ -1817,6 +1877,9 @@ func (r *EnvironmentReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		})).
 		Watches(&platformv1alpha1.Project{}, handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, object client.Object) []reconcile.Request {
 			return r.environmentReferenceRequests(ctx, object.GetNamespace(), projectRefField, object.GetName())
+		})).
+		Watches(&nodev1.RuntimeClass{}, handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, object client.Object) []reconcile.Request {
+			return r.runtimeClassReferenceRequests(ctx, object.GetName())
 		})).
 		Complete(r)
 }
