@@ -280,9 +280,12 @@ immutable Run UID so a same-name replacement Run's transcript cannot be removed.
 
 ### Backup and restore
 
-The PostgreSQL transcript database is the only stateful component that requires backup.
-Environment workspace PVCs survive pause/resume but are per-environment ephemeral disks,
-not backup targets. CRDs are infrastructure state that Helm reapplies on install or upgrade.
+The PostgreSQL transcript database is the only component requiring backup for transcript
+durability. Environment workspace PVCs survive pause/resume but are per-environment ephemeral
+disks, not backup targets. Helm reapplies CRD definitions and chart-owned EnvironmentTemplate
+resources on install or upgrade, but user-created Project, Run, and Environment instances are
+Kubernetes objects that would be lost in a cluster-loss scenario; back them up separately if
+full disaster recovery is required.
 
 Back up the database before every upgrade using your PostgreSQL provider's backup mechanism
 (`pg_dump`, managed-service snapshots, or equivalent). To restore, point the same connection
@@ -320,6 +323,7 @@ Validate every production preset before installation. The chart's CI runs the sa
 reproducing them locally confirms that the preset renders against the current chart version:
 
 ```sh
+set -e
 for preset in k3s gke eks; do
   helm lint ./charts/swe-platform --values "./charts/swe-platform/values-${preset}.yaml"
   helm template swe-platform ./charts/swe-platform \
