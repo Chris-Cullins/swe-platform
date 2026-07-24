@@ -1593,6 +1593,299 @@ func TestProjectRepositoryValidationIsTerminal(t *testing.T) {
 	}
 }
 
+func TestReconcileRejectsUnsupportedEgressAllowlistBeforeCreatingChildren(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	if err := networkingv1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	if err := platformv1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	project := &platformv1alpha1.Project{
+		ObjectMeta: metav1.ObjectMeta{Name: "project", Namespace: "default"},
+		Spec: platformv1alpha1.ProjectSpec{
+			Repositories:    []string{"https://github.com/example/repo"},
+			EgressAllowlist: []string{"github.com"},
+		},
+	}
+	env := &platformv1alpha1.Environment{
+		ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default", UID: "environment-uid", Generation: 1, Finalizers: []string{environmentFinalizer}},
+		Spec:       platformv1alpha1.EnvironmentSpec{TemplateRef: "small", ProjectRef: project.Name},
+	}
+	template := &platformv1alpha1.EnvironmentTemplate{ObjectMeta: metav1.ObjectMeta{Name: "small", Namespace: "default"}}
+	reconciler := &EnvironmentReconciler{
+		Client: fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(env).WithObjects(env, project, template).Build(), Scheme: scheme,
+	}
+
+	result, err := reconciler.Reconcile(context.Background(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(env)})
+	if err != nil || result != (ctrl.Result{}) {
+		t.Fatalf("Reconcile() = (%#v, %v), want stable terminal result", result, err)
+	}
+	var failed platformv1alpha1.Environment
+	if err := reconciler.Get(context.Background(), client.ObjectKeyFromObject(env), &failed); err != nil {
+		t.Fatal(err)
+	}
+	condition := apimeta.FindStatusCondition(failed.Status.Conditions, platformv1alpha1.EnvironmentConditionReady)
+	if failed.Status.Phase != platformv1alpha1.EnvironmentPhaseFailed || condition == nil || condition.Reason != "InvalidConfiguration" ||
+		condition.Message != `project "project" has a non-empty egressAllowlist, which is unsupported until GitHub issue #68 is implemented` {
+		t.Fatalf("unsupported allowlist status = phase %q, condition %#v", failed.Status.Phase, condition)
+	}
+	var pods corev1.PodList
+	var pvcs corev1.PersistentVolumeClaimList
+	var secrets corev1.SecretList
+	var policies networkingv1.NetworkPolicyList
+	for _, list := range []client.ObjectList{&pods, &pvcs, &secrets, &policies} {
+		if err := reconciler.List(context.Background(), list, client.InNamespace(env.Namespace)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if len(pods.Items) != 0 || len(pvcs.Items) != 0 || len(secrets.Items) != 0 || len(policies.Items) != 0 {
+		t.Fatalf("unsupported allowlist created children: %d Pods, %d PVCs, %d Secrets, %d NetworkPolicies", len(pods.Items), len(pvcs.Items), len(secrets.Items), len(policies.Items))
+	}
+}
+
+func TestUnsupportedEgressAllowlistFencesExactOwnedExecutionAndRetainsWorkspace(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	if err := networkingv1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	if err := platformv1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	project := &platformv1alpha1.Project{
+		ObjectMeta: metav1.ObjectMeta{Name: "project", Namespace: "default"},
+		Spec:       platformv1alpha1.ProjectSpec{Repositories: []string{"https://github.com/example/repo"}, EgressAllowlist: []string{"github.com"}},
+	}
+	env := &platformv1alpha1.Environment{
+		ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default", UID: "environment-uid", Generation: 2, Finalizers: []string{environmentFinalizer}},
+		Spec:       platformv1alpha1.EnvironmentSpec{TemplateRef: "small", ProjectRef: project.Name},
+		Status: platformv1alpha1.EnvironmentStatus{
+			ObservedGeneration: 2, Phase: platformv1alpha1.EnvironmentPhaseReady, PodName: "env-test",
+			Endpoints:  platformv1alpha1.EnvironmentEndpoints{Sandboxd: "10.0.0.1:50051"},
+			Conditions: []metav1.Condition{{Type: platformv1alpha1.EnvironmentConditionReady, Status: metav1.ConditionTrue, ObservedGeneration: 2, Reason: "SandboxdReady"}},
+		},
+	}
+	controller := true
+	owner := metav1.OwnerReference{APIVersion: platformv1alpha1.GroupVersion.String(), Kind: "Environment", Name: env.Name, UID: env.UID, Controller: &controller}
+	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: envPodName(env), Namespace: env.Namespace, UID: "pod-uid", OwnerReferences: []metav1.OwnerReference{owner}}}
+	secret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: envCredentialName(env), Namespace: env.Namespace, UID: "secret-uid", OwnerReferences: []metav1.OwnerReference{owner}}}
+	pvc := &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: envPVCName(env), Namespace: env.Namespace, UID: "pvc-uid", OwnerReferences: []metav1.OwnerReference{owner}}}
+	policy := &networkingv1.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{Name: envNetworkPolicyName(env), Namespace: env.Namespace, UID: "policy-uid", OwnerReferences: []metav1.OwnerReference{owner}}}
+	template := &platformv1alpha1.EnvironmentTemplate{ObjectMeta: metav1.ObjectMeta{Name: "small", Namespace: "default"}}
+	reconciler := &EnvironmentReconciler{
+		Client: fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(env).WithObjects(env, project, template, pod, secret, pvc, policy).Build(), Scheme: scheme,
+	}
+	request := ctrl.Request{NamespacedName: client.ObjectKeyFromObject(env)}
+
+	if result, err := reconciler.Reconcile(context.Background(), request); err != nil || !result.Requeue {
+		t.Fatalf("withdraw readiness = (%#v, %v)", result, err)
+	}
+	var failed platformv1alpha1.Environment
+	if err := reconciler.Get(context.Background(), client.ObjectKeyFromObject(env), &failed); err != nil {
+		t.Fatal(err)
+	}
+	ready := apimeta.FindStatusCondition(failed.Status.Conditions, platformv1alpha1.EnvironmentConditionReady)
+	if failed.Status.Phase != platformv1alpha1.EnvironmentPhaseFailed || failed.Status.PodName != "" || failed.Status.Endpoints.Sandboxd != "" || ready == nil || ready.Reason != "InvalidConfiguration" {
+		t.Fatalf("readiness was not withdrawn: %#v", failed.Status)
+	}
+	if err := reconciler.Get(context.Background(), client.ObjectKeyFromObject(pod), &corev1.Pod{}); err != nil {
+		t.Fatal("pod was deleted before readiness withdrawal")
+	}
+	if result, err := reconciler.Reconcile(context.Background(), request); err != nil || !result.Requeue {
+		t.Fatalf("delete pod = (%#v, %v)", result, err)
+	}
+	if err := reconciler.Get(context.Background(), client.ObjectKeyFromObject(pod), &corev1.Pod{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("owned pod still exists: %v", err)
+	}
+	if result, err := reconciler.Reconcile(context.Background(), request); err != nil || !result.Requeue {
+		t.Fatalf("revoke credentials = (%#v, %v)", result, err)
+	}
+	if err := reconciler.Get(context.Background(), client.ObjectKeyFromObject(secret), &corev1.Secret{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("owned credentials still exist: %v", err)
+	}
+	if err := reconciler.Get(context.Background(), client.ObjectKeyFromObject(pvc), &corev1.PersistentVolumeClaim{}); err != nil {
+		t.Fatal("workspace PVC was not retained")
+	}
+	if err := reconciler.Get(context.Background(), client.ObjectKeyFromObject(policy), &networkingv1.NetworkPolicy{}); err != nil {
+		t.Fatal("ingress NetworkPolicy was not retained")
+	}
+	if result, err := reconciler.Reconcile(context.Background(), request); err != nil || result != (ctrl.Result{}) {
+		t.Fatalf("stable failed reconcile = (%#v, %v)", result, err)
+	}
+}
+
+func TestUnsupportedEgressAllowlistDoesNotDeleteForeignSameNameChildren(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	if err := platformv1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	project := &platformv1alpha1.Project{
+		ObjectMeta: metav1.ObjectMeta{Name: "project", Namespace: "default"},
+		Spec:       platformv1alpha1.ProjectSpec{Repositories: []string{"https://github.com/example/repo"}, EgressAllowlist: []string{"github.com"}},
+	}
+	env := &platformv1alpha1.Environment{
+		ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default", UID: "current-environment", Generation: 1, Finalizers: []string{environmentFinalizer}},
+		Spec:       platformv1alpha1.EnvironmentSpec{TemplateRef: "small", ProjectRef: project.Name},
+	}
+	controller := true
+	oldOwner := metav1.OwnerReference{APIVersion: platformv1alpha1.GroupVersion.String(), Kind: "Environment", Name: env.Name, UID: "old-environment", Controller: &controller}
+	foreignPod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: envPodName(env), Namespace: env.Namespace, UID: "foreign-pod", OwnerReferences: []metav1.OwnerReference{oldOwner}}}
+	foreignSecret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: envCredentialName(env), Namespace: env.Namespace, UID: "foreign-secret", OwnerReferences: []metav1.OwnerReference{oldOwner}}}
+	reconciler := &EnvironmentReconciler{
+		Client: fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(env).WithObjects(env, project, foreignPod, foreignSecret).Build(), Scheme: scheme,
+	}
+
+	result, err := reconciler.Reconcile(context.Background(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(env)})
+	if err != nil || result != (ctrl.Result{}) {
+		t.Fatalf("Reconcile() = (%#v, %v), want stable terminal result", result, err)
+	}
+	if err := reconciler.Get(context.Background(), client.ObjectKeyFromObject(foreignPod), &corev1.Pod{}); err != nil {
+		t.Fatal("foreign same-name Pod was deleted")
+	}
+	if err := reconciler.Get(context.Background(), client.ObjectKeyFromObject(foreignSecret), &corev1.Secret{}); err != nil {
+		t.Fatal("foreign same-name Secret was deleted")
+	}
+}
+
+func TestUnsupportedEgressAllowlistRevokesOwnedSecretBehindForeignPod(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	if err := platformv1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	project := &platformv1alpha1.Project{
+		ObjectMeta: metav1.ObjectMeta{Name: "project", Namespace: "default"},
+		Spec:       platformv1alpha1.ProjectSpec{Repositories: []string{"https://github.com/example/repo"}, EgressAllowlist: []string{"github.com"}},
+	}
+	env := &platformv1alpha1.Environment{
+		ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default", UID: "current-environment", Generation: 1, Finalizers: []string{environmentFinalizer}},
+		Spec:       platformv1alpha1.EnvironmentSpec{TemplateRef: "small", ProjectRef: project.Name},
+	}
+	controller := true
+	oldOwner := metav1.OwnerReference{APIVersion: platformv1alpha1.GroupVersion.String(), Kind: "Environment", Name: env.Name, UID: "old-environment", Controller: &controller}
+	currentOwner := oldOwner
+	currentOwner.UID = env.UID
+	foreignPod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: envPodName(env), Namespace: env.Namespace, UID: "foreign-pod", OwnerReferences: []metav1.OwnerReference{oldOwner}}}
+	ownedSecret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: envCredentialName(env), Namespace: env.Namespace, UID: "owned-secret", OwnerReferences: []metav1.OwnerReference{currentOwner}}}
+	reconciler := &EnvironmentReconciler{
+		Client: fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(env).WithObjects(env, project, foreignPod, ownedSecret).Build(), Scheme: scheme,
+	}
+
+	result, err := reconciler.Reconcile(context.Background(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(env)})
+	if err != nil || !result.Requeue {
+		t.Fatalf("Reconcile() = (%#v, %v), want credential revocation requeue", result, err)
+	}
+	if err := reconciler.Get(context.Background(), client.ObjectKeyFromObject(foreignPod), &corev1.Pod{}); err != nil {
+		t.Fatal("foreign same-name Pod was deleted")
+	}
+	if err := reconciler.Get(context.Background(), client.ObjectKeyFromObject(ownedSecret), &corev1.Secret{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("exact-owned Secret still exists: %v", err)
+	}
+}
+
+func TestUnsupportedEgressAllowlistRetainsForeignSecretAfterFencingOwnedPod(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	if err := platformv1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	project := &platformv1alpha1.Project{
+		ObjectMeta: metav1.ObjectMeta{Name: "project", Namespace: "default"},
+		Spec:       platformv1alpha1.ProjectSpec{Repositories: []string{"https://github.com/example/repo"}, EgressAllowlist: []string{"github.com"}},
+	}
+	env := &platformv1alpha1.Environment{
+		ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default", UID: "current-environment", Generation: 1, Finalizers: []string{environmentFinalizer}},
+		Spec:       platformv1alpha1.EnvironmentSpec{TemplateRef: "small", ProjectRef: project.Name},
+	}
+	controller := true
+	currentOwner := metav1.OwnerReference{APIVersion: platformv1alpha1.GroupVersion.String(), Kind: "Environment", Name: env.Name, UID: env.UID, Controller: &controller}
+	oldOwner := currentOwner
+	oldOwner.UID = "old-environment"
+	ownedPod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: envPodName(env), Namespace: env.Namespace, UID: "owned-pod", OwnerReferences: []metav1.OwnerReference{currentOwner}}}
+	foreignSecret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: envCredentialName(env), Namespace: env.Namespace, UID: "foreign-secret", OwnerReferences: []metav1.OwnerReference{oldOwner}}}
+	reconciler := &EnvironmentReconciler{
+		Client: fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(env).WithObjects(env, project, ownedPod, foreignSecret).Build(), Scheme: scheme,
+	}
+	request := ctrl.Request{NamespacedName: client.ObjectKeyFromObject(env)}
+
+	if result, err := reconciler.Reconcile(context.Background(), request); err != nil || !result.Requeue {
+		t.Fatalf("fence Pod = (%#v, %v)", result, err)
+	}
+	if err := reconciler.Get(context.Background(), client.ObjectKeyFromObject(ownedPod), &corev1.Pod{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("exact-owned Pod still exists: %v", err)
+	}
+	if result, err := reconciler.Reconcile(context.Background(), request); err != nil || result != (ctrl.Result{}) {
+		t.Fatalf("foreign Secret reconcile = (%#v, %v), want stable result", result, err)
+	}
+	if err := reconciler.Get(context.Background(), client.ObjectKeyFromObject(foreignSecret), &corev1.Secret{}); err != nil {
+		t.Fatal("foreign same-name Secret was deleted")
+	}
+}
+
+func TestUnsupportedEgressAllowlistRecoversAfterProjectIsCleared(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	if err := networkingv1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	if err := platformv1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	project := &platformv1alpha1.Project{
+		ObjectMeta: metav1.ObjectMeta{Name: "project", Namespace: "default"},
+		Spec:       platformv1alpha1.ProjectSpec{Repositories: []string{"https://github.com/example/repo"}, EgressAllowlist: []string{"github.com"}},
+	}
+	env := &platformv1alpha1.Environment{
+		ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default", UID: "environment-uid", Generation: 1, Finalizers: []string{environmentFinalizer}},
+		Spec:       platformv1alpha1.EnvironmentSpec{TemplateRef: "small", ProjectRef: project.Name},
+	}
+	template := &platformv1alpha1.EnvironmentTemplate{ObjectMeta: metav1.ObjectMeta{Name: "small", Namespace: "default"}, Spec: platformv1alpha1.EnvironmentTemplateSpec{Image: "example/environment:dev", Size: "small"}}
+	reconciler := &EnvironmentReconciler{
+		Client: fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(env).WithObjects(env, project, template).Build(), Scheme: scheme,
+	}
+	request := ctrl.Request{NamespacedName: client.ObjectKeyFromObject(env)}
+	if _, err := reconciler.Reconcile(context.Background(), request); err != nil {
+		t.Fatal(err)
+	}
+	var updatedProject platformv1alpha1.Project
+	if err := reconciler.Get(context.Background(), client.ObjectKeyFromObject(project), &updatedProject); err != nil {
+		t.Fatal(err)
+	}
+	updatedProject.Spec.EgressAllowlist = nil
+	if err := reconciler.Update(context.Background(), &updatedProject); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reconciler.Reconcile(context.Background(), request); err != nil {
+		t.Fatalf("Reconcile() after clearing allowlist: %v", err)
+	}
+	var pod corev1.Pod
+	if err := reconciler.Get(context.Background(), types.NamespacedName{Namespace: env.Namespace, Name: envPodName(env)}, &pod); err != nil {
+		t.Fatalf("ordinary provisioning did not recover: %v", err)
+	}
+	var recovering platformv1alpha1.Environment
+	if err := reconciler.Get(context.Background(), client.ObjectKeyFromObject(env), &recovering); err != nil {
+		t.Fatal(err)
+	}
+	if recovering.Status.Phase == platformv1alpha1.EnvironmentPhaseFailed {
+		t.Fatalf("Environment remained failed after allowlist was cleared: %#v", recovering.Status)
+	}
+}
+
 func TestReconcileRejectsUnsupportedEffectiveBackendBeforeCreatingChildren(t *testing.T) {
 	tests := []struct {
 		name            string
