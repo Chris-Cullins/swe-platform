@@ -2,7 +2,7 @@ import { QueryClient, QueryObserver } from '@tanstack/react-query'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { api, ApiProblem } from './api'
 import type { RunSummary, RunSummaryList, RunWatchEvent } from './contracts'
-import { applyRunEvent, consumeSSE, listRunSnapshot, refreshMatchingDetail } from './runFeed'
+import { applyRunEvent, consumeSSE, listRunSnapshot, refreshMatchingDetail, waitForRunFeedRetry } from './runFeed'
 
 afterEach(() => vi.restoreAllMocks())
 
@@ -30,7 +30,7 @@ describe('Run summary watch', () => {
     const body = [
       'event: run\nid: 2\ndata: {"type":"ADDED"}\n\n',
       'event: run-checkpoint\nid: 3\ndata: {"resourceVersion":"3"}\n\n',
-      'event: run-relist\ndata:\n\n',
+      'event: run-relist\ndata: {"reason":"resource-version-expired"}\n\n',
     ].join('')
     const seen: Array<{ event: string; id?: string }> = []
     await consumeSSE(new Response(body), event => { seen.push({ event: event.event, id: event.id }) }, new AbortController().signal)
@@ -82,5 +82,18 @@ describe('Run summary watch', () => {
     resolveFirst({ uid: 'stale-uid', generation: 0 })
     await vi.waitFor(() => expect(client.getQueryData(['run', 'ns', 'one'])).toEqual({ uid: 'one-uid', generation: 1 }))
     unsubscribe()
+  })
+
+  it('settles a pending reconnect delay immediately when its feed is aborted', async () => {
+    vi.useFakeTimers()
+    const controller = new AbortController()
+    let settled = false
+    const waiting = waitForRunFeedRetry(controller.signal).then(() => { settled = true })
+    expect(vi.getTimerCount()).toBe(1)
+    controller.abort()
+    await waiting
+    expect(settled).toBe(true)
+    expect(vi.getTimerCount()).toBe(0)
+    vi.useRealTimers()
   })
 })

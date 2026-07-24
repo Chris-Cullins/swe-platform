@@ -5,7 +5,7 @@ import {
   useNavigate, useOutletContext, useParams,
 } from 'react-router'
 import {
-  api, ApiProblem, isTerminal, onUnauthorized, queryKeys,
+  api, ApiProblem, fallbackPollInterval, isTerminal, onUnauthorized, queryKeys,
 } from './api'
 import type { CreateRun, Run, Selector } from './contracts'
 import { useRunFeed } from './runFeed'
@@ -193,7 +193,12 @@ function NewRun() {
 
 function useRun() {
   const { namespace = '', run = '' } = useParams()
-  return useQuery({ queryKey: queryKeys.run(namespace, run), queryFn: () => api.run(namespace, run) })
+  const feed = useActiveRunFeed()
+  return useQuery({
+    queryKey: queryKeys.run(namespace, run),
+    queryFn: ({ signal }) => api.run(namespace, run, signal),
+    refetchInterval: feed.fallback ? fallbackPollInterval : false,
+  })
 }
 
 function Detail() {
@@ -240,7 +245,7 @@ function Overview() {
   </section>
 }
 
-function TranscriptRoute() { const run = useOutletRun(); const { namespace = '' } = useParams(); const identity = `${run.uid}/${run.generation}`; return <Transcript key={`${namespace}/${run.name}/${identity}`} namespace={namespace} run={run.name} identity={identity} /> }
+function TranscriptRoute() { const run = useOutletRun(); const { namespace = '' } = useParams(); return <Transcript key={`${namespace}/${run.name}/${run.uid}`} namespace={namespace} run={run.name} identity={run.uid} /> }
 function TerminalRoute() { const run = useOutletRun(); const { namespace = '' } = useParams(); return run.environment ? <Suspense fallback={<Busy label="Loading terminal" />}><Terminal namespace={namespace} environment={run.environment.name} /></Suspense> : <p role="status">No environment allocated.</p> }
 
 export function App() {

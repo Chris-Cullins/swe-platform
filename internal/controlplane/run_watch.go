@@ -204,7 +204,7 @@ func (s *Server) watchRuns(w http.ResponseWriter, r *http.Request, namespace str
 			return write("run-checkpoint", meta.GetResourceVersion(), RunWatchCheckpoint{ResourceVersion: meta.GetResourceVersion()})
 		case watch.Error:
 			if staleWatchEvent(event) {
-				write("run-relist", "", RunWatchCheckpoint{ResourceVersion: ""})
+				write("run-relist", "", RunWatchRelist{Reason: "resource-version-expired"})
 			}
 			return false
 		}

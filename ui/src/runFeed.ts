@@ -9,6 +9,19 @@ const MAX_EVENT_BYTES = 64 * 1024
 const FALLBACK_STATUSES = new Set([404, 405, 501])
 class Relisted extends Error {}
 
+export function waitForRunFeedRetry(signal: AbortSignal, delay = 1000): Promise<void> {
+  return new Promise(resolve => {
+    const finish = () => {
+      clearTimeout(timeout)
+      signal.removeEventListener('abort', finish)
+      resolve()
+    }
+    const timeout = setTimeout(finish, delay)
+    signal.addEventListener('abort', finish, { once: true })
+    if (signal.aborted) finish()
+  })
+}
+
 export async function listRunSnapshot(namespace: string, signal?: AbortSignal): Promise<RunSummaryList> {
   for (let attempt = 0; attempt < MAX_SNAPSHOT_ATTEMPTS; attempt += 1) {
     signal?.throwIfAborted()
@@ -109,7 +122,7 @@ export function useRunFeed(namespace: string) {
   const [watchError, setWatchError] = React.useState<Error>()
   const query = useQuery({
     queryKey: queryKeys.runs(namespace), queryFn: ({ signal }) => listRunSnapshot(namespace, signal),
-    refetchInterval: fallback ? fallbackPollInterval : false,
+    refetchInterval: current => fallback || current.state.status === 'error' ? fallbackPollInterval : false,
     staleTime: fallback ? 0 : Infinity,
     refetchOnMount: false,
     refetchOnWindowFocus: false,
@@ -130,7 +143,6 @@ export function useRunFeed(namespace: string) {
     let watchStart = resourceVersion
     let resume = false
     let everConnected = false
-    let retry: ReturnType<typeof setTimeout> | undefined
     const relist = async () => {
       const snapshot = await listRunSnapshot(namespace, controller.signal)
       if (controller.signal.aborted) return false
@@ -153,7 +165,12 @@ export function useRunFeed(namespace: string) {
           }
           everConnected = true; resume = true; setWatchError(undefined)
           await consumeSSE(response, async message => {
-            if (message.event === 'run-relist' && !message.id) { resume = false; if (await relist()) throw new Relisted(); return }
+            if (message.event === 'run-relist') {
+              if (message.id) throw new Error('Run relist event must not carry an ID.')
+              const relistEvent = JSON.parse(message.data) as { reason?: string }
+              if (relistEvent.reason !== 'resource-version-expired') throw new Error('Invalid Run relist event.')
+              resume = false; if (await relist()) throw new Relisted(); return
+            }
             if (message.event === 'run-checkpoint') {
               const checkpoint = JSON.parse(message.data) as { resourceVersion: string }
               if (!message.id || checkpoint.resourceVersion !== message.id) throw new Error('Invalid Run watch checkpoint.')
@@ -173,11 +190,11 @@ export function useRunFeed(namespace: string) {
           if (error instanceof Relisted) continue
           setWatchError(error instanceof Error ? error : new Error('Run watch failed.'))
         }
-        await new Promise<void>(resolve => { retry = setTimeout(resolve, 1000) })
+        await waitForRunFeedRetry(controller.signal)
       }
     }
     void connect()
-    return () => { unsubscribe(); controller.abort(); if (retry) clearTimeout(retry) }
+    return () => { unsubscribe(); controller.abort() }
   }, [fallback, namespace, query.isSuccess, queryClient])
   return { ...query, fallback, watchError }
 }

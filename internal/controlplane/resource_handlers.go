@@ -54,7 +54,7 @@ func (s *Server) listRuns(w http.ResponseWriter, r *http.Request, namespace stri
 	if summary {
 		page, err := s.resources.ListRunSummaries(r.Context(), namespace, limit, continueToken)
 		if err != nil {
-			s.writeResourceError(w, "list Run summaries", namespace, "", err)
+			s.writeRunListError(w, "list Run summaries", namespace, err)
 			return
 		}
 		writeJSON(w, http.StatusOK, page)
@@ -62,7 +62,7 @@ func (s *Server) listRuns(w http.ResponseWriter, r *http.Request, namespace stri
 	}
 	page, err := s.resources.ListRuns(r.Context(), namespace, limit, continueToken)
 	if err != nil {
-		s.writeResourceError(w, "list runs", namespace, "", err)
+		s.writeRunListError(w, "list runs", namespace, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, page)
@@ -304,4 +304,12 @@ func (s *Server) writeResourceError(w http.ResponseWriter, operation, namespace,
 		s.log.Warn(operation, "namespace", namespace, "name", name, "error", err)
 		writeProblem(w, http.StatusInternalServerError, "resource-error", "Resource operation failed", "the resource operation could not be completed")
 	}
+}
+
+func (s *Server) writeRunListError(w http.ResponseWriter, operation, namespace string, err error) {
+	if apierrors.IsResourceExpired(err) || apierrors.IsGone(err) {
+		writeProblem(w, http.StatusGone, "list-snapshot-expired", "List snapshot expired", "restart the resource list from its first page")
+		return
+	}
+	s.writeResourceError(w, operation, namespace, "", err)
 }

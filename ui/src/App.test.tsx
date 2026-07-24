@@ -26,7 +26,20 @@ function show(path: string, state?: unknown) {
   return { client, ...render(<QueryClientProvider client={client}><MemoryRouter initialEntries={[entry]}><LocationProbe /><App /></MemoryRouter></QueryClientProvider>) }
 }
 
-afterEach(() => { vi.useRealTimers(); vi.restoreAllMocks() })
+class TestEventSource {
+  static instances: TestEventSource[] = []
+  static CONNECTING = 0
+  static OPEN = 1
+  static CLOSED = 2
+  readyState = TestEventSource.CONNECTING
+  onopen: (() => void) | null = null
+  onerror: (() => void) | null = null
+  close = vi.fn()
+  constructor(public url: string) { TestEventSource.instances.push(this) }
+  addEventListener() {}
+}
+
+afterEach(() => { TestEventSource.instances = []; vi.useRealTimers(); vi.restoreAllMocks(); vi.unstubAllGlobals() })
 describe('App frozen API integration', () => {
   it('lands on the default namespace Run feed from the root route', async () => {
     const fetch = vi.spyOn(globalThis, 'fetch').mockImplementation(async path => path === '/api/v1/session' ? response({ authenticated: true, username: 'alex' }) : response({ items: [] }))
@@ -118,6 +131,69 @@ describe('App frozen API integration', () => {
     await act(async () => { await vi.advanceTimersByTimeAsync(4001); await Promise.resolve() })
     expect(screen.getByText('repair-ui')).toBeInTheDocument()
     expect(fetch).toHaveBeenCalledOnce()
+  })
+
+  it('recovers a transient initial summary failure without classifying it as legacy fallback', async () => {
+    vi.useFakeTimers()
+    let summaries = 0
+    const fetch = vi.spyOn(globalThis, 'fetch').mockImplementation(async path => {
+      if (path === '/api/v1/session') return response({ authenticated: true, username: 'alex' })
+      if (path === '/api/v1/namespaces/default/runs?limit=200&view=summary') {
+        summaries += 1
+        if (summaries === 1) return response({ title: 'Unavailable', status: 503 }, 503)
+        return response({ items: [run], resourceVersion: '2' })
+      }
+      if (String(path).includes('watch=true')) return response({ title: 'Legacy', status: 501 }, 501)
+      throw new Error(`Unexpected request: ${path}`)
+    })
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    client.setQueryData(queryKeys.session, { authenticated: true, username: 'alex' })
+    render(<QueryClientProvider client={client}><MemoryRouter initialEntries={['/namespaces/default/runs']}><App /></MemoryRouter></QueryClientProvider>)
+    await act(async () => { await vi.advanceTimersByTimeAsync(0) })
+    expect(screen.getByRole('alert')).toHaveTextContent('Unavailable')
+    expect(screen.queryByText(/Live updates unavailable/)).not.toBeInTheDocument()
+    await act(async () => { await vi.advanceTimersByTimeAsync(4001); await Promise.resolve(); await Promise.resolve() })
+    expect(screen.getByText('repair-ui')).toBeInTheDocument()
+    expect(fetch).toHaveBeenCalledWith(expect.stringContaining('watch=true'), expect.anything())
+  })
+
+  it('polls exact Run detail only while the summary feed uses compatibility fallback', async () => {
+    vi.useFakeTimers()
+    let details = 0
+    const initial = { ...run, environment: undefined, generation: 1, state: 'Running' }
+    const updated = { ...initial, generation: 2, state: 'Succeeded' }
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async path => {
+      if (path === '/api/v1/session') return response({ authenticated: true, username: 'alex' })
+      if (path === '/api/v1/namespaces/default/runs?limit=200&view=summary') return response({ items: [initial] })
+      if (path === '/api/v1/namespaces/default/runs/repair-ui') { details += 1; return response(details === 1 ? initial : updated) }
+      throw new Error(`Unexpected request: ${path}`)
+    })
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    client.setQueryData(queryKeys.session, { authenticated: true, username: 'alex' })
+    render(<QueryClientProvider client={client}><MemoryRouter initialEntries={['/namespaces/default/runs/repair-ui/overview']}><App /></MemoryRouter></QueryClientProvider>)
+    await act(async () => { await vi.advanceTimersByTimeAsync(0) })
+    expect(screen.getByText('Running', { selector: '.pill' })).toBeInTheDocument()
+    await act(async () => { await vi.advanceTimersByTimeAsync(4001); await Promise.resolve(); await Promise.resolve() })
+    expect(screen.getByText('Succeeded', { selector: '.pill' })).toBeInTheDocument()
+    expect(details).toBe(2)
+  })
+
+  it('keeps the transcript stream mounted when cancellation only advances Run generation', async () => {
+    vi.stubGlobal('EventSource', TestEventSource)
+    const detail = { ...run, environment: undefined, generation: 1 }
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async path => {
+      if (path === '/api/v1/session') return response({ authenticated: true, username: 'alex' })
+      if (path === '/api/v1/namespaces/default/runs?limit=200&view=summary') return response({ items: [detail] })
+      if (path === '/api/v1/namespaces/default/runs/repair-ui') return response(detail)
+      throw new Error(`Unexpected request: ${path}`)
+    })
+    const { client } = show('/namespaces/default/runs/repair-ui/transcript')
+    await waitFor(() => expect(TestEventSource.instances).toHaveLength(1))
+    const stream = TestEventSource.instances[0]
+    act(() => client.setQueryData(queryKeys.run('default', 'repair-ui'), { ...detail, generation: 2, cancelRequested: true }))
+    await waitFor(() => expect(client.getQueryData<Run>(queryKeys.run('default', 'repair-ui'))?.generation).toBe(2))
+    expect(TestEventSource.instances).toHaveLength(1)
+    expect(stream.close).not.toHaveBeenCalled()
   })
 
   it('shows accessible loading and problem error states', async () => {

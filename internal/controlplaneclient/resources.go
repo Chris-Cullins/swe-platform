@@ -119,6 +119,10 @@ func (c *Client) StreamRunSummaries(ctx context.Context, namespace, resourceVers
 			if event.HasID {
 				return fmt.Errorf("Run relist event must not carry an ID")
 			}
+			var relist controlplane.RunWatchRelist
+			if err := json.Unmarshal(event.Data, &relist); err != nil || relist.Reason != "resource-version-expired" {
+				return fmt.Errorf("invalid Run relist event")
+			}
 			return ErrRunRelist
 		case "run-checkpoint":
 			var checkpoint controlplane.RunWatchCheckpoint

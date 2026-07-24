@@ -30,6 +30,7 @@ func (a *recordingAccess) Authorize(_ *http.Request, x ResourceAccess, _ bool) e
 type fakeResources struct {
 	calls                             []string
 	createErr, errorGet, collisionErr error
+	listErr                           error
 	created, existing                 Run
 	createdRequest                    CreateRunRequest
 	cancel                            Run
@@ -49,12 +50,12 @@ type fakeResources struct {
 func (f *fakeResources) ListRuns(_ context.Context, n string, l int64, c string) (RunList, error) {
 	f.calls = append(f.calls, "list")
 	f.listLimit, f.listContinue = l, c
-	return f.listPage, nil
+	return f.listPage, f.listErr
 }
 func (f *fakeResources) ListRunSummaries(_ context.Context, n string, l int64, c string) (RunSummaryList, error) {
 	f.calls = append(f.calls, "list-summary")
 	f.listLimit, f.listContinue = l, c
-	return f.summaryPage, nil
+	return f.summaryPage, f.listErr
 }
 func (f *fakeResources) CreateRun(_ context.Context, n string, r CreateRunRequest) (Run, error) {
 	f.calls = append(f.calls, "create")
@@ -246,6 +247,14 @@ func TestRunSummaryListRoute(t *testing.T) {
 	w := resourceRequest(NewServer(nil, ServerOptions{Access: &recordingAccess{}, Resources: f}), "GET", "/api/v1/namespaces/ns/runs?view=summary&limit=7&continue=cursor", "", "")
 	if w.Code != http.StatusOK || strings.Join(f.calls, ",") != "list-summary" || f.listLimit != 7 || f.listContinue != "cursor" || !strings.Contains(w.Body.String(), `"promptPreview":"safe"`) {
 		t.Fatalf("summary response = %d %s; calls=%v args=%d/%q", w.Code, w.Body.String(), f.calls, f.listLimit, f.listContinue)
+	}
+}
+
+func TestRunListExpiryUsesSnapshotProblemType(t *testing.T) {
+	f := &fakeResources{listErr: apierrors.NewResourceExpired("private continuation")}
+	w := resourceRequest(NewServer(nil, ServerOptions{Access: &recordingAccess{}, Resources: f}), "GET", "/api/v1/namespaces/ns/runs?view=summary&continue=opaque", "", "")
+	if w.Code != http.StatusGone || !strings.Contains(w.Body.String(), "/list-snapshot-expired") || strings.Contains(w.Body.String(), "private continuation") {
+		t.Fatalf("expired summary response = %d %s", w.Code, w.Body.String())
 	}
 }
 

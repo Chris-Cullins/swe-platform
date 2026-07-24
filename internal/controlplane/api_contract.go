@@ -114,6 +114,11 @@ type RunWatchCheckpoint struct {
 	ResourceVersion string `json:"resourceVersion"`
 }
 
+// RunWatchRelist directs clients to replace a stale resource snapshot.
+type RunWatchRelist struct {
+	Reason string `json:"reason"`
+}
+
 // CancelRunRequest optionally fences cancellation to one immutable Run.
 // An empty request remains supported for existing browser clients.
 type CancelRunRequest struct {

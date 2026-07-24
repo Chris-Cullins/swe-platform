@@ -127,6 +127,78 @@ func TestTUIReplacementEventCoalescesExactDetailRefresh(t *testing.T) {
 	}
 }
 
+func TestTUIPollRecoversSnapshotAndExactDetailFailures(t *testing.T) {
+	model := newTUIModel(context.Background(), nil, "team-a")
+	model.listInFlight = true
+	_, _ = model.Update(runsLoadedMsg{err: errors.New("temporary list failure")})
+	if model.resourceCancel != nil || model.listInFlight || !model.listNeedsRefresh {
+		t.Fatalf("failed snapshot state = cancel %v, inflight %t, needs refresh %t", model.resourceCancel, model.listInFlight, model.listNeedsRefresh)
+	}
+	_, command := model.Update(pollMsg(time.Now()))
+	if command == nil || !model.listInFlight {
+		t.Fatalf("snapshot recovery = command %v, inflight %t", command, model.listInFlight)
+	}
+
+	model.listInFlight = false
+	model.mode = tuiDetail
+	model.run = &controlplane.Run{Name: "same", UID: "uid"}
+	model.detailInFlight = true
+	_, _ = model.Update(runLoadedMsg{name: "same", expectedUID: "uid", err: errors.New("temporary detail failure")})
+	if !model.detailNeedsRefresh || model.detailInFlight {
+		t.Fatalf("failed detail state = needs refresh %t, inflight %t", model.detailNeedsRefresh, model.detailInFlight)
+	}
+	_, command = model.Update(pollMsg(time.Now()))
+	if command == nil || !model.detailInFlight {
+		t.Fatalf("detail recovery = command %v, inflight %t", command, model.detailInFlight)
+	}
+}
+
+func TestTUIDiscardedDetailLoadImmediatelyRefreshesCurrentSelection(t *testing.T) {
+	model := newTUIModel(context.Background(), nil, "team-a")
+	model.mode = tuiDetail
+	model.run = &controlplane.Run{Name: "same", UID: "selected-uid"}
+	model.detailInFlight = true
+	_, command := model.Update(runLoadedMsg{
+		name: "same", expectedUID: "old-uid", run: controlplane.Run{Name: "same", UID: "old-uid"},
+	})
+	if command == nil || !model.detailInFlight || !model.detailNeedsRefresh {
+		t.Fatalf("discard recovery = command %v, inflight %t, needs refresh %t", command, model.detailInFlight, model.detailNeedsRefresh)
+	}
+}
+
+func TestTUICancellationGenerationDoesNotRestartTranscript(t *testing.T) {
+	model := newTUIModel(context.Background(), nil, "team-a")
+	model.mode = tuiDetail
+	model.run = &controlplane.Run{Name: "run", UID: "uid", Generation: 1}
+	model.streamID = runIdentity{namespace: "team-a", name: "run", uid: "uid"}
+	model.streamCursor = "cursor"
+	model.transcript = []string{"retained"}
+	cancelled := false
+	model.streamCancel = func() { cancelled = true }
+	_, command := model.Update(runLoadedMsg{name: "run", expectedUID: "uid", run: controlplane.Run{Name: "run", UID: "uid", Generation: 2, CancelRequested: true}})
+	if cancelled || command != nil || model.streamCursor != "cursor" || len(model.transcript) != 1 || model.run.Generation != 2 {
+		t.Fatalf("generation update = cancelled %t, command %v, cursor %q, transcript %#v, run %#v", cancelled, command, model.streamCursor, model.transcript, model.run)
+	}
+}
+
+func TestTUITranscriptPumpRearmsIgnoredLiveMessagesOnly(t *testing.T) {
+	model := newTUIModel(context.Background(), nil, "team-a")
+	current := runIdentity{namespace: "team-a", name: "run", uid: "uid"}
+	model.mode = tuiDetail
+	model.run = &controlplane.Run{Name: "run", UID: "uid"}
+	model.streamID = current
+	model.streamGeneration = 3
+	model.transcriptMessages = make(chan tea.Msg)
+	_, command := model.Update(transcriptMsg{identity: runIdentity{namespace: "team-a", name: "other", uid: "other"}, generation: 3})
+	if command == nil {
+		t.Fatal("ignored live-generation message did not rearm the transcript reader")
+	}
+	_, command = model.Update(transcriptMsg{identity: current, generation: 2})
+	if command != nil {
+		t.Fatal("stale stream generation rearmed the current transcript reader")
+	}
+}
+
 func TestTUITranscriptRenderingIsGapVisibleSafeAndBounded(t *testing.T) {
 	event := controlplaneclient.SSEEvent{
 		ID:    "cursor",

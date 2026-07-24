@@ -469,8 +469,10 @@ Authenticated consoles obtain a fully paginated Run summary snapshot from
 and each `run` (`ADDED`, `MODIFIED`, or `DELETED`) or `run-checkpoint` event carry an opaque
 Kubernetes resource version; clients must never parse or compare it. `Last-Event-ID` takes
 precedence when reconnecting, and an ID-less `run-relist` means the client must discard its
-snapshot and list again. Run names are not identities: clients fence replacement objects by UID
-and generation.
+snapshot and list again; its payload is `{"reason":"resource-version-expired"}`. Run names are
+not identities: clients fence replacement objects by UID
+and use generation only to order mutable detail state. Transcript stream identity is the immutable
+Run UID, so cancellation updates do not reset or replay the same Run's transcript.
 
 This resource-state stream is independent from the adapter-owned transcript SSE stream below;
 its cursor cannot be used for transcripts and it does not interpret transcript payloads. A watch

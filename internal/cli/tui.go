@@ -51,6 +51,7 @@ type tuiModel struct {
 	listInFlight          bool
 	detailInFlight        bool
 	detailRefreshPending  bool
+	detailNeedsRefresh    bool
 	envInFlight           bool
 	mutationInFlight      bool
 	mutationID            uint64
@@ -66,6 +67,7 @@ type tuiModel struct {
 	resourceGeneration    uint64
 	resourceVersion       string
 	pollFallback          bool
+	listNeedsRefresh      bool
 	resourceEverConnected atomic.Bool
 	resourceMessages      <-chan tea.Msg
 
@@ -85,10 +87,9 @@ type tuiModel struct {
 }
 
 type runIdentity struct {
-	namespace  string
-	name       string
-	uid        string
-	generation int64
+	namespace string
+	name      string
+	uid       string
 }
 
 type runsLoadedMsg struct {
@@ -110,9 +111,10 @@ type runWatchDoneMsg struct {
 type runWatchEstablishedMsg struct{ generation uint64 }
 
 type runLoadedMsg struct {
-	name string
-	run  controlplane.Run
-	err  error
+	name        string
+	expectedUID string
+	run         controlplane.Run
+	err         error
 }
 
 type environmentLoadedMsg struct {
@@ -221,10 +223,10 @@ func (m *tuiModel) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 	case pollMsg:
 		commands := []tea.Cmd{pollAfter()}
-		if m.pollFallback && !m.listInFlight {
+		if (m.pollFallback || m.listNeedsRefresh) && !m.listInFlight {
 			commands = append(commands, m.loadRuns())
 		}
-		if m.pollFallback && m.mode == tuiDetail && m.run != nil && !m.detailInFlight {
+		if (m.pollFallback || m.detailNeedsRefresh) && m.mode == tuiDetail && m.run != nil && !m.detailInFlight {
 			commands = append(commands, m.loadRun(m.run.Name))
 		}
 		if m.mode == tuiDetail && m.run != nil && m.run.Environment != nil && !m.envInFlight {
@@ -236,9 +238,11 @@ func (m *tuiModel) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		m.loading = false
 		if msg.err != nil {
 			m.err = safeError(msg.err)
+			m.listNeedsRefresh = true
 			return m, nil
 		}
 		m.err = ""
+		m.listNeedsRefresh = false
 		m.stopResourceStream()
 		sortRunSummaries(msg.snapshot.Items)
 		selected := m.selectedRunIdentity()
@@ -302,17 +306,27 @@ func (m *tuiModel) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		refreshAgain := m.detailRefreshPending
 		m.detailRefreshPending = false
 		if m.mode != tuiDetail || m.run == nil || msg.name != m.run.Name {
+			if m.mode == tuiDetail && m.run != nil {
+				m.detailNeedsRefresh = true
+				return m, m.loadRun(m.run.Name)
+			}
 			return m, nil
+		}
+		if msg.expectedUID != "" && msg.expectedUID != m.run.UID && msg.run.UID != m.run.UID {
+			m.detailNeedsRefresh = true
+			return m, m.loadRun(m.run.Name)
 		}
 		if msg.err != nil {
 			m.err = safeError(msg.err)
+			m.detailNeedsRefresh = true
 			if refreshAgain {
 				return m, m.loadRun(msg.name)
 			}
 			return m, nil
 		}
 		m.err = ""
-		identity := runIdentity{namespace: m.namespace, name: msg.run.Name, uid: msg.run.UID, generation: msg.run.Generation}
+		m.detailNeedsRefresh = false
+		identity := runIdentity{namespace: m.namespace, name: msg.run.Name, uid: msg.run.UID}
 		if identity != m.streamID {
 			m.stopStream()
 			m.transcript = nil
@@ -349,11 +363,14 @@ func (m *tuiModel) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 	case transcriptMsg:
-		if msg.identity != m.currentIdentity() || msg.identity != m.streamID || msg.generation != m.streamGeneration {
+		if msg.generation != m.streamGeneration {
 			return m, nil
 		}
+		if msg.identity != m.currentIdentity() || msg.identity != m.streamID {
+			return m, m.waitTranscriptMessage()
+		}
 		if msg.event.Event != "transcript-gap" && msg.event.ID != "" && msg.event.ID == m.streamCursor {
-			return m, nil
+			return m, m.waitTranscriptMessage()
 		}
 		if msg.event.Event != "transcript-gap" && msg.event.ID != "" {
 			m.streamCursor = msg.event.ID
@@ -658,9 +675,13 @@ func (m *tuiModel) loadRun(name string) tea.Cmd {
 		return nil
 	}
 	m.detailInFlight = true
+	expectedUID := ""
+	if m.run != nil && m.run.Name == name {
+		expectedUID = m.run.UID
+	}
 	return func() tea.Msg {
 		run, err := m.client.GetRun(m.ctx, m.namespace, name)
-		return runLoadedMsg{name: name, run: run, err: err}
+		return runLoadedMsg{name: name, expectedUID: expectedUID, run: run, err: err}
 	}
 }
 
@@ -696,7 +717,7 @@ func (m *tuiModel) startTranscript(identity runIdentity) tea.Cmd {
 			if err != nil {
 				return fmt.Errorf("verify Run identity before transcript connection: %w", err)
 			}
-			if run.UID != identity.uid || run.Generation != identity.generation {
+			if run.UID != identity.uid {
 				return fmt.Errorf("Run %s was replaced; refreshing transcript identity", safeText(identity.name))
 			}
 			return nil
@@ -908,7 +929,7 @@ func (m *tuiModel) currentIdentity() runIdentity {
 	if m.run == nil {
 		return runIdentity{}
 	}
-	return runIdentity{namespace: m.namespace, name: m.run.Name, uid: m.run.UID, generation: m.run.Generation}
+	return runIdentity{namespace: m.namespace, name: m.run.Name, uid: m.run.UID}
 }
 
 func (m *tuiModel) canAttachTerminal() bool {
@@ -921,7 +942,7 @@ func (m *tuiModel) selectedRunIdentity() runIdentity {
 		return runIdentity{}
 	}
 	run := m.runs[m.cursor]
-	return runIdentity{name: run.Name, uid: run.UID, generation: run.Generation}
+	return runIdentity{name: run.Name, uid: run.UID}
 }
 
 func (m *tuiModel) appendTranscript(line string) {

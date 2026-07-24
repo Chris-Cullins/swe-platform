@@ -81,7 +81,7 @@ export const api = {
       headers, credentials: 'same-origin', signal,
     })
   },
-  run: (namespace: string, name: string) => request<Run>(`${base(namespace)}/runs/${encodeURIComponent(name)}`),
+  run: (namespace: string, name: string, signal?: AbortSignal) => request<Run>(`${base(namespace)}/runs/${encodeURIComponent(name)}`, { signal }),
   createRun: (namespace: string, value: CreateRun) => request<Run>(`${base(namespace)}/runs`, { method: 'POST', body: JSON.stringify(value) }),
   cancelRun: (namespace: string, name: string, runUID: string) => request<Run>(`${base(namespace)}/runs/${encodeURIComponent(name)}/cancel`, { method: 'POST', body: JSON.stringify({ runUID }) }),
   environment: (namespace: string, name: string) => request<Environment>(`${base(namespace)}/environments/${encodeURIComponent(name)}`),

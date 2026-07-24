@@ -126,7 +126,7 @@ func TestRunWatchStaleBeforeAndAfterHeaders(t *testing.T) {
 		upstream.Error(event.Object)
 		<-done
 		body := w.Body.String()
-		if w.Code != http.StatusOK || !strings.Contains(body, "event: run-relist") || strings.Contains(body, "secret Kubernetes detail") || strings.Contains(body, "id: ") {
+		if w.Code != http.StatusOK || !strings.Contains(body, "event: run-relist") || !strings.Contains(body, `data: {"reason":"resource-version-expired"}`) || strings.Contains(body, "secret Kubernetes detail") || strings.Contains(body, "id: ") {
 			t.Fatalf("response = %d %q", w.Code, body)
 		}
 	})

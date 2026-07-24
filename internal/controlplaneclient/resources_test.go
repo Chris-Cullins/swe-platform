@@ -250,7 +250,7 @@ func TestRunWatchFallbackOnlyBeforeFirstSuccessfulConnection(t *testing.T) {
 func TestRunWatchRecognizesIDLessRelistAfterCheckpoint(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
-		_, _ = io.WriteString(w, "event: run-checkpoint\nid: 2\ndata: {\"resourceVersion\":\"2\"}\n\nevent: run-relist\ndata: {}\n\n")
+		_, _ = io.WriteString(w, "event: run-checkpoint\nid: 2\ndata: {\"resourceVersion\":\"2\"}\n\nevent: run-relist\ndata: {\"reason\":\"resource-version-expired\"}\n\n")
 	}))
 	defer server.Close()
 	client, _ := New(server.URL, "token", server.Client())
