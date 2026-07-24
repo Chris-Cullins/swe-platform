@@ -14,8 +14,9 @@ with a reviewable diff, branch, or PR.
 > plane's WebSocket terminal endpoint connect to a shared tmux session through `sandboxd`;
 > pause/resume preserves workspace disks and runs repository resume hooks, and idle
 > environments pause automatically before terminal requests wake them. Template warm
-> pools keep unclaimed environments ready for `swe run` to claim. The first agent adapter
-> runs Claude Code through sandboxd's managed-process API. Portal proxying is not built yet.
+> pools keep unclaimed environments ready for `swe run` to claim. The `claude-code` (default),
+> `amp`, and `codex` adapters run through sandboxd's managed-process API. Portal proxying is not
+> built yet.
 > The Helm chart installs the
 > operator, control plane, and CRDs. Values presets
 > cover kind, k3s, GKE with GKE Sandbox, and EKS.
@@ -308,10 +309,21 @@ append order; an operator restart can replay an overlapping range because output
 process-local, while retrying an uncertain append within one operator process resends the exact
 same event and idempotency key.
 
-`AMP_API_KEY` is currently an unmet runtime prerequisite: secure Amp key delivery is deferred
-to issue #9. The platform does not mount user Amp configuration, add ambient credentials, or
-accept a credential profile for this adapter. Consequently the stock image cannot run Amp
-against its service without separately solving that prerequisite; tests use a fake executable.
+For non-interactive environments, the pinned public Amp CLI follows the official
+[Amp authentication contract](https://ampcode.com/manual#non-interactive-environments): an
+API-key profile selected with `--credential-profile` is delivered as `AMP_API_KEY` only through
+sandboxd launch material to the Run-owned Amp process. Credentialless Runs retain the plain
+managed-process path. The platform does not persist Amp login files, mount user configuration,
+or place the key in the public process specification, setup/resume hooks, sandboxd environment,
+or ordinary executions. Rotation does not restart or compare an existing process; acceptance in
+a fresh sandbox epoch reads and materializes the current key.
+
+The selected Amp process and its descendants can read or explicitly output the key. Profiles
+are namespace-shared: anyone authorized to create Runs there can initially select a profile,
+and same-UID peers are not strongly isolated. Transcript redaction is not guaranteed.
+Subscription/OAuth login persistence, refresh/writeback, leases, and stronger per-user or
+same-user isolation remain unsupported issue #9 work. Never put the key in a Run prompt,
+Project configuration, image, or chart values.
 Abrupt cancellation stops only the Run-owned local process tree, but Amp's public contract does
 not guarantee that remote/server-backed thread work has also stopped.
 

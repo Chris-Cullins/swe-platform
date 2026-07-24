@@ -13,23 +13,30 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
+	platformv1alpha1 "github.com/Chris-Cullins/swe-platform/api/v1alpha1"
 	"github.com/Chris-Cullins/swe-platform/internal/controllers"
 	sandboxdv1 "github.com/Chris-Cullins/swe-platform/sandboxd/gen/proto/sandboxd/v1"
 )
 
 type fakeClient struct {
-	process      *sandboxdv1.Process
-	stdout       []byte
-	stderr       []byte
-	gapBytes     uint64
-	retainedFrom uint64
-	getErr       error
-	starts       int
-	launches     int
-	startedKey   *sandboxdv1.ProcessKey
-	startedSpec  *sandboxdv1.ProcessSpec
-	stoppedKey   *sandboxdv1.ProcessKey
-	readRequests []*sandboxdv1.ReadOutputRequest
+	process         *sandboxdv1.Process
+	stdout          []byte
+	stderr          []byte
+	gapBytes        uint64
+	retainedFrom    uint64
+	getErr          error
+	starts          int
+	launchCalls     int
+	launches        int
+	startedKey      *sandboxdv1.ProcessKey
+	startedSpec     *sandboxdv1.ProcessSpec
+	launchValue     []byte
+	submittedValue  []byte
+	launchRequest   *sandboxdv1.StartProcessWithLaunchMaterialRequest
+	beforeLaunchErr error
+	afterLaunchErr  error
+	stoppedKey      *sandboxdv1.ProcessKey
+	readRequests    []*sandboxdv1.ReadOutputRequest
 }
 
 func (f *fakeClient) Start(_ context.Context, request *sandboxdv1.StartProcessRequest, _ ...grpc.CallOption) (*sandboxdv1.Process, error) {
@@ -46,8 +53,27 @@ func (f *fakeClient) Start(_ context.Context, request *sandboxdv1.StartProcessRe
 	return f.process, nil
 }
 
-func (f *fakeClient) StartWithLaunchMaterial(context.Context, *sandboxdv1.StartProcessWithLaunchMaterialRequest, ...grpc.CallOption) (*sandboxdv1.Process, error) {
-	return nil, errors.New("unexpected launch material")
+func (f *fakeClient) StartWithLaunchMaterial(_ context.Context, request *sandboxdv1.StartProcessWithLaunchMaterialRequest, _ ...grpc.CallOption) (*sandboxdv1.Process, error) {
+	f.launchCalls++
+	f.launchRequest = request
+	f.submittedValue = append([]byte(nil), request.LaunchMaterial.SecretEnv["AMP_API_KEY"]...)
+	if f.beforeLaunchErr != nil {
+		return nil, f.beforeLaunchErr
+	}
+	if f.startedKey == nil {
+		f.launches++
+		f.startedKey, f.startedSpec = request.Key, request.Spec
+		f.launchValue = append([]byte(nil), request.LaunchMaterial.SecretEnv["AMP_API_KEY"]...)
+	} else if !reflect.DeepEqual(f.startedKey, request.Key) || !reflect.DeepEqual(f.startedSpec, request.Spec) {
+		return nil, status.Error(codes.FailedPrecondition, "conflicting start")
+	}
+	if f.process == nil {
+		f.process = &sandboxdv1.Process{Key: request.Key, Spec: request.Spec, State: sandboxdv1.ProcessState_PROCESS_STATE_RUNNING, ExecutionId: "execution"}
+	}
+	if f.afterLaunchErr != nil {
+		return nil, f.afterLaunchErr
+	}
+	return f.process, nil
 }
 func (f *fakeClient) Get(context.Context, *sandboxdv1.GetProcessRequest, ...grpc.CallOption) (*sandboxdv1.Process, error) {
 	if f.getErr != nil {
@@ -125,15 +151,85 @@ func TestAcceptanceIsDuplicateSafePromptSafeAndFreshEpoch(t *testing.T) {
 	}
 }
 
-func TestCredentialIsRejectedWithoutDial(t *testing.T) {
+func TestAPIKeyUsesLaunchMaterialOnlyAndClearsTemporaryCopy(t *testing.T) {
+	client := &fakeClient{}
+	key := []byte("!!AMP-API-KEY-FIXTURE!!")
+	credential := &controllers.AdapterCredential{Type: platformv1alpha1.AgentCredentialTypeAPIKey, APIKey: key}
+	if err := (&Adapter{}).EnsureAccepted(context.Background(), controllers.AdapterTask{ID: "run", Prompt: "task"}, testSandbox(client), credential); err != nil {
+		t.Fatal(err)
+	}
+	if client.launchCalls != 1 || client.starts != 0 || string(client.launchValue) != string(key) || string(credential.APIKey) != string(key) {
+		t.Fatalf("launch/plain calls = %d/%d", client.launchCalls, client.starts)
+	}
+	if client.launchRequest == nil || !reflect.DeepEqual(client.launchRequest.LaunchMaterial.SecretEnv["AMP_API_KEY"], make([]byte, len(key))) {
+		t.Fatal("adapter did not clear its temporary launch-material copy")
+	}
+	if client.launchRequest.Spec == nil {
+		t.Fatal("launch request is missing its public process spec")
+	}
+	if _, exposed := client.launchRequest.Spec.Env["AMP_API_KEY"]; exposed {
+		t.Fatalf("public process spec contains credential material: %#v", client.launchRequest.Spec)
+	}
+}
+
+func TestUnsupportedCredentialTypeFailsBeforeDial(t *testing.T) {
 	dials := 0
 	sandbox := controllers.AdapterSandbox{DialProcess: func(context.Context) (sandboxdv1.ProcessServiceClient, func() error, error) {
 		dials++
 		return nil, nil, nil
 	}}
-	err := (&Adapter{}).EnsureAccepted(context.Background(), controllers.AdapterTask{}, sandbox, &controllers.AdapterCredential{APIKey: []byte("secret")})
+	err := (&Adapter{}).EnsureAccepted(context.Background(), controllers.AdapterTask{}, sandbox, &controllers.AdapterCredential{Type: "OAuth", APIKey: []byte("!!UNUSED-KEY-FIXTURE!!")})
 	if !errors.Is(err, controllers.ErrAdapterTaskRejected) || dials != 0 {
 		t.Fatalf("error/dials = %v/%d", err, dials)
+	}
+}
+
+func TestLaunchMaterialFailureDoesNotFallbackOrExposeKey(t *testing.T) {
+	key := []byte("!!AMP-FAILURE-KEY-FIXTURE!!")
+	client := &fakeClient{beforeLaunchErr: status.Error(codes.Unimplemented, "old sandboxd")}
+	err := (&Adapter{}).EnsureAccepted(context.Background(), controllers.AdapterTask{ID: "run", Prompt: "task"}, testSandbox(client), &controllers.AdapterCredential{Type: platformv1alpha1.AgentCredentialTypeAPIKey, APIKey: key})
+	if status.Code(err) != codes.Unimplemented || client.starts != 0 || client.launchCalls != 1 || client.launches != 0 || strings.Contains(err.Error(), string(key)) {
+		t.Fatalf("error/start/calls/launches = %v/%d/%d/%d", err, client.starts, client.launchCalls, client.launches)
+	}
+}
+
+func TestKeyedAcceptancePreservesDuplicateRotationAndFreshEpochSemantics(t *testing.T) {
+	task := controllers.AdapterTask{ID: "run-uid", Prompt: "task"}
+	adapter := &Adapter{}
+	first := &fakeClient{}
+	for _, value := range []string{"first-key", "rotated-key"} {
+		credential := &controllers.AdapterCredential{Type: platformv1alpha1.AgentCredentialTypeAPIKey, APIKey: []byte(value)}
+		if err := adapter.EnsureAccepted(context.Background(), task, testSandbox(first), credential); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if first.launchCalls != 2 || first.launches != 1 || string(first.launchValue) != "first-key" || string(first.submittedValue) != "rotated-key" || first.startedKey.OwnerId != task.ID {
+		t.Fatalf("duplicate calls/launches/launched/submitted/key = %d/%d/%q/%q/%#v", first.launchCalls, first.launches, first.launchValue, first.submittedValue, first.startedKey)
+	}
+	second := &fakeClient{}
+	credential := &controllers.AdapterCredential{Type: platformv1alpha1.AgentCredentialTypeAPIKey, APIKey: []byte("current-key")}
+	if err := adapter.EnsureAccepted(context.Background(), task, testSandbox(second), credential); err != nil {
+		t.Fatal(err)
+	}
+	if second.launches != 1 || string(second.launchValue) != "current-key" || second.startedKey.OwnerId != task.ID {
+		t.Fatalf("fresh epoch launch/value/key = %d/%q/%#v", second.launches, second.launchValue, second.startedKey)
+	}
+}
+
+func TestUncertainKeyedStartRetryDoesNotUsePlainStart(t *testing.T) {
+	client := &fakeClient{afterLaunchErr: status.Error(codes.Unavailable, "response lost")}
+	credential := &controllers.AdapterCredential{Type: platformv1alpha1.AgentCredentialTypeAPIKey, APIKey: []byte("first-key")}
+	task := controllers.AdapterTask{ID: "run", Prompt: "task"}
+	if err := (&Adapter{}).EnsureAccepted(context.Background(), task, testSandbox(client), credential); status.Code(err) != codes.Unavailable {
+		t.Fatalf("first start error = %v", err)
+	}
+	client.afterLaunchErr = nil
+	credential.APIKey = []byte("rotated-key")
+	if err := (&Adapter{}).EnsureAccepted(context.Background(), task, testSandbox(client), credential); err != nil {
+		t.Fatal(err)
+	}
+	if client.launchCalls != 2 || client.launches != 1 || client.starts != 0 || string(client.launchValue) != "first-key" || string(client.submittedValue) != "rotated-key" {
+		t.Fatalf("calls/launches/plain/launched/submitted = %d/%d/%d/%q/%q", client.launchCalls, client.launches, client.starts, client.launchValue, client.submittedValue)
 	}
 }
 
