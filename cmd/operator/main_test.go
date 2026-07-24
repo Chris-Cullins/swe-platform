@@ -12,4 +12,7 @@ func TestDefaultClaudeCodeAdapterIsRegistered(t *testing.T) {
 	if registeredAdapters()["codex"] == nil {
 		t.Fatal("codex adapter is not registered")
 	}
+	if registeredAdapters()["pi"] == nil {
+		t.Fatal("pi adapter is not registered")
+	}
 }

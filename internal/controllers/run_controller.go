@@ -119,6 +119,12 @@ type AdapterLifecycle interface {
 	Cancel(context.Context, AdapterTask, AdapterSandbox) error
 }
 
+// AdapterCredentialPolicy is an optional adapter capability. Adapters that
+// return false reject credential profiles before any profile or Secret read.
+type AdapterCredentialPolicy interface {
+	SupportsCredentialProfiles() bool
+}
+
 // RunReconciler turns a Run intent into one Environment allocation and drives
 // its adapter lifecycle. sandboxd, reached through an adapter, owns all agent
 // and declared-service processes inside the Environment.
@@ -175,6 +181,11 @@ func (r *RunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.R
 		return ctrl.Result{Requeue: true}, r.setRunState(ctx, &run, platformv1alpha1.RunStateAllocating, "EnvironmentRecovered", fmt.Sprintf("recovered environment %s before cancellation", ref.Name), false)
 	}
 	if run.Status.EnvironmentRef == nil {
+		if run.Spec.CredentialProfileRef != "" {
+			if policy, ok := r.Adapters[run.Spec.Agent].(AdapterCredentialPolicy); ok && !policy.SupportsCredentialProfiles() {
+				return ctrl.Result{}, r.failCredential(ctx, &run, "CredentialProfilesUnsupported", fmt.Sprintf("adapter %q does not support credential profiles", run.Spec.Agent))
+			}
+		}
 		result, done, err := r.ensureCredentialBinding(ctx, &run)
 		if done || err != nil {
 			return result, err

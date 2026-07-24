@@ -23,9 +23,10 @@ repeated Kubernetes TokenReview/SAR authorization, and typed
 Run/Environment resource APIs for the console.
 Remaining gaps are marked `TODO(P0/P1/P2)` in code — most notably secure agent credential
 injection, additional agent adapters, GitHub App–scoped git tokens, and egress/portal
-networking. The `claude-code` (default), `amp`, and `codex` adapters are registered and use sandboxd
+networking. The `claude-code` (default), `amp`, `codex`, and `pi` adapters are registered and use sandboxd
 managed processes; Amp's `AMP_API_KEY` delivery remains an unmet prerequisite and adapter
-tests use fake process services; Codex supports process-scoped `CODEX_API_KEY` delivery.
+tests use fake process services; Codex supports process-scoped `CODEX_API_KEY` delivery. Pi
+deliberately supports no credential profiles or credential injection.
 
 ## Architecture invariants — do not violate these
 

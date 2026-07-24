@@ -10,6 +10,11 @@ The image also bundles the explicitly selected `codex` adapter and pinned Codex 
 key profiles use sandboxd's process-scoped launch-material path as `CODEX_API_KEY`; never put the
 key in chart values, Project configuration, or custom-image ambient environment variables.
 
+The image also bundles pinned Pi (`swe run --agent pi ...`). Pi has no credential-profile or
+credential-injection support: selecting a profile fails before allocation or credential reads.
+Custom ambient authentication is outside the supported contract and should not be added to
+chart values or custom images.
+
 This chart installs the swe-platform CRDs, operator, and the first control-plane API.
 The control plane accepts adapter-owned transcript events and streams them over SSE.
 Production installs must configure the PostgreSQL transcript store described below. The chart

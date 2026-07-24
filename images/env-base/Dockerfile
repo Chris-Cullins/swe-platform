@@ -69,11 +69,20 @@ RUN case "$TARGETARCH" in \
 	&& test -f /opt/codex/codex-package.json \
 	&& test "$(/opt/codex/bin/codex --version)" = "codex-cli ${CODEX_VERSION}"
 
+FROM node:24-bookworm-slim AS pi
+ARG PI_VERSION=0.73.1
+RUN archive="$(npm pack "@mariozechner/pi-coding-agent@${PI_VERSION}" --silent)" \
+	&& node -e 'const [file, want] = process.argv.slice(1); const fs = require("fs"), crypto = require("crypto"); const got = "sha512-" + crypto.createHash("sha512").update(fs.readFileSync(file)).digest("base64"); if (got !== want) throw new Error(`integrity mismatch for ${file}`)' "$archive" 'sha512-gXQh3SaZmWTfVMc4Ao5+LGbVeKvzyO7tolok0nLsZgq9nGjZx/EEU3NM8C+qUnB4Nvs2rswG5qOVgLzQkq0fHQ==' \
+	&& npm install --ignore-scripts --omit=dev --prefix /opt/pi "$archive" \
+	&& test "$(node -p "require('/opt/pi/node_modules/@mariozechner/pi-coding-agent/package.json').version")" = "$PI_VERSION" \
+	&& test "$(readlink -f /opt/pi/node_modules/.bin/pi)" = /opt/pi/node_modules/@mariozechner/pi-coding-agent/dist/cli.js \
+	&& test "$(/opt/pi/node_modules/.bin/pi --version)" = "$PI_VERSION"
+
 # Base image for environments.
 FROM debian:12-slim AS environment
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-		git ca-certificates curl tmux jq ripgrep \
+		git ca-certificates curl libatomic1 tmux jq ripgrep \
 	&& rm -rf /var/lib/apt/lists/*
 
 RUN useradd --create-home --uid 10001 swe \
@@ -86,14 +95,20 @@ COPY --from=claude-code /usr/local/lib/node_modules/@anthropic-ai /usr/local/lib
 COPY --from=claude-code /usr/local/bin/claude /usr/local/bin/claude
 COPY --from=amp /usr/local/bin/amp /usr/local/bin/amp
 COPY --from=codex /opt/codex /opt/codex
+COPY --from=pi /usr/local/bin/node /usr/local/bin/node
+COPY --from=pi /opt/pi /opt/pi
 RUN ln -s /opt/codex/bin/codex /usr/local/bin/codex
+RUN ln -s /opt/pi/node_modules/.bin/pi /usr/local/bin/pi
 ENV AMP_SKIP_UPDATE_CHECK=1
 RUN claude --version \
 	&& test "$(amp --version | awk '{print $1}')" = "0.0.1784492094-g5d18e2" \
 	&& test "$(codex --version)" = "codex-cli 0.144.6" \
 	&& test "$(readlink -f "$(command -v codex)")" = /opt/codex/bin/codex \
 	&& test -x /opt/codex/codex-resources/bwrap \
-	&& test -f /opt/codex/codex-package.json
+	&& test -f /opt/codex/codex-package.json \
+	&& test "$(node -p "require('/opt/pi/node_modules/@mariozechner/pi-coding-agent/package.json').version")" = "0.73.1" \
+	&& test "$(readlink -f "$(command -v pi)")" = /opt/pi/node_modules/@mariozechner/pi-coding-agent/dist/cli.js \
+	&& test "$(pi --version)" = "0.73.1"
 
 USER swe
 WORKDIR /workspace

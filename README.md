@@ -339,6 +339,21 @@ can still read or disclose it; stronger credential isolation and additional cred
 remain issue #9 limitations. Acceptance tests use a fake Codex executable and no provider or
 network access.
 
+### Pi adapter
+
+Select Pi with `swe run --agent pi ...`. The coordinated image pins
+`@mariozechner/pi-coding-agent@0.73.1`; the adapter invokes
+`pi --mode json --no-session -p PROMPT`. Because this Pi parser has no working `--` separator
+and managed processes have no stdin, prompts beginning `-` or `@` are rejected before sandboxd
+is dialed. Success requires exit zero, well-formed complete JSONL ending at `agent_end`, and a
+coherent final assistant message whose `stopReason` is neither `error` nor `aborted`.
+
+Pi does not support agent credential profiles or platform credential injection. A selected
+profile fails before Environment allocation and before profile or Secret reads. Custom ambient
+authentication is outside the provided adapter contract and is not recommended. Stdout and
+stderr remain bounded opaque `pi.process-output` transcript events; no shared transcript schema
+is imposed.
+
 `--name` is the create idempotency key: retry an uncertain request with the same name and
 immutable task arguments. The CLI returns the existing Run only when its intent matches;
 the controller creates or claims the Environment server-side.
