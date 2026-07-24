@@ -1886,6 +1886,54 @@ func TestUnsupportedEgressAllowlistRecoversAfterProjectIsCleared(t *testing.T) {
 	}
 }
 
+func TestMissingReferencedProjectFencesExistingExecution(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	if err := platformv1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	env := &platformv1alpha1.Environment{
+		ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default", UID: "environment-uid", Generation: 2, Finalizers: []string{environmentFinalizer}},
+		Spec:       platformv1alpha1.EnvironmentSpec{TemplateRef: "small", ProjectRef: "deleted-project"},
+		Status: platformv1alpha1.EnvironmentStatus{
+			ObservedGeneration: 2, Phase: platformv1alpha1.EnvironmentPhaseReady, PodName: "env-test",
+			Endpoints:  platformv1alpha1.EnvironmentEndpoints{Sandboxd: "10.0.0.1:50051"},
+			Conditions: []metav1.Condition{{Type: platformv1alpha1.EnvironmentConditionReady, Status: metav1.ConditionTrue, ObservedGeneration: 2, Reason: "SandboxdReady"}},
+		},
+	}
+	controller := true
+	owner := metav1.OwnerReference{APIVersion: platformv1alpha1.GroupVersion.String(), Kind: "Environment", Name: env.Name, UID: env.UID, Controller: &controller}
+	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: envPodName(env), Namespace: env.Namespace, UID: "pod-uid", OwnerReferences: []metav1.OwnerReference{owner}}}
+	secret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: envCredentialName(env), Namespace: env.Namespace, UID: "secret-uid", OwnerReferences: []metav1.OwnerReference{owner}}}
+	reconciler := &EnvironmentReconciler{
+		Client: fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(env).WithObjects(env, pod, secret).Build(), Scheme: scheme,
+	}
+	request := ctrl.Request{NamespacedName: client.ObjectKeyFromObject(env)}
+
+	for step := 0; step < 3; step++ {
+		result, err := reconciler.Reconcile(context.Background(), request)
+		if err != nil || !result.Requeue {
+			t.Fatalf("fencing step %d = (%#v, %v)", step+1, result, err)
+		}
+	}
+	if err := reconciler.Get(context.Background(), client.ObjectKeyFromObject(pod), &corev1.Pod{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("owned Pod still exists: %v", err)
+	}
+	if err := reconciler.Get(context.Background(), client.ObjectKeyFromObject(secret), &corev1.Secret{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("owned Secret still exists: %v", err)
+	}
+	var failed platformv1alpha1.Environment
+	if err := reconciler.Get(context.Background(), client.ObjectKeyFromObject(env), &failed); err != nil {
+		t.Fatal(err)
+	}
+	ready := apimeta.FindStatusCondition(failed.Status.Conditions, platformv1alpha1.EnvironmentConditionReady)
+	if failed.Status.Phase != platformv1alpha1.EnvironmentPhaseFailed || ready == nil || ready.Reason != "InvalidConfiguration" || !strings.Contains(ready.Message, `get project "deleted-project"`) {
+		t.Fatalf("missing Project status = %#v", failed.Status)
+	}
+}
+
 func TestReconcileRejectsUnsupportedEffectiveBackendBeforeCreatingChildren(t *testing.T) {
 	tests := []struct {
 		name            string

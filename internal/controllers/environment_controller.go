@@ -204,7 +204,7 @@ func (r *EnvironmentReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	}
 	project, projectErr := r.resolveEnvironmentProject(ctx, &env)
 	if project != nil && len(project.Spec.EgressAllowlist) != 0 {
-		return r.reconcileUnsupportedEgressAllowlist(ctx, &env, project)
+		return r.reconcileInvalidProjectConfiguration(ctx, &env, unsupportedEgressAllowlistMessage(project.Name))
 	}
 	// Fencing must not depend on a still-readable template or successful setup.
 	// Cancellation/finalization can therefore stop an execution domain even after
@@ -217,6 +217,10 @@ func (r *EnvironmentReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		return result, nil
 	}
 	if projectErr != nil {
+		var terminal *terminalEnvironmentError
+		if stderrors.As(projectErr, &terminal) {
+			return r.reconcileInvalidProjectConfiguration(ctx, &env, projectErr.Error())
+		}
 		return ctrl.Result{}, r.fail(ctx, &env, projectErr)
 	}
 	if err := validateEnvironmentProject(project); err != nil {
@@ -545,13 +549,12 @@ func (r *EnvironmentReconciler) now() time.Time {
 	return time.Now()
 }
 
-// reconcileUnsupportedEgressAllowlist withdraws the published connection
-// before fencing an execution domain that cannot enforce its Project's egress
-// policy. The workspace and ingress policy are retained, and credentials are
-// revoked only after the exact Environment-owned Pod is gone.
-func (r *EnvironmentReconciler) reconcileUnsupportedEgressAllowlist(ctx context.Context, env *platformv1alpha1.Environment, project *platformv1alpha1.Project) (ctrl.Result, error) {
+// reconcileInvalidProjectConfiguration withdraws the published connection
+// before fencing an execution domain whose Project configuration cannot be
+// safely established. The workspace and ingress policy are retained, and
+// credentials are revoked only after the exact Environment-owned Pod is gone.
+func (r *EnvironmentReconciler) reconcileInvalidProjectConfiguration(ctx context.Context, env *platformv1alpha1.Environment, message string) (ctrl.Result, error) {
 	hadPublishedConnection := env.Status.PodName != "" || env.Status.Endpoints.Sandboxd != "" || platformv1alpha1.IsEnvironmentReady(env)
-	message := unsupportedEgressAllowlistMessage(project.Name)
 	if err := r.setEnvironmentStatus(ctx, env, platformv1alpha1.EnvironmentPhaseFailed, "", "", "InvalidConfiguration", message); err != nil {
 		return ctrl.Result{}, err
 	}
@@ -563,7 +566,7 @@ func (r *EnvironmentReconciler) reconcileUnsupportedEgressAllowlist(ctx context.
 	if err := r.Get(ctx, types.NamespacedName{Namespace: env.Namespace, Name: envPodName(env)}, &pod); err == nil {
 		if exactControllerOwner(&pod, platformv1alpha1.GroupVersion.String(), "Environment", env.Name, env.UID) {
 			if err := r.deleteObservedChild(ctx, &pod); err != nil && !errors.IsNotFound(err) {
-				return ctrl.Result{}, fmt.Errorf("delete pod for unsupported egress allowlist: %w", err)
+				return ctrl.Result{}, fmt.Errorf("delete pod for invalid Project configuration: %w", err)
 			}
 			return ctrl.Result{Requeue: true}, nil
 		}
@@ -577,7 +580,7 @@ func (r *EnvironmentReconciler) reconcileUnsupportedEgressAllowlist(ctx context.
 			return ctrl.Result{}, nil
 		}
 		if err := r.deleteObservedChild(ctx, &credentials); err != nil && !errors.IsNotFound(err) {
-			return ctrl.Result{}, fmt.Errorf("revoke credentials for unsupported egress allowlist: %w", err)
+			return ctrl.Result{}, fmt.Errorf("revoke credentials for invalid Project configuration: %w", err)
 		}
 		return ctrl.Result{Requeue: true}, nil
 	} else if !errors.IsNotFound(err) {
