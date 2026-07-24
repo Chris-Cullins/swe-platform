@@ -176,6 +176,10 @@ Kubernetes NetworkPolicy for this defense in depth; TLS identity and capability 
 remain mandatory regardless. See [the security model](../../SECURITY.md) for credential
 lifecycle and backend requirements.
 
+The chart does not install default-deny egress or an egress allowlist proxy. Project
+`egressAllowlist` values are reserved and rejected when non-empty; empty or omitted values leave
+egress subject to the cluster's network configuration.
+
 For local development, use `values-kind.yaml`; it references locally loaded `:dev`
 images and disables leader election. `values-argocd.yaml` is the preset for the
 local Argo CD mirror (`hack/argocd-up.sh`): it tracks the mutable `:latest` images

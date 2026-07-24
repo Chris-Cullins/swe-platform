@@ -202,15 +202,29 @@ func (r *EnvironmentReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	if changed {
 		return ctrl.Result{Requeue: true}, nil
 	}
+	project, projectErr := r.resolveEnvironmentProject(ctx, &env)
+	if project != nil && len(project.Spec.EgressAllowlist) != 0 {
+		return r.reconcileInvalidProjectConfiguration(ctx, &env, unsupportedEgressAllowlistMessage(project.Name))
+	}
 	// Fencing must not depend on a still-readable template or successful setup.
-	// Cancellation/finalization can therefore stop an execution domain even
-	// after its template was deleted or provisioning became permanently broken.
+	// Cancellation/finalization can therefore stop an execution domain even after
+	// its template or Project was deleted or provisioning became permanently broken.
 	if env.Status.Lifecycle.Suspended {
 		result, err := r.reconcilePaused(ctx, &env)
 		if err != nil {
 			return ctrl.Result{}, r.fail(ctx, &env, fmt.Errorf("pause environment: %w", err))
 		}
 		return result, nil
+	}
+	if projectErr != nil {
+		var terminal *terminalEnvironmentError
+		if stderrors.As(projectErr, &terminal) {
+			return r.reconcileInvalidProjectConfiguration(ctx, &env, projectErr.Error())
+		}
+		return ctrl.Result{}, r.fail(ctx, &env, projectErr)
+	}
+	if err := validateEnvironmentProject(project); err != nil {
+		return ctrl.Result{}, r.fail(ctx, &env, err)
 	}
 	if result, handled, err := r.reconcilePendingPodRecovery(ctx, &env); handled || err != nil {
 		return result, err
@@ -252,7 +266,7 @@ func (r *EnvironmentReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		return ctrl.Result{Requeue: true}, r.setPhase(ctx, &env, platformv1alpha1.EnvironmentPhaseResuming, "", "")
 	}
 
-	pod, err := r.ensurePod(ctx, &env, &tmpl)
+	pod, err := r.ensurePodForProject(ctx, &env, &tmpl, project)
 	if stderrors.Is(err, errPodReplacing) {
 		return ctrl.Result{Requeue: true}, nil
 	}
@@ -535,6 +549,46 @@ func (r *EnvironmentReconciler) now() time.Time {
 	return time.Now()
 }
 
+// reconcileInvalidProjectConfiguration withdraws the published connection
+// before fencing an execution domain whose Project configuration cannot be
+// safely established. The workspace and ingress policy are retained, and
+// credentials are revoked only after the exact Environment-owned Pod is gone.
+func (r *EnvironmentReconciler) reconcileInvalidProjectConfiguration(ctx context.Context, env *platformv1alpha1.Environment, message string) (ctrl.Result, error) {
+	hadPublishedConnection := env.Status.PodName != "" || env.Status.Endpoints.Sandboxd != "" || platformv1alpha1.IsEnvironmentReady(env)
+	if err := r.setEnvironmentStatus(ctx, env, platformv1alpha1.EnvironmentPhaseFailed, "", "", "InvalidConfiguration", message); err != nil {
+		return ctrl.Result{}, err
+	}
+	if hadPublishedConnection {
+		return ctrl.Result{Requeue: true}, nil
+	}
+
+	var pod corev1.Pod
+	if err := r.Get(ctx, types.NamespacedName{Namespace: env.Namespace, Name: envPodName(env)}, &pod); err == nil {
+		if exactControllerOwner(&pod, platformv1alpha1.GroupVersion.String(), "Environment", env.Name, env.UID) {
+			if err := r.deleteObservedChild(ctx, &pod); err != nil && !errors.IsNotFound(err) {
+				return ctrl.Result{}, fmt.Errorf("delete pod for invalid Project configuration: %w", err)
+			}
+			return ctrl.Result{Requeue: true}, nil
+		}
+	} else if !errors.IsNotFound(err) {
+		return ctrl.Result{}, err
+	}
+
+	var credentials corev1.Secret
+	if err := r.Get(ctx, types.NamespacedName{Namespace: env.Namespace, Name: envCredentialName(env)}, &credentials); err == nil {
+		if !exactControllerOwner(&credentials, platformv1alpha1.GroupVersion.String(), "Environment", env.Name, env.UID) {
+			return ctrl.Result{}, nil
+		}
+		if err := r.deleteObservedChild(ctx, &credentials); err != nil && !errors.IsNotFound(err) {
+			return ctrl.Result{}, fmt.Errorf("revoke credentials for invalid Project configuration: %w", err)
+		}
+		return ctrl.Result{Requeue: true}, nil
+	} else if !errors.IsNotFound(err) {
+		return ctrl.Result{}, err
+	}
+	return ctrl.Result{}, nil
+}
+
 // reconcileUnsupportedBackend withdraws the published connection identity
 // before stopping any legacy pod admitted under an older CRD. It retains the
 // workspace PVC and removes credentials only after the pod is gone.
@@ -797,8 +851,50 @@ func envImagePullPolicy(image string) corev1.PullPolicy {
 	return corev1.PullAlways
 }
 
-// ensurePod returns the backing pod, creating it if necessary.
+// ensurePod resolves the optional Project and returns the backing pod, creating
+// it if necessary. Reconcile resolves the Project earlier so validation happens
+// before any child resource is created.
 func (r *EnvironmentReconciler) ensurePod(ctx context.Context, env *platformv1alpha1.Environment, tmpl *platformv1alpha1.EnvironmentTemplate) (*corev1.Pod, error) {
+	project, err := r.resolveEnvironmentProject(ctx, env)
+	if err != nil {
+		return nil, err
+	}
+	if project != nil && len(project.Spec.EgressAllowlist) != 0 {
+		return nil, terminalEnvironment(stderrors.New(unsupportedEgressAllowlistMessage(project.Name)))
+	}
+	if err := validateEnvironmentProject(project); err != nil {
+		return nil, err
+	}
+	return r.ensurePodForProject(ctx, env, tmpl, project)
+}
+
+func (r *EnvironmentReconciler) resolveEnvironmentProject(ctx context.Context, env *platformv1alpha1.Environment) (*platformv1alpha1.Project, error) {
+	if env.Spec.ProjectRef == "" {
+		return nil, nil
+	}
+	var project platformv1alpha1.Project
+	if err := r.Get(ctx, types.NamespacedName{Namespace: env.Namespace, Name: env.Spec.ProjectRef}, &project); err != nil {
+		wrapped := fmt.Errorf("get project %q: %w", env.Spec.ProjectRef, err)
+		if errors.IsNotFound(err) {
+			wrapped = terminalEnvironment(wrapped)
+		}
+		return nil, wrapped
+	}
+	return &project, nil
+}
+
+func validateEnvironmentProject(project *platformv1alpha1.Project) error {
+	if project != nil && len(project.Spec.Repositories) != 1 {
+		return terminalEnvironment(fmt.Errorf("project %q must have exactly one repository, got %d", project.Name, len(project.Spec.Repositories)))
+	}
+	return nil
+}
+
+func unsupportedEgressAllowlistMessage(projectName string) string {
+	return fmt.Sprintf("project %q has a non-empty egressAllowlist, which is unsupported until GitHub issue #68 is implemented", projectName)
+}
+
+func (r *EnvironmentReconciler) ensurePodForProject(ctx context.Context, env *platformv1alpha1.Environment, tmpl *platformv1alpha1.EnvironmentTemplate, project *platformv1alpha1.Project) (*corev1.Pod, error) {
 	podName := envPodName(env)
 	var pod corev1.Pod
 	err := r.Get(ctx, types.NamespacedName{Namespace: env.Namespace, Name: podName}, &pod)
@@ -975,18 +1071,7 @@ func (r *EnvironmentReconciler) ensurePod(ctx context.Context, env *platformv1al
 	if tmpl.Spec.RuntimeClass != "" {
 		pod.Spec.RuntimeClassName = &tmpl.Spec.RuntimeClass
 	}
-	if env.Spec.ProjectRef != "" {
-		var project platformv1alpha1.Project
-		if err := r.Get(ctx, types.NamespacedName{Namespace: env.Namespace, Name: env.Spec.ProjectRef}, &project); err != nil {
-			wrapped := fmt.Errorf("get project %q: %w", env.Spec.ProjectRef, err)
-			if errors.IsNotFound(err) {
-				wrapped = terminalEnvironment(wrapped)
-			}
-			return nil, wrapped
-		}
-		if len(project.Spec.Repositories) != 1 {
-			return nil, terminalEnvironment(fmt.Errorf("project %q must have exactly one repository, got %d", env.Spec.ProjectRef, len(project.Spec.Repositories)))
-		}
+	if project != nil {
 		repository := project.Spec.Repositories[0]
 		projectEnv := []corev1.EnvVar{
 			{Name: "SWE_REPOSITORY", Value: repository},

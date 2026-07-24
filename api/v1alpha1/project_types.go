@@ -29,8 +29,9 @@ type ProjectSpec struct {
 	// +optional
 	ChangesWorkflow ChangesWorkflow `json:"changesWorkflow,omitempty"`
 
-	// EgressAllowlist lists hosts environments for this project may reach.
-	// Everything else is denied by the egress proxy.
+	// EgressAllowlist is reserved for future per-project egress enforcement.
+	// Non-empty values are currently unsupported and cause referenced Environments
+	// to fail validation until the egress proxy is implemented.
 	// +optional
 	// +listType=set
 	EgressAllowlist []string `json:"egressAllowlist,omitempty"`

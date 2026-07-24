@@ -50,6 +50,12 @@ enforcement. Environment pods do not receive a Kubernetes service-account token 
 NetworkPolicies are additive, destination-node traffic may be exempt, and Kubernetes API
 port-forwarding is governed by `pods/portforward` RBAC rather than this policy.
 
+Default-deny egress and the per-project egress proxy are not implemented. The
+`Project.spec.egressAllowlist` field is reserved for that future contract; the operator rejects
+non-empty values and fences any existing Environment execution rather than running with an
+unenforced allowlist. Empty or omitted allowlists do not restrict environment egress, which is
+subject to the cluster's network configuration.
+
 ### Credential lifecycle
 
 1. **Bootstrap:** before creating a pod, the operator generates a new certificate, private key,
