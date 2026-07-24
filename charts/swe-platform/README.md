@@ -253,8 +253,30 @@ does not yet reclaim its UID-fenced transcript rows automatically, because compl
 and Project-offboarding retention policy depends on the lifecycle decisions tracked in
 [#101](https://github.com/Chris-Cullins/swe-platform/issues/101) and #11. Until that work ships,
 operators must monitor and provision the dedicated transcript database for accumulated history.
-Manual deletion should be exceptional: take a backup and target the exact namespace and immutable
-Run UID so a same-name replacement Run's transcript cannot be removed.
+Total retained storage across all Runs can be checked directly against the per-Run accounting
+columns the append path maintains:
+
+```sql
+SELECT count(*) AS runs,
+       coalesce(sum(retained_events), 0) AS retained_events,
+       coalesce(sum(retained_bytes), 0) AS retained_bytes
+FROM transcript_runs;
+```
+
+or grouped by namespace:
+
+```sql
+SELECT namespace, count(*) AS runs,
+       coalesce(sum(retained_events), 0) AS retained_events,
+       coalesce(sum(retained_bytes), 0) AS retained_bytes
+FROM transcript_runs
+GROUP BY namespace
+ORDER BY coalesce(sum(retained_bytes), 0) DESC;
+```
+
+These queries are read-only and report retained history only; they do not advise when or whether
+to delete. Manual deletion should be exceptional: take a backup and target the exact namespace and
+immutable Run UID so a same-name replacement Run's transcript cannot be removed.
 
 ## Control-plane authentication and authorization
 
