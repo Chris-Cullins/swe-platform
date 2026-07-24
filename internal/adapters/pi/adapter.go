@@ -132,7 +132,7 @@ func (a *Adapter) Observe(ctx context.Context, task controllers.AdapterTask, san
 		}
 		detail, ok := terminal(out)
 		if !ok {
-			return controllers.AdapterObservationFailed, message("Pi exited without a coherent agent_end", detail), nil
+			return controllers.AdapterObservationFailed, message("Pi exited without a coherent settled result", detail), nil
 		}
 		return controllers.AdapterObservationSucceeded, "Pi completed", nil
 	default:
@@ -141,6 +141,7 @@ func (a *Adapter) Observe(ctx context.Context, task controllers.AdapterTask, san
 }
 func terminal(out []byte) (string, bool) {
 	var end *piEvent
+	settled := false
 	for _, line := range bytes.Split(out, []byte("\n")) {
 		line = bytes.TrimSpace(line)
 		if len(line) == 0 {
@@ -153,16 +154,28 @@ func terminal(out []byte) (string, bool) {
 		if e.Type == "" {
 			return "JSONL event is missing type", false
 		}
-		if end != nil {
-			return "output after agent_end", false
+		if settled {
+			if e.Type == "agent_settled" {
+				return "duplicate agent_settled", false
+			}
+			return "output after agent_settled", false
 		}
-		if e.Type == "agent_end" {
+		switch e.Type {
+		case "agent_end":
 			copy := e
 			end = &copy
+		case "agent_settled":
+			if end == nil {
+				return "agent_settled before agent_end", false
+			}
+			settled = true
 		}
 	}
 	if end == nil {
 		return "missing agent_end", false
+	}
+	if !settled {
+		return "missing agent_settled", false
 	}
 	if len(end.Messages) == 0 {
 		return "agent_end has no messages", false

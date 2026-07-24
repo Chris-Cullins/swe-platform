@@ -76,7 +76,7 @@ RUN archive="$(npm pack "@mariozechner/pi-coding-agent@${PI_VERSION}" --silent)"
 	&& npm install --ignore-scripts --omit=dev --prefix /opt/pi "$archive" \
 	&& test "$(node -p "require('/opt/pi/node_modules/@mariozechner/pi-coding-agent/package.json').version")" = "$PI_VERSION" \
 	&& test "$(readlink -f /opt/pi/node_modules/.bin/pi)" = /opt/pi/node_modules/@mariozechner/pi-coding-agent/dist/cli.js \
-	&& test "$(/opt/pi/node_modules/.bin/pi --version)" = "$PI_VERSION"
+	&& test "$(/opt/pi/node_modules/.bin/pi --version 2>&1)" = "$PI_VERSION"
 
 # Base image for environments.
 FROM debian:12-slim AS environment
@@ -108,7 +108,7 @@ RUN claude --version \
 	&& test -f /opt/codex/codex-package.json \
 	&& test "$(node -p "require('/opt/pi/node_modules/@mariozechner/pi-coding-agent/package.json').version")" = "0.73.1" \
 	&& test "$(readlink -f "$(command -v pi)")" = /opt/pi/node_modules/@mariozechner/pi-coding-agent/dist/cli.js \
-	&& test "$(pi --version)" = "0.73.1"
+	&& test "$(pi --version 2>&1)" = "0.73.1"
 
 USER swe
 WORKDIR /workspace

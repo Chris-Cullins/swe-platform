@@ -12,8 +12,9 @@ key in chart values, Project configuration, or custom-image ambient environment 
 
 The image also bundles pinned Pi (`swe run --agent pi ...`). Pi has no credential-profile or
 credential-injection support: selecting a profile fails before allocation or credential reads.
-Custom ambient authentication is outside the supported contract and should not be added to
-chart values or custom images.
+The stock image contains no Pi authentication. Ambient auth or configuration introduced by a
+custom image, attached user, hooks/repository code, or the process environment is outside the
+supported process-scoped credential contract and should not be added to chart values.
 
 This chart installs the swe-platform CRDs, operator, and the first control-plane API.
 The control plane accepts adapter-owned transcript events and streams them over SSE.
@@ -90,9 +91,10 @@ step, including both architectures and registry export.
 | + Codex | `bfeab4f` / `sha-bfeab4f` | 418,687,171 B (399.29 MiB) | 408,239,734 B (389.33 MiB) | 198 s |
 | + Pi (historical; reverted by PR #93) | `c9daef7` / `sha-c9daef7` | 494,042,178 B (471.16 MiB) | 483,574,399 B (461.17 MiB) | 257 s |
 
-Pi was reverted by PR #93 pending provenance and security review. Current `main` contains
-Claude Code, Amp, and Codex and therefore ends at the three-CLI row above; this historical
-four-CLI measurement does not reinstate Pi or change its review status.
+The four-CLI row is explicitly a historical measurement of the implementation reverted by PR
+#93; it is retained only as evidence for the coordinated-image decision. The current clean-room
+image bundles and registers Claude Code, Amp, Codex, and Pi, but has not yet been remeasured, so
+the historical row must not be presented as its size or build time.
 
 Relative to Claude Code alone, all four CLIs added 250,832,668 compressed bytes on amd64
 (103.1%) and 242,396,734 bytes on arm64 (100.5%); the observed publish step was 194 seconds
@@ -106,7 +108,7 @@ These observations still favor retaining one coordinated image as the lower-comp
 the largest measured compressed layer payload remains below 500 MB, the corresponding release
 step completed in under five minutes, nodes can reuse one image across Runs, and a warm
 Environment contains the binaries for every currently registered adapter (Claude Code, Amp,
-and Codex). Per-agent images could avoid some unused bytes on a cold pull, but would multiply
+Codex, and Pi). Per-agent images could avoid some unused bytes on a cold pull, but would multiply
 release artifacts and require agent-specific template/image and warm-pool selection. Per-agent
 images and startup latency were not measured, so the data does not establish a performance
 advantage for the coordinated image; it shows no reason to add that operational dimension yet.

@@ -187,7 +187,8 @@ test -z "${ANTHROPIC_API_KEY+x}"; test -z "${OPENAI_API_KEY+x}"; test -z "${GEMI
 printf '%s\n' '{"type":"message_end","message":{"role":"assistant","stopReason":"stop"}}'
 printf '%s\n' 'fake-pi-stderr-marker' >&2
 if [ "$5" = 'fake Pi failure smoke test' ]; then reason=error; else test "$5" = 'fake Pi lifecycle smoke test'; reason=stop; sleep 5; fi
-printf '%s\n' "{\"type\":\"agent_end\",\"messages\":[{\"role\":\"assistant\",\"stopReason\":\"$reason\"}]}"
+printf '%s\n' "{\"type\":\"agent_end\",\"messages\":[{\"role\":\"assistant\",\"stopReason\":\"$reason\"}],\"willRetry\":false}"
+printf '%s\n' '{"type":"agent_settled"}'
 EOF
 chmod 0755 "$FAKE_ENV_CONTEXT/pi"
 cat > "$FAKE_ENV_CONTEXT/Dockerfile" <<'EOF'
@@ -925,7 +926,7 @@ set -e
 if [[ "$PI_TRANSCRIPT_STATUS" != "0" && "$PI_TRANSCRIPT_STATUS" != "28" ]]; then echo "FAIL: Pi transcript read failed"; exit 1; fi
 grep -F '"source":"pi"' /tmp/swe-platform-pi-transcript.out | grep -F '"type":"pi.process-output"' | \
 	grep -oE '"data":"[A-Za-z0-9+/=]+"' | sed 's/^"data":"//; s/"$//' | while IFS= read -r encoded; do printf '%s' "$encoded" | base64 --decode || exit 1; done > /tmp/swe-platform-pi-process-output.out
-for marker in agent_end fake-pi-stderr-marker; do grep -Fq "$marker" /tmp/swe-platform-pi-process-output.out || { echo "FAIL: missing Pi marker $marker"; exit 1; }; done
+for marker in agent_end agent_settled fake-pi-stderr-marker; do grep -Fq "$marker" /tmp/swe-platform-pi-process-output.out || { echo "FAIL: missing Pi marker $marker"; exit 1; }; done
 kubectl delete run "$PI_RUN_NAME" --wait=true >/dev/null
 PI_FAILED_RUN_NAME=e2e-fake-pi-failed-run
 bin/swe run "fake Pi failure smoke test" --name "$PI_FAILED_RUN_NAME" --environment "$ENV_NAME" --agent pi --wait=false

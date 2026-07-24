@@ -147,8 +147,8 @@ runs both via `make` targets:
   its pinned tmux with `images/env-base/tmux-control-output-drain.patch`; keep the
   source checksum and patch synchronized when upgrading tmux. Its `terminal-test`
   target runs the patched-runtime terminal regression during `hack/e2e.sh`. The image
-  also includes version-pinned Claude Code (the default adapter) and Amp CLIs. Amp image
-  installs must retain `AMP_SKIP_UPDATE_CHECK=1` and the pinned npm integrity check.
+  also includes version-pinned Claude Code (the default adapter), Amp, Codex, and Pi CLIs. Amp
+  image installs must retain `AMP_SKIP_UPDATE_CHECK=1` and the pinned npm integrity check.
 - **Publish images:** pushes to `main` and `v*` tags publish multi-architecture operator
   and env-base images to GHCR via `.github/workflows/publish-images.yaml`.
 

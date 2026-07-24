@@ -101,8 +101,10 @@ Git/setup/service credentials, Amp login persistence, and stronger confinement r
 
 The Pi adapter never accepts a credential profile or injects provider credentials. The
 controller rejects such Runs before Environment allocation and before reading the selected
-profile or Secret. Ambient Pi authentication in a custom image is outside the platform's
-provided security contract and is not recommended.
+profile or Secret, and the stock image contains no Pi authentication. Pi still loads ambient
+authentication, configuration, and extensions from its controlled Environment. State introduced
+outside the profile path by a custom image, attached user, setup/resume or repository code, or
+the process environment is unsupported and is not confined to the managed Pi process.
 
 ### Other environment backends
 
