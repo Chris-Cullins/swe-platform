@@ -21,6 +21,8 @@ E2E_AGENT_API_KEY='!!SWE-E2E-AGENT-API-KEY-DO-NOT-USE!!'
 E2E_ROTATED_AGENT_API_KEY='!!SWE-E2E-ROTATED-AGENT-API-KEY-DO-NOT-USE!!'
 PORT_FORWARD_PID=""
 SANDBOXD_PORT_FORWARD_PID=""
+STREAM_PID=""
+CLI_STREAM_PID=""
 WEB_TERMINAL_CLIENT=""
 PROJECT_REPO=""
 PROJECT_WORKTREE=""
@@ -28,6 +30,14 @@ FAKE_ENV_CONTEXT=""
 E2E_KUBECONFIG=""
 
 cleanup() {
+	if [[ -n "$STREAM_PID" ]]; then
+		kill "$STREAM_PID" >/dev/null 2>&1 || true
+		wait "$STREAM_PID" >/dev/null 2>&1 || true
+	fi
+	if [[ -n "$CLI_STREAM_PID" ]]; then
+		kill "$CLI_STREAM_PID" >/dev/null 2>&1 || true
+		wait "$CLI_STREAM_PID" >/dev/null 2>&1 || true
+	fi
 	if [[ -n "$PORT_FORWARD_PID" ]]; then
 		kill "$PORT_FORWARD_PID" >/dev/null 2>&1 || true
 		wait "$PORT_FORWARD_PID" >/dev/null 2>&1 || true
@@ -620,6 +630,9 @@ curl --fail --silent --no-buffer --max-time 10 \
 	-H "Authorization: Bearer ${E2E_BOOTSTRAP_TOKEN}" \
 	"http://127.0.0.1:18080/api/v1/namespaces/default/runs/${RUN_NAME}/transcript" > /tmp/swe-platform-transcript.out &
 STREAM_PID=$!
+SWE_CONTROL_PLANE_URL=http://127.0.0.1:18080 SWE_CONTROL_PLANE_TOKEN="$E2E_BOOTSTRAP_TOKEN" \
+	timeout 10 bin/swe logs --run "$RUN_NAME" > /tmp/swe-platform-cli-transcript.out &
+CLI_STREAM_PID=$!
 sleep 1
 APPEND_STATUS=$(curl --silent --output /dev/null --write-out '%{http_code}' \
 	-H "Authorization: Bearer ${PRODUCER_TOKEN}" \
@@ -647,16 +660,27 @@ if [[ "$UNKNOWN_STATUS" != "404" ]]; then
 	exit 1
 fi
 for _ in $(seq 1 30); do
-	if grep -q 'e2e transcript event' /tmp/swe-platform-transcript.out; then
+	if grep -q 'e2e transcript event' /tmp/swe-platform-transcript.out && \
+		grep -q 'e2e transcript event' /tmp/swe-platform-cli-transcript.out; then
 		break
 	fi
 	sleep 1
 done
 kill "$STREAM_PID" >/dev/null 2>&1 || true
 wait "$STREAM_PID" >/dev/null 2>&1 || true
+STREAM_PID=""
+kill "$CLI_STREAM_PID" >/dev/null 2>&1 || true
+wait "$CLI_STREAM_PID" >/dev/null 2>&1 || true
+CLI_STREAM_PID=""
 if ! grep -q 'e2e transcript event' /tmp/swe-platform-transcript.out; then
 	echo "FAIL: transcript event was not received from the SSE stream"
 	cat /tmp/swe-platform-transcript.out
+	exit 1
+fi
+if ! grep -F '"event":"transcript"' /tmp/swe-platform-cli-transcript.out | \
+	grep -Fq 'e2e transcript event'; then
+	echo "FAIL: swe logs --run did not emit the opaque transcript SSE envelope as NDJSON"
+	cat /tmp/swe-platform-cli-transcript.out
 	exit 1
 fi
 if ! grep -F '"source":"claude-code"' /tmp/swe-platform-transcript.out | \
