@@ -299,6 +299,7 @@ func (m *tuiModel) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		if msg.err != nil && m.ctx.Err() == nil {
 			m.err = "Run watch: " + safeError(msg.err)
+			m.listNeedsRefresh = true
 		}
 		return m, nil
 	case runLoadedMsg:

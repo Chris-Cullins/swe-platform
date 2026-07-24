@@ -153,6 +153,22 @@ func TestTUIPollRecoversSnapshotAndExactDetailFailures(t *testing.T) {
 	}
 }
 
+func TestTUIWatchErrorRecoversThroughSnapshotWithoutCompatibilityFallback(t *testing.T) {
+	model := newTUIModel(context.Background(), nil, "team-a")
+	model.resourceGeneration = 3
+	model.resourceCancel = func() {}
+	model.resourceDone = make(chan struct{})
+
+	_, command := model.Update(runWatchDoneMsg{generation: 3, err: errors.New("invalid watch event")})
+	if command != nil || model.resourceCancel != nil || model.resourceDone != nil || !model.listNeedsRefresh || model.pollFallback {
+		t.Fatalf("watch error recovery state = command %v, cancel %v, done %v, needs refresh %t, fallback %t", command, model.resourceCancel, model.resourceDone, model.listNeedsRefresh, model.pollFallback)
+	}
+	_, command = model.Update(pollMsg(time.Now()))
+	if command == nil || !model.listInFlight || model.pollFallback {
+		t.Fatalf("snapshot retry state = command %v, inflight %t, fallback %t", command, model.listInFlight, model.pollFallback)
+	}
+}
+
 func TestTUIDiscardedDetailLoadImmediatelyRefreshesCurrentSelection(t *testing.T) {
 	model := newTUIModel(context.Background(), nil, "team-a")
 	model.mode = tuiDetail
