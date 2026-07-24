@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -33,15 +34,27 @@ type fakeResources struct {
 	createdRequest                    CreateRunRequest
 	cancel                            Run
 	listPage                          RunList
+	summaryPage                       RunSummaryList
 	environment                       Environment
 	listLimit                         int64
 	listContinue                      string
+	cancelUID                         string
+	cancelErr                         error
+	terminalAssociation               RunTerminalAssociation
+	terminalRunUID                    string
+	terminalEnvironmentUID            string
+	terminalErr                       error
 }
 
 func (f *fakeResources) ListRuns(_ context.Context, n string, l int64, c string) (RunList, error) {
 	f.calls = append(f.calls, "list")
 	f.listLimit, f.listContinue = l, c
 	return f.listPage, nil
+}
+func (f *fakeResources) ListRunSummaries(_ context.Context, n string, l int64, c string) (RunSummaryList, error) {
+	f.calls = append(f.calls, "list-summary")
+	f.listLimit, f.listContinue = l, c
+	return f.summaryPage, nil
 }
 func (f *fakeResources) CreateRun(_ context.Context, n string, r CreateRunRequest) (Run, error) {
 	f.calls = append(f.calls, "create")
@@ -56,9 +69,10 @@ func (f *fakeResources) GetRun(_ context.Context, n, x string) (Run, error) {
 	f.calls = append(f.calls, "get")
 	return f.existing, f.errorGet
 }
-func (f *fakeResources) CancelRun(_ context.Context, n, x string) (Run, error) {
+func (f *fakeResources) CancelRun(_ context.Context, n, x, uid string) (Run, error) {
 	f.calls = append(f.calls, "cancel")
-	return f.cancel, nil
+	f.cancelUID = uid
+	return f.cancel, f.cancelErr
 }
 func (f *fakeResources) GetEnvironment(_ context.Context, n, x string) (Environment, error) {
 	f.calls = append(f.calls, "environment")
@@ -66,6 +80,10 @@ func (f *fakeResources) GetEnvironment(_ context.Context, n, x string) (Environm
 		return Environment{Name: x}, nil
 	}
 	return f.environment, nil
+}
+func (f *fakeResources) ResolveRunTerminal(_ context.Context, namespace, runName, runUID, environmentUID string) (RunTerminalAssociation, error) {
+	f.terminalRunUID, f.terminalEnvironmentUID = runUID, environmentUID
+	return f.terminalAssociation, f.terminalErr
 }
 
 func resourceRequest(s *Server, method, path, body, origin string) *httptest.ResponseRecorder {
@@ -201,6 +219,55 @@ func TestCancelBodyResponseAndDelegation(t *testing.T) {
 	}
 	if strings.Join(f.calls, ",") != "cancel,cancel" {
 		t.Fatalf("calls=%v", f.calls)
+	}
+}
+
+func TestCancelTypedUIDConflictAndEmptyBodyCompatibility(t *testing.T) {
+	f := &fakeResources{cancel: Run{Name: "r", CancelRequested: true}}
+	s := NewServer(nil, ServerOptions{Access: &recordingAccess{}, Resources: f})
+	w := resourceRequest(s, "POST", "/api/v1/namespaces/ns/runs/r/cancel", `{"runUID":"uid-1"}`, "")
+	if w.Code != http.StatusOK || f.cancelUID != "uid-1" {
+		t.Fatalf("typed cancel = %d, UID %q", w.Code, f.cancelUID)
+	}
+	f.cancelErr = errRunUIDConflict
+	w = resourceRequest(s, "POST", "/api/v1/namespaces/ns/runs/r/cancel", `{"runUID":"wrong"}`, "")
+	if w.Code != http.StatusConflict || !strings.Contains(w.Body.String(), `/run-uid-conflict"`) {
+		t.Fatalf("conflict = %d %s", w.Code, w.Body.String())
+	}
+	f.cancelErr = nil
+	w = resourceRequest(s, "POST", "/api/v1/namespaces/ns/runs/r/cancel", "", "")
+	if w.Code != http.StatusOK || f.cancelUID != "" {
+		t.Fatalf("empty cancel = %d, UID %q", w.Code, f.cancelUID)
+	}
+}
+
+func TestRunSummaryListRoute(t *testing.T) {
+	f := &fakeResources{summaryPage: RunSummaryList{Items: []RunSummary{{Name: "r", PromptPreview: "safe"}}, Continue: "next"}}
+	w := resourceRequest(NewServer(nil, ServerOptions{Access: &recordingAccess{}, Resources: f}), "GET", "/api/v1/namespaces/ns/runs?view=summary&limit=7&continue=cursor", "", "")
+	if w.Code != http.StatusOK || strings.Join(f.calls, ",") != "list-summary" || f.listLimit != 7 || f.listContinue != "cursor" || !strings.Contains(w.Body.String(), `"promptPreview":"safe"`) {
+		t.Fatalf("summary response = %d %s; calls=%v args=%d/%q", w.Code, w.Body.String(), f.calls, f.listLimit, f.listContinue)
+	}
+}
+
+func TestRunTerminalRouteRequiresExactIdentityAndPreservesEnvironmentSAR(t *testing.T) {
+	access := &recordingAccess{}
+	resources := &fakeResources{terminalAssociation: RunTerminalAssociation{RunName: "run", RunUID: "run-uid", EnvironmentName: "env", EnvironmentUID: "env-uid"}}
+	server := NewServer(nil, ServerOptions{Access: access, Resources: resources, TerminalDialer: &terminalTestDialer{}})
+	request := httptest.NewRequest(http.MethodGet, "/api/v1/namespaces/ns/runs/run/terminal", nil)
+	request.Header.Set("Authorization", "Bearer x")
+	request.Header.Set(RunUIDHeader, "run-uid")
+	request.Header.Set(EnvironmentUIDHeader, "env-uid")
+	response := httptest.NewRecorder()
+	server.Handler().ServeHTTP(response, request)
+	if response.Code != http.StatusBadRequest || resources.terminalRunUID != "run-uid" || resources.terminalEnvironmentUID != "env-uid" {
+		t.Fatalf("response/identity = %d/%q/%q", response.Code, resources.terminalRunUID, resources.terminalEnvironmentUID)
+	}
+	want := []ResourceAccess{
+		{Namespace: "ns", Verb: "get", Resource: "runs", Name: "run"},
+		{Namespace: "ns", Verb: "get", Resource: "environments", Subresource: "terminal", Name: "env"},
+	}
+	if !reflect.DeepEqual(access.calls, want) {
+		t.Fatalf("authorization calls = %#v, want %#v", access.calls, want)
 	}
 }
 

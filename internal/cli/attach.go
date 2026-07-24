@@ -5,13 +5,17 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
+	"github.com/Chris-Cullins/swe-platform/internal/controlplane"
 	"github.com/Chris-Cullins/swe-platform/internal/controlplaneclient"
 	"github.com/gorilla/websocket"
+	"github.com/muesli/cancelreader"
 	"github.com/spf13/cobra"
 	"golang.org/x/term"
 )
@@ -39,8 +43,30 @@ func attachTerminal(cmd *cobra.Command, controlPlaneURL, token, namespace, envNa
 	if err != nil {
 		return err
 	}
-	endpoint := client.WebSocketEndpoint("api", "v1", "namespaces", namespace, "environments", envName, "terminal")
-	connection, response, err := websocket.DefaultDialer.DialContext(cmd.Context(), endpoint, client.AuthorizationHeader())
+	return attachTerminalWithClient(cmd.Context(), client, namespace, envName, cmd.InOrStdin(), cmd.OutOrStdout())
+}
+
+func attachTerminalWithClient(ctx context.Context, client *controlplaneclient.Client, namespace, environment string, input io.Reader, output io.Writer) error {
+	if err := validateTerminalInput(input); err != nil {
+		return err
+	}
+	endpoint := client.WebSocketEndpoint("api", "v1", "namespaces", namespace, "environments", environment, "terminal")
+	return dialAndBridgeTerminal(ctx, endpoint, client.AuthorizationHeader(), input, output)
+}
+
+func attachRunTerminalWithClient(ctx context.Context, client *controlplaneclient.Client, namespace, runName, runUID, environmentUID string, input io.Reader, output io.Writer) error {
+	if err := validateTerminalInput(input); err != nil {
+		return err
+	}
+	endpoint := client.WebSocketEndpoint("api", "v1", "namespaces", namespace, "runs", runName, "terminal")
+	header := client.AuthorizationHeader()
+	header.Set(controlplane.RunUIDHeader, runUID)
+	header.Set(controlplane.EnvironmentUIDHeader, environmentUID)
+	return dialAndBridgeTerminal(ctx, endpoint, header, input, output)
+}
+
+func dialAndBridgeTerminal(ctx context.Context, endpoint string, header http.Header, input io.Reader, output io.Writer) error {
+	connection, response, err := websocket.DefaultDialer.DialContext(ctx, endpoint, header)
 	if err != nil {
 		if response != nil {
 			return fmt.Errorf("connect to environment terminal: control plane returned %s", response.Status)
@@ -48,7 +74,7 @@ func attachTerminal(cmd *cobra.Command, controlPlaneURL, token, namespace, envNa
 		return fmt.Errorf("connect to environment terminal: %w", err)
 	}
 	defer connection.Close()
-	return bridgeTerminal(cmd.Context(), connection, cmd.InOrStdin(), cmd.OutOrStdout())
+	return bridgeTerminal(ctx, connection, input, output)
 }
 
 func terminalGatewayURL(baseURL, namespace, environment string) (string, error) {
@@ -58,11 +84,6 @@ func terminalGatewayURL(baseURL, namespace, environment string) (string, error) 
 func bridgeTerminal(ctx context.Context, connection *websocket.Conn, input io.Reader, output io.Writer) error {
 	streamCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	go func() {
-		<-streamCtx.Done()
-		_ = connection.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""), time.Now().Add(time.Second))
-		_ = connection.Close()
-	}()
 	cols, rows := 80, 24
 	var terminalFile *os.File
 	if file, ok := input.(*os.File); ok && term.IsTerminal(int(file.Fd())) {
@@ -80,23 +101,36 @@ func bridgeTerminal(ctx context.Context, connection *websocket.Conn, input io.Re
 	if err := connection.WriteJSON(map[string]any{"type": "open", "cols": cols, "rows": rows}); err != nil {
 		return fmt.Errorf("open terminal: %w", err)
 	}
+	cancelInput, err := cancelreader.NewReader(input)
+	if err != nil {
+		return fmt.Errorf("prepare terminal input: %w", err)
+	}
+	defer cancelInput.Close()
 
 	type inputResult struct {
-		data []byte
-		err  error
+		data   []byte
+		err    error
+		detach bool
 	}
 	inputCh := make(chan inputResult)
+	inputDone := make(chan struct{})
 	go func() {
+		defer close(inputDone)
 		buf := make([]byte, 32*1024)
 		for {
-			n, err := input.Read(buf)
-			result := inputResult{data: append([]byte(nil), buf[:n]...), err: err}
+			n, err := cancelInput.Read(buf)
+			data := append([]byte(nil), buf[:n]...)
+			detachAt := bytes.IndexByte(data, 0x1d)
+			result := inputResult{data: data, err: err, detach: detachAt >= 0}
+			if detachAt >= 0 {
+				result.data = data[:detachAt]
+			}
 			select {
 			case inputCh <- result:
 			case <-streamCtx.Done():
 				return
 			}
-			if err != nil {
+			if err != nil || result.detach {
 				return
 			}
 		}
@@ -106,32 +140,34 @@ func bridgeTerminal(ctx context.Context, connection *websocket.Conn, input io.Re
 		signal.Notify(resizeCh, syscall.SIGWINCH)
 		defer signal.Stop(resizeCh)
 	}
+	writeDone := make(chan error, 1)
 	go func() {
+		terminalInput := inputCh
 		for {
 			select {
 			case <-streamCtx.Done():
+				writeDone <- nil
 				return
-			case result := <-inputCh:
-				if detachAt := bytes.IndexByte(result.data, 0x1d); detachAt >= 0 {
-					if detachAt > 0 {
-						_ = connection.WriteMessage(websocket.BinaryMessage, result.data[:detachAt])
-					}
-					_ = connection.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""), time.Now().Add(time.Second))
-					cancel()
-					return
-				}
+			case result := <-terminalInput:
 				if len(result.data) > 0 {
-					if connection.WriteMessage(websocket.BinaryMessage, result.data) != nil {
+					if err := connection.WriteMessage(websocket.BinaryMessage, result.data); err != nil {
+						writeDone <- fmt.Errorf("send terminal input: %w", err)
 						return
 					}
 				}
-				if result.err != nil {
+				if result.detach {
+					_ = connection.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""), time.Now().Add(time.Second))
+					writeDone <- nil
 					return
+				}
+				if result.err != nil {
+					terminalInput = nil
 				}
 			case <-resizeCh:
 				width, height, err := term.GetSize(int(terminalFile.Fd()))
 				if err == nil {
-					if connection.WriteJSON(map[string]any{"type": "resize", "cols": width, "rows": height}) != nil {
+					if err := connection.WriteJSON(map[string]any{"type": "resize", "cols": width, "rows": height}); err != nil {
+						writeDone <- fmt.Errorf("resize terminal: %w", err)
 						return
 					}
 				}
@@ -139,22 +175,68 @@ func bridgeTerminal(ctx context.Context, connection *websocket.Conn, input io.Re
 		}
 	}()
 
-	for {
-		messageType, message, err := connection.ReadMessage()
-		if err != nil {
-			if streamCtx.Err() != nil {
-				return nil
+	readDone := make(chan error, 1)
+	go func() {
+		for {
+			messageType, message, err := connection.ReadMessage()
+			if err != nil {
+				if websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway) {
+					readDone <- nil
+				} else {
+					readDone <- fmt.Errorf("terminal stream: %w", err)
+				}
+				return
 			}
-			if websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway) {
-				return nil
+			if messageType != websocket.BinaryMessage {
+				continue
 			}
-			return fmt.Errorf("terminal stream: %w", err)
+			if _, err := output.Write(message); err != nil {
+				readDone <- fmt.Errorf("write terminal output: %w", err)
+				return
+			}
 		}
-		if messageType != websocket.BinaryMessage {
-			continue
-		}
-		if _, err := output.Write(message); err != nil {
-			return fmt.Errorf("write terminal output: %w", err)
-		}
+	}()
+
+	var result error
+	readFinished, writeFinished := false, false
+	select {
+	case result = <-readDone:
+		readFinished = true
+	case result = <-writeDone:
+		writeFinished = true
+	case <-ctx.Done():
+		result = ctx.Err()
 	}
+	cancel()
+	cancelInput.Cancel()
+	_ = connection.Close()
+	if !readFinished {
+		<-readDone
+	}
+	if !writeFinished {
+		<-writeDone
+	}
+	// Input ownership must be fully returned before Bubble Tea resumes and
+	// installs its own reader. A timeout here would abandon a goroutine that
+	// could consume future dashboard keystrokes on fallback platforms.
+	<-inputDone
+	if result != nil && ctx.Err() != nil {
+		return ctx.Err()
+	}
+	return result
+}
+
+func validateTerminalInput(input io.Reader) error {
+	switch value := input.(type) {
+	case *os.File:
+		if value.Fd() == os.Stdin.Fd() {
+			return nil
+		}
+	case *bytes.Buffer, *bytes.Reader, *strings.Reader:
+		return nil
+	}
+	// Do not accept structural lookalikes: a custom Len method says nothing
+	// about whether Read can block or be canceled and joined before the TUI
+	// regains terminal input ownership.
+	return fmt.Errorf("terminal input must be standard input or a finite in-memory reader")
 }

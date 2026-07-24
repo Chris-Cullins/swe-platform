@@ -18,6 +18,7 @@ const (
 	maxRunListLimit     = int64(200)
 	maxContinueLength   = 4096
 	maxCreateRunBody    = 1 << 20
+	maxCancelRunBody    = 4096
 	maxAgentLength      = 128
 )
 
@@ -37,13 +38,22 @@ func (s *Server) listRuns(w http.ResponseWriter, r *http.Request, namespace stri
 	if !s.authorizeResource(w, r, ResourceAccess{Namespace: namespace, Verb: "list", Resource: "runs"}, true) {
 		return
 	}
-	limit, continueToken, err := runListQuery(r)
+	limit, continueToken, summary, err := runListQuery(r)
 	if err != nil {
 		writeProblem(w, http.StatusBadRequest, "invalid-query", "Invalid query", err.Error())
 		return
 	}
 	if s.resources == nil {
 		writeProblem(w, http.StatusServiceUnavailable, "resource-service-unavailable", "Resource service unavailable", "Run resources are not configured")
+		return
+	}
+	if summary {
+		page, err := s.resources.ListRunSummaries(r.Context(), namespace, limit, continueToken)
+		if err != nil {
+			s.writeResourceError(w, "list Run summaries", namespace, "", err)
+			return
+		}
+		writeJSON(w, http.StatusOK, page)
 		return
 	}
 	page, err := s.resources.ListRuns(r.Context(), namespace, limit, continueToken)
@@ -122,7 +132,8 @@ func (s *Server) handleCancelRun(w http.ResponseWriter, r *http.Request, namespa
 	if !s.requireMutationOrigin(w, r) {
 		return
 	}
-	if err := requireEmptyBody(r); err != nil {
+	request, err := decodeCancelRun(w, r)
+	if err != nil {
 		writeProblem(w, http.StatusBadRequest, "invalid-request", "Invalid request", err.Error())
 		return
 	}
@@ -130,8 +141,12 @@ func (s *Server) handleCancelRun(w http.ResponseWriter, r *http.Request, namespa
 		writeProblem(w, http.StatusServiceUnavailable, "resource-service-unavailable", "Resource service unavailable", "Run resources are not configured")
 		return
 	}
-	run, err := s.resources.CancelRun(r.Context(), namespace, name)
+	run, err := s.resources.CancelRun(r.Context(), namespace, name, request.RunUID)
 	if err != nil {
+		if errors.Is(err, errRunUIDConflict) {
+			writeProblem(w, http.StatusConflict, "run-uid-conflict", "Run identity conflict", "the Run name now identifies a different Run")
+			return
+		}
 		s.writeResourceError(w, "cancel run", namespace, name, err)
 		return
 	}
@@ -166,29 +181,33 @@ func (s *Server) authorizeResource(w http.ResponseWriter, r *http.Request, acces
 	return true
 }
 
-func runListQuery(r *http.Request) (int64, string, error) {
+func runListQuery(r *http.Request) (int64, string, bool, error) {
 	query := r.URL.Query()
 	for key, values := range query {
-		if key != "limit" && key != "continue" {
-			return 0, "", fmt.Errorf("unknown query parameter %q", key)
+		if key != "limit" && key != "continue" && key != "view" {
+			return 0, "", false, fmt.Errorf("unknown query parameter %q", key)
 		}
 		if len(values) != 1 {
-			return 0, "", fmt.Errorf("query parameter %q must be supplied once", key)
+			return 0, "", false, fmt.Errorf("query parameter %q must be supplied once", key)
 		}
 	}
 	limit := defaultRunListLimit
 	if value := query.Get("limit"); value != "" {
 		parsed, err := strconv.ParseInt(value, 10, 64)
 		if err != nil || parsed < 1 || parsed > maxRunListLimit {
-			return 0, "", fmt.Errorf("limit must be an integer from 1 through %d", maxRunListLimit)
+			return 0, "", false, fmt.Errorf("limit must be an integer from 1 through %d", maxRunListLimit)
 		}
 		limit = parsed
 	}
 	continueToken := query.Get("continue")
 	if len(continueToken) > maxContinueLength {
-		return 0, "", fmt.Errorf("continue exceeds %d bytes", maxContinueLength)
+		return 0, "", false, fmt.Errorf("continue exceeds %d bytes", maxContinueLength)
 	}
-	return limit, continueToken, nil
+	view := query.Get("view")
+	if view != "" && view != "summary" {
+		return 0, "", false, fmt.Errorf("view must be summary when supplied")
+	}
+	return limit, continueToken, view == "summary", nil
 }
 
 func decodeCreateRun(w http.ResponseWriter, r *http.Request) (CreateRunRequest, error) {
@@ -238,13 +257,29 @@ func decodeCreateRun(w http.ResponseWriter, r *http.Request) (CreateRunRequest, 
 	return request, nil
 }
 
-func requireEmptyBody(r *http.Request) error {
+func decodeCancelRun(w http.ResponseWriter, r *http.Request) (CancelRunRequest, error) {
+	r.Body = http.MaxBytesReader(w, r.Body, maxCancelRunBody)
 	defer r.Body.Close()
-	var one [1]byte
-	if count, err := r.Body.Read(one[:]); count != 0 || (err != nil && err != io.EOF) {
-		return fmt.Errorf("request body must be empty")
+	decoder := json.NewDecoder(r.Body)
+	decoder.DisallowUnknownFields()
+	var request CancelRunRequest
+	if err := decoder.Decode(&request); err != nil {
+		if errors.Is(err, io.EOF) {
+			return request, nil
+		}
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			return request, fmt.Errorf("request body exceeds %d bytes", maxCancelRunBody)
+		}
+		return request, fmt.Errorf("invalid JSON body: %w", err)
 	}
-	return nil
+	if err := decoder.Decode(&struct{}{}); err != io.EOF {
+		return request, fmt.Errorf("request body must contain exactly one JSON object")
+	}
+	if len(request.RunUID) > 128 {
+		return request, fmt.Errorf("runUID must not exceed 128 bytes")
+	}
+	return request, nil
 }
 
 func (s *Server) writeResourceError(w http.ResponseWriter, operation, namespace, name string, err error) {
