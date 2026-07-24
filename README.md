@@ -506,7 +506,13 @@ current Environment pod's `environment` container using kubeconfig authenticatio
 does not read a Run transcript, and the CLI never infers a Run from a reusable
 Environment. Production transcript durability and replay across control-plane restarts
 require the chart's PostgreSQL configuration. The default, kind, and Argo development
-presets retain bounded process-local storage and cannot promise restart replay.
+presets retain bounded process-local storage and cannot promise restart replay. Per-Run event
+and byte limits bound each Run's retained window, but total transcript storage is not bounded
+across Run churn: deleting a Run does not reclaim its UID-fenced transcript rows, and
+retention/garbage-collection policy is tracked in
+[#101](https://github.com/Chris-Cullins/swe-platform/issues/101). See the
+[chart README](charts/swe-platform/README.md#durable-transcript-storage) for operator monitoring
+guidance and the manual retention procedure until automatic cleanup ships.
 
 ## Contributing
 
