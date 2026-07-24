@@ -461,6 +461,27 @@ a common event schema.
 For a non-interactive authentication/connectivity check (including CI), use `swe tui --check`.
 It validates namespaced Run-list access without starting a terminal UI or printing credentials.
 
+### Run resource watches
+
+Authenticated consoles obtain a fully paginated Run summary snapshot from
+`GET /api/v1/namespaces/{namespace}/runs?view=summary`, then watch that same collection with
+`watch=true&view=summary&resourceVersion=<opaque>` and `Accept: text/event-stream`. The snapshot
+and each `run` (`ADDED`, `MODIFIED`, or `DELETED`) or `run-checkpoint` event carry an opaque
+Kubernetes resource version; clients must never parse or compare it. `Last-Event-ID` takes
+precedence when reconnecting, and an ID-less `run-relist` means the client must discard its
+snapshot and list again. Run names are not identities: clients fence replacement objects by UID
+and generation.
+
+This resource-state stream is independent from the adapter-owned transcript SSE stream below;
+its cursor cannot be used for transcripts and it does not interpret transcript payloads. A watch
+is authorized once with `watch` on namespace-scoped `runs`, then is hard-closed within five
+minutes so reconnect repeats browser-session or bearer TokenReview and SubjectAccessReview.
+Authorization changes can therefore take up to the remaining connection lifetime to take effect.
+The first release admits at most 20 new establishments per second (burst 40), 32 concurrent
+establishments, 128 active watches globally, 16 per namespace, and four per authenticated
+principal. A control-plane restart closes watches and invalidates process-local browser sessions;
+clients relist after signing in again.
+
 Run transcripts use the same explicit control-plane URL and bearer credential:
 
 ```sh

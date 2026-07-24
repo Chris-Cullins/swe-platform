@@ -256,6 +256,7 @@ exact namespace, resource name, and subresource on every request:
 | Operation | Kubernetes authorization attributes |
 |---|---|
 | List Runs | `list` on `runs` with an empty `resourceName` |
+| Watch Runs | `watch` on `runs` with an empty `resourceName` |
 | Create a Run | `create` on `runs` with an empty `resourceName` |
 | Read a Run | `get` on `runs` with the requested Run `resourceName` |
 | Cancel a Run | `update` on base `runs` with the requested Run `resourceName` |

@@ -27,6 +27,7 @@ export interface CreateRun {
 export interface Run {
   name: string
   uid: string
+  generation: number
   createdAt: string
   intent: {
     selector: Selector
@@ -51,6 +52,33 @@ export interface Run {
 export interface RunList {
   items: Run[]
   continue?: string
+}
+
+export interface RunSummary {
+  name: string
+  uid: string
+  generation: number
+  createdAt: string
+  agent: string
+  promptPreview: string
+  cancelRequested: boolean
+  state: string
+  environment?: {
+    name: string
+    ownership: 'Owned' | 'Claimed'
+  }
+}
+
+export interface RunSummaryList {
+  items: RunSummary[]
+  continue?: string
+  resourceVersion?: string
+}
+
+export interface RunWatchEvent {
+  type: 'ADDED' | 'MODIFIED' | 'DELETED'
+  resourceVersion: string
+  run: RunSummary
 }
 
 export interface Environment {

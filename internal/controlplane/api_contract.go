@@ -62,6 +62,7 @@ type RunUsage struct {
 type Run struct {
 	Name              string          `json:"name"`
 	UID               string          `json:"uid"`
+	Generation        int64           `json:"generation"`
 	CreatedAt         time.Time       `json:"createdAt"`
 	Intent            RunIntent       `json:"intent"`
 	CancelRequested   bool            `json:"cancelRequested"`
@@ -75,8 +76,9 @@ type Run struct {
 // RunList is a bounded page of Runs. Continue is opaque and may be supplied to
 // the next list request.
 type RunList struct {
-	Items    []Run  `json:"items"`
-	Continue string `json:"continue,omitempty"`
+	Items           []Run  `json:"items"`
+	Continue        string `json:"continue,omitempty"`
+	ResourceVersion string `json:"resourceVersion"`
 }
 
 // RunSummary is the bounded representation used by operations-console lists.
@@ -84,6 +86,7 @@ type RunList struct {
 type RunSummary struct {
 	Name            string          `json:"name"`
 	UID             string          `json:"uid"`
+	Generation      int64           `json:"generation"`
 	CreatedAt       time.Time       `json:"createdAt"`
 	Agent           string          `json:"agent"`
 	PromptPreview   string          `json:"promptPreview"`
@@ -94,8 +97,21 @@ type RunSummary struct {
 
 // RunSummaryList is a bounded page of Run list summaries.
 type RunSummaryList struct {
-	Items    []RunSummary `json:"items"`
-	Continue string       `json:"continue,omitempty"`
+	Items           []RunSummary `json:"items"`
+	Continue        string       `json:"continue,omitempty"`
+	ResourceVersion string       `json:"resourceVersion"`
+}
+
+// RunWatchEvent is the bounded, typed representation of a Kubernetes Run watch event.
+type RunWatchEvent struct {
+	Type            string     `json:"type"`
+	ResourceVersion string     `json:"resourceVersion"`
+	Run             RunSummary `json:"run"`
+}
+
+// RunWatchCheckpoint advances a watch cursor without changing a Run.
+type RunWatchCheckpoint struct {
+	ResourceVersion string `json:"resourceVersion"`
 }
 
 // CancelRunRequest optionally fences cancellation to one immutable Run.

@@ -5,10 +5,10 @@ import {
   useNavigate, useOutletContext, useParams,
 } from 'react-router'
 import {
-  api, ApiProblem, isTerminal, listAllRuns, listPollInterval, onUnauthorized,
-  queryKeys, runPollInterval,
+  api, ApiProblem, isTerminal, onUnauthorized, queryKeys,
 } from './api'
 import type { CreateRun, Run, Selector } from './contracts'
+import { useRunFeed } from './runFeed'
 import { Transcript } from './Transcript'
 
 const Terminal = lazy(() => import('./Terminal'))
@@ -48,6 +48,18 @@ export function validateCreateRun(value: CreateRun): string | undefined {
 
 const Busy = ({ label = 'Loading' }: { label?: string }) => <p role="status">{label}…</p>
 const Failure = ({ error }: { error: Error }) => <div role="alert"><strong>Request failed</strong><p>{error.message}</p></div>
+type RunFeed = ReturnType<typeof useRunFeed>
+const RunFeedContext = React.createContext<RunFeed | undefined>(undefined)
+const useActiveRunFeed = () => {
+  const feed = React.useContext(RunFeedContext)
+  if (!feed) throw new Error('Run feed is unavailable')
+  return feed
+}
+
+function RunFeedOutlet({ namespace }: { namespace: string }) {
+  const feed = useRunFeed(namespace)
+  return <RunFeedContext.Provider value={feed}><Outlet /></RunFeedContext.Provider>
+}
 const age = (createdAt: string) => {
   const minutes = Math.max(0, Math.floor((Date.now() - new Date(createdAt).getTime()) / 60_000))
   if (minutes < 1) return 'just now'
@@ -131,22 +143,20 @@ function Shell() {
       {validation && <span id="namespace-error" role="alert">{validation}</span>}
     </form>
     <button onClick={() => logout.mutate()}>Log out</button>
-  </header>{routeError ? <main><Failure error={new Error(routeError)} /></main> : <Outlet />}</>
+  </header>{routeError ? <main><Failure error={new Error(routeError)} /></main> : <RunFeedOutlet namespace={namespace} />}</>
 }
 
 function RunList() {
   const { namespace = '' } = useParams()
-  const query = useQuery({
-    queryKey: queryKeys.runs(namespace),
-    queryFn: () => listAllRuns(namespace),
-    refetchInterval: listPollInterval,
-  })
+  const query = useActiveRunFeed()
   return <main>
     <div className="title"><div><h1>Runs</h1><p>Agent tasks in {namespace}</p></div><Link className="button" to="new">New run</Link></div>
+    {query.fallback && <p className="hint" role="status">Live updates unavailable; refreshing every 4 seconds.</p>}
+    {!query.fallback && query.watchError && <p className="hint" role="status">Live updates disconnected; reconnecting…</p>}
     {query.isPending ? <Busy label="Loading runs" /> : query.error ? <Failure error={query.error} /> : !query.data.items.length ? <p role="status">No runs found.</p> :
       <div className="cards">{query.data.items.map(run => <Link className="card" key={run.uid} to={`${encodeURIComponent(run.name)}/overview`}>
         <div><strong>{run.name}</strong><span className="pill">{run.state}</span></div>
-        <p>{run.intent.prompt}</p><dl><dt>Agent</dt><dd>{run.intent.agent}</dd><dt>Environment</dt><dd>{run.environment?.name || 'Allocating'}</dd><dt>Age</dt><dd title={run.createdAt}>{age(run.createdAt)}</dd></dl>
+        <p>{run.promptPreview}</p><dl><dt>Agent</dt><dd>{run.agent}</dd><dt>Environment</dt><dd>{run.environment?.name || 'Allocating'}</dd><dt>Age</dt><dd title={run.createdAt}>{age(run.createdAt)}</dd></dl>
       </Link>)}</div>}
   </main>
 }
@@ -155,14 +165,10 @@ type RunForm = { name: string; agent: string; prompt: string; credentialProfile:
 function NewRun() {
   const { namespace = '' } = useParams()
   const navigate = useNavigate()
-  const queryClient = useQueryClient()
   const [form, setForm] = React.useState<RunForm>({ name: '', agent: 'claude-code', prompt: '', credentialProfile: '', environment: '', project: '', template: '' })
   const [validation, setValidation] = React.useState('')
   const mutation = useMutation({
     mutationFn: (value: CreateRun) => api.createRun(namespace, value),
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: queryKeys.runs(namespace) })
-    },
   })
   const field = (key: keyof RunForm, label: string, area = false) => <label>{label}{area
     ? <textarea value={form[key]} onChange={event => setForm({ ...form, [key]: event.target.value })} />
@@ -187,7 +193,7 @@ function NewRun() {
 
 function useRun() {
   const { namespace = '', run = '' } = useParams()
-  return useQuery({ queryKey: queryKeys.run(namespace, run), queryFn: () => api.run(namespace, run), refetchInterval: state => runPollInterval(state.state.data) })
+  return useQuery({ queryKey: queryKeys.run(namespace, run), queryFn: () => api.run(namespace, run) })
 }
 
 function Detail() {
@@ -214,11 +220,10 @@ function Overview() {
     refetchInterval: () => !isTerminal(run.state) ? 4000 : false,
   })
   const cancel = useMutation({
-    mutationFn: () => api.cancelRun(namespace, run.name),
+    mutationFn: () => api.cancelRun(namespace, run.name, run.uid),
     onSuccess: updated => {
-      queryClient.setQueryData(queryKeys.run(namespace, run.name), updated)
+      queryClient.setQueryData<Run>(queryKeys.run(namespace, run.name), current => current?.uid === run.uid && updated.uid === run.uid ? updated : current)
       queryClient.invalidateQueries({ queryKey: queryKeys.run(namespace, run.name) })
-      queryClient.invalidateQueries({ queryKey: queryKeys.runs(namespace) })
     },
   })
   const env = environment.data
@@ -235,7 +240,7 @@ function Overview() {
   </section>
 }
 
-function TranscriptRoute() { const run = useOutletRun(); const { namespace = '' } = useParams(); return <Transcript key={`${namespace}/${run.name}`} namespace={namespace} run={run.name} /> }
+function TranscriptRoute() { const run = useOutletRun(); const { namespace = '' } = useParams(); const identity = `${run.uid}/${run.generation}`; return <Transcript key={`${namespace}/${run.name}/${identity}`} namespace={namespace} run={run.name} identity={identity} /> }
 function TerminalRoute() { const run = useOutletRun(); const { namespace = '' } = useParams(); return run.environment ? <Suspense fallback={<Busy label="Loading terminal" />}><Terminal namespace={namespace} environment={run.environment.name} /></Suspense> : <p role="status">No environment allocated.</p> }
 
 export function App() {

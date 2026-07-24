@@ -25,6 +25,7 @@ const (
 // SSEEvent is one decoded Server-Sent Event. Data remains application-owned.
 type SSEEvent struct {
 	ID    string
+	HasID bool
 	Event string
 	Data  []byte
 }
@@ -33,13 +34,17 @@ type SSEEvent struct {
 // the first successful connection. The initial cursor is sent as ?after=; a
 // reconnect carries the last completely committed event ID in Last-Event-ID.
 func (c *Client) StreamSSE(ctx context.Context, endpoint, cursor string, handle func(SSEEvent) error) error {
-	return c.StreamSSEWithReconnectCheck(ctx, endpoint, cursor, nil, handle)
+	return c.streamSSEWithReconnectCheck(ctx, endpoint, cursor, nil, nil, nil, handle)
 }
 
 // StreamSSEWithReconnectCheck is StreamSSE with a check immediately before
 // every connection attempt. Callers can use it to fence a name-based endpoint
 // to an immutable resource identity across reconnects.
 func (c *Client) StreamSSEWithReconnectCheck(ctx context.Context, endpoint, cursor string, check func(context.Context) error, handle func(SSEEvent) error) error {
+	return c.streamSSEWithReconnectCheck(ctx, endpoint, cursor, check, nil, nil, handle)
+}
+
+func (c *Client) streamSSEWithReconnectCheck(ctx context.Context, endpoint, cursor string, check func(context.Context) error, retryInitial func(error) bool, established func(), handle func(SSEEvent) error) error {
 	connected := false
 	reconnectWait := c.reconnectWait
 	for {
@@ -66,7 +71,7 @@ func (c *Client) StreamSSEWithReconnectCheck(ctx context.Context, endpoint, curs
 			if ctx.Err() != nil {
 				return ctx.Err()
 			}
-			if !connected {
+			if !connected && (retryInitial == nil || !retryInitial(err)) {
 				return err
 			}
 			wait := reconnectWait
@@ -102,6 +107,9 @@ func (c *Client) StreamSSEWithReconnectCheck(ctx context.Context, endpoint, curs
 			}
 		}
 		connected = true
+		if established != nil {
+			established()
+		}
 		streamRetry := time.Duration(-1)
 		cursor, streamRetry, err = consumeSSE(response.Body, cursor, handle)
 		response.Body.Close()
@@ -194,6 +202,7 @@ func consumeSSE(reader io.Reader, cursor string, handle func(SSEEvent) error) (s
 		}
 		if len(data) != 0 {
 			event.ID = nextCursor
+			event.HasID = hasBlockID
 			if event.Event == "" {
 				event.Event = "message"
 			}

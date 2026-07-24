@@ -187,3 +187,104 @@ func TestListRunSummariesPaginatesWithoutFullNearMiBPrompt(t *testing.T) {
 		}
 	}
 }
+
+func TestRunSnapshotRestartsInconsistentAndExpiredChains(t *testing.T) {
+	request := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		request++
+		w.Header().Set("Content-Type", "application/json")
+		switch request {
+		case 1:
+			_, _ = io.WriteString(w, `{"items":[],"continue":"next","resourceVersion":"1"}`)
+		case 2:
+			_, _ = io.WriteString(w, `{"items":[],"resourceVersion":"2"}`)
+		case 3:
+			w.Header().Set("Content-Type", "application/problem+json")
+			w.WriteHeader(http.StatusGone)
+			_, _ = io.WriteString(w, `{"title":"expired","status":410}`)
+		case 4:
+			_, _ = io.WriteString(w, `{"items":[{"name":"current"}],"resourceVersion":"3"}`)
+		default:
+			t.Fatalf("unexpected request %d: %s", request, r.URL.RequestURI())
+		}
+	}))
+	defer server.Close()
+	client, _ := New(server.URL, "token", server.Client())
+	snapshot, err := client.ListRunSummarySnapshot(context.Background(), "ns")
+	if err != nil || request != 4 || snapshot.ResourceVersion != "3" || len(snapshot.Items) != 1 || snapshot.Items[0].Name != "current" {
+		t.Fatalf("snapshot/requests/error = %#v/%d/%v", snapshot, request, err)
+	}
+}
+
+func TestRunWatchFallbackOnlyBeforeFirstSuccessfulConnection(t *testing.T) {
+	t.Run("initial", func(t *testing.T) {
+		server := httptest.NewServer(http.NotFoundHandler())
+		defer server.Close()
+		client, _ := New(server.URL, "token", server.Client())
+		err := client.StreamRunSummaries(context.Background(), "ns", "1", nil, func(controlplane.RunWatchEvent) error { return nil })
+		if !RunWatchCompatibilityFallback(err) {
+			t.Fatalf("initial error = %#v", err)
+		}
+	})
+	t.Run("after-connect", func(t *testing.T) {
+		requests := 0
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			requests++
+			if requests == 1 {
+				w.Header().Set("Content-Type", "text/event-stream")
+				return
+			}
+			http.NotFound(w, nil)
+		}))
+		defer server.Close()
+		client, _ := New(server.URL, "token", server.Client())
+		client.reconnectWait = 0
+		established := 0
+		err := client.StreamRunSummaries(context.Background(), "ns", "1", func() { established++ }, func(controlplane.RunWatchEvent) error { return nil })
+		if established != 1 || requests != 2 || RunWatchCompatibilityFallback(err) {
+			t.Fatalf("established/requests/error = %d/%d/%#v", established, requests, err)
+		}
+	})
+}
+
+func TestRunWatchRecognizesIDLessRelistAfterCheckpoint(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "event: run-checkpoint\nid: 2\ndata: {\"resourceVersion\":\"2\"}\n\nevent: run-relist\ndata: {}\n\n")
+	}))
+	defer server.Close()
+	client, _ := New(server.URL, "token", server.Client())
+	err := client.StreamRunSummaries(context.Background(), "ns", "1", nil, func(controlplane.RunWatchEvent) error {
+		t.Fatal("unexpected Run event")
+		return nil
+	})
+	if !errors.Is(err, ErrRunRelist) {
+		t.Fatalf("StreamRunSummaries() error = %v, want ErrRunRelist", err)
+	}
+}
+
+func TestRunWatchRetriesInitialAdmissionFailure(t *testing.T) {
+	requests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		requests++
+		if requests == 1 {
+			w.Header().Set("Content-Type", "application/problem+json")
+			w.Header().Set("Retry-After", "0")
+			w.WriteHeader(http.StatusTooManyRequests)
+			_, _ = io.WriteString(w, `{"title":"watch capacity reached","status":429}`)
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "event: run\nid: 2\ndata: {\"type\":\"ADDED\",\"resourceVersion\":\"2\",\"run\":{\"name\":\"one\",\"uid\":\"uid-one\"}}\n\n")
+	}))
+	defer server.Close()
+	client, _ := New(server.URL, "token", server.Client())
+	sentinel := errors.New("handled")
+	established := 0
+	err := client.StreamRunSummaries(context.Background(), "ns", "1", func() { established++ }, func(controlplane.RunWatchEvent) error {
+		return sentinel
+	})
+	if !errors.Is(err, sentinel) || requests != 2 || established != 1 {
+		t.Fatalf("error/requests/established = %v/%d/%d", err, requests, established)
+	}
+}

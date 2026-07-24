@@ -471,7 +471,7 @@ metadata:
 rules:
   - apiGroups: ["swe.dev"]
     resources: ["runs"]
-    verbs: ["create", "get", "list", "update"]
+    verbs: ["create", "get", "list", "update", "watch"]
   - apiGroups: ["swe.dev"]
     resources: ["environments"]
     verbs: ["get"]
@@ -621,6 +621,70 @@ if ! grep -Fq '"credentialProfile":"e2e-claude"' /tmp/swe-platform-runs.json || 
 	grep -Fq "$PROFILE_UID" /tmp/swe-platform-runs.json || \
 	contains_e2e_key /tmp/swe-platform-runs.json || contains_e2e_key /tmp/swe-platform-environment.json; then
 	echo "FAIL: typed APIs did not expose only the selected credential profile name"
+	exit 1
+fi
+
+echo "==> verifying authenticated typed Run watch"
+curl --fail --silent --cookie "$COOKIE_JAR" \
+	'http://127.0.0.1:18080/api/v1/namespaces/default/runs?limit=200&view=summary' \
+	> /tmp/swe-platform-run-watch-snapshot.json
+RUN_WATCH_RV=$(python3 -c 'import json; print(json.load(open("/tmp/swe-platform-run-watch-snapshot.json"))["resourceVersion"])')
+DENIED_WATCH_STATUS=$(curl --silent --output /dev/null --write-out '%{http_code}' \
+	--cookie "$COOKIE_JAR" -H 'Accept: text/event-stream' \
+	"http://127.0.0.1:18080/api/v1/namespaces/e2e-console-other/runs?watch=true&view=summary&resourceVersion=${RUN_WATCH_RV}")
+if [[ "$DENIED_WATCH_STATUS" != "403" ]]; then
+	echo "FAIL: unauthorized namespace Run watch status was ${DENIED_WATCH_STATUS}, expected 403"
+	exit 1
+fi
+curl --silent --no-buffer --max-time 30 --cookie "$COOKIE_JAR" -H 'Accept: text/event-stream' \
+	"http://127.0.0.1:18080/api/v1/namespaces/default/runs?watch=true&view=summary&resourceVersion=${RUN_WATCH_RV}" \
+	> /tmp/swe-platform-run-watch.out &
+RUN_WATCH_PID=$!
+cat <<'EOF' | kubectl apply -f -
+apiVersion: swe.dev/v1alpha1
+kind: Run
+metadata:
+  name: e2e-watch-replacement
+spec:
+  templateRef: unavailable
+  agent: e2e
+  prompt: public Run watch acceptance
+EOF
+OLD_WATCH_UID=$(kubectl get run e2e-watch-replacement -o jsonpath='{.metadata.uid}')
+kubectl patch run e2e-watch-replacement --subresource=status --type=merge -p '{"status":{"state":"Running"}}'
+kubectl patch run e2e-watch-replacement --type=merge -p '{"metadata":{"finalizers":[]}}'
+kubectl delete run e2e-watch-replacement --wait=true
+cat <<'EOF' | kubectl apply -f -
+apiVersion: swe.dev/v1alpha1
+kind: Run
+metadata:
+  name: e2e-watch-replacement
+spec:
+  templateRef: unavailable
+  agent: e2e
+  prompt: replacement Run watch acceptance
+EOF
+NEW_WATCH_UID=$(kubectl get run e2e-watch-replacement -o jsonpath='{.metadata.uid}')
+for _ in $(seq 1 30); do
+	if grep -Fq '"type":"ADDED"' /tmp/swe-platform-run-watch.out && \
+		grep -Fq '"type":"MODIFIED"' /tmp/swe-platform-run-watch.out && \
+		grep -Fq '"type":"DELETED"' /tmp/swe-platform-run-watch.out && \
+		grep -Fq "\"uid\":\"${OLD_WATCH_UID}\"" /tmp/swe-platform-run-watch.out && \
+		grep -Fq "\"uid\":\"${NEW_WATCH_UID}\"" /tmp/swe-platform-run-watch.out; then
+		break
+	fi
+	sleep 1
+done
+kill "$RUN_WATCH_PID" 2>/dev/null || true
+wait "$RUN_WATCH_PID" 2>/dev/null || true
+if [[ "$OLD_WATCH_UID" == "$NEW_WATCH_UID" ]] || \
+	! grep -Fq '"type":"ADDED"' /tmp/swe-platform-run-watch.out || \
+	! grep -Fq '"type":"MODIFIED"' /tmp/swe-platform-run-watch.out || \
+	! grep -Fq '"type":"DELETED"' /tmp/swe-platform-run-watch.out || \
+	! grep -Fq "\"uid\":\"${OLD_WATCH_UID}\"" /tmp/swe-platform-run-watch.out || \
+	! grep -Fq "\"uid\":\"${NEW_WATCH_UID}\"" /tmp/swe-platform-run-watch.out; then
+	echo "FAIL: public Run watch did not preserve ADDED/MODIFIED and replacement UID fencing"
+	cat /tmp/swe-platform-run-watch.out
 	exit 1
 fi
 API_RUN_BODY='{"name":"e2e-api-run","selector":{"template":"small"},"agent":"e2e","prompt":"resource API acceptance"}'

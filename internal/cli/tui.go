@@ -4,11 +4,14 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"sort"
 	"strings"
+	"sync/atomic"
 	"time"
 	"unicode"
 	"unicode/utf8"
@@ -40,26 +43,35 @@ type tuiModel struct {
 	ctx       context.Context
 	client    *controlplaneclient.Client
 	namespace string
-	send      func(tea.Msg)
 
-	mode             tuiMode
-	width            int
-	height           int
-	loading          bool
-	listInFlight     bool
-	detailInFlight   bool
-	envInFlight      bool
-	mutationInFlight bool
-	mutationID       uint64
-	cancelIdentity   runIdentity
-	status           string
-	err              string
-	runs             []controlplane.RunSummary
-	cursor           int
-	run              *controlplane.Run
-	env              *controlplane.Environment
+	mode                  tuiMode
+	width                 int
+	height                int
+	loading               bool
+	listInFlight          bool
+	detailInFlight        bool
+	detailRefreshPending  bool
+	envInFlight           bool
+	mutationInFlight      bool
+	mutationID            uint64
+	cancelIdentity        runIdentity
+	status                string
+	err                   string
+	runs                  []controlplane.RunSummary
+	cursor                int
+	run                   *controlplane.Run
+	env                   *controlplane.Environment
+	resourceCancel        context.CancelFunc
+	resourceDone          <-chan struct{}
+	resourceGeneration    uint64
+	resourceVersion       string
+	pollFallback          bool
+	resourceEverConnected atomic.Bool
+	resourceMessages      <-chan tea.Msg
 
 	streamCancel        context.CancelFunc
+	streamDone          <-chan struct{}
+	transcriptMessages  <-chan tea.Msg
 	streamID            runIdentity
 	streamGeneration    uint64
 	streamCursor        string
@@ -73,15 +85,29 @@ type tuiModel struct {
 }
 
 type runIdentity struct {
-	namespace string
-	name      string
-	uid       string
+	namespace  string
+	name       string
+	uid        string
+	generation int64
 }
 
 type runsLoadedMsg struct {
-	runs []controlplane.RunSummary
-	err  error
+	snapshot controlplaneclient.RunSummarySnapshot
+	err      error
 }
+
+type runWatchMsg struct {
+	generation uint64
+	event      controlplane.RunWatchEvent
+	committed  chan struct{}
+}
+
+type runWatchDoneMsg struct {
+	generation uint64
+	err        error
+}
+
+type runWatchEstablishedMsg struct{ generation uint64 }
 
 type runLoadedMsg struct {
 	name string
@@ -155,10 +181,11 @@ func runTUI(ctx context.Context, input io.Reader, output io.Writer, client *cont
 	defer cancel()
 	model := newTUIModel(tuiCtx, client, namespace)
 	program := tea.NewProgram(model, tea.WithContext(tuiCtx), tea.WithInput(input), tea.WithOutput(output), tea.WithAltScreen())
-	model.send = program.Send
 	_, err := program.Run()
 	cancel()
-	model.stopStream()
+	resourceDone, transcriptDone := model.cancelStreams()
+	waitForStream(resourceDone)
+	waitForStream(transcriptDone)
 	if err != nil {
 		return fmt.Errorf("run terminal console: %w", err)
 	}
@@ -194,11 +221,14 @@ func (m *tuiModel) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 	case pollMsg:
 		commands := []tea.Cmd{pollAfter()}
-		if !m.listInFlight {
+		if m.pollFallback && !m.listInFlight {
 			commands = append(commands, m.loadRuns())
 		}
-		if m.mode == tuiDetail && m.run != nil && !m.detailInFlight {
+		if m.pollFallback && m.mode == tuiDetail && m.run != nil && !m.detailInFlight {
 			commands = append(commands, m.loadRun(m.run.Name))
+		}
+		if m.mode == tuiDetail && m.run != nil && m.run.Environment != nil && !m.envInFlight {
+			commands = append(commands, m.loadEnvironment(m.currentIdentity(), m.run.Environment.Name))
 		}
 		return m, tea.Batch(commands...)
 	case runsLoadedMsg:
@@ -209,25 +239,80 @@ func (m *tuiModel) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.err = ""
-		sort.SliceStable(msg.runs, func(i, j int) bool { return msg.runs[i].CreatedAt.After(msg.runs[j].CreatedAt) })
-		selected := m.selectedRunName()
-		m.runs = msg.runs
-		m.cursor = indexRun(m.runs, selected)
+		m.stopResourceStream()
+		sortRunSummaries(msg.snapshot.Items)
+		selected := m.selectedRunIdentity()
+		m.runs = msg.snapshot.Items
+		m.resourceVersion = msg.snapshot.ResourceVersion
+		m.pollFallback = !msg.snapshot.WatchSupported
+		m.cursor = indexRunIdentity(m.runs, selected)
 		if m.cursor < 0 {
 			m.cursor = 0
+		}
+		if msg.snapshot.WatchSupported {
+			return m, m.startResourceStream(msg.snapshot.ResourceVersion)
+		}
+		m.status = "Run watch unavailable; polling every 4s"
+		return m, nil
+	case runWatchMsg:
+		defer close(msg.committed)
+		if msg.generation != m.resourceGeneration {
+			return m, nil
+		}
+		selected := m.selectedRunIdentity()
+		m.applyRunWatch(msg.event)
+		m.resourceVersion = msg.event.ResourceVersion
+		m.cursor = indexRunIdentity(m.runs, selected)
+		if m.cursor < 0 {
+			m.cursor = 0
+		}
+		if m.mode == tuiDetail && m.run != nil && msg.event.Run.Name == m.run.Name {
+			if m.detailInFlight {
+				m.detailRefreshPending = true
+			} else {
+				return m, tea.Batch(m.waitResourceMessage(), m.loadRun(m.run.Name))
+			}
+		}
+		return m, m.waitResourceMessage()
+	case runWatchEstablishedMsg:
+		if msg.generation != m.resourceGeneration {
+			return m, nil
+		}
+		m.resourceEverConnected.Store(true)
+		return m, m.waitResourceMessage()
+	case runWatchDoneMsg:
+		if msg.generation != m.resourceGeneration {
+			return m, nil
+		}
+		m.resourceCancel, m.resourceDone = nil, nil
+		if errors.Is(msg.err, controlplaneclient.ErrRunRelist) || isProblemStatus(msg.err, http.StatusGone) {
+			return m, m.loadRuns()
+		}
+		if !m.resourceEverConnected.Load() && controlplaneclient.RunWatchCompatibilityFallback(msg.err) {
+			m.pollFallback = true
+			m.status = "Run watch unavailable; polling every 4s"
+			return m, nil
+		}
+		if msg.err != nil && m.ctx.Err() == nil {
+			m.err = "Run watch: " + safeError(msg.err)
 		}
 		return m, nil
 	case runLoadedMsg:
 		m.detailInFlight = false
+		refreshAgain := m.detailRefreshPending
+		m.detailRefreshPending = false
 		if m.mode != tuiDetail || m.run == nil || msg.name != m.run.Name {
 			return m, nil
 		}
 		if msg.err != nil {
 			m.err = safeError(msg.err)
+			if refreshAgain {
+				return m, m.loadRun(msg.name)
+			}
 			return m, nil
 		}
 		m.err = ""
-		identity := runIdentity{namespace: m.namespace, name: msg.run.Name, uid: msg.run.UID}
+		identity := runIdentity{namespace: m.namespace, name: msg.run.Name, uid: msg.run.UID, generation: msg.run.Generation}
 		if identity != m.streamID {
 			m.stopStream()
 			m.transcript = nil
@@ -246,6 +331,9 @@ func (m *tuiModel) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		if m.streamCancel == nil && identity.uid != "" && !m.streamBlocked {
 			commands = append(commands, m.startTranscript(identity))
+		}
+		if refreshAgain {
+			commands = append(commands, m.loadRun(msg.name))
 		}
 		return m, tea.Batch(commands...)
 	case environmentLoadedMsg:
@@ -271,7 +359,7 @@ func (m *tuiModel) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 			m.streamCursor = msg.event.ID
 		}
 		m.appendTranscript(formatTranscriptEvent(msg.event))
-		return m, nil
+		return m, m.waitTranscriptMessage()
 	case transcriptDoneMsg:
 		if msg.identity != m.streamID || msg.generation != m.streamGeneration {
 			return m, nil
@@ -321,10 +409,7 @@ func (m *tuiModel) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		} else {
 			m.status = "terminal detached"
 		}
-		if m.run != nil {
-			return m, m.loadRun(m.run.Name)
-		}
-		return m, nil
+		return m, m.loadRuns()
 	case tea.KeyMsg:
 		return m.handleKey(msg)
 	}
@@ -351,7 +436,7 @@ func (m *tuiModel) handleKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 	}
 	switch key.String() {
 	case "ctrl+c", "q":
-		m.stopStream()
+		m.stopAllStreams()
 		return m, tea.Quit
 	case "c":
 		m.stopStream()
@@ -409,7 +494,8 @@ func (m *tuiModel) handleKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 			}
 		case "t":
 			if m.canAttachTerminal() {
-				command := &terminalExec{ctx: m.ctx, client: m.client, namespace: m.namespace, runName: m.run.Name, runUID: m.run.UID, environmentUID: m.run.Environment.UID}
+				resourceDone, transcriptDone := m.cancelStreams()
+				command := &terminalExec{ctx: m.ctx, client: m.client, namespace: m.namespace, runName: m.run.Name, runUID: m.run.UID, environmentUID: m.run.Environment.UID, resourceDone: resourceDone, transcriptDone: transcriptDone}
 				return m, tea.Exec(command, func(err error) tea.Msg { return attachDoneMsg{err: err} })
 			}
 		}
@@ -562,8 +648,8 @@ func (m *tuiModel) loadRuns() tea.Cmd {
 	}
 	m.listInFlight = true
 	return func() tea.Msg {
-		runs, err := m.client.ListRunSummaries(m.ctx, m.namespace)
-		return runsLoadedMsg{runs: runs, err: err}
+		snapshot, err := m.client.ListRunSummarySnapshot(m.ctx, m.namespace)
+		return runsLoadedMsg{snapshot: snapshot, err: err}
 	}
 }
 
@@ -592,30 +678,49 @@ func (m *tuiModel) loadEnvironment(identity runIdentity, name string) tea.Cmd {
 func (m *tuiModel) startTranscript(identity runIdentity) tea.Cmd {
 	ctx, cancel := context.WithCancel(m.ctx)
 	m.streamCancel = cancel
+	done := make(chan struct{})
+	m.streamDone = done
 	m.streamID = identity
 	m.streamGeneration++
 	generation := m.streamGeneration
 	cursor := m.streamCursor
-	send := m.send
+	messages := make(chan tea.Msg)
+	m.transcriptMessages = messages
 	endpoint := m.client.Endpoint("api", "v1", "namespaces", identity.namespace, "runs", identity.name, "transcript")
-	return func() tea.Msg {
+	stream := func() tea.Msg {
+		defer cancel()
+		defer close(done)
+		defer close(messages)
 		checkIdentity := func(checkCtx context.Context) error {
 			run, err := m.client.GetRun(checkCtx, identity.namespace, identity.name)
 			if err != nil {
 				return fmt.Errorf("verify Run identity before transcript connection: %w", err)
 			}
-			if run.UID != identity.uid {
+			if run.UID != identity.uid || run.Generation != identity.generation {
 				return fmt.Errorf("Run %s was replaced; refreshing transcript identity", safeText(identity.name))
 			}
 			return nil
 		}
 		err := m.client.StreamSSEWithReconnectCheck(ctx, endpoint, cursor, checkIdentity, func(event controlplaneclient.SSEEvent) error {
-			if send != nil {
-				send(transcriptMsg{identity: identity, generation: generation, event: event})
+			select {
+			case messages <- transcriptMsg{identity: identity, generation: generation, event: event}:
+				return nil
+			case <-ctx.Done():
+				return ctx.Err()
 			}
-			return nil
 		})
 		return transcriptDoneMsg{identity: identity, generation: generation, err: err}
+	}
+	return tea.Batch(stream, m.waitTranscriptMessage())
+}
+
+func (m *tuiModel) waitTranscriptMessage() tea.Cmd {
+	messages := m.transcriptMessages
+	return func() tea.Msg {
+		if messages == nil {
+			return nil
+		}
+		return <-messages
 	}
 }
 
@@ -626,6 +731,116 @@ func (m *tuiModel) stopStream() {
 	}
 	m.streamGeneration++
 	m.streamID = runIdentity{}
+}
+
+func (m *tuiModel) applyRunWatch(event controlplane.RunWatchEvent) {
+	index := -1
+	for i := range m.runs {
+		if m.runs[i].UID == event.Run.UID {
+			index = i
+			break
+		}
+	}
+	if event.Type == "DELETED" {
+		if index >= 0 {
+			m.runs = append(m.runs[:index], m.runs[index+1:]...)
+		}
+		return
+	}
+	for i := len(m.runs) - 1; i >= 0; i-- {
+		if m.runs[i].Name == event.Run.Name && m.runs[i].UID != event.Run.UID {
+			m.runs = append(m.runs[:i], m.runs[i+1:]...)
+			if i < index {
+				index--
+			}
+		}
+	}
+	if index >= 0 {
+		m.runs[index] = event.Run
+	} else {
+		m.runs = append(m.runs, event.Run)
+	}
+	sortRunSummaries(m.runs)
+}
+
+func sortRunSummaries(runs []controlplane.RunSummary) {
+	sort.SliceStable(runs, func(i, j int) bool { return runs[i].CreatedAt.After(runs[j].CreatedAt) })
+}
+
+func isProblemStatus(err error, status int) bool {
+	var problem *controlplaneclient.ProblemError
+	return errors.As(err, &problem) && problem.Problem.Status == status
+}
+
+func (m *tuiModel) startResourceStream(resourceVersion string) tea.Cmd {
+	ctx, cancel := context.WithCancel(m.ctx)
+	done := make(chan struct{})
+	m.resourceCancel, m.resourceDone = cancel, done
+	m.resourceGeneration++
+	generation := m.resourceGeneration
+	messages := make(chan tea.Msg)
+	m.resourceMessages = messages
+	stream := func() tea.Msg {
+		defer cancel()
+		defer close(done)
+		defer close(messages)
+		established := func() {
+			m.resourceEverConnected.Store(true)
+			select {
+			case messages <- runWatchEstablishedMsg{generation: generation}:
+			case <-ctx.Done():
+			}
+		}
+		err := m.client.StreamRunSummaries(ctx, m.namespace, resourceVersion, established, func(event controlplane.RunWatchEvent) error {
+			committed := make(chan struct{})
+			select {
+			case messages <- runWatchMsg{generation: generation, event: event, committed: committed}:
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+			select {
+			case <-committed:
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+			return nil
+		})
+		return runWatchDoneMsg{generation: generation, err: err}
+	}
+	return tea.Batch(stream, m.waitResourceMessage())
+}
+
+func (m *tuiModel) waitResourceMessage() tea.Cmd {
+	messages := m.resourceMessages
+	return func() tea.Msg {
+		if messages == nil {
+			return nil
+		}
+		return <-messages
+	}
+}
+
+func (m *tuiModel) stopResourceStream() {
+	if m.resourceCancel != nil {
+		m.resourceCancel()
+		m.resourceCancel = nil
+	}
+	m.resourceGeneration++
+}
+
+func (m *tuiModel) cancelStreams() (<-chan struct{}, <-chan struct{}) {
+	resourceDone, transcriptDone := m.resourceDone, m.streamDone
+	m.stopResourceStream()
+	m.stopStream()
+	return resourceDone, transcriptDone
+}
+
+func (m *tuiModel) stopAllStreams() { m.cancelStreams() }
+
+func waitForStream(done <-chan struct{}) {
+	if done != nil {
+		<-done
+	}
 }
 
 func (m *tuiModel) createRun(request controlplane.CreateRunRequest, id uint64) tea.Cmd {
@@ -693,7 +908,7 @@ func (m *tuiModel) currentIdentity() runIdentity {
 	if m.run == nil {
 		return runIdentity{}
 	}
-	return runIdentity{namespace: m.namespace, name: m.run.Name, uid: m.run.UID}
+	return runIdentity{namespace: m.namespace, name: m.run.Name, uid: m.run.UID, generation: m.run.Generation}
 }
 
 func (m *tuiModel) canAttachTerminal() bool {
@@ -701,11 +916,12 @@ func (m *tuiModel) canAttachTerminal() bool {
 		m.env.Name == m.run.Environment.Name && m.env.UID == m.run.Environment.UID
 }
 
-func (m *tuiModel) selectedRunName() string {
+func (m *tuiModel) selectedRunIdentity() runIdentity {
 	if len(m.runs) == 0 || m.cursor < 0 || m.cursor >= len(m.runs) {
-		return ""
+		return runIdentity{}
 	}
-	return m.runs[m.cursor].Name
+	run := m.runs[m.cursor]
+	return runIdentity{name: run.Name, uid: run.UID, generation: run.Generation}
 }
 
 func (m *tuiModel) appendTranscript(line string) {
@@ -721,20 +937,30 @@ func pollAfter() tea.Cmd {
 }
 
 type terminalExec struct {
-	ctx            context.Context
-	client         *controlplaneclient.Client
-	namespace      string
-	runName        string
-	runUID         string
-	environmentUID string
-	stdin          io.Reader
-	stdout, stderr io.Writer
+	ctx                          context.Context
+	client                       *controlplaneclient.Client
+	namespace                    string
+	runName                      string
+	runUID                       string
+	environmentUID               string
+	resourceDone, transcriptDone <-chan struct{}
+	stdin                        io.Reader
+	stdout, stderr               io.Writer
 }
 
 func (c *terminalExec) SetStdin(reader io.Reader)  { c.stdin = reader }
 func (c *terminalExec) SetStdout(writer io.Writer) { c.stdout = writer }
 func (c *terminalExec) SetStderr(writer io.Writer) { c.stderr = writer }
 func (c *terminalExec) Run() error {
+	for _, done := range []<-chan struct{}{c.resourceDone, c.transcriptDone} {
+		if done != nil {
+			select {
+			case <-done:
+			case <-c.ctx.Done():
+				return c.ctx.Err()
+			}
+		}
+	}
 	return attachRunTerminalWithClient(c.ctx, c.client, c.namespace, c.runName, c.runUID, c.environmentUID, c.stdin, c.stdout)
 }
 
@@ -826,9 +1052,9 @@ func isTerminalRun(state string) bool {
 	return state == "Succeeded" || state == "Failed" || state == "Cancelled"
 }
 
-func indexRun(runs []controlplane.RunSummary, name string) int {
+func indexRunIdentity(runs []controlplane.RunSummary, identity runIdentity) int {
 	for i := range runs {
-		if runs[i].Name == name {
+		if runs[i].UID == identity.uid {
 			return i
 		}
 	}

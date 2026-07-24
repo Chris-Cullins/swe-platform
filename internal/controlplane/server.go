@@ -47,6 +47,7 @@ type Server struct {
 	allowInsecureSessions bool
 	heartbeat             time.Duration
 	streams               context.Context
+	watchAdmission        *watchAdmission
 }
 
 // RunResolver verifies that a namespaced Run exists before transcript state is used.
@@ -113,6 +114,7 @@ func NewServer(log *slog.Logger, options ServerOptions) *Server {
 		allowInsecureSessions: options.AllowInsecureSessions,
 		heartbeat:             heartbeat,
 		streams:               streams,
+		watchAdmission:        processWatchAdmission,
 	}
 }
 
