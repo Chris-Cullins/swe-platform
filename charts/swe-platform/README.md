@@ -278,6 +278,74 @@ These queries are read-only and report retained history only; they do not advise
 to delete. Manual deletion should be exceptional: take a backup and target the exact namespace and
 immutable Run UID so a same-name replacement Run's transcript cannot be removed.
 
+### Backup and restore
+
+The PostgreSQL transcript database is the only stateful component that requires backup.
+Environment workspace PVCs survive pause/resume but are per-environment ephemeral disks,
+not backup targets. CRDs are infrastructure state that Helm reapplies on install or upgrade.
+
+Back up the database before every upgrade using your PostgreSQL provider's backup mechanism
+(`pg_dump`, managed-service snapshots, or equivalent). To restore, point the same connection
+URL at the recovered database and restart the control-plane pod. The control plane applies
+ordered embedded migrations under a PostgreSQL advisory lock on startup, so a restored
+database at an older migration version is brought forward automatically.
+
+This release does not provide a tested restore procedure, RPO, or RTO. The monitoring queries
+above report retained history so you can size backups. Per-Run retention limits bound
+individual Run windows, but total database size is not bounded across Run churn until the
+garbage-collection policy in
+[#101](https://github.com/Chris-Cullins/swe-platform/issues/101) ships.
+
+## BYOC operations
+
+The k3s, GKE, and EKS presets are the starting point for running swe-platform in your own
+cluster. This section consolidates the provider-specific prerequisites, pre-flight validation,
+and networking requirements that a BYOC operator needs beyond the [install](#install) and
+[upgrade](#upgrade) procedures above. The acceptance criteria track
+[#79](https://github.com/Chris-Cullins/swe-platform/issues/79); the hosted offering alpha is
+out of scope here and requires separate maintainer product input.
+
+### Provider prerequisites
+
+Each production preset assumes an out-of-band `swe-platform-postgres` Secret (see
+[Install](#install) and [Durable transcript storage](#durable-transcript-storage)) and a
+default StorageClass for environment workspace PVCs. The operator creates PVCs with
+`ReadWriteOnce` access and the cluster's default `storageClassName`; it does not create or
+manage StorageClasses. Provider-specific runtime, replica, and isolation assumptions are
+documented in the [preset table](#environment-image-footprint) above.
+
+### Pre-flight validation
+
+Validate every production preset before installation. The chart's CI runs the same checks;
+reproducing them locally confirms that the preset renders against the current chart version:
+
+```sh
+for preset in k3s gke eks; do
+  helm lint ./charts/swe-platform --values "./charts/swe-platform/values-${preset}.yaml"
+  helm template swe-platform ./charts/swe-platform \
+    --namespace swe-platform-system \
+    --values "./charts/swe-platform/values-${preset}.yaml" >/dev/null
+done
+```
+
+The production presets reference the out-of-band PostgreSQL Secret by name; the chart does
+not create it, so the template renders whether or not the Secret exists. A missing Secret
+keeps the control-plane pod from starting after installation.
+
+### Networking requirements
+
+| Requirement | Chart behavior | Operator action |
+|---|---|---|
+| Control-plane exposure | ClusterIP Service on port 80 (HTTP); no Ingress or TLS termination created | Provide a TLS-terminating reverse proxy or load balancer; production browser sessions require HTTPS |
+| Environment sandboxd isolation | Ingress NetworkPolicy per environment pod: port 50051 admitted only from release-namespace control-plane and operator pods | CNI must enforce Kubernetes NetworkPolicy for defense in depth; TLS and capability authorization remain mandatory regardless |
+| Environment egress | No default-deny egress or egress proxy | Environment egress is subject to cluster network configuration; `Project.spec.egressAllowlist` is reserved and rejected when non-empty |
+| Operator → control plane | In-cluster HTTP to the control-plane Service | No external networking required; both components run in the release namespace |
+
+The `controlPlane.auth.trustProxyHeaders` option is available for a trusted reverse proxy
+that overwrites `X-Forwarded-Host` and `X-Forwarded-Proto`; see
+[Control-plane authentication and authorization](#control-plane-authentication-and-authorization)
+for session, CSRF, and WebSocket origin requirements.
+
 ## Control-plane authentication and authorization
 
 Terminal and transcript endpoints require a credential. The control plane authenticates
