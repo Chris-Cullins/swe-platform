@@ -260,6 +260,12 @@ if [[ -n "${E2E_RUNTIME_CLASS:-}" ]]; then
 		echo "FAIL: warm Environment uses RuntimeClass '$WARM_RUNTIME_CLASS', expected '$E2E_RUNTIME_CLASS'"
 		exit 1
 	fi
+	WARM_RUNTIME_CLASS_UID=$(kubectl get pod "env-${WARM_ENV_NAME}" -o jsonpath='{.metadata.annotations.swe\.dev/runtime-class-uid}')
+	EXPECTED_RUNTIME_CLASS_UID=$(kubectl get runtimeclass "$E2E_RUNTIME_CLASS" -o jsonpath='{.metadata.uid}')
+	if [[ "$WARM_RUNTIME_CLASS_UID" != "$EXPECTED_RUNTIME_CLASS_UID" ]]; then
+		echo "FAIL: warm Environment pins RuntimeClass UID '$WARM_RUNTIME_CLASS_UID', expected '$EXPECTED_RUNTIME_CLASS_UID'"
+		exit 1
+	fi
 fi
 if [[ "${E2E_USE_EXISTING_CLUSTER:-false}" == "true" ]]; then
 	WARM_PVC_NAME=$(kubectl get pod "env-${WARM_ENV_NAME}" -o jsonpath='{.spec.volumes[?(@.name=="workspace")].persistentVolumeClaim.claimName}')
