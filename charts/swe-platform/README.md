@@ -165,9 +165,19 @@ unmeasured.
 | `values-gke.yaml` | GKE Sandbox is enabled on every node that can host environments, and the out-of-band `swe-platform-postgres` Secret is available. Sets `runtimeClass: gvisor` and runs two operator replicas with leader election. |
 | `values-eks.yaml` | A default EBS CSI StorageClass and the out-of-band `swe-platform-postgres` Secret are available. Runs two operator replicas with leader election. EKS does not provide a standard gVisor RuntimeClass, so environments use the cluster default unless you override `environmentTemplates[].spec.runtimeClass`. |
 
-The RuntimeClass applies to environment pods, not the operator. A preset that names a
-RuntimeClass will leave environments Pending unless that RuntimeClass is installed and
-supported by eligible nodes.
+The RuntimeClass applies to environment pods, not the operator. Before creating or retaining
+execution, the operator verifies that a RuntimeClass explicitly named by a template exists. A
+missing named RuntimeClass fails the Environment with `InvalidConfiguration`; removing one
+withdraws readiness and fences its exact-owned pod, while recreating it allows provisioning to
+recover. RuntimeClass identity is pinned by UID, so the first operator upgrade containing this
+check also replaces existing pods that use a named RuntimeClass; their workspace PVCs are
+retained. The chart does not create or manage provider RuntimeClasses.
+
+This existence check does not prove that the runtime handler works or that eligible nodes can
+run it. Cluster operators must still install and test the handler on every eligible environment
+node; unsupported scheduling or handler failures may leave pods Pending. `make kind-up` performs
+that separate smoke test for its pinned gVisor installation. Templates that omit `runtimeClass`
+continue to select the cluster default runtime as documented in the preset table above.
 
 The operator creates a default ingress NetworkPolicy for each environment. It permits the
 environment's sandboxd port only from this release's control-plane-labeled pods in the release
