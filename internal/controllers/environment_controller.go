@@ -561,14 +561,44 @@ func (r *EnvironmentReconciler) now() time.Time {
 // Environment-owned Pod is gone.
 func (r *EnvironmentReconciler) reconcileInvalidProvisioningConfiguration(ctx context.Context, env *platformv1alpha1.Environment, message string) (ctrl.Result, error) {
 	hadPublishedConnection := env.Status.PodName != "" || env.Status.Endpoints.Sandboxd != "" || platformv1alpha1.IsEnvironmentReady(env)
-	if err := r.setEnvironmentStatus(ctx, env, platformv1alpha1.EnvironmentPhaseFailed, "", "", "InvalidConfiguration", message); err != nil {
+	persisted, err := r.setInvalidProvisioningStatus(ctx, env, message)
+	if err != nil {
 		return ctrl.Result{}, err
 	}
-	if hadPublishedConnection {
+	if !persisted || hadPublishedConnection {
 		return ctrl.Result{Requeue: true}, nil
 	}
 	result, _, err := r.reconcileInvalidProvisioningFence(ctx, env)
 	return result, err
+}
+
+// setInvalidProvisioningStatus reports whether the invalid status was persisted
+// for the exact Environment UID and generation observed by this reconcile. A
+// concurrent spec correction wins without allowing stale teardown to begin.
+func (r *EnvironmentReconciler) setInvalidProvisioningStatus(ctx context.Context, env *platformv1alpha1.Environment, message string) (bool, error) {
+	var current platformv1alpha1.Environment
+	if err := r.Get(ctx, client.ObjectKeyFromObject(env), &current); err != nil {
+		return false, err
+	}
+	if current.UID != env.UID {
+		return false, errEnvironmentIncarnationChanged
+	}
+	if current.Generation != env.Generation {
+		return false, nil
+	}
+	before := current.DeepCopy()
+	applyEnvironmentStatus(&current, platformv1alpha1.EnvironmentPhaseFailed, "", "", "InvalidConfiguration", message, env.Status.LastActiveAt)
+	clearChildOwnershipCollision(&current)
+	if !apiequality.Semantic.DeepEqual(before.Status, current.Status) {
+		if err := r.Status().Update(ctx, &current); err != nil {
+			if errors.IsConflict(err) {
+				return false, nil
+			}
+			return false, err
+		}
+	}
+	env.Status = current.Status
+	return true, nil
 }
 
 func invalidProvisioningFenceStarted(env *platformv1alpha1.Environment) bool {

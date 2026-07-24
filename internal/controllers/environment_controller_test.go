@@ -1561,6 +1561,48 @@ func TestMissingTemplateDoesNotMutateForeignSameNameChildren(t *testing.T) {
 	}
 }
 
+func TestInvalidProvisioningFenceDoesNotStartAfterConcurrentSpecCorrection(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	if err := platformv1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	current := &platformv1alpha1.Environment{
+		ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default", UID: "environment-uid", Generation: 2, Finalizers: []string{environmentFinalizer}},
+		Spec:       platformv1alpha1.EnvironmentSpec{TemplateRef: "corrected"},
+	}
+	stale := current.DeepCopy()
+	stale.Generation = 1
+	stale.Spec.TemplateRef = "missing"
+	controller := true
+	owner := metav1.OwnerReference{APIVersion: platformv1alpha1.GroupVersion.String(), Kind: "Environment", Name: current.Name, UID: current.UID, Controller: &controller}
+	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: envPodName(current), Namespace: current.Namespace, UID: "pod-uid", OwnerReferences: []metav1.OwnerReference{owner}}}
+	secret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: envCredentialName(current), Namespace: current.Namespace, UID: "secret-uid", OwnerReferences: []metav1.OwnerReference{owner}}}
+	reconciler := &EnvironmentReconciler{
+		Client: fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(current).WithObjects(current, pod, secret).Build(), Scheme: scheme,
+	}
+
+	result, err := reconciler.reconcileInvalidProvisioningConfiguration(context.Background(), stale, `get template "missing": not found`)
+	if err != nil || !result.Requeue {
+		t.Fatalf("stale invalid reconcile = (%#v, %v), want a safe requeue", result, err)
+	}
+	if err := reconciler.Get(context.Background(), client.ObjectKeyFromObject(pod), &corev1.Pod{}); err != nil {
+		t.Fatal("stale generation deleted the corrected Environment Pod")
+	}
+	if err := reconciler.Get(context.Background(), client.ObjectKeyFromObject(secret), &corev1.Secret{}); err != nil {
+		t.Fatal("stale generation revoked the corrected Environment credentials")
+	}
+	var retained platformv1alpha1.Environment
+	if err := reconciler.Get(context.Background(), client.ObjectKeyFromObject(current), &retained); err != nil {
+		t.Fatal(err)
+	}
+	if invalidProvisioningFenceStarted(&retained) {
+		t.Fatalf("stale generation published invalid status: %#v", retained.Status)
+	}
+}
+
 func TestBlankTemplateRefIsTerminalAndCorrectedSpecRecovers(t *testing.T) {
 	scheme := runtime.NewScheme()
 	if err := corev1.AddToScheme(scheme); err != nil {
