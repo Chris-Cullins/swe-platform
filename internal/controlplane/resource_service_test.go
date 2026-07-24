@@ -13,6 +13,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
@@ -125,11 +126,11 @@ func TestResourceServiceCancelIdempotentRetriesAndErrors(t *testing.T) {
 		return underlying.Update(ctx, obj, opts...)
 	}})
 	service := &KubernetesResourceService{Client: c}
-	got, err := service.CancelRun(context.Background(), "ns", "r")
+	got, err := service.CancelRun(context.Background(), "ns", "r", "")
 	if err != nil || !got.CancelRequested || updates != 3 {
 		t.Fatalf("run = %#v, updates = %d, err = %v", got, updates, err)
 	}
-	if _, err := service.CancelRun(context.Background(), "ns", "r"); err != nil || updates != 3 {
+	if _, err := service.CancelRun(context.Background(), "ns", "r", ""); err != nil || updates != 3 {
 		t.Fatalf("idempotent updates = %d, err = %v", updates, err)
 	}
 
@@ -141,13 +142,104 @@ func TestResourceServiceCancelIdempotentRetriesAndErrors(t *testing.T) {
 			return final
 		},
 	})
-	_, err = (&KubernetesResourceService{Client: alwaysConflict}).CancelRun(context.Background(), "ns", "r")
+	_, err = (&KubernetesResourceService{Client: alwaysConflict}).CancelRun(context.Background(), "ns", "r", "")
 	if err != final || attempts != 5 {
 		t.Fatalf("final error = %v, attempts = %d", err, attempts)
 	}
 	_, err = service.GetRun(context.Background(), "ns", "missing")
 	if !apierrors.IsNotFound(err) {
 		t.Fatalf("get error = %v", err)
+	}
+}
+
+func TestResourceServiceCancelRunFencesEveryRetryByUID(t *testing.T) {
+	scheme := resourceScheme(t)
+	newRun := func(uid types.UID, cancel bool) *platformv1alpha1.Run {
+		return &platformv1alpha1.Run{ObjectMeta: metav1.ObjectMeta{Name: "r", Namespace: "ns", UID: uid}, Spec: platformv1alpha1.RunSpec{Cancel: cancel}}
+	}
+
+	t.Run("wrong UID conflicts without mutation", func(t *testing.T) {
+		updates := 0
+		base := fake.NewClientBuilder().WithScheme(scheme).WithObjects(newRun("current", false)).Build()
+		wrapped := interceptor.NewClient(base, interceptor.Funcs{Update: func(context.Context, client.WithWatch, client.Object, ...client.UpdateOption) error {
+			updates++
+			return nil
+		}})
+		_, err := (&KubernetesResourceService{Client: wrapped}).CancelRun(context.Background(), "ns", "r", "stale")
+		if !errors.Is(err, errRunUIDConflict) || updates != 0 {
+			t.Fatalf("error = %v, updates = %d", err, updates)
+		}
+	})
+
+	t.Run("replacement after conflict is rechecked", func(t *testing.T) {
+		old := newRun("old", false)
+		base := fake.NewClientBuilder().WithScheme(scheme).WithObjects(old).Build()
+		updates := 0
+		wrapped := interceptor.NewClient(base, interceptor.Funcs{Update: func(ctx context.Context, underlying client.WithWatch, obj client.Object, _ ...client.UpdateOption) error {
+			updates++
+			if err := underlying.Delete(ctx, old); err != nil {
+				t.Fatal(err)
+			}
+			if err := underlying.Create(ctx, newRun("replacement", false)); err != nil {
+				t.Fatal(err)
+			}
+			return apierrors.NewConflict(schema.GroupResource{Resource: "runs"}, "r", errors.New("replaced"))
+		}})
+		_, err := (&KubernetesResourceService{Client: wrapped}).CancelRun(context.Background(), "ns", "r", "old")
+		if !errors.Is(err, errRunUIDConflict) || updates != 1 {
+			t.Fatalf("error = %v, updates = %d", err, updates)
+		}
+		var retained platformv1alpha1.Run
+		if err := base.Get(context.Background(), client.ObjectKey{Namespace: "ns", Name: "r"}, &retained); err != nil || retained.Spec.Cancel {
+			t.Fatalf("replacement = %#v, error = %v", retained, err)
+		}
+	})
+
+	t.Run("exact UID idempotent retry succeeds", func(t *testing.T) {
+		service := &KubernetesResourceService{Client: fake.NewClientBuilder().WithScheme(scheme).WithObjects(newRun("exact", true)).Build()}
+		got, err := service.CancelRun(context.Background(), "ns", "r", "exact")
+		if err != nil || !got.CancelRequested || got.UID != "exact" {
+			t.Fatalf("run = %#v, error = %v", got, err)
+		}
+	})
+}
+
+func TestResourceServiceRunSummaryBoundsPromptByRunes(t *testing.T) {
+	prompt := strings.Repeat(`<>&界`, runPromptPreviewRunes/4) + strings.Repeat("x", (1<<20)-4096)
+	run := &platformv1alpha1.Run{ObjectMeta: metav1.ObjectMeta{Name: "r", Namespace: "ns"}, Spec: platformv1alpha1.RunSpec{Prompt: prompt}}
+	service := &KubernetesResourceService{Client: fake.NewClientBuilder().WithScheme(resourceScheme(t)).WithObjects(run).Build()}
+	page, err := service.ListRunSummaries(context.Background(), "ns", 1, "")
+	if err != nil || len(page.Items) != 1 {
+		t.Fatalf("page = %#v, error = %v", page, err)
+	}
+	preview := page.Items[0].PromptPreview
+	if got := len([]rune(strings.TrimSuffix(preview, "…"))); got != runPromptPreviewRunes || !strings.HasSuffix(preview, "…") || !strings.Contains(preview, "<>&") {
+		t.Fatalf("preview runes/content = %d/%q", got, preview)
+	}
+}
+
+func TestResourceServiceGetRunPublishesOnlyExactAttachableEnvironmentUID(t *testing.T) {
+	run := &platformv1alpha1.Run{
+		ObjectMeta: metav1.ObjectMeta{Name: "run", Namespace: "ns", UID: "run-uid"},
+		Status: platformv1alpha1.RunStatus{EnvironmentRef: &platformv1alpha1.RunEnvironmentReference{
+			Name: "env", UID: "env-uid", Ownership: platformv1alpha1.EnvironmentOwnershipClaimed,
+		}},
+	}
+	environment := &platformv1alpha1.Environment{
+		ObjectMeta: metav1.ObjectMeta{Name: "env", Namespace: "ns", UID: "env-uid"},
+		Status:     platformv1alpha1.EnvironmentStatus{ClaimedBy: &platformv1alpha1.RunReference{Name: "run", UID: "run-uid"}},
+	}
+	service := &KubernetesResourceService{Client: fake.NewClientBuilder().WithScheme(resourceScheme(t)).WithObjects(run, environment).Build()}
+	got, err := service.GetRun(context.Background(), "ns", "run")
+	if err != nil || !got.TerminalAvailable || got.Environment == nil || got.Environment.UID != "env-uid" {
+		t.Fatalf("GetRun() = %#v, %v", got, err)
+	}
+
+	environment.Status.ClaimedBy = &platformv1alpha1.RunReference{Name: "other", UID: "other-uid"}
+	service = &KubernetesResourceService{Client: fake.NewClientBuilder().WithScheme(resourceScheme(t)).WithObjects(run, environment).Build()}
+	got, err = service.GetRun(context.Background(), "ns", "run")
+	if err != nil || got.TerminalAvailable || got.Environment == nil || got.Environment.UID != "" {
+		t.Fatalf("foreign GetRun() = %#v, %v", got, err)
 	}
 }
 

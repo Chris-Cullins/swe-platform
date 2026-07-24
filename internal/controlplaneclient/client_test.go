@@ -75,6 +75,10 @@ func TestClientReturnsProblemResponse(t *testing.T) {
 	if problem.Problem.Status != http.StatusGone || problem.Problem.Title != "transcript cursor expired" || problem.retryAfter != "7" || !strings.Contains(string(problem.Body), `"resumeAfter":"next"`) {
 		t.Fatalf("problem = %#v, body = %s", problem.Problem, problem.Body)
 	}
+	recovery, ok := TranscriptCursorRecovery(err)
+	if !ok || recovery.ResumeAfter != "next" {
+		t.Fatalf("cursor recovery = %#v/%t", recovery, ok)
+	}
 }
 
 func TestClientClassifiesTruncatedErrorResponseAsProblem(t *testing.T) {
@@ -242,6 +246,30 @@ func TestStreamSSEReconnectUsesCommittedLastEventID(t *testing.T) {
 	}
 	if len(events) != 1 || events[0].ID != "cursor-1" {
 		t.Fatalf("events = %#v", events)
+	}
+}
+
+func TestStreamSSEReconnectCheckFencesNameBasedIdentity(t *testing.T) {
+	requests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		requests++
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "id: cursor-1\nevent: transcript\ndata: {}\n\n")
+	}))
+	defer server.Close()
+	client, _ := New(server.URL, "token", server.Client())
+	client.reconnectWait = time.Millisecond
+	checks := 0
+	replaced := errors.New("Run UID changed")
+	err := client.StreamSSEWithReconnectCheck(context.Background(), server.URL, "", func(context.Context) error {
+		checks++
+		if checks == 2 {
+			return replaced
+		}
+		return nil
+	}, func(SSEEvent) error { return nil })
+	if !errors.Is(err, replaced) || checks != 2 || requests != 1 {
+		t.Fatalf("error/checks/requests = %v/%d/%d", err, checks, requests)
 	}
 }
 

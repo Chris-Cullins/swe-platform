@@ -531,6 +531,16 @@ for _ in $(seq 1 30); do
 	sleep 1
 done
 
+echo "==> verifying terminal console authenticated client path"
+SWE_CONTROL_PLANE_URL=http://127.0.0.1:18080 SWE_CONTROL_PLANE_TOKEN="$CONSOLE_TOKEN" \
+	bin/swe tui --check --namespace default > /tmp/swe-platform-tui-check.out
+if ! grep -Fq 'terminal console API ready for namespace default' /tmp/swe-platform-tui-check.out || \
+	grep -Fq "$CONSOLE_TOKEN" /tmp/swe-platform-tui-check.out; then
+	echo "FAIL: swe tui --check did not validate the namespaced Run API safely"
+	cat /tmp/swe-platform-tui-check.out
+	exit 1
+fi
+
 echo "==> verifying embedded operations console through the control-plane Service"
 ROOT_STATUS=$(curl --silent --dump-header /tmp/swe-platform-console-root.headers \
 	--output /tmp/swe-platform-console-root.html --write-out '%{http_code}' \

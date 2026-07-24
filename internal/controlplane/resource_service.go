@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"reflect"
+	"strings"
 
 	platformv1alpha1 "github.com/Chris-Cullins/swe-platform/api/v1alpha1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -12,17 +13,40 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
-var errRunIntentConflict = errors.New("run already exists with different immutable intent")
+var (
+	errRunIntentConflict      = errors.New("run already exists with different immutable intent")
+	errRunUIDConflict         = errors.New("run UID does not match the current Run")
+	errRunTerminalAssociation = errors.New("run is not associated with the exact environment")
+)
+
+const (
+	runPromptPreviewRunes = 160
+	runAgentSummaryRunes  = 128
+)
 
 // ResourceService is the Kubernetes-independent resource API used by HTTP
 // handlers. Its representations deliberately contain only the frozen API DTOs.
 type ResourceService interface {
 	ListRuns(ctx context.Context, namespace string, limit int64, continueToken string) (RunList, error)
+	ListRunSummaries(ctx context.Context, namespace string, limit int64, continueToken string) (RunSummaryList, error)
 	CreateRun(ctx context.Context, namespace string, request CreateRunRequest) (Run, error)
 	ResolveRunCreateCollision(ctx context.Context, namespace string, request CreateRunRequest) (Run, error)
 	GetRun(ctx context.Context, namespace, name string) (Run, error)
-	CancelRun(ctx context.Context, namespace, name string) (Run, error)
+	CancelRun(ctx context.Context, namespace, name, expectedUID string) (Run, error)
 	GetEnvironment(ctx context.Context, namespace, name string) (Environment, error)
+	ResolveRunTerminal(ctx context.Context, namespace, name, expectedRunUID, expectedEnvironmentUID string) (RunTerminalAssociation, error)
+}
+
+func (s *KubernetesResourceService) ListRunSummaries(ctx context.Context, namespace string, limit int64, continueToken string) (RunSummaryList, error) {
+	var runs platformv1alpha1.RunList
+	if err := s.Client.List(ctx, &runs, &client.ListOptions{Namespace: namespace, Limit: limit, Continue: continueToken}); err != nil {
+		return RunSummaryList{}, err
+	}
+	result := RunSummaryList{Items: make([]RunSummary, 0, len(runs.Items)), Continue: runs.Continue}
+	for i := range runs.Items {
+		result.Items = append(result.Items, runSummaryDTO(&runs.Items[i]))
+	}
+	return result, nil
 }
 
 // KubernetesResourceService stores resource intent in swe.dev CRDs.
@@ -85,7 +109,17 @@ func (s *KubernetesResourceService) GetRun(ctx context.Context, namespace, name 
 	if err := s.Client.Get(ctx, types.NamespacedName{Namespace: namespace, Name: name}, &run); err != nil {
 		return Run{}, err
 	}
-	return runDTO(&run), nil
+	result := runDTO(&run)
+	if run.Status.EnvironmentRef != nil {
+		var environment platformv1alpha1.Environment
+		if err := s.Client.Get(ctx, types.NamespacedName{Namespace: namespace, Name: run.Status.EnvironmentRef.Name}, &environment); err == nil {
+			result.TerminalAvailable = runOwnsOrClaimsEnvironment(&run, &environment)
+			if result.TerminalAvailable {
+				result.Environment.UID = string(environment.UID)
+			}
+		}
+	}
+	return result, nil
 }
 
 func desiredRunSpec(request CreateRunRequest) platformv1alpha1.RunSpec {
@@ -101,12 +135,15 @@ func desiredRunSpec(request CreateRunRequest) platformv1alpha1.RunSpec {
 	}
 }
 
-func (s *KubernetesResourceService) CancelRun(ctx context.Context, namespace, name string) (Run, error) {
+func (s *KubernetesResourceService) CancelRun(ctx context.Context, namespace, name, expectedUID string) (Run, error) {
 	key := types.NamespacedName{Namespace: namespace, Name: name}
 	for attempt := 0; attempt < 5; attempt++ {
 		var run platformv1alpha1.Run
 		if err := s.Client.Get(ctx, key, &run); err != nil {
 			return Run{}, err
+		}
+		if expectedUID != "" && string(run.UID) != expectedUID {
+			return Run{}, errRunUIDConflict
 		}
 		if run.Spec.Cancel {
 			return runDTO(&run), nil
@@ -121,6 +158,46 @@ func (s *KubernetesResourceService) CancelRun(ctx context.Context, namespace, na
 		return runDTO(&run), nil
 	}
 	panic("unreachable")
+}
+
+func (s *KubernetesResourceService) ResolveRunTerminal(ctx context.Context, namespace, name, expectedRunUID, expectedEnvironmentUID string) (RunTerminalAssociation, error) {
+	var run platformv1alpha1.Run
+	if err := s.Client.Get(ctx, types.NamespacedName{Namespace: namespace, Name: name}, &run); err != nil {
+		return RunTerminalAssociation{}, err
+	}
+	if string(run.UID) != expectedRunUID {
+		return RunTerminalAssociation{}, errRunUIDConflict
+	}
+	if run.Status.EnvironmentRef == nil || run.Status.EnvironmentRef.Name == "" {
+		return RunTerminalAssociation{}, errRunTerminalAssociation
+	}
+	var environment platformv1alpha1.Environment
+	if err := s.Client.Get(ctx, types.NamespacedName{Namespace: namespace, Name: run.Status.EnvironmentRef.Name}, &environment); err != nil {
+		return RunTerminalAssociation{}, err
+	}
+	if string(environment.UID) != expectedEnvironmentUID || !runOwnsOrClaimsEnvironment(&run, &environment) {
+		return RunTerminalAssociation{}, errRunTerminalAssociation
+	}
+	return RunTerminalAssociation{
+		RunName: name, RunUID: expectedRunUID,
+		EnvironmentName: environment.Name, EnvironmentUID: expectedEnvironmentUID,
+		EnvironmentOwnership: string(run.Status.EnvironmentRef.Ownership),
+	}, nil
+}
+
+func runOwnsOrClaimsEnvironment(run *platformv1alpha1.Run, environment *platformv1alpha1.Environment) bool {
+	if run.Status.EnvironmentRef == nil || run.Status.EnvironmentRef.Name != environment.Name || run.Status.EnvironmentRef.UID != environment.UID {
+		return false
+	}
+	switch run.Status.EnvironmentRef.Ownership {
+	case platformv1alpha1.EnvironmentOwnershipClaimed:
+		return environment.Status.ClaimedBy != nil && environment.Status.ClaimedBy.Name == run.Name && environment.Status.ClaimedBy.UID == run.UID
+	case platformv1alpha1.EnvironmentOwnershipOwned:
+		owner := metav1.GetControllerOf(environment)
+		return owner != nil && owner.APIVersion == platformv1alpha1.GroupVersion.String() && owner.Kind == "Run" && owner.Name == run.Name && owner.UID == run.UID
+	default:
+		return false
+	}
 }
 
 func (s *KubernetesResourceService) GetEnvironment(ctx context.Context, namespace, name string) (Environment, error) {
@@ -158,6 +235,52 @@ func runDTO(run *platformv1alpha1.Run) Run {
 		}
 	}
 	return result
+}
+
+func runSummaryDTO(run *platformv1alpha1.Run) RunSummary {
+	full := runDTO(run)
+	var environment *RunEnvironment
+	if full.Environment != nil {
+		environment = &RunEnvironment{
+			Name:      boundedRunes(full.Environment.Name, 253),
+			Ownership: boundedRunes(full.Environment.Ownership, 32),
+		}
+	}
+	return RunSummary{
+		Name: full.Name, UID: full.UID, CreatedAt: full.CreatedAt,
+		Agent: boundedRunes(full.Intent.Agent, runAgentSummaryRunes), PromptPreview: boundedPromptPreview(full.Intent.Prompt),
+		CancelRequested: full.CancelRequested, State: boundedRunes(full.State, 64), Environment: environment,
+	}
+}
+
+func boundedRunes(value string, limit int) string {
+	count := 0
+	for offset := range value {
+		if count == limit {
+			return value[:offset] + "…"
+		}
+		count++
+	}
+	return value
+}
+
+func boundedPromptPreview(prompt string) string {
+	var preview strings.Builder
+	runeCount := 0
+	truncated := false
+	for _, r := range prompt {
+		if runeCount == runPromptPreviewRunes {
+			truncated = true
+			break
+		}
+		preview.WriteRune(r)
+		runeCount++
+	}
+	normalized := strings.Join(strings.Fields(preview.String()), " ")
+	if normalized != "" && truncated {
+		return normalized + "…"
+	}
+	return normalized
 }
 
 func environmentDTO(environment *platformv1alpha1.Environment) Environment {
