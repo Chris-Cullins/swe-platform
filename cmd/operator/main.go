@@ -20,6 +20,7 @@ import (
 	"github.com/Chris-Cullins/swe-platform/internal/adapters/amp"
 	"github.com/Chris-Cullins/swe-platform/internal/adapters/claudecode"
 	"github.com/Chris-Cullins/swe-platform/internal/adapters/codex"
+	"github.com/Chris-Cullins/swe-platform/internal/adapters/pi"
 	"github.com/Chris-Cullins/swe-platform/internal/controllers"
 	"github.com/Chris-Cullins/swe-platform/internal/transcriptclient"
 )
@@ -134,5 +135,6 @@ func registeredAdapters() map[string]controllers.AdapterLifecycle {
 		"amp":         &amp.Adapter{},
 		"claude-code": &claudecode.Adapter{},
 		"codex":       &codex.Adapter{},
+		"pi":          &pi.Adapter{},
 	}
 }

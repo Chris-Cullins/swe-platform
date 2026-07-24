@@ -15,8 +15,8 @@ with a reviewable diff, branch, or PR.
 > pause/resume preserves workspace disks and runs repository resume hooks, and idle
 > environments pause automatically before terminal requests wake them. Template warm
 > pools keep unclaimed environments ready for `swe run` to claim. The `claude-code` (default),
-> `amp`, and `codex` adapters run through sandboxd's managed-process API. Portal proxying is not
-> built yet.
+> `amp`, `codex`, and `pi` adapters run through sandboxd's managed-process API. Portal proxying
+> is not built yet.
 > The Helm chart installs the
 > operator, control plane, and CRDs. Values presets
 > cover kind, k3s, GKE with GKE Sandbox, and EKS.
@@ -350,6 +350,26 @@ other credential types are rejected before dialing. The selected agent and same-
 can still read or disclose it; stronger credential isolation and additional credential forms
 remain issue #9 limitations. Acceptance tests use a fake Codex executable and no provider or
 network access.
+
+### Pi adapter
+
+Select Pi with `swe run --agent pi ...`. The coordinated image pins
+`@mariozechner/pi-coding-agent@0.73.1`; the adapter invokes
+`pi --mode json --no-session -p PROMPT`. Because this Pi parser has no working `--` separator
+and managed processes have no stdin, prompts beginning `-` or `@` are rejected before sandboxd
+is dialed. After process EOF, success requires exit zero, well-formed complete JSONL with at
+least one `agent_end`, and a coherent final assistant message from the last `agent_end` whose
+`stopReason` is neither `error` nor `aborted`. Earlier `agent_end` events and later typed events
+can belong to Pi's retry, compaction, or extension continuations and do not independently
+complete the Run.
+
+Pi does not support agent credential profiles or platform credential injection. A selected
+profile fails before Environment allocation and before profile or Secret reads. The platform
+injects no Pi credential and the stock image contains none. Pi still loads ambient auth,
+configuration, and extensions from its controlled Environment; state introduced outside the
+profile path by a custom image, attached user, lifecycle/repository code, or process environment
+is unsupported and not process-scoped. Stdout and stderr remain bounded opaque
+`pi.process-output` transcript events; no shared transcript schema is imposed.
 
 `--name` is the create idempotency key: retry an uncertain request with the same name and
 immutable task arguments. The CLI returns the existing Run only when its intent matches;

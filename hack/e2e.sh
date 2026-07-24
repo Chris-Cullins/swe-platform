@@ -188,6 +188,18 @@ sleep 5
 printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":1,"output_tokens":2}}'
 EOF
 chmod 0755 "$FAKE_ENV_CONTEXT/codex"
+cat > "$FAKE_ENV_CONTEXT/pi" <<'EOF'
+#!/bin/sh
+set -eu
+test "$#" -eq 5
+test "$1" = --mode; test "$2" = json; test "$3" = --no-session; test "$4" = -p
+test -z "${ANTHROPIC_API_KEY+x}"; test -z "${OPENAI_API_KEY+x}"; test -z "${GEMINI_API_KEY+x}"
+printf '%s\n' '{"type":"message_end","message":{"role":"assistant","stopReason":"stop"}}'
+printf '%s\n' 'fake-pi-stderr-marker' >&2
+if [ "$5" = 'fake Pi failure smoke test' ]; then reason=error; else test "$5" = 'fake Pi lifecycle smoke test'; reason=stop; sleep 5; fi
+printf '%s\n' "{\"type\":\"agent_end\",\"messages\":[{\"role\":\"assistant\",\"stopReason\":\"$reason\"}]}"
+EOF
+chmod 0755 "$FAKE_ENV_CONTEXT/pi"
 cat > "$FAKE_ENV_CONTEXT/Dockerfile" <<'EOF'
 ARG BASE_IMAGE
 FROM ${BASE_IMAGE}
@@ -195,6 +207,7 @@ USER root
 COPY claude /usr/local/bin/claude
 COPY amp /usr/local/bin/amp
 COPY codex /usr/local/bin/codex
+COPY pi /usr/local/bin/pi
 USER swe
 EOF
 docker build --build-arg BASE_IMAGE="$ENV_IMAGE" -t "$E2E_ENV_IMAGE" "$FAKE_ENV_CONTEXT" >/dev/null
@@ -950,6 +963,26 @@ CODEX_FAILED_RUN_NAME=e2e-fake-codex-failed-run
 bin/swe run "fake Codex failure smoke test" --name "$CODEX_FAILED_RUN_NAME" --environment "$ENV_NAME" --agent codex --wait=false
 kubectl wait --for=jsonpath='{.status.state}'=Failed run/"$CODEX_FAILED_RUN_NAME" --timeout=3m
 kubectl delete run "$CODEX_FAILED_RUN_NAME" --wait=true >/dev/null
+
+echo "==> verifying fake Pi success, opaque output, and terminal error"
+PI_RUN_NAME=e2e-fake-pi-run
+bin/swe run "fake Pi lifecycle smoke test" --name "$PI_RUN_NAME" --environment "$ENV_NAME" --agent pi --wait=false
+kubectl wait --for=jsonpath='{.status.state}'=Running run/"$PI_RUN_NAME" --timeout=3m
+kubectl wait --for=jsonpath='{.status.state}'=Succeeded run/"$PI_RUN_NAME" --timeout=3m
+set +e
+curl --silent --no-buffer --max-time 2 -H "Authorization: Bearer ${E2E_BOOTSTRAP_TOKEN}" \
+	"http://127.0.0.1:18080/api/v1/namespaces/default/runs/${PI_RUN_NAME}/transcript" > /tmp/swe-platform-pi-transcript.out
+PI_TRANSCRIPT_STATUS=$?
+set -e
+if [[ "$PI_TRANSCRIPT_STATUS" != "0" && "$PI_TRANSCRIPT_STATUS" != "28" ]]; then echo "FAIL: Pi transcript read failed"; exit 1; fi
+grep -F '"source":"pi"' /tmp/swe-platform-pi-transcript.out | grep -F '"type":"pi.process-output"' | \
+	grep -oE '"data":"[A-Za-z0-9+/=]+"' | sed 's/^"data":"//; s/"$//' | while IFS= read -r encoded; do printf '%s' "$encoded" | base64 --decode || exit 1; done > /tmp/swe-platform-pi-process-output.out
+for marker in agent_end fake-pi-stderr-marker; do grep -Fq "$marker" /tmp/swe-platform-pi-process-output.out || { echo "FAIL: missing Pi marker $marker"; exit 1; }; done
+kubectl delete run "$PI_RUN_NAME" --wait=true >/dev/null
+PI_FAILED_RUN_NAME=e2e-fake-pi-failed-run
+bin/swe run "fake Pi failure smoke test" --name "$PI_FAILED_RUN_NAME" --environment "$ENV_NAME" --agent pi --wait=false
+kubectl wait --for=jsonpath='{.status.state}'=Failed run/"$PI_FAILED_RUN_NAME" --timeout=3m
+kubectl delete run "$PI_FAILED_RUN_NAME" --wait=true >/dev/null
 
 echo "==> verifying idle pause and terminal wake through the control plane"
 PRE_IDLE_POD_UID=$(kubectl get pod "$POD_NAME" -o jsonpath='{.metadata.uid}')

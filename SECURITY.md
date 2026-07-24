@@ -99,6 +99,13 @@ initially select any profile in that namespace; profile management requires sepa
 CRD administration. OAuth/subscription files, refresh and writeback, leases, per-user ownership,
 Git/setup/service credentials, Amp login persistence, and stronger confinement remain deferred.
 
+The Pi adapter never accepts a credential profile or injects provider credentials. The
+controller rejects such Runs before Environment allocation and before reading the selected
+profile or Secret, and the stock image contains no Pi authentication. Pi still loads ambient
+authentication, configuration, and extensions from its controlled Environment. State introduced
+outside the profile path by a custom image, attached user, setup/resume or repository code, or
+the process environment is unsupported and is not confined to the managed Pi process.
+
 ### Other environment backends
 
 TLS identity plus bearer service capabilities are backend-portable and do not use Kubernetes
