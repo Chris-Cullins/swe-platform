@@ -21,6 +21,9 @@ provides PostgreSQL-backed durable transcript ingestion and database-polled SSE 
 a development-only bounded memory fallback, opaque process-local browser sessions backed by
 repeated Kubernetes TokenReview/SAR authorization, and typed
 Run/Environment resource APIs for the console.
+The CLI also provides a local stdio `swe mcp` server with bounded `create_run` and
+UID-fenced `read_transcript` tools that act through the caller's existing explicit
+control-plane bearer credential; interactive terminal attach is intentionally not an MCP tool.
 Remaining gaps are marked `TODO(P0/P1/P2)` in code — most notably additional credential forms,
 additional agent adapters, GitHub App–scoped git tokens, and egress/portal networking. The
 `claude-code` (default), `amp`, `codex`, and `pi` adapters are registered and use sandboxd managed
@@ -139,6 +142,7 @@ runs both via `make` targets:
   control-plane TokenReview/SAR scoping, opaque browser session exchange/logout and CSRF,
   the embedded console entry point/SPA fallback/static assets, typed Run
   list/get/create/retry/cancel, Environment get, transcript SSE, terminal attach, and
+  the local stdio MCP tool list plus UID-fenced bounded transcript read,
   process-scoped fake Claude and Amp API-key delivery without ambient
   setup/resume/sandboxd exposure.
   Runs in CI as the `e2e` workflow on relevant PRs and via `workflow_dispatch`.

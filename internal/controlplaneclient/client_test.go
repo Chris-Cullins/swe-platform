@@ -153,6 +153,18 @@ func TestConsumeSSEDoesNotCommitIDWhenHandlerFails(t *testing.T) {
 	}
 }
 
+func TestConsumeSSEBoundsCumulativeMultilineEvent(t *testing.T) {
+	line := strings.Repeat("x", maxSSELineSize/2)
+	input := "id: oversized\ndata: " + line + "\ndata: " + line + "\n\n"
+	cursor, _, err := consumeSSE(strings.NewReader(input), "previous", func(SSEEvent) error {
+		t.Fatal("oversized event was dispatched")
+		return nil
+	})
+	if err == nil || !strings.Contains(err.Error(), "event data exceeds") || cursor != "previous" {
+		t.Fatalf("cursor/error = %q/%v", cursor, err)
+	}
+}
+
 func TestStreamSSEAcceptsWorstCaseEscapedServerEnvelope(t *testing.T) {
 	text := strings.Repeat("<", 350<<10)
 	requestBody := []byte(`{"type":"output","data":{"text":"` + text + `"}}`)

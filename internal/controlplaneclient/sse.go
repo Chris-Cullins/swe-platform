@@ -192,6 +192,7 @@ func consumeSSE(reader io.Reader, cursor string, handle func(SSEEvent) error) (s
 	scanner.Buffer(make([]byte, 4096), maxSSELineSize)
 	var event SSEEvent
 	var data []string
+	dataSize := 0
 	var blockID string
 	var hasBlockID bool
 	retry := time.Duration(-1)
@@ -214,6 +215,7 @@ func consumeSSE(reader io.Reader, cursor string, handle func(SSEEvent) error) (s
 		cursor = nextCursor
 		event = SSEEvent{}
 		data = nil
+		dataSize = 0
 		blockID = ""
 		hasBlockID = false
 		return nil
@@ -240,7 +242,15 @@ func consumeSSE(reader io.Reader, cursor string, handle func(SSEEvent) error) (s
 		case "event":
 			event.Event = value
 		case "data":
+			additional := len(value)
+			if len(data) != 0 {
+				additional++ // strings.Join inserts one newline between data fields.
+			}
+			if additional > maxSSELineSize-dataSize {
+				return cursor, retry, fmt.Errorf("SSE event data exceeds %d bytes", maxSSELineSize)
+			}
 			data = append(data, value)
+			dataSize += additional
 		case "retry":
 			milliseconds, err := strconv.ParseUint(value, 10, 31)
 			if err == nil {
