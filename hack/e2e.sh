@@ -362,6 +362,12 @@ if [[ "$BOUND_PROFILE_NAME" != "e2e-claude" || -z "$PROFILE_UID" || "$BOUND_PROF
 fi
 RUN_ENV_NAME=$(kubectl get run "$RUN_NAME" -o jsonpath='{.status.environmentRef.name}')
 RUN_ENV_OWNERSHIP=$(kubectl get run "$RUN_NAME" -o jsonpath='{.status.environmentRef.ownership}')
+RUN_STARTED_AT=$(kubectl get run "$RUN_NAME" -o jsonpath='{.status.startedAt}')
+RUN_FINISHED_AT=$(kubectl get run "$RUN_NAME" -o jsonpath='{.status.finishedAt}')
+if [[ -z "$RUN_STARTED_AT" || -z "$RUN_FINISHED_AT" ]]; then
+	echo "FAIL: Run lifecycle timestamps missing (startedAt=$RUN_STARTED_AT finishedAt=$RUN_FINISHED_AT)"
+	exit 1
+fi
 if [[ "$RUN_ENV_NAME" != "$WARM_ENV_NAME" || "$RUN_ENV_OWNERSHIP" != "Claimed" ]]; then
 	echo "FAIL: Run allocated $RUN_ENV_NAME ($RUN_ENV_OWNERSHIP), expected claimed warm environment $WARM_ENV_NAME"
 	exit 1

@@ -233,7 +233,7 @@ function Overview() {
   })
   const env = environment.data
   return <section>
-    <dl className="facts"><dt>State</dt><dd>{run.state}</dd><dt>Agent</dt><dd>{run.intent.agent}</dd><dt>Credential profile</dt><dd>{run.intent.credentialProfile || '—'}</dd><dt>Prompt</dt><dd>{run.intent.prompt}</dd><dt>Created</dt><dd>{run.createdAt}</dd><dt>UID</dt><dd>{run.uid}</dd><dt>Branch</dt><dd>{run.branch || '—'}</dd></dl>
+    <dl className="facts"><dt>State</dt><dd>{run.state}</dd><dt>Agent</dt><dd>{run.intent.agent}</dd><dt>Credential profile</dt><dd>{run.intent.credentialProfile || '—'}</dd><dt>Prompt</dt><dd>{run.intent.prompt}</dd><dt>Created</dt><dd>{run.createdAt}</dd><dt>Started</dt><dd>{run.startedAt || '—'}</dd><dt>Finished</dt><dd>{run.finishedAt || '—'}</dd><dt>UID</dt><dd>{run.uid}</dd><dt>Branch</dt><dd>{run.branch || '—'}</dd></dl>
     <h2>Usage</h2><dl className="facts"><dt>CPU seconds</dt><dd>{run.usage.cpuSeconds}</dd><dt>Tokens in</dt><dd>{run.usage.tokensIn}</dd><dt>Tokens out</dt><dd>{run.usage.tokensOut}</dd></dl>
     <h2>Operational conditions</h2><table><thead><tr><th>Exposed fact</th><th>Status</th></tr></thead><tbody>
       <tr><td>Cancellation requested</td><td>{run.cancelRequested ? 'Yes' : 'No'}</td></tr>

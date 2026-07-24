@@ -1005,6 +1005,14 @@ func (r *RunReconciler) setRunState(ctx context.Context, run *platformv1alpha1.R
 	before := run.Status.DeepCopy()
 	run.Status.State = state
 	run.Status.ObservedGeneration = run.Generation
+	if state == platformv1alpha1.RunStateRunning && run.Status.StartedAt == nil {
+		startedAt := metav1.Now()
+		run.Status.StartedAt = &startedAt
+	}
+	if terminalRunState(state) && run.Status.FinishedAt == nil {
+		finishedAt := metav1.Now()
+		run.Status.FinishedAt = &finishedAt
+	}
 	environmentReason, environmentMessage := reason, message
 	if environmentReady {
 		environmentReason, environmentMessage = "EnvironmentReady", "sandboxd is ready"

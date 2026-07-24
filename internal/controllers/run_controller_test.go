@@ -2208,3 +2208,81 @@ func TestCancellationBeforeAllocationDoesNotReadCredentialProfileOrSecret(t *tes
 		t.Fatalf("cancellation state = %s, credential reads = %d", got.Status.State, reads)
 	}
 }
+
+func TestLifecycleTimestampsSetOnceAcrossPauseResumeAndTerminal(t *testing.T) {
+	run := &platformv1alpha1.Run{ObjectMeta: metav1.ObjectMeta{Name: "r", Namespace: "ns", UID: "uid", Finalizers: []string{runFinalizer}}, Spec: platformv1alpha1.RunSpec{Agent: "test"}, Status: platformv1alpha1.RunStatus{State: platformv1alpha1.RunStateAllocating, EnvironmentRef: &platformv1alpha1.RunEnvironmentReference{Name: "e", UID: "euid", Ownership: platformv1alpha1.EnvironmentOwnershipOwned}}}
+	env := &platformv1alpha1.Environment{ObjectMeta: metav1.ObjectMeta{Name: "e", Namespace: "ns", UID: "euid"}, Status: platformv1alpha1.EnvironmentStatus{Phase: platformv1alpha1.EnvironmentPhaseReady}}
+	r := reconciler(t, &scriptedAdapter{observations: []AdapterObservation{AdapterObservationRunning}}, run, env)
+
+	// Drive through allocation to Running.
+	reconcileRun(t, r, "r") // EnvironmentReady
+	reconcileRun(t, r, "r") // acceptance attempt marker
+	reconcileRun(t, r, "r") // AdapterAccepted
+	got := reconcileRun(t, r, "r") // Running
+	if got.Status.State != platformv1alpha1.RunStateRunning {
+		t.Fatalf("state = %s, want Running", got.Status.State)
+	}
+	if got.Status.StartedAt == nil {
+		t.Fatal("StartedAt is nil after first Running")
+	}
+	if got.Status.FinishedAt != nil {
+		t.Fatal("FinishedAt is set before terminal")
+	}
+	startedAt := *got.Status.StartedAt
+
+	// Pause and resume: StartedAt must not change.
+	_ = r.Get(context.Background(), client.ObjectKeyFromObject(env), env)
+	env.Status.Phase = platformv1alpha1.EnvironmentPhasePaused
+	_ = r.Status().Update(context.Background(), env)
+	got = reconcileRun(t, r, "r")
+	if got.Status.State != platformv1alpha1.RunStatePaused {
+		t.Fatalf("state = %s, want Paused", got.Status.State)
+	}
+	if got.Status.StartedAt == nil || !got.Status.StartedAt.Equal(&startedAt) {
+		t.Fatalf("StartedAt changed during pause: got %v, want %v", got.Status.StartedAt, &startedAt)
+	}
+
+	// Resume: re-accept and return to Running. StartedAt still unchanged.
+	env.Status.Phase = platformv1alpha1.EnvironmentPhaseReady
+	_ = r.Status().Update(context.Background(), env)
+	reconcileRun(t, r, "r") // EnvironmentReady
+	reconcileRun(t, r, "r") // AdapterAccepted (re-accept)
+	got = reconcileRun(t, r, "r") // Running again
+	if got.Status.State != platformv1alpha1.RunStateRunning {
+		t.Fatalf("state = %s after resume, want Running", got.Status.State)
+	}
+	if got.Status.StartedAt == nil || !got.Status.StartedAt.Equal(&startedAt) {
+		t.Fatalf("StartedAt changed after resume: got %v, want %v", got.Status.StartedAt, &startedAt)
+	}
+
+	// Terminal: FinishedAt is set once, StartedAt unchanged.
+	adapter := r.Adapters["test"].(*scriptedAdapter)
+	adapter.observations = []AdapterObservation{AdapterObservationSucceeded}
+	got = reconcileRun(t, r, "r")
+	if got.Status.State != platformv1alpha1.RunStateSucceeded {
+		t.Fatalf("state = %s, want Succeeded", got.Status.State)
+	}
+	if got.Status.FinishedAt == nil {
+		t.Fatal("FinishedAt is nil after terminal")
+	}
+	if got.Status.StartedAt == nil || !got.Status.StartedAt.Equal(&startedAt) {
+		t.Fatalf("StartedAt changed at terminal: got %v, want %v", got.Status.StartedAt, &startedAt)
+	}
+}
+
+func TestLifecycleTimestampsNilForRunThatNeverRan(t *testing.T) {
+	run := &platformv1alpha1.Run{ObjectMeta: metav1.ObjectMeta{Name: "r", Namespace: "ns", UID: "uid", Finalizers: []string{runFinalizer}}, Spec: platformv1alpha1.RunSpec{Agent: "test"}, Status: platformv1alpha1.RunStatus{State: platformv1alpha1.RunStateAllocating, EnvironmentRef: &platformv1alpha1.RunEnvironmentReference{Name: "e", UID: "euid", Ownership: platformv1alpha1.EnvironmentOwnershipOwned}}}
+	env := &platformv1alpha1.Environment{ObjectMeta: metav1.ObjectMeta{Name: "e", Namespace: "ns", UID: "euid"}, Status: platformv1alpha1.EnvironmentStatus{Phase: platformv1alpha1.EnvironmentPhaseFailed}}
+	r := reconciler(t, &scriptedAdapter{}, run, env)
+
+	got := reconcileRun(t, r, "r")
+	if got.Status.State != platformv1alpha1.RunStateFailed {
+		t.Fatalf("state = %s, want Failed", got.Status.State)
+	}
+	if got.Status.StartedAt != nil {
+		t.Fatalf("StartedAt = %v, want nil (never ran)", got.Status.StartedAt)
+	}
+	if got.Status.FinishedAt == nil {
+		t.Fatal("FinishedAt is nil after terminal Failed")
+	}
+}
