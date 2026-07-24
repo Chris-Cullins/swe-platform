@@ -345,10 +345,11 @@ Select Pi with `swe run --agent pi ...`. The coordinated image pins
 `@mariozechner/pi-coding-agent@0.73.1`; the adapter invokes
 `pi --mode json --no-session -p PROMPT`. Because this Pi parser has no working `--` separator
 and managed processes have no stdin, prompts beginning `-` or `@` are rejected before sandboxd
-is dialed. Success requires exit zero, well-formed complete JSONL ending at the session-level
-`agent_settled` event, and a coherent final assistant message from the last `agent_end` whose
-`stopReason` is neither `error` nor `aborted`. Earlier `agent_end` events can be followed by Pi's
-retry, compaction, or extension continuations and do not independently complete the Run.
+is dialed. After process EOF, success requires exit zero, well-formed complete JSONL with at
+least one `agent_end`, and a coherent final assistant message from the last `agent_end` whose
+`stopReason` is neither `error` nor `aborted`. Earlier `agent_end` events and later typed events
+can belong to Pi's retry, compaction, or extension continuations and do not independently
+complete the Run.
 
 Pi does not support agent credential profiles or platform credential injection. A selected
 profile fails before Environment allocation and before profile or Secret reads. The platform

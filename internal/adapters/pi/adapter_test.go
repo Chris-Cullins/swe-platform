@@ -93,22 +93,20 @@ func TestTerminalContract(t *testing.T) {
 		name, output string
 		ok           bool
 	}{
-		{"ordinary settled success", `{"type":"agent_end","messages":[{"role":"user"},{"role":"assistant","stopReason":"stop"}],"willRetry":false}` + "\n" + `{"type":"agent_settled"}`, true},
-		{"length", `{"type":"agent_end","messages":[{"role":"assistant","stopReason":"length"}],"willRetry":false}` + "\n" + `{"type":"agent_settled"}`, true},
-		{"last assistant before trailing tool", `{"type":"agent_end","messages":[{"role":"assistant","stopReason":"stop"},{"role":"toolResult"}],"willRetry":false}` + "\n" + `{"type":"agent_settled"}`, true},
-		{"retry settles from last agent end", `{"type":"agent_end","messages":[{"role":"assistant","stopReason":"error"}],"willRetry":true}` + "\n" + `{"type":"auto_retry_start","attempt":1,"maxAttempts":3,"delayMs":1,"errorMessage":"retry"}` + "\n" + `{"type":"agent_end","messages":[{"role":"assistant","stopReason":"stop"}],"willRetry":false}` + "\n" + `{"type":"auto_retry_end","success":true,"attempt":1}` + "\n" + `{"type":"agent_settled"}`, true},
+		{"ordinary success", `{"type":"agent_end","messages":[{"role":"user"},{"role":"assistant","stopReason":"stop"}]}`, true},
+		{"length", `{"type":"agent_end","messages":[{"role":"assistant","stopReason":"length"}]}`, true},
+		{"last assistant before trailing tool", `{"type":"agent_end","messages":[{"role":"assistant","stopReason":"stop"},{"role":"toolResult"}]}`, true},
+		{"retry uses final agent end", `{"type":"agent_end","messages":[{"role":"assistant","stopReason":"error"}]}` + "\n" + `{"type":"auto_retry_start","attempt":1,"maxAttempts":3,"delayMs":1,"errorMessage":"retry"}` + "\n" + `{"type":"agent_start"}` + "\n" + `{"type":"auto_retry_end","success":true,"attempt":1}` + "\n" + `{"type":"agent_end","messages":[{"role":"assistant","stopReason":"stop"}]}`, true},
+		{"compaction continuation uses final agent end", `{"type":"agent_end","messages":[{"role":"assistant","stopReason":"error"}]}` + "\n" + `{"type":"compaction_start","reason":"overflow"}` + "\n" + `{"type":"compaction_end","reason":"overflow","aborted":false}` + "\n" + `{"type":"agent_end","messages":[{"role":"assistant","stopReason":"stop"}]}`, true},
+		{"typed event after final end", `{"type":"agent_end","messages":[{"role":"assistant","stopReason":"stop"}]}` + "\n" + `{"type":"auto_retry_end","success":true,"attempt":1}`, true},
 		{"malformed", `{`, false},
 		{"missing event type", `{}`, false},
 		{"missing", `{"type":"message_end"}`, false},
-		{"settlement before end", `{"type":"agent_settled"}`, false},
-		{"missing settlement", `{"type":"agent_end","messages":[{"role":"assistant","stopReason":"stop"}],"willRetry":false}`, false},
-		{"duplicate settlement", `{"type":"agent_end","messages":[{"role":"assistant","stopReason":"stop"}],"willRetry":false}` + "\n" + `{"type":"agent_settled"}` + "\n" + `{"type":"agent_settled"}`, false},
-		{"output after settlement", `{"type":"agent_end","messages":[{"role":"assistant","stopReason":"stop"}],"willRetry":false}` + "\n" + `{"type":"agent_settled"}` + "\n" + `{"type":"message_end"}`, false},
-		{"empty", `{"type":"agent_end","messages":[],"willRetry":false}` + "\n" + `{"type":"agent_settled"}`, false},
-		{"non-assistant", `{"type":"agent_end","messages":[{"role":"user","stopReason":"stop"}],"willRetry":false}` + "\n" + `{"type":"agent_settled"}`, false},
-		{"error", `{"type":"agent_end","messages":[{"role":"assistant","stopReason":"error"}],"willRetry":false}` + "\n" + `{"type":"agent_settled"}`, false},
-		{"aborted", `{"type":"agent_end","messages":[{"role":"assistant","stopReason":"aborted"}],"willRetry":false}` + "\n" + `{"type":"agent_settled"}`, false},
-		{"unknown stop", `{"type":"agent_end","messages":[{"role":"assistant","stopReason":"future"}],"willRetry":false}` + "\n" + `{"type":"agent_settled"}`, false},
+		{"empty", `{"type":"agent_end","messages":[]}`, false},
+		{"non-assistant", `{"type":"agent_end","messages":[{"role":"user","stopReason":"stop"}]}`, false},
+		{"error", `{"type":"agent_end","messages":[{"role":"assistant","stopReason":"error"}]}`, false},
+		{"aborted", `{"type":"agent_end","messages":[{"role":"assistant","stopReason":"aborted"}]}`, false},
+		{"unknown stop", `{"type":"agent_end","messages":[{"role":"assistant","stopReason":"future"}]}`, false},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -173,7 +171,7 @@ func processSandbox(client sandboxdv1.ProcessServiceClient, epoch string) contro
 
 func TestObservationOutcomes(t *testing.T) {
 	exit0, exit1 := int32(0), int32(1)
-	success := `{"type":"session"}` + "\n" + `{"type":"agent_end","messages":[{"role":"assistant","stopReason":"stop"}],"willRetry":false}` + "\n" + `{"type":"agent_settled"}` + "\n"
+	success := `{"type":"session"}` + "\n" + `{"type":"agent_end","messages":[{"role":"assistant","stopReason":"stop"}]}` + "\n"
 	tests := []struct {
 		name    string
 		process *sandboxdv1.Process
@@ -188,8 +186,8 @@ func TestObservationOutcomes(t *testing.T) {
 		{"nonzero", &sandboxdv1.Process{State: sandboxdv1.ProcessState_PROCESS_STATE_EXITED, ExecutionId: "e", ExitCode: &exit1}, success, controllers.AdapterObservationFailed},
 		{"malformed", &sandboxdv1.Process{State: sandboxdv1.ProcessState_PROCESS_STATE_EXITED, ExecutionId: "e", ExitCode: &exit0}, "not-json\n", controllers.AdapterObservationFailed},
 		{"missing terminal", &sandboxdv1.Process{State: sandboxdv1.ProcessState_PROCESS_STATE_EXITED, ExecutionId: "e", ExitCode: &exit0}, `{"type":"session"}`, controllers.AdapterObservationFailed},
-		{"assistant error despite zero exit", &sandboxdv1.Process{State: sandboxdv1.ProcessState_PROCESS_STATE_EXITED, ExecutionId: "e", ExitCode: &exit0}, `{"type":"agent_end","messages":[{"role":"assistant","stopReason":"error"}],"willRetry":false}` + "\n" + `{"type":"agent_settled"}`, controllers.AdapterObservationFailed},
-		{"assistant aborted despite zero exit", &sandboxdv1.Process{State: sandboxdv1.ProcessState_PROCESS_STATE_EXITED, ExecutionId: "e", ExitCode: &exit0}, `{"type":"agent_end","messages":[{"role":"assistant","stopReason":"aborted"}],"willRetry":false}` + "\n" + `{"type":"agent_settled"}`, controllers.AdapterObservationFailed},
+		{"assistant error despite zero exit", &sandboxdv1.Process{State: sandboxdv1.ProcessState_PROCESS_STATE_EXITED, ExecutionId: "e", ExitCode: &exit0}, `{"type":"agent_end","messages":[{"role":"assistant","stopReason":"error"}]}`, controllers.AdapterObservationFailed},
+		{"assistant aborted despite zero exit", &sandboxdv1.Process{State: sandboxdv1.ProcessState_PROCESS_STATE_EXITED, ExecutionId: "e", ExitCode: &exit0}, `{"type":"agent_end","messages":[{"role":"assistant","stopReason":"aborted"}]}`, controllers.AdapterObservationFailed},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
