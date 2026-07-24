@@ -23,8 +23,9 @@ with a reviewable diff, branch, or PR.
 
 ## Why
 
-- **Real isolation** — agents execute untrusted, model-generated code. Environments run
-  under gVisor/Kata by default, behind default-deny egress with per-project allowlists.
+- **Real isolation** — agents execute untrusted, model-generated code. Environments support
+  hardened containers, sandboxd authentication, restricted sandboxd ingress, and optional
+  RuntimeClasses such as gVisor. Default-deny egress is not implemented yet.
 - **Pause economics** — idle environments are paused (pod deleted, disk retained) and
   woken on demand. An agent waiting on its children costs ~$0.
 - **Agent-agnostic** — existing agents plug in via adapters; the platform never depends
@@ -39,7 +40,7 @@ with a reviewable diff, branch, or PR.
 | **Environment** | One ephemeral machine an agent works in (pod + volume + network policy) |
 | **Run** | One agent task executing in an environment |
 | **Project** | One or more git repos + config: setup hooks, size, changes workflow |
-| **Template** | Environment class: image, size, runtime, egress rules, warm pool |
+| **Template** | Environment class: image, size, runtime, warm pool |
 | **Inbox** | Addressable message queue per run — how agents talk to each other |
 | **Portal** | Authenticated URL exposing a dev server inside an environment |
 
