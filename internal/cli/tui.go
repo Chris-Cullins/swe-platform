@@ -632,7 +632,18 @@ func (m *tuiModel) renderDetail(body *strings.Builder, width int) {
 	}
 	fmt.Fprintf(body, "\nAgent: %s\nPrompt: %s\n", safeText(run.Intent.Agent), truncate(safeText(run.Intent.Prompt), width-8))
 	selector, selectorValue := selectedSelector(run.Intent.Selector)
-	fmt.Fprintf(body, "Selector: %s=%s\nUsage: CPU %ds • tokens %d in / %d out\n", selector, safeText(selectorValue), run.Usage.CPUSeconds, run.Usage.TokensIn, run.Usage.TokensOut)
+	fmt.Fprintf(body, "Selector: %s=%s\n", selector, safeText(selectorValue))
+	if run.StartedAt != nil {
+		body.WriteString("Started: " + run.StartedAt.Format(time.RFC3339) + "\n")
+	} else {
+		body.WriteString("Started: —\n")
+	}
+	if run.FinishedAt != nil {
+		body.WriteString("Finished: " + run.FinishedAt.Format(time.RFC3339) + "\n")
+	} else {
+		body.WriteString("Finished: —\n")
+	}
+	fmt.Fprintf(body, "Usage: CPU %ds • tokens %d in / %d out\n", run.Usage.CPUSeconds, run.Usage.TokensIn, run.Usage.TokensOut)
 	if run.Environment == nil {
 		body.WriteString("Environment: not allocated\n")
 	} else if m.env == nil {
@@ -641,7 +652,7 @@ func (m *tuiModel) renderDetail(body *strings.Builder, width int) {
 		fmt.Fprintf(body, "Environment: %s • phase %s • ready %t • paused %t\n", safeText(m.env.Name), safeText(m.env.Phase), m.env.Ready, m.env.Paused)
 	}
 	body.WriteString("Transcript (opaque adapter events):\n")
-	available := m.height - 13
+	available := m.height - 15
 	if available < 3 {
 		available = 3
 	}

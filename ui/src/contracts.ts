@@ -37,6 +37,8 @@ export interface Run {
   }
   cancelRequested: boolean
   state: string
+  startedAt?: string
+  finishedAt?: string
   environment?: {
     name: string
     ownership: 'Owned' | 'Claimed'

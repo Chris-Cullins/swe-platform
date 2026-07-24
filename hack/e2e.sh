@@ -368,6 +368,12 @@ if [[ "$BOUND_PROFILE_NAME" != "e2e-claude" || -z "$PROFILE_UID" || "$BOUND_PROF
 fi
 RUN_ENV_NAME=$(kubectl get run "$RUN_NAME" -o jsonpath='{.status.environmentRef.name}')
 RUN_ENV_OWNERSHIP=$(kubectl get run "$RUN_NAME" -o jsonpath='{.status.environmentRef.ownership}')
+RUN_STARTED_AT=$(kubectl get run "$RUN_NAME" -o jsonpath='{.status.startedAt}')
+RUN_FINISHED_AT=$(kubectl get run "$RUN_NAME" -o jsonpath='{.status.finishedAt}')
+if [[ -z "$RUN_STARTED_AT" || -z "$RUN_FINISHED_AT" ]]; then
+	echo "FAIL: Run lifecycle timestamps missing (startedAt=$RUN_STARTED_AT finishedAt=$RUN_FINISHED_AT)"
+	exit 1
+fi
 if [[ "$RUN_ENV_NAME" != "$WARM_ENV_NAME" || "$RUN_ENV_OWNERSHIP" != "Claimed" ]]; then
 	echo "FAIL: Run allocated $RUN_ENV_NAME ($RUN_ENV_OWNERSHIP), expected claimed warm environment $WARM_ENV_NAME"
 	exit 1
@@ -784,6 +790,33 @@ if ! grep -F '"event":"transcript"' /tmp/swe-platform-cli-transcript.out | \
 	grep -Fq 'e2e transcript event'; then
 	echo "FAIL: swe logs --run did not emit the opaque transcript SSE envelope as NDJSON"
 	cat /tmp/swe-platform-cli-transcript.out
+	exit 1
+fi
+echo "==> verifying local authenticated MCP stdio tools"
+{
+	printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"swe-e2e","version":"1"}}}'
+	sleep 1
+	printf '%s\n' \
+		'{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}' \
+		'{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}' \
+		"{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\",\"params\":{\"name\":\"read_transcript\",\"arguments\":{\"runName\":\"${RUN_NAME}\",\"runUID\":\"${RUN_UID}\",\"maxEvents\":100,\"waitMilliseconds\":1000}}}"
+	sleep 2
+} | \
+	SWE_CONTROL_PLANE_URL=http://127.0.0.1:18080 SWE_CONTROL_PLANE_TOKEN="$E2E_BOOTSTRAP_TOKEN" \
+	timeout 10 bin/swe mcp > /tmp/swe-platform-mcp.out || {
+	echo "FAIL: local MCP stdio process did not complete cleanly"
+	cat /tmp/swe-platform-mcp.out
+	exit 1
+}
+if ! grep -F '"id":2' /tmp/swe-platform-mcp.out | grep -Fq '"name":"create_run"' || \
+	! grep -F '"id":2' /tmp/swe-platform-mcp.out | grep -Fq '"name":"read_transcript"' || \
+	! grep -F '"id":3' /tmp/swe-platform-mcp.out | grep -Fq "\"runUID\":\"${RUN_UID}\"" || \
+	! grep -F '"id":3' /tmp/swe-platform-mcp.out | grep -Fq '"event":"transcript"' || \
+	! grep -F '"id":3' /tmp/swe-platform-mcp.out | grep -Fq '"nextCursor"' || \
+	! grep -F '"id":3' /tmp/swe-platform-mcp.out | grep -Fq 'e2e transcript event' || \
+	grep -Fq "$E2E_BOOTSTRAP_TOKEN" /tmp/swe-platform-mcp.out; then
+	echo "FAIL: local MCP stdio server did not list tools and return a UID-fenced transcript batch"
+	cat /tmp/swe-platform-mcp.out
 	exit 1
 fi
 if ! grep -F '"source":"claude-code"' /tmp/swe-platform-transcript.out | \
