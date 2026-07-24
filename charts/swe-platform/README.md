@@ -538,6 +538,7 @@ and clients can consume replay plus live events as an SSE stream:
 ```sh
 kubectl port-forward service/swe-platform-swe-platform-control-plane 8080:80
 TOKEN="$(kubectl create token my-reader -n project-a --audience=swe-platform)"
+RUN_UID="$(kubectl get run run-123 -n project-a -o jsonpath='{.metadata.uid}')"
 curl -N -H "Authorization: Bearer ${TOKEN}" \
   http://127.0.0.1:8080/api/v1/namespaces/project-a/runs/run-123/transcript
 curl -H "Authorization: Bearer ${TOKEN}" -H 'Content-Type: application/json' \
