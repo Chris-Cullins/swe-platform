@@ -35,6 +35,10 @@ func (s *Server) handleRunCollection(w http.ResponseWriter, r *http.Request, nam
 }
 
 func (s *Server) listRuns(w http.ResponseWriter, r *http.Request, namespace string) {
+	if r.URL.Query().Get("watch") != "" {
+		s.watchRuns(w, r, namespace)
+		return
+	}
 	if !s.authorizeResource(w, r, ResourceAccess{Namespace: namespace, Verb: "list", Resource: "runs"}, true) {
 		return
 	}
@@ -50,7 +54,7 @@ func (s *Server) listRuns(w http.ResponseWriter, r *http.Request, namespace stri
 	if summary {
 		page, err := s.resources.ListRunSummaries(r.Context(), namespace, limit, continueToken)
 		if err != nil {
-			s.writeResourceError(w, "list Run summaries", namespace, "", err)
+			s.writeRunListError(w, "list Run summaries", namespace, err)
 			return
 		}
 		writeJSON(w, http.StatusOK, page)
@@ -58,7 +62,7 @@ func (s *Server) listRuns(w http.ResponseWriter, r *http.Request, namespace stri
 	}
 	page, err := s.resources.ListRuns(r.Context(), namespace, limit, continueToken)
 	if err != nil {
-		s.writeResourceError(w, "list runs", namespace, "", err)
+		s.writeRunListError(w, "list runs", namespace, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, page)
@@ -286,6 +290,8 @@ func (s *Server) writeResourceError(w http.ResponseWriter, operation, namespace,
 	switch {
 	case apierrors.IsNotFound(err):
 		writeProblem(w, http.StatusNotFound, "resource-not-found", "Resource not found", "the requested resource does not exist")
+	case apierrors.IsResourceExpired(err) || apierrors.IsGone(err):
+		writeProblem(w, http.StatusGone, "resource-expired", "Resource version expired", "restart the resource list from its first page")
 	case apierrors.IsAlreadyExists(err):
 		writeProblem(w, http.StatusConflict, "resource-already-exists", "Resource already exists", "the requested resource name is already in use")
 	case apierrors.IsInvalid(err), apierrors.IsBadRequest(err):
@@ -298,4 +304,12 @@ func (s *Server) writeResourceError(w http.ResponseWriter, operation, namespace,
 		s.log.Warn(operation, "namespace", namespace, "name", name, "error", err)
 		writeProblem(w, http.StatusInternalServerError, "resource-error", "Resource operation failed", "the resource operation could not be completed")
 	}
+}
+
+func (s *Server) writeRunListError(w http.ResponseWriter, operation, namespace string, err error) {
+	if apierrors.IsResourceExpired(err) || apierrors.IsGone(err) {
+		writeProblem(w, http.StatusGone, "list-snapshot-expired", "List snapshot expired", "restart the resource list from its first page")
+		return
+	}
+	s.writeResourceError(w, operation, namespace, "", err)
 }

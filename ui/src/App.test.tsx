@@ -8,7 +8,7 @@ import { queryKeys } from './api'
 import type { Environment, Run } from './contracts'
 
 const run: Run = {
-  name: 'repair-ui', uid: 'run-uid', createdAt: '2026-07-19T12:00:00Z',
+  name: 'repair-ui', uid: 'run-uid', generation: 1, createdAt: '2026-07-19T12:00:00Z',
   intent: { selector: { project: 'platform', template: 'small' }, agent: 'amp', prompt: 'Repair UI', credentialProfile: 'amp-production' },
   cancelRequested: false, state: 'Running', environment: { name: 'repair-env', ownership: 'Owned' }, branch: 'agent/repair',
   usage: { cpuSeconds: 12.5, tokensIn: 101, tokensOut: 202 },
@@ -26,7 +26,20 @@ function show(path: string, state?: unknown) {
   return { client, ...render(<QueryClientProvider client={client}><MemoryRouter initialEntries={[entry]}><LocationProbe /><App /></MemoryRouter></QueryClientProvider>) }
 }
 
-afterEach(() => { vi.useRealTimers(); vi.restoreAllMocks() })
+class TestEventSource {
+  static instances: TestEventSource[] = []
+  static CONNECTING = 0
+  static OPEN = 1
+  static CLOSED = 2
+  readyState = TestEventSource.CONNECTING
+  onopen: (() => void) | null = null
+  onerror: (() => void) | null = null
+  close = vi.fn()
+  constructor(public url: string) { TestEventSource.instances.push(this) }
+  addEventListener() {}
+}
+
+afterEach(() => { TestEventSource.instances = []; vi.useRealTimers(); vi.restoreAllMocks(); vi.unstubAllGlobals() })
 describe('App frozen API integration', () => {
   it('lands on the default namespace Run feed from the root route', async () => {
     const fetch = vi.spyOn(globalThis, 'fetch').mockImplementation(async path => path === '/api/v1/session' ? response({ authenticated: true, username: 'alex' }) : response({ items: [] }))
@@ -34,7 +47,7 @@ describe('App frozen API integration', () => {
     expect(await screen.findByText('No runs found.')).toBeInTheDocument()
     expect(screen.getByLabelText('Namespace')).toHaveValue('default')
     expect(screen.getByTestId('location')).toHaveTextContent('/namespaces/default/runs')
-    expect(fetch).toHaveBeenCalledWith('/api/v1/namespaces/default/runs?limit=200', expect.anything())
+    expect(fetch).toHaveBeenCalledWith('/api/v1/namespaces/default/runs?limit=200&view=summary', expect.anything())
   })
 
   it('redirects a session 401 to login', async () => {
@@ -51,12 +64,12 @@ describe('App frozen API integration', () => {
     let resolveOther!: (value: Response) => void
     const fetch = vi.spyOn(globalThis, 'fetch').mockImplementation(async path => {
       if (path === '/api/v1/session') return response({ authenticated: true, username: 'alex' })
-      if (path === '/api/v1/namespaces/default/runs?limit=200') {
+      if (path === '/api/v1/namespaces/default/runs?limit=200&view=summary') {
         defaultRequests += 1
         if (defaultRequests === 1) return response({ items: [run] })
         return new Promise<Response>(resolve => { resolveLateDefault = resolve })
       }
-      if (path === '/api/v1/namespaces/swe-platform-system/runs?limit=200') return new Promise<Response>(resolve => { resolveOther = resolve })
+      if (path === '/api/v1/namespaces/swe-platform-system/runs?limit=200&view=summary') return new Promise<Response>(resolve => { resolveOther = resolve })
       throw new Error(`Unexpected request: ${path}`)
     })
     const { client } = show('/namespaces/default/runs')
@@ -72,12 +85,12 @@ describe('App frozen API integration', () => {
     expect(await screen.findByText('argo-run')).toBeInTheDocument()
     expect(screen.queryByText('repair-ui')).not.toBeInTheDocument()
     expect(screen.getByTestId('location')).toHaveTextContent('/namespaces/swe-platform-system/runs')
-    expect(client.getQueryData(queryKeys.runs('swe-platform-system'))).toEqual({ items: [otherRun] })
+    expect(client.getQueryData(queryKeys.runs('swe-platform-system'))).toEqual(expect.objectContaining({ items: [expect.objectContaining({ name: 'argo-run', uid: 'argo-uid', agent: 'amp', promptPreview: 'Argo namespace task' })] }))
     resolveLateDefault(response({ items: [lateRun] }))
-    await waitFor(() => expect(client.getQueryData(queryKeys.runs('default'))).toEqual({ items: [lateRun] }))
+    await waitFor(() => expect(client.getQueryData(queryKeys.runs('default'))).toEqual(expect.objectContaining({ items: [expect.objectContaining({ name: 'repair-ui', uid: 'run-uid' })] })))
     expect(screen.getByText('argo-run')).toBeInTheDocument()
     expect(screen.queryByText('late-default-run')).not.toBeInTheDocument()
-    expect(fetch).toHaveBeenCalledWith('/api/v1/namespaces/swe-platform-system/runs?limit=200', expect.anything())
+    expect(fetch).toHaveBeenCalledWith('/api/v1/namespaces/swe-platform-system/runs?limit=200&view=summary', expect.anything())
   })
 
   it.each(['', 'Default', 'team/a', 'https://evil.example', 'team?next=evil', 'team#fragment', '-team', `${'a'.repeat(64)}`])('rejects invalid namespace input %j without navigating or fetching', async invalid => {
@@ -118,6 +131,69 @@ describe('App frozen API integration', () => {
     await act(async () => { await vi.advanceTimersByTimeAsync(4001); await Promise.resolve() })
     expect(screen.getByText('repair-ui')).toBeInTheDocument()
     expect(fetch).toHaveBeenCalledOnce()
+  })
+
+  it('recovers a transient initial summary failure without classifying it as legacy fallback', async () => {
+    vi.useFakeTimers()
+    let summaries = 0
+    const fetch = vi.spyOn(globalThis, 'fetch').mockImplementation(async path => {
+      if (path === '/api/v1/session') return response({ authenticated: true, username: 'alex' })
+      if (path === '/api/v1/namespaces/default/runs?limit=200&view=summary') {
+        summaries += 1
+        if (summaries === 1) return response({ title: 'Unavailable', status: 503 }, 503)
+        return response({ items: [run], resourceVersion: '2' })
+      }
+      if (String(path).includes('watch=true')) return response({ title: 'Legacy', status: 501 }, 501)
+      throw new Error(`Unexpected request: ${path}`)
+    })
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    client.setQueryData(queryKeys.session, { authenticated: true, username: 'alex' })
+    render(<QueryClientProvider client={client}><MemoryRouter initialEntries={['/namespaces/default/runs']}><App /></MemoryRouter></QueryClientProvider>)
+    await act(async () => { await vi.advanceTimersByTimeAsync(0) })
+    expect(screen.getByRole('alert')).toHaveTextContent('Unavailable')
+    expect(screen.queryByText(/Live updates unavailable/)).not.toBeInTheDocument()
+    await act(async () => { await vi.advanceTimersByTimeAsync(4001); await Promise.resolve(); await Promise.resolve() })
+    expect(screen.getByText('repair-ui')).toBeInTheDocument()
+    expect(fetch).toHaveBeenCalledWith(expect.stringContaining('watch=true'), expect.anything())
+  })
+
+  it('polls exact Run detail only while the summary feed uses compatibility fallback', async () => {
+    vi.useFakeTimers()
+    let details = 0
+    const initial = { ...run, environment: undefined, generation: 1, state: 'Running' }
+    const updated = { ...initial, generation: 2, state: 'Succeeded' }
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async path => {
+      if (path === '/api/v1/session') return response({ authenticated: true, username: 'alex' })
+      if (path === '/api/v1/namespaces/default/runs?limit=200&view=summary') return response({ items: [initial] })
+      if (path === '/api/v1/namespaces/default/runs/repair-ui') { details += 1; return response(details === 1 ? initial : updated) }
+      throw new Error(`Unexpected request: ${path}`)
+    })
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    client.setQueryData(queryKeys.session, { authenticated: true, username: 'alex' })
+    render(<QueryClientProvider client={client}><MemoryRouter initialEntries={['/namespaces/default/runs/repair-ui/overview']}><App /></MemoryRouter></QueryClientProvider>)
+    await act(async () => { await vi.advanceTimersByTimeAsync(0) })
+    expect(screen.getByText('Running', { selector: '.pill' })).toBeInTheDocument()
+    await act(async () => { await vi.advanceTimersByTimeAsync(4001); await Promise.resolve(); await Promise.resolve() })
+    expect(screen.getByText('Succeeded', { selector: '.pill' })).toBeInTheDocument()
+    expect(details).toBe(2)
+  })
+
+  it('keeps the transcript stream mounted when cancellation only advances Run generation', async () => {
+    vi.stubGlobal('EventSource', TestEventSource)
+    const detail = { ...run, environment: undefined, generation: 1 }
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async path => {
+      if (path === '/api/v1/session') return response({ authenticated: true, username: 'alex' })
+      if (path === '/api/v1/namespaces/default/runs?limit=200&view=summary') return response({ items: [detail] })
+      if (path === '/api/v1/namespaces/default/runs/repair-ui') return response(detail)
+      throw new Error(`Unexpected request: ${path}`)
+    })
+    const { client } = show('/namespaces/default/runs/repair-ui/transcript')
+    await waitFor(() => expect(TestEventSource.instances).toHaveLength(1))
+    const stream = TestEventSource.instances[0]
+    act(() => client.setQueryData(queryKeys.run('default', 'repair-ui'), { ...detail, generation: 2, cancelRequested: true }))
+    await waitFor(() => expect(client.getQueryData<Run>(queryKeys.run('default', 'repair-ui'))?.generation).toBe(2))
+    expect(TestEventSource.instances).toHaveLength(1)
+    expect(stream.close).not.toHaveBeenCalled()
   })
 
   it('shows accessible loading and problem error states', async () => {
@@ -205,7 +281,7 @@ describe('App frozen API integration', () => {
     expect(localGet).not.toHaveBeenCalled(); expect(localSet).not.toHaveBeenCalled()
   })
 
-  it('creates the exact selector contract and invalidates the namespace feed', async () => {
+  it('creates the exact selector contract without racing the namespace watch', async () => {
     const fetch = vi.spyOn(globalThis, 'fetch').mockImplementation(async (path, init) => {
       if (path === '/api/v1/session') return response({ authenticated: true, username: 'alex' })
       if (path === '/api/v1/namespaces/default/runs' && init?.method === 'POST') return response(run, 201)
@@ -228,7 +304,7 @@ describe('App frozen API integration', () => {
     expect(JSON.parse(String(createInit?.body))).toEqual({
       name: 'repair-ui', selector: { project: 'platform', template: 'small' }, agent: 'amp', prompt: '  Repair UI  ', credentialProfile: 'amp-production',
     })
-    expect(invalidate).toHaveBeenCalledWith({ queryKey: ['runs', 'default'] })
+    expect(invalidate).not.toHaveBeenCalledWith({ queryKey: ['runs', 'default'] })
     expect(await screen.findByRole('heading', { name: 'repair-ui' })).toBeInTheDocument()
   })
 
@@ -237,7 +313,7 @@ describe('App frozen API integration', () => {
     const fetch = vi.spyOn(globalThis, 'fetch').mockImplementation(async (path, init) => {
       if (path === '/api/v1/session') return response({ authenticated: true, username: 'alex' })
       if (path === '/api/v1/namespaces/default/runs' && init?.method === 'POST') return new Promise<Response>(resolve => { resolveCreate = resolve })
-      if (path === '/api/v1/namespaces/swe-platform-system/runs?limit=200') return response({ items: [] })
+      if (path === '/api/v1/namespaces/swe-platform-system/runs?limit=200&view=summary') return response({ items: [] })
       throw new Error(`Unexpected request: ${path}`)
     })
     const { client } = show('/namespaces/default/runs/new')
@@ -253,13 +329,13 @@ describe('App frozen API integration', () => {
     await userEvent.click(screen.getByRole('button', { name: 'Switch' }))
     expect(await screen.findByText('No runs found.')).toBeInTheDocument()
     resolveCreate(response(run, 201))
-    await waitFor(() => expect(invalidate).toHaveBeenCalledWith({ queryKey: queryKeys.runs('default') }))
-    await waitFor(() => expect(client.getQueryState(queryKeys.runs('default'))?.isInvalidated).toBe(true))
+    await waitFor(() => expect(invalidate).not.toHaveBeenCalledWith({ queryKey: queryKeys.runs('default') }))
+    expect(client.getQueryState(queryKeys.runs('default'))?.isInvalidated).toBe(false)
     expect(screen.getByTestId('location')).toHaveTextContent('/namespaces/swe-platform-system/runs')
     expect(screen.queryByRole('heading', { name: 'repair-ui' })).not.toBeInTheDocument()
   })
 
-  it('cancels with an empty POST and invalidates list and detail data', async () => {
+  it('cancels with an immutable UID fence and lets the watch update list data', async () => {
     const cancelled = { ...run, cancelRequested: true }
     const fetch = vi.spyOn(globalThis, 'fetch').mockImplementation(async (path, init) => {
       if (path === '/api/v1/session') return response({ authenticated: true, username: 'alex' })
@@ -272,8 +348,8 @@ describe('App frozen API integration', () => {
     await userEvent.click(await screen.findByRole('button', { name: 'Cancel run' }))
     await waitFor(() => expect(fetch).toHaveBeenCalledWith('/api/v1/namespaces/default/runs/repair-ui/cancel', expect.objectContaining({ method: 'POST' })))
     const cancelInit = fetch.mock.calls.find(call => String(call[0]).endsWith('/cancel'))?.[1]
-    expect(cancelInit).not.toHaveProperty('body')
+    expect(JSON.parse(String(cancelInit?.body))).toEqual({ runUID: 'run-uid' })
     expect(invalidate).toHaveBeenCalledWith({ queryKey: ['run', 'default', 'repair-ui'] })
-    expect(invalidate).toHaveBeenCalledWith({ queryKey: ['runs', 'default'] })
+    expect(invalidate).not.toHaveBeenCalledWith({ queryKey: ['runs', 'default'] })
   })
 })

@@ -129,9 +129,9 @@ func TestConsumeSSEFramingAndCursorCommit(t *testing.T) {
 		t.Fatalf("committed cursor = %q, want empty ID reset", cursor)
 	}
 	want := []SSEEvent{
-		{ID: "cursor-1", Event: "transcript", Data: []byte("{\"line\":\n1}")},
-		{ID: "", Event: "transcript-gap", Data: []byte("{}")},
-		{ID: "", Event: "message", Data: []byte("{\"default\":true}")},
+		{ID: "cursor-1", HasID: true, Event: "transcript", Data: []byte("{\"line\":\n1}")},
+		{ID: "", HasID: false, Event: "transcript-gap", Data: []byte("{}")},
+		{ID: "", HasID: false, Event: "message", Data: []byte("{\"default\":true}")},
 	}
 	if len(events) != len(want) {
 		t.Fatalf("events = %#v", events)

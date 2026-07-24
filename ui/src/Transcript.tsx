@@ -82,7 +82,7 @@ function emptyTranscriptState(): TranscriptState {
   return { timeline, claude: updateClaudeTranscript(undefined, timeline) }
 }
 
-export function Transcript({ namespace, run }: { namespace: string; run: string }) {
+export function Transcript({ namespace, run, identity }: { namespace: string; run: string; identity?: string }) {
   const [status, setStatus] = useState('Connecting')
   const [transcript, setTranscript] = useState<TranscriptState>(emptyTranscriptState)
   useEffect(() => {
@@ -176,7 +176,7 @@ export function Transcript({ namespace, run }: { namespace: string; run: string 
       if (timer !== undefined) window.clearTimeout(timer)
       stream?.close()
     }
-  }, [namespace, run])
+  }, [namespace, run, identity])
   const { timeline, claude } = transcript
   return <section><p role="status" aria-live="polite">Transcript: {status}</p>
     {!timeline.length ? <p>No transcript events yet.</p> : <ol className="transcript">

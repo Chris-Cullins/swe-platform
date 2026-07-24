@@ -37,6 +37,7 @@ func TestResourceServiceListPassesPaginationAndRedacts(t *testing.T) {
 		}
 		runs := list.(*platformv1alpha1.RunList)
 		runs.Continue = "next"
+		runs.ResourceVersion = "opaque-rv"
 		runs.Items = []platformv1alpha1.Run{{
 			ObjectMeta: metav1.ObjectMeta{Name: "r", Namespace: "team", UID: "uid", ManagedFields: []metav1.ManagedFieldsEntry{{Manager: "secret-manager"}}},
 			Spec:       platformv1alpha1.RunSpec{Agent: "agent", Prompt: "prompt", Notify: []string{"private"}, ParentRef: "hidden"},
@@ -48,7 +49,7 @@ func TestResourceServiceListPassesPaginationAndRedacts(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.Namespace != "team" || got.Limit != 17 || got.Continue != "opaque" || page.Continue != "next" || len(page.Items) != 1 {
+	if got.Namespace != "team" || got.Limit != 17 || got.Continue != "opaque" || page.Continue != "next" || page.ResourceVersion != "opaque-rv" || len(page.Items) != 1 {
 		t.Fatalf("options/page = %#v, %#v", got, page)
 	}
 	assertJSONRedacted(t, page, "transcript", "conditions", "managedFields", "notify", "parentRef")
