@@ -44,6 +44,10 @@ type AccessController interface {
 	Authorize(*http.Request, ResourceAccess, bool) error
 }
 
+type principalAccessController interface {
+	AuthorizePrincipal(*http.Request, ResourceAccess, bool) (string, error)
+}
+
 // SessionAuthenticator validates Kubernetes credentials for browser session
 // exchange without issuing or retaining a platform credential.
 type SessionAuthenticator interface {
@@ -64,22 +68,28 @@ type KubernetesAccessController struct {
 // Authorize authenticates a bearer token (or, for browser reads, a session cookie) and
 // authorizes the exact namespaced resource through Kubernetes RBAC.
 func (a KubernetesAccessController) Authorize(r *http.Request, access ResourceAccess, allowSession bool) error {
+	_, err := a.AuthorizePrincipal(r, access, allowSession)
+	return err
+}
+
+// AuthorizePrincipal authorizes access and returns a stable, non-secret admission key.
+func (a KubernetesAccessController) AuthorizePrincipal(r *http.Request, access ResourceAccess, allowSession bool) (string, error) {
 	token, bearer, sessionID, err := a.requestCredential(r, allowSession)
 	if err != nil {
-		return err
+		return "", err
 	}
 	user, err := a.authenticate(r.Context(), token, bearer)
 	if err != nil {
 		if sessionID != "" {
 			a.Sessions.Delete(sessionID)
 		}
-		return err
+		return "", err
 	}
 	if user.bootstrap {
-		return nil
+		return "bootstrap", nil
 	}
 	if a.Client == nil {
-		return fmt.Errorf("authorize request: Kubernetes client is unavailable")
+		return "", fmt.Errorf("authorize request: Kubernetes client is unavailable")
 	}
 	review, err := a.Client.AuthorizationV1().SubjectAccessReviews().Create(r.Context(), &authorizationv1.SubjectAccessReview{
 		Spec: authorizationv1.SubjectAccessReviewSpec{
@@ -99,15 +109,18 @@ func (a KubernetesAccessController) Authorize(r *http.Request, access ResourceAc
 		},
 	}, metav1.CreateOptions{})
 	if err != nil {
-		return fmt.Errorf("authorize request: %w", err)
+		return "", fmt.Errorf("authorize request: %w", err)
 	}
 	if review.Status.EvaluationError != "" {
-		return fmt.Errorf("authorize request: %s", review.Status.EvaluationError)
+		return "", fmt.Errorf("authorize request: %s", review.Status.EvaluationError)
 	}
 	if !review.Status.Allowed {
-		return errForbidden
+		return "", errForbidden
 	}
-	return nil
+	if user.uid != "" {
+		return user.uid, nil
+	}
+	return user.name, nil
 }
 
 // CreateSession validates an explicit bearer credential and stores it behind a

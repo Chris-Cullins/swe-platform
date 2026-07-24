@@ -119,7 +119,8 @@ func sameRunIntent(a, b platformv1alpha1.RunSpec) bool {
 }
 
 // waitForRun polls until the adapter accepts and starts work or the Run ends.
-// TODO(P1): replace polling with a watch once the control plane exists.
+// This direct-Kubernetes compatibility path intentionally retains polling; the
+// authenticated control-plane clients use the typed Run resource watch.
 func waitForRun(ctx context.Context, clients *kubeClients, namespace, name string, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
 	lastState := platformv1alpha1.RunState("")

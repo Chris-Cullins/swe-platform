@@ -24,7 +24,7 @@ func TestTUIModelListDetailCancelAndFreeFormCreate(t *testing.T) {
 		Name: "run-one", UID: "uid-one", State: "Running", CreatedAt: time.Now(),
 		Intent: controlplane.RunIntent{Agent: "agent-added-next-year", Prompt: "do work", Selector: controlplane.RunSelector{Template: "small"}},
 	}
-	_, _ = model.Update(runsLoadedMsg{runs: []controlplane.RunSummary{{Name: run.Name, UID: run.UID, Agent: run.Intent.Agent, PromptPreview: run.Intent.Prompt, State: run.State}}})
+	_, _ = model.Update(runsLoadedMsg{snapshot: controlplaneclient.RunSummarySnapshot{Items: []controlplane.RunSummary{{Name: run.Name, UID: run.UID, Agent: run.Intent.Agent, PromptPreview: run.Intent.Prompt, State: run.State}}}})
 	if len(model.runs) != 1 || model.runs[0].Agent != "agent-added-next-year" {
 		t.Fatalf("runs = %#v", model.runs)
 	}
@@ -100,6 +100,31 @@ func TestTUIModelFencesTranscriptByImmutableRunIdentity(t *testing.T) {
 		t.Fatalf("stale transcript was rendered: %#v", model.transcript)
 	}
 	model.stopStream()
+}
+
+func TestTUIReplacementEventCoalescesExactDetailRefresh(t *testing.T) {
+	client, _ := controlplaneclient.New("http://control.test", "token", &http.Client{})
+	model := newTUIModel(context.Background(), client, "team-a")
+	model.mode = tuiDetail
+	model.run = &controlplane.Run{Name: "same", UID: "old", Generation: 1}
+	model.runs = []controlplane.RunSummary{{Name: "same", UID: "old", Generation: 1}}
+	model.resourceGeneration = 2
+	model.detailInFlight = true
+	model.streamBlocked = true
+	committed := make(chan struct{})
+	_, command := model.Update(runWatchMsg{generation: 2, event: controlplane.RunWatchEvent{Type: "ADDED", ResourceVersion: "2", Run: controlplane.RunSummary{Name: "same", UID: "new", Generation: 1}}, committed: committed})
+	if command == nil || !model.detailRefreshPending || len(model.runs) != 1 || model.runs[0].UID != "new" {
+		t.Fatalf("replacement state = pending %t, runs %#v, command %v", model.detailRefreshPending, model.runs, command)
+	}
+	select {
+	case <-committed:
+	default:
+		t.Fatal("replacement event was not committed after handling")
+	}
+	_, refresh := model.Update(runLoadedMsg{name: "same", run: *model.run})
+	if refresh == nil || !model.detailInFlight || model.detailRefreshPending {
+		t.Fatalf("coalesced refresh = %v, inflight %t, pending %t", refresh, model.detailInFlight, model.detailRefreshPending)
+	}
 }
 
 func TestTUITranscriptRenderingIsGapVisibleSafeAndBounded(t *testing.T) {
@@ -218,8 +243,12 @@ func TestTUITranscriptStreamStopsWithContext(t *testing.T) {
 	model := newTUIModel(context.Background(), client, "team-a")
 	identity := runIdentity{namespace: "team-a", name: "run-one", uid: "uid-one"}
 	command := model.startTranscript(identity)
+	batch, ok := command().(tea.BatchMsg)
+	if !ok || len(batch) != 2 {
+		t.Fatalf("startTranscript command = %#v", batch)
+	}
 	result := make(chan tea.Msg, 1)
-	go func() { result <- command() }()
+	go func() { result <- batch[0]() }()
 	select {
 	case <-connected:
 	case <-time.After(time.Second):

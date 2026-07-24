@@ -33,13 +33,17 @@ type SSEEvent struct {
 // the first successful connection. The initial cursor is sent as ?after=; a
 // reconnect carries the last completely committed event ID in Last-Event-ID.
 func (c *Client) StreamSSE(ctx context.Context, endpoint, cursor string, handle func(SSEEvent) error) error {
-	return c.StreamSSEWithReconnectCheck(ctx, endpoint, cursor, nil, handle)
+	return c.streamSSEWithReconnectCheck(ctx, endpoint, cursor, nil, nil, handle)
 }
 
 // StreamSSEWithReconnectCheck is StreamSSE with a check immediately before
 // every connection attempt. Callers can use it to fence a name-based endpoint
 // to an immutable resource identity across reconnects.
 func (c *Client) StreamSSEWithReconnectCheck(ctx context.Context, endpoint, cursor string, check func(context.Context) error, handle func(SSEEvent) error) error {
+	return c.streamSSEWithReconnectCheck(ctx, endpoint, cursor, check, nil, handle)
+}
+
+func (c *Client) streamSSEWithReconnectCheck(ctx context.Context, endpoint, cursor string, check func(context.Context) error, established func(), handle func(SSEEvent) error) error {
 	connected := false
 	reconnectWait := c.reconnectWait
 	for {
@@ -102,6 +106,9 @@ func (c *Client) StreamSSEWithReconnectCheck(ctx context.Context, endpoint, curs
 			}
 		}
 		connected = true
+		if established != nil {
+			established()
+		}
 		streamRetry := time.Duration(-1)
 		cursor, streamRetry, err = consumeSSE(response.Body, cursor, handle)
 		response.Body.Close()

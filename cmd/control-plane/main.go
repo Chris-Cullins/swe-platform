@@ -44,7 +44,7 @@ func main() {
 		os.Exit(1)
 	}
 	restConfig := config.GetConfigOrDie()
-	kubeClient, err := client.New(restConfig, client.Options{Scheme: scheme})
+	kubeClient, err := client.NewWithWatch(restConfig, client.Options{Scheme: scheme})
 	if err != nil {
 		log.Error("create Kubernetes client", "error", err)
 		os.Exit(1)

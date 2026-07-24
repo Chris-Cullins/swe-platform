@@ -5,11 +5,13 @@ import (
 	"errors"
 	"reflect"
 	"strings"
+	"time"
 
 	platformv1alpha1 "github.com/Chris-Cullins/swe-platform/api/v1alpha1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/watch"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
@@ -42,7 +44,7 @@ func (s *KubernetesResourceService) ListRunSummaries(ctx context.Context, namesp
 	if err := s.Client.List(ctx, &runs, &client.ListOptions{Namespace: namespace, Limit: limit, Continue: continueToken}); err != nil {
 		return RunSummaryList{}, err
 	}
-	result := RunSummaryList{Items: make([]RunSummary, 0, len(runs.Items)), Continue: runs.Continue}
+	result := RunSummaryList{Items: make([]RunSummary, 0, len(runs.Items)), Continue: runs.Continue, ResourceVersion: runs.ResourceVersion}
 	for i := range runs.Items {
 		result.Items = append(result.Items, runSummaryDTO(&runs.Items[i]))
 	}
@@ -51,7 +53,17 @@ func (s *KubernetesResourceService) ListRunSummaries(ctx context.Context, namesp
 
 // KubernetesResourceService stores resource intent in swe.dev CRDs.
 type KubernetesResourceService struct {
-	Client client.Client
+	Client client.WithWatch
+}
+
+func (s *KubernetesResourceService) WatchRuns(ctx context.Context, namespace, resourceVersion string, timeout time.Duration) (watch.Interface, error) {
+	seconds := int64(timeout / time.Second)
+	if seconds < 1 {
+		seconds = 1
+	}
+	return s.Client.Watch(ctx, &platformv1alpha1.RunList{}, &client.ListOptions{Namespace: namespace, Raw: &metav1.ListOptions{
+		ResourceVersion: resourceVersion, AllowWatchBookmarks: true, TimeoutSeconds: &seconds,
+	}})
 }
 
 func (s *KubernetesResourceService) ListRuns(ctx context.Context, namespace string, limit int64, continueToken string) (RunList, error) {
@@ -64,7 +76,7 @@ func (s *KubernetesResourceService) ListRuns(ctx context.Context, namespace stri
 		return RunList{}, err
 	}
 
-	result := RunList{Items: make([]Run, 0, len(runs.Items)), Continue: runs.Continue}
+	result := RunList{Items: make([]Run, 0, len(runs.Items)), Continue: runs.Continue, ResourceVersion: runs.ResourceVersion}
 	for i := range runs.Items {
 		result.Items = append(result.Items, runDTO(&runs.Items[i]))
 	}
@@ -210,9 +222,10 @@ func (s *KubernetesResourceService) GetEnvironment(ctx context.Context, namespac
 
 func runDTO(run *platformv1alpha1.Run) Run {
 	result := Run{
-		Name:      run.Name,
-		UID:       string(run.UID),
-		CreatedAt: run.CreationTimestamp.Time,
+		Name:       run.Name,
+		UID:        string(run.UID),
+		Generation: run.Generation,
+		CreatedAt:  run.CreationTimestamp.Time,
 		Intent: RunIntent{
 			Selector:          RunSelector{Environment: run.Spec.EnvironmentRef, Project: run.Spec.ProjectRef, Template: run.Spec.TemplateRef},
 			Agent:             run.Spec.Agent,
@@ -247,7 +260,7 @@ func runSummaryDTO(run *platformv1alpha1.Run) RunSummary {
 		}
 	}
 	return RunSummary{
-		Name: full.Name, UID: full.UID, CreatedAt: full.CreatedAt,
+		Name: full.Name, UID: full.UID, Generation: full.Generation, CreatedAt: full.CreatedAt,
 		Agent: boundedRunes(full.Intent.Agent, runAgentSummaryRunes), PromptPreview: boundedPromptPreview(full.Intent.Prompt),
 		CancelRequested: full.CancelRequested, State: boundedRunes(full.State, 64), Environment: environment,
 	}

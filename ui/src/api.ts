@@ -1,4 +1,4 @@
-import type { CreateRun, Environment, Problem, Run, RunList, Session } from './contracts'
+import type { CreateRun, Environment, Problem, Run, RunList, RunSummaryList, Session } from './contracts'
 
 export class ApiProblem extends Error {
   constructor(public readonly problem: Problem, public readonly status: number) {
@@ -13,6 +13,8 @@ export const onUnauthorized = (listener: UnauthorizedListener) => {
   unauthorizedListeners.add(listener)
   return () => { unauthorizedListeners.delete(listener) }
 }
+
+export const notifyUnauthorized = () => unauthorizedListeners.forEach(listener => listener())
 
 function asProblem(value: unknown, response: Response): Problem {
   const fallback = {
@@ -39,7 +41,7 @@ async function request<T>(path: string, init: RequestInit = {}, options?: { toke
     let body: unknown
     try { body = await response.json() } catch { body = undefined }
     if (response.status === 401 && options?.notifyUnauthorized !== false) {
-      unauthorizedListeners.forEach(listener => listener())
+      notifyUnauthorized()
     }
     throw new ApiProblem(asProblem(body, response), response.status)
   }
@@ -49,7 +51,7 @@ async function request<T>(path: string, init: RequestInit = {}, options?: { toke
 
 const base = (namespace: string) => `/api/v1/namespaces/${encodeURIComponent(namespace)}`
 
-export interface RunListOptions { limit?: number; continue?: string }
+export interface RunListOptions { limit?: number; continue?: string; signal?: AbortSignal }
 const MAX_RUN_LIST_PAGES = 100
 
 export const api = {
@@ -66,9 +68,22 @@ export const api = {
     const suffix = query.size ? `?${query}` : ''
     return request<RunList>(`${base(namespace)}/runs${suffix}`)
   },
+  runSummaries: (namespace: string, options: RunListOptions = {}) => {
+    const query = new URLSearchParams({ limit: String(options.limit ?? 200), view: 'summary' })
+    if (options.continue) query.set('continue', options.continue)
+    return request<RunSummaryList>(`${base(namespace)}/runs?${query}`, { signal: options.signal })
+  },
+  watchRunSummaries: (namespace: string, resourceVersion: string, signal: AbortSignal, lastEventID?: string) => {
+    const query = new URLSearchParams({ watch: 'true', view: 'summary', resourceVersion })
+    const headers: Record<string, string> = { Accept: 'text/event-stream' }
+    if (lastEventID) headers['Last-Event-ID'] = lastEventID
+    return fetch(`${base(namespace)}/runs?${query}`, {
+      headers, credentials: 'same-origin', signal,
+    })
+  },
   run: (namespace: string, name: string) => request<Run>(`${base(namespace)}/runs/${encodeURIComponent(name)}`),
   createRun: (namespace: string, value: CreateRun) => request<Run>(`${base(namespace)}/runs`, { method: 'POST', body: JSON.stringify(value) }),
-  cancelRun: (namespace: string, name: string) => request<Run>(`${base(namespace)}/runs/${encodeURIComponent(name)}/cancel`, { method: 'POST' }),
+  cancelRun: (namespace: string, name: string, runUID: string) => request<Run>(`${base(namespace)}/runs/${encodeURIComponent(name)}/cancel`, { method: 'POST', body: JSON.stringify({ runUID }) }),
   environment: (namespace: string, name: string) => request<Environment>(`${base(namespace)}/environments/${encodeURIComponent(name)}`),
   transcriptUrl: (namespace: string, name: string) => `${base(namespace)}/runs/${encodeURIComponent(name)}/transcript`,
   terminalPath: (namespace: string, environment: string) => `${base(namespace)}/environments/${encodeURIComponent(environment)}/terminal`,
@@ -90,8 +105,7 @@ export async function listAllRuns(namespace: string): Promise<RunList> {
 
 const terminalStates = new Set(['Succeeded', 'Failed', 'Cancelled'])
 export const isTerminal = (state?: string) => !!state && terminalStates.has(state)
-export const runPollInterval = (run?: Run) => run && !isTerminal(run.state) ? 4000 : false
-export const listPollInterval = 4000
+export const fallbackPollInterval = 4000
 
 export const queryKeys = {
   session: ['session'] as const,

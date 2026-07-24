@@ -35,6 +35,10 @@ func (s *Server) handleRunCollection(w http.ResponseWriter, r *http.Request, nam
 }
 
 func (s *Server) listRuns(w http.ResponseWriter, r *http.Request, namespace string) {
+	if r.URL.Query().Get("watch") != "" {
+		s.watchRuns(w, r, namespace)
+		return
+	}
 	if !s.authorizeResource(w, r, ResourceAccess{Namespace: namespace, Verb: "list", Resource: "runs"}, true) {
 		return
 	}
@@ -286,6 +290,8 @@ func (s *Server) writeResourceError(w http.ResponseWriter, operation, namespace,
 	switch {
 	case apierrors.IsNotFound(err):
 		writeProblem(w, http.StatusNotFound, "resource-not-found", "Resource not found", "the requested resource does not exist")
+	case apierrors.IsResourceExpired(err) || apierrors.IsGone(err):
+		writeProblem(w, http.StatusGone, "resource-expired", "Resource version expired", "restart the resource list from its first page")
 	case apierrors.IsAlreadyExists(err):
 		writeProblem(w, http.StatusConflict, "resource-already-exists", "Resource already exists", "the requested resource name is already in use")
 	case apierrors.IsInvalid(err), apierrors.IsBadRequest(err):

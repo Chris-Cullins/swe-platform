@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -13,7 +14,9 @@ import (
 )
 
 const (
-	maxRunListPages = 100
+	maxRunListPages        = 100
+	maxRunSnapshotAttempts = 3
+	maxRunWatchEvent       = 64 << 10
 	// A server page has at most 200 summaries; every caller-controlled field is
 	// length-bounded and each prompt preview has at most 160 runes. This leaves
 	// ample room for JSON's worst-case escaping without accepting unbounded data.
@@ -24,12 +27,50 @@ const (
 	maxExactResourceResponse = 8 << 20
 )
 
+var ErrRunRelist = errors.New("Run watch requires a full relist")
+
+type initialRunWatchCompatibilityError struct{ error }
+
+// RunSummarySnapshot is one fully paginated, internally consistent collection
+// snapshot. WatchSupported is false only for a legacy server that omitted its
+// required resource version.
+type RunSummarySnapshot struct {
+	Items           []controlplane.RunSummary
+	ResourceVersion string
+	WatchSupported  bool
+}
+
 // ListRunSummaries returns every bounded Run summary in a namespace using
 // bounded API pagination. Full prompts are fetched only from exact Run detail.
 func (c *Client) ListRunSummaries(ctx context.Context, namespace string) ([]controlplane.RunSummary, error) {
+	snapshot, err := c.ListRunSummarySnapshot(ctx, namespace)
+	return snapshot.Items, err
+}
+
+// ListRunSummarySnapshot restarts the complete continuation chain when its
+// Kubernetes snapshot expires or a server returns inconsistent page versions.
+func (c *Client) ListRunSummarySnapshot(ctx context.Context, namespace string) (RunSummarySnapshot, error) {
+	for attempt := 0; attempt < maxRunSnapshotAttempts; attempt++ {
+		snapshot, restart, err := c.listRunSummarySnapshot(ctx, namespace)
+		if err != nil {
+			var problem *ProblemError
+			if errors.As(err, &problem) && problem.Problem.Status == http.StatusGone {
+				continue
+			}
+			return RunSummarySnapshot{}, err
+		}
+		if !restart {
+			return snapshot, nil
+		}
+	}
+	return RunSummarySnapshot{}, fmt.Errorf("control plane Run snapshot did not remain consistent after %d attempts", maxRunSnapshotAttempts)
+}
+
+func (c *Client) listRunSummarySnapshot(ctx context.Context, namespace string) (RunSummarySnapshot, bool, error) {
 	items := make([]controlplane.RunSummary, 0)
 	seen := make(map[string]struct{})
 	continuation := ""
+	resourceVersion := ""
 	for pageNumber := 0; pageNumber < maxRunListPages; pageNumber++ {
 		endpoint := c.Endpoint("api", "v1", "namespaces", namespace, "runs")
 		query := url.Values{"limit": {"200"}, "view": {"summary"}}
@@ -38,19 +79,81 @@ func (c *Client) ListRunSummaries(ctx context.Context, namespace string) ([]cont
 		}
 		var page controlplane.RunSummaryList
 		if err := c.getJSONLimit(ctx, endpoint+"?"+query.Encode(), &page, maxRunSummaryResponse); err != nil {
-			return nil, err
+			return RunSummarySnapshot{}, false, err
+		}
+		if pageNumber == 0 {
+			resourceVersion = page.ResourceVersion
+		} else if page.ResourceVersion != resourceVersion {
+			return RunSummarySnapshot{}, true, nil
 		}
 		items = append(items, page.Items...)
 		if page.Continue == "" {
-			return items, nil
+			return RunSummarySnapshot{Items: items, ResourceVersion: resourceVersion, WatchSupported: resourceVersion != ""}, false, nil
 		}
 		if _, duplicate := seen[page.Continue]; duplicate {
-			return nil, fmt.Errorf("control plane repeated a Run list cursor")
+			return RunSummarySnapshot{}, false, fmt.Errorf("control plane repeated a Run list cursor")
 		}
 		seen[page.Continue] = struct{}{}
 		continuation = page.Continue
 	}
-	return nil, fmt.Errorf("control plane Run list exceeded %d pages", maxRunListPages)
+	return RunSummarySnapshot{}, false, fmt.Errorf("control plane Run list exceeded %d pages", maxRunListPages)
+}
+
+// StreamRunSummaries consumes the typed collection watch. It reconnects with
+// Last-Event-ID only after the callback has successfully handled an event.
+func (c *Client) StreamRunSummaries(ctx context.Context, namespace, resourceVersion string, established func(), handle func(controlplane.RunWatchEvent) error) error {
+	endpoint := c.Endpoint("api", "v1", "namespaces", namespace, "runs")
+	query := url.Values{"watch": {"true"}, "view": {"summary"}, "resourceVersion": {resourceVersion}}
+	connected := false
+	err := c.streamSSEWithReconnectCheck(ctx, endpoint+"?"+query.Encode(), "", nil, func() {
+		connected = true
+		if established != nil {
+			established()
+		}
+	}, func(event SSEEvent) error {
+		if len(event.Data) > maxRunWatchEvent || len(event.ID) > 4096 {
+			return fmt.Errorf("Run watch event exceeds its bounded contract")
+		}
+		switch event.Event {
+		case "run-relist":
+			if event.ID != "" {
+				return fmt.Errorf("Run relist event must not carry an ID")
+			}
+			return ErrRunRelist
+		case "run-checkpoint":
+			var checkpoint controlplane.RunWatchCheckpoint
+			if err := json.Unmarshal(event.Data, &checkpoint); err != nil || checkpoint.ResourceVersion == "" || checkpoint.ResourceVersion != event.ID {
+				return fmt.Errorf("invalid Run watch checkpoint")
+			}
+			return nil
+		case "run":
+			var update controlplane.RunWatchEvent
+			if err := json.Unmarshal(event.Data, &update); err != nil {
+				return fmt.Errorf("decode Run watch event: %w", err)
+			}
+			if update.ResourceVersion == "" || update.ResourceVersion != event.ID || (update.Type != "ADDED" && update.Type != "MODIFIED" && update.Type != "DELETED") {
+				return fmt.Errorf("invalid Run watch event")
+			}
+			return handle(update)
+		default:
+			return nil
+		}
+	})
+	if !connected && runWatchCompatibilityStatus(err) {
+		return &initialRunWatchCompatibilityError{error: err}
+	}
+	return err
+}
+
+// RunWatchCompatibilityFallback reports only explicit legacy endpoint statuses.
+func RunWatchCompatibilityFallback(err error) bool {
+	var initial *initialRunWatchCompatibilityError
+	return errors.As(err, &initial)
+}
+
+func runWatchCompatibilityStatus(err error) bool {
+	var problem *ProblemError
+	return errors.As(err, &problem) && (problem.Problem.Status == http.StatusNotFound || problem.Problem.Status == http.StatusMethodNotAllowed || problem.Problem.Status == http.StatusNotImplemented)
 }
 
 // GetRun returns an exact namespaced Run.
