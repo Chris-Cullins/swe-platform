@@ -103,7 +103,9 @@ runs both via `make` targets:
   Vite development server with `npm run dev`. Production uses `make ui-build`
   followed by `make build-control-plane-production`; the tagged build embeds `ui/dist`,
   while ordinary Go builds intentionally work without generated assets. The control-plane
-  image performs both stages in one multi-stage build.
+  image performs both stages in one multi-stage build. The ESLint flat config deliberately
+  enables only `rules-of-hooks` and `exhaustive-deps` from the React Hooks plugin; treat
+  enabling that plugin's expanding recommended preset as a lint-policy change.
 - **Windows portability:** CI runs focused sandboxd process, launch-material, Exec, and
   filesystem tests on `windows-latest`; keep OS-specific tests behind build tags.
 - **Regenerate deepcopy:** `make generate` · **CRDs + RBAC:** `make manifests`
