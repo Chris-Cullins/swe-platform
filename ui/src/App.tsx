@@ -3,7 +3,7 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
   Link, Navigate, NavLink, Outlet, Route, Routes, useLocation,
   useNavigate, useOutletContext, useParams,
-} from 'react-router-dom'
+} from 'react-router'
 import {
   api, ApiProblem, isTerminal, onUnauthorized, queryKeys,
 } from './api'
