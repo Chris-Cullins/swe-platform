@@ -56,9 +56,160 @@ spec:
                 enum:
                 - pod
                 type: string
+              lifecycle:
+                description: Lifecycle contains explicit hold policy and bounded lifecycle
+                  requests.
+                properties:
+                  activity:
+                    description: |-
+                      Activity contains legacy source-keyed activity requests. New activity
+                      publishers use bounded metadata slots so heartbeats do not advance the
+                      Environment generation; the lifecycle controller consumes both forms.
+                    items:
+                      description: EnvironmentActivityRequest is one source's latest
+                        activity intent.
+                      properties:
+                        environmentUID:
+                          description: EnvironmentUID is the exact Environment incarnation
+                            targeted.
+                          type: string
+                        holdPolicyRevision:
+                          description: HoldPolicyRevision is the policy revision observed
+                            by the requester.
+                          format: int64
+                          minimum: 0
+                          type: integer
+                        id:
+                          description: ID is chosen by the requester and is its idempotency
+                            key.
+                          maxLength: 128
+                          minLength: 1
+                          type: string
+                        source:
+                          description: |-
+                            EnvironmentActivitySource identifies an independently updated activity
+                            slot. One latest request per source keeps the API bounded.
+                          enum:
+                          - Terminal
+                          - Portal
+                          - Inbox
+                          - Agent
+                          - Run
+                          type: string
+                      required:
+                      - environmentUID
+                      - holdPolicyRevision
+                      - id
+                      - source
+                      type: object
+                      x-kubernetes-validations:
+                      - message: environmentUID must not be empty
+                        rule: size(self.environmentUID) > 0
+                    maxItems: 5
+                    type: array
+                    x-kubernetes-list-map-keys:
+                    - source
+                    x-kubernetes-list-type: map
+                  hold:
+                    description: Hold is explicit policy and is never cleared by ordinary
+                      wake traffic.
+                    properties:
+                      enabled:
+                        type: boolean
+                      revision:
+                        format: int64
+                        minimum: 1
+                        type: integer
+                    required:
+                    - enabled
+                    - revision
+                    type: object
+                    x-kubernetes-validations:
+                    - message: revision must increase when hold policy changes
+                      rule: self == oldSelf || self.revision > oldSelf.revision
+                  suspend:
+                    description: |-
+                      Suspend requests a backend fence without creating an explicit hold. Run
+                      cleanup uses this to preserve a workspace after accepted work stops.
+                    properties:
+                      environmentUID:
+                        description: EnvironmentUID is the exact Environment incarnation
+                          targeted.
+                        type: string
+                      holdPolicyRevision:
+                        description: HoldPolicyRevision is the policy revision observed
+                          by the requester.
+                        format: int64
+                        minimum: 0
+                        type: integer
+                      id:
+                        description: ID is chosen by the requester and is its idempotency
+                          key.
+                        maxLength: 128
+                        minLength: 1
+                        type: string
+                      sequence:
+                        format: int64
+                        minimum: 1
+                        type: integer
+                    required:
+                    - environmentUID
+                    - holdPolicyRevision
+                    - id
+                    - sequence
+                    type: object
+                    x-kubernetes-validations:
+                    - message: environmentUID must not be empty
+                      rule: size(self.environmentUID) > 0
+                  wake:
+                    description: Wake is the requester's latest ordinary wake intent.
+                    properties:
+                      environmentUID:
+                        description: EnvironmentUID is the exact Environment incarnation
+                          targeted.
+                        type: string
+                      expectedSuspensionReason:
+                        description: |-
+                          ExpectedSuspensionReason limits the transition this request may release.
+                          Empty requests written before scoped wake intents were introduced are
+                          interpreted as Idle so migration remains fail-closed for cleanup fences.
+                        enum:
+                        - Hold
+                        - Idle
+                        - Requested
+                        type: string
+                      holdPolicyRevision:
+                        description: HoldPolicyRevision is the policy revision observed
+                          by the requester.
+                        format: int64
+                        minimum: 0
+                        type: integer
+                      id:
+                        description: ID is chosen by the requester and is its idempotency
+                          key.
+                        maxLength: 128
+                        minLength: 1
+                        type: string
+                    required:
+                    - environmentUID
+                    - holdPolicyRevision
+                    - id
+                    type: object
+                    x-kubernetes-validations:
+                    - message: environmentUID must not be empty
+                      rule: size(self.environmentUID) > 0
+                type: object
+                x-kubernetes-validations:
+                - message: hold policy cannot be removed; disable it at a higher revision
+                  rule: '!has(oldSelf.hold) || has(self.hold)'
+                - message: suspend requests must preserve or increase sequence
+                  rule: '!has(oldSelf.suspend) || !has(self.suspend) || self.suspend
+                    == oldSelf.suspend || self.suspend.sequence > oldSelf.suspend.sequence'
               paused:
-                description: Paused requests that the environment be paused (pod deleted,
-                  disk retained).
+                description: |-
+                  Paused is a deprecated compatibility input. The lifecycle controller
+                  migrates true to an explicit hold and clears it. New clients must
+                  use Lifecycle.Hold or lifecycle requests.
                 type: boolean
               projectRef:
                 description: ProjectRef is the name of the Project this environment
@@ -72,6 +223,10 @@ spec:
             required:
             - templateRef
             type: object
+            x-kubernetes-validations:
+            - message: hold policy cannot be removed; disable it at a higher revision
+              rule: '!has(oldSelf.lifecycle) || !has(oldSelf.lifecycle.hold) || (has(self.lifecycle)
+                && has(self.lifecycle.hold))'
           status:
             description: EnvironmentStatus defines the observed state of Environment.
             properties:
@@ -174,6 +329,89 @@ spec:
                   The idle reaper uses it to decide when to pause.
                 format: date-time
                 type: string
+              lifecycle:
+                description: Lifecycle is observed state owned by the lifecycle controller.
+                properties:
+                  activityReceipts:
+                    description: ActivityReceipts makes activity consumption idempotent
+                      and bounded.
+                    items:
+                      description: EnvironmentActivityReceipt records the latest request
+                        consumed for a source.
+                      properties:
+                        requestID:
+                          type: string
+                        source:
+                          description: |-
+                            EnvironmentActivitySource identifies an independently updated activity
+                            slot. One latest request per source keeps the API bounded.
+                          enum:
+                          - Terminal
+                          - Portal
+                          - Inbox
+                          - Agent
+                          - Run
+                          type: string
+                      required:
+                      - requestID
+                      - source
+                      type: object
+                    maxItems: 5
+                    type: array
+                    x-kubernetes-list-map-keys:
+                    - source
+                    x-kubernetes-list-type: map
+                  epoch:
+                    description: |-
+                      Epoch increases before each transition into suspension. Backends and
+                      endpoints from an older epoch are fenced.
+                    format: int64
+                    minimum: 0
+                    type: integer
+                  lastSuspendRequestID:
+                    description: |-
+                      LastSuspendRequestID is the latest suspension request accepted. It keeps
+                      replay of an acknowledged request idempotent after a later wake.
+                    type: string
+                  lastSuspendRequestSequence:
+                    description: |-
+                      LastSuspendRequestSequence is the greatest suspension sequence accepted,
+                      including a request whose backend fence is still pending.
+                    format: int64
+                    minimum: 0
+                    type: integer
+                  lastWakeRequestID:
+                    description: |-
+                      LastWakeRequestID is the latest valid wake consumed, including a wake
+                      refused because an explicit hold was enabled.
+                    type: string
+                  observedHoldPolicyRevision:
+                    description: ObservedHoldPolicyRevision is the revision used for
+                      this decision.
+                    format: int64
+                    type: integer
+                  pendingSuspendRequestID:
+                    description: |-
+                      PendingSuspendRequestID identifies the accepted request whose backend
+                      teardown has not yet been acknowledged. It remains authoritative across
+                      later hold-policy revisions.
+                    type: string
+                  suspended:
+                    description: Suspended is the controller's decision that backend
+                      execution must be absent.
+                    type: boolean
+                  suspensionReason:
+                    description: SuspensionReason explains the current suspension.
+                    enum:
+                    - Hold
+                    - Idle
+                    - Requested
+                    type: string
+                  suspensionRequestID:
+                    description: SuspensionRequestID identifies the request that caused
+                      Requested suspension.
+                    type: string
+                type: object
               observedGeneration:
                 description: ObservedGeneration is the Environment generation reflected
                   by this status.

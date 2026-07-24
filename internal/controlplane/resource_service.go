@@ -172,7 +172,7 @@ func environmentDTO(environment *platformv1alpha1.Environment) Environment {
 		Project:   environment.Spec.ProjectRef,
 		Template:  environment.Spec.TemplateRef,
 		Backend:   string(backend),
-		Paused:    environment.Spec.Paused,
+		Paused:    environment.Spec.Paused || environment.Status.Lifecycle.Suspended,
 		Phase:     string(environment.Status.Phase),
 		Ready:     platformv1alpha1.IsEnvironmentReady(environment),
 	}

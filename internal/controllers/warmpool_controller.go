@@ -110,7 +110,7 @@ func (r *WarmPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 			continue
 		}
 		statusCurrent := env.Status.ObservedGeneration == env.Generation
-		if env.Spec.Paused || statusCurrent && (env.Status.Phase == platformv1alpha1.EnvironmentPhaseFailed || env.Status.Phase == platformv1alpha1.EnvironmentPhaseTerminated) {
+		if environmentSuspended(env) || statusCurrent && (env.Status.Phase == platformv1alpha1.EnvironmentPhaseFailed || env.Status.Phase == platformv1alpha1.EnvironmentPhaseTerminated) {
 			quarantined++
 			unusableSince, marked := warmPoolUnusableSince(env)
 			if !marked || unusableSince.After(now) {

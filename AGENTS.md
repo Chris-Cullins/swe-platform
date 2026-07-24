@@ -49,7 +49,9 @@ tests use fake process services; Codex supports process-scoped `CODEX_API_KEY` d
 
 - **Language:** Go for control plane, operator, `sandboxd`, and CLI.
 - **Layout:** kubebuilder conventions — `api/v1alpha1/` for types,
-  `internal/controllers/`, `cmd/{operator,swe}`. `sandboxd/` is a **separate Go
+  `internal/controllers/`, `cmd/{operator,swe}`. Shared fenced Environment intent
+  publication and validation belongs in `internal/lifecycle/`; controllers remain
+  the sole owners of observed lifecycle transitions. `sandboxd/` is a **separate Go
   module** with its own `go.mod`: keep its dependencies minimal (gRPC + protobuf
   only) so it stays portable and the environment base image stays small.
   Generated protobuf code lives in `sandboxd/gen/` and is committed.

@@ -131,6 +131,13 @@ type RunStatus struct {
 	// +optional
 	ObservedGeneration int64 `json:"observedGeneration,omitempty"`
 
+	// AcceptedEnvironmentEpoch is the Environment lifecycle epoch in which the
+	// adapter most recently accepted this Run. A different current epoch fences
+	// observation until credentials are rematerialized and acceptance succeeds.
+	// +kubebuilder:validation:Minimum=0
+	// +optional
+	AcceptedEnvironmentEpoch *int64 `json:"acceptedEnvironmentEpoch,omitempty"`
+
 	// Branch is the git branch holding the run's changes, once pushed.
 	// +optional
 	Branch string `json:"branch,omitempty"`

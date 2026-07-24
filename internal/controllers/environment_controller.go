@@ -38,6 +38,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	platformv1alpha1 "github.com/Chris-Cullins/swe-platform/api/v1alpha1"
+	"github.com/Chris-Cullins/swe-platform/internal/lifecycle"
 	sandboxdauth "github.com/Chris-Cullins/swe-platform/sandboxd/auth"
 )
 
@@ -170,10 +171,41 @@ func (r *EnvironmentReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		}
 		return ctrl.Result{Requeue: true}, nil
 	}
+	if env.Spec.Paused {
+		before := env.DeepCopy()
+		if env.Spec.Lifecycle.Hold == nil {
+			env.Spec.Lifecycle.Hold = &platformv1alpha1.EnvironmentHoldPolicy{Enabled: true, Revision: 1}
+		} else if !env.Spec.Lifecycle.Hold.Enabled {
+			env.Spec.Lifecycle.Hold.Enabled = true
+			env.Spec.Lifecycle.Hold.Revision++
+		}
+		env.Spec.Paused = false
+		if err := r.Patch(ctx, &env, client.MergeFromWithOptions(before, client.MergeFromWithOptimisticLock{})); err != nil {
+			return ctrl.Result{}, fmt.Errorf("migrate deprecated paused intent: %w", err)
+		}
+		return ctrl.Result{Requeue: true}, nil
+	}
+	if request := env.Spec.Lifecycle.Suspend; request != nil &&
+		(env.Status.Lifecycle.PendingSuspendRequestID != request.ID || env.Status.Lifecycle.LastSuspendRequestSequence != request.Sequence) &&
+		(request.Sequence <= env.Status.Lifecycle.LastSuspendRequestSequence || request.ID == env.Status.Lifecycle.LastSuspendRequestID || !validLifecycleRequest(&env, &request.EnvironmentLifecycleRequest)) {
+		before := env.DeepCopy()
+		env.Spec.Lifecycle.Suspend = nil
+		if err := r.Patch(ctx, &env, client.MergeFromWithOptions(before, client.MergeFromWithOptimisticLock{})); err != nil {
+			return ctrl.Result{}, fmt.Errorf("discard replayed suspension request: %w", err)
+		}
+		return ctrl.Result{Requeue: true}, nil
+	}
+	changed, err := r.reconcileLifecycleIntent(ctx, &env)
+	if err != nil {
+		return ctrl.Result{}, fmt.Errorf("reconcile lifecycle intent: %w", err)
+	}
+	if changed {
+		return ctrl.Result{Requeue: true}, nil
+	}
 	// Fencing must not depend on a still-readable template or successful setup.
 	// Cancellation/finalization can therefore stop an execution domain even
 	// after its template was deleted or provisioning became permanently broken.
-	if env.Spec.Paused {
+	if env.Status.Lifecycle.Suspended {
 		result, err := r.reconcilePaused(ctx, &env)
 		if err != nil {
 			return ctrl.Result{}, r.fail(ctx, &env, fmt.Errorf("pause environment: %w", err))
@@ -249,6 +281,141 @@ func (r *EnvironmentReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		return ctrl.Result{}, r.fail(ctx, &env, fmt.Errorf("reconcile idle policy: %w", err))
 	}
 	return result, nil
+}
+
+// reconcileLifecycleIntent is the sole owner of lifecycle transitions. Other
+// components publish fenced intents in spec or bounded metadata slots; this
+// method consumes each valid request once and decides whether execution is suspended.
+func (r *EnvironmentReconciler) reconcileLifecycleIntent(ctx context.Context, env *platformv1alpha1.Environment) (bool, error) {
+	activityRequests := lifecycle.ActivityRequests(env)
+	if env.Spec.Lifecycle.Hold == nil && env.Spec.Lifecycle.Wake == nil && env.Spec.Lifecycle.Suspend == nil && len(activityRequests) == 0 &&
+		!env.Status.Lifecycle.Suspended && env.Status.Lifecycle.Epoch == 0 && env.Status.Lifecycle.ObservedHoldPolicyRevision == 0 &&
+		env.Status.Lifecycle.LastWakeRequestID == "" && env.Status.Lifecycle.LastSuspendRequestID == "" && env.Status.Lifecycle.LastSuspendRequestSequence == 0 &&
+		env.Status.Lifecycle.PendingSuspendRequestID == "" && len(env.Status.Lifecycle.ActivityReceipts) == 0 {
+		return false, nil
+	}
+	policyRevision := int64(0)
+	held := false
+	if env.Spec.Lifecycle.Hold != nil {
+		policyRevision = env.Spec.Lifecycle.Hold.Revision
+		held = env.Spec.Lifecycle.Hold.Enabled
+	}
+	valid := func(request *platformv1alpha1.EnvironmentLifecycleRequest) bool {
+		return request != nil && request.EnvironmentUID == env.UID && request.HoldPolicyRevision == policyRevision
+	}
+
+	before := env.Status.DeepCopy()
+	lifecycleStatus := &env.Status.Lifecycle
+	lifecycleStatus.ObservedHoldPolicyRevision = policyRevision
+	now := metav1.NewTime(r.now())
+	for i := range activityRequests {
+		request := &activityRequests[i]
+		if !valid(&request.EnvironmentLifecycleRequest) || activityReceipt(lifecycleStatus.ActivityReceipts, request.Source) == request.ID {
+			continue
+		}
+		setActivityReceipt(&lifecycleStatus.ActivityReceipts, request.Source, request.ID)
+		if env.Status.LastActiveAt == nil || now.After(env.Status.LastActiveAt.Time) {
+			env.Status.LastActiveAt = &now
+		}
+	}
+
+	suspend := env.Spec.Lifecycle.Suspend
+	suspendValid := suspend != nil && valid(&suspend.EnvironmentLifecycleRequest)
+	suspendInFlight := lifecycleStatus.PendingSuspendRequestID != ""
+	suspendNew := suspendValid && !suspendInFlight && suspend.Sequence > lifecycleStatus.LastSuspendRequestSequence && suspend.ID != lifecycleStatus.LastSuspendRequestID
+	if suspendNew {
+		lifecycleStatus.LastSuspendRequestID = suspend.ID
+		lifecycleStatus.LastSuspendRequestSequence = suspend.Sequence
+		lifecycleStatus.PendingSuspendRequestID = suspend.ID
+	}
+	wake := env.Spec.Lifecycle.Wake
+	wakeNew := wake != nil && valid(&wake.EnvironmentLifecycleRequest) && wake.ID != lifecycleStatus.LastWakeRequestID
+	wakeSuspensionReason := lifecycleStatus.SuspensionReason
+	switch {
+	case held:
+		wakeSuspensionReason = platformv1alpha1.EnvironmentSuspensionReasonHold
+	case suspendNew || suspendInFlight:
+		wakeSuspensionReason = platformv1alpha1.EnvironmentSuspensionReasonRequested
+	}
+	wakeReasonMatches := false
+	if wake != nil {
+		expectedReason := wake.ExpectedSuspensionReason
+		if expectedReason == "" {
+			expectedReason = platformv1alpha1.EnvironmentSuspensionReasonIdle
+		}
+		wakeReasonMatches = expectedReason == wakeSuspensionReason
+	}
+	backendFencePending := lifecycleStatus.Suspended && env.Status.Phase != platformv1alpha1.EnvironmentPhasePaused
+	consumeWake := wakeNew && (held || !wakeReasonMatches || !suspendNew && !suspendInFlight && !backendFencePending)
+	if consumeWake {
+		lifecycleStatus.LastWakeRequestID = wake.ID
+	}
+
+	suspended := lifecycleStatus.Suspended
+	reason := lifecycleStatus.SuspensionReason
+	requestID := lifecycleStatus.SuspensionRequestID
+	switch {
+	case held:
+		suspended = true
+		reason = platformv1alpha1.EnvironmentSuspensionReasonHold
+		requestID = ""
+	case suspendNew || suspendInFlight:
+		suspended = true
+		reason = platformv1alpha1.EnvironmentSuspensionReasonRequested
+		requestID = lifecycleStatus.PendingSuspendRequestID
+	case lifecycleStatus.Suspended && lifecycleStatus.SuspensionReason == platformv1alpha1.EnvironmentSuspensionReasonHold && !backendFencePending:
+		// Disabling a hold at a newer policy revision is itself the authorized
+		// release; no ordinary stale wake is required. The backend fence must
+		// complete first so release cannot reuse the previous execution domain.
+		suspended = false
+		reason = ""
+		requestID = ""
+	case consumeWake && wakeReasonMatches && lifecycleStatus.SuspensionReason != platformv1alpha1.EnvironmentSuspensionReasonHold:
+		suspended = false
+		reason = ""
+		requestID = ""
+	}
+	if suspended && !lifecycleStatus.Suspended {
+		lifecycleStatus.Epoch++
+	}
+	lifecycleStatus.Suspended = suspended
+	lifecycleStatus.SuspensionReason = reason
+	lifecycleStatus.SuspensionRequestID = requestID
+
+	if apiequality.Semantic.DeepEqual(*before, env.Status) {
+		return false, nil
+	}
+	if err := r.Status().Update(ctx, env); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func validLifecycleRequest(env *platformv1alpha1.Environment, request *platformv1alpha1.EnvironmentLifecycleRequest) bool {
+	policyRevision := int64(0)
+	if env.Spec.Lifecycle.Hold != nil {
+		policyRevision = env.Spec.Lifecycle.Hold.Revision
+	}
+	return request.EnvironmentUID == env.UID && request.HoldPolicyRevision == policyRevision
+}
+
+func activityReceipt(receipts []platformv1alpha1.EnvironmentActivityReceipt, source platformv1alpha1.EnvironmentActivitySource) string {
+	for i := range receipts {
+		if receipts[i].Source == source {
+			return receipts[i].RequestID
+		}
+	}
+	return ""
+}
+
+func setActivityReceipt(receipts *[]platformv1alpha1.EnvironmentActivityReceipt, source platformv1alpha1.EnvironmentActivitySource, requestID string) {
+	for i := range *receipts {
+		if (*receipts)[i].Source == source {
+			(*receipts)[i].RequestID = requestID
+			return
+		}
+	}
+	*receipts = append(*receipts, platformv1alpha1.EnvironmentActivityReceipt{Source: source, RequestID: requestID})
 }
 
 // reconcilePendingPodRecovery advances persisted recovery before ensurePod can
@@ -409,7 +576,8 @@ func (r *EnvironmentReconciler) reconcileUnsupportedBackend(ctx context.Context,
 	return ctrl.Result{}, nil
 }
 
-// reconcileIdle schedules the next activity check or requests a pause once the
+// reconcileIdle schedules the next activity check or records an idle
+// suspension once the
 // template's idle timeout has elapsed. An exact, non-terminal Run owner or
 // claim is authoritative activity regardless of timestamps. The subsequent
 // optimistic Environment patch closes the race with a concurrent claim.
@@ -436,14 +604,17 @@ func (r *EnvironmentReconciler) reconcileIdle(ctx context.Context, env *platform
 		return ctrl.Result{RequeueAfter: remaining}, nil
 	}
 
-	before := env.DeepCopy()
-	env.Spec.Paused = true
-	patch := client.MergeFromWithOptions(before, client.MergeFromWithOptimisticLock{})
-	if err := r.Patch(ctx, env, patch); err != nil {
-		return ctrl.Result{}, fmt.Errorf("request idle pause: %w", err)
+	before := env.Status.DeepCopy()
+	env.Status.Lifecycle.Suspended = true
+	env.Status.Lifecycle.SuspensionReason = platformv1alpha1.EnvironmentSuspensionReasonIdle
+	env.Status.Lifecycle.SuspensionRequestID = ""
+	env.Status.Lifecycle.Epoch++
+	applyEnvironmentStatus(env, platformv1alpha1.EnvironmentPhaseIdle, env.Status.PodName, env.Status.Endpoints.Sandboxd, "PauseRequested", "environment is idle and suspension was recorded", env.Status.LastActiveAt)
+	if apiequality.Semantic.DeepEqual(*before, env.Status) {
+		return ctrl.Result{}, nil
 	}
-	if err := r.setPhase(ctx, env, platformv1alpha1.EnvironmentPhaseIdle, env.Status.PodName, env.Status.Endpoints.Sandboxd); err != nil {
-		return ctrl.Result{}, err
+	if err := r.Status().Update(ctx, env); err != nil {
+		return ctrl.Result{}, fmt.Errorf("record idle suspension: %w", err)
 	}
 	return ctrl.Result{Requeue: true}, nil
 }
@@ -556,6 +727,13 @@ func (r *EnvironmentReconciler) reconcilePaused(ctx context.Context, env *platfo
 		return ctrl.Result{Requeue: true}, nil
 	} else if !errors.IsNotFound(err) {
 		return ctrl.Result{}, err
+	}
+	if env.Status.Phase == platformv1alpha1.EnvironmentPhasePaused && env.Status.Lifecycle.PendingSuspendRequestID != "" {
+		env.Status.Lifecycle.PendingSuspendRequestID = ""
+		if err := r.Status().Update(ctx, env); err != nil {
+			return ctrl.Result{}, fmt.Errorf("acknowledge suspension request: %w", err)
+		}
+		return ctrl.Result{Requeue: true}, nil
 	}
 
 	return ctrl.Result{}, r.setPhase(ctx, env, platformv1alpha1.EnvironmentPhasePaused, "", "")
@@ -727,10 +905,10 @@ func (r *EnvironmentReconciler) ensurePod(ctx context.Context, env *platformv1al
 			SecurityContext: &corev1.PodSecurityContext{
 				SeccompProfile: &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault},
 			},
-		Containers: []corev1.Container{{
-			Name:            "environment",
-			Image:           tmpl.Spec.Image,
-			ImagePullPolicy: envImagePullPolicy(tmpl.Spec.Image),
+			Containers: []corev1.Container{{
+				Name:            "environment",
+				Image:           tmpl.Spec.Image,
+				ImagePullPolicy: envImagePullPolicy(tmpl.Spec.Image),
 				Command:         []string{"sandboxd", "serve"},
 				Args: []string{
 					"-tls-cert=" + sandboxdCredentialMount + "/" + sandboxdauth.TLSCertKey,

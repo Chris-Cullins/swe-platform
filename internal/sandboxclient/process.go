@@ -34,7 +34,7 @@ type Connector struct {
 // DialTerminal resolves the current ready Environment incarnation and returns
 // terminal and health clients sharing one authenticated, pod-pinned connection.
 func (c Connector) DialTerminal(ctx context.Context, namespace, environment string, environmentUID types.UID) (sandboxdv1.TerminalServiceClient, sandboxdv1.HealthServiceClient, func() error, error) {
-	env, pod, err := c.resolvePod(ctx, namespace, environment, environmentUID)
+	env, pod, err := c.resolvePod(ctx, namespace, environment, environmentUID, nil)
 	if err != nil {
 		return nil, nil, nil, err
 	}
@@ -52,7 +52,17 @@ func (c Connector) DialTerminal(ctx context.Context, namespace, environment stri
 // DialProcess resolves the exact Environment UID immediately before dialing
 // and returns a process-only sandboxd client.
 func (c Connector) DialProcess(ctx context.Context, namespace, environment string, environmentUID types.UID) (sandboxdv1.ProcessServiceClient, func() error, error) {
-	env, pod, err := c.resolvePod(ctx, namespace, environment, environmentUID)
+	return c.dialProcess(ctx, namespace, environment, environmentUID, nil)
+}
+
+// DialProcessForEpoch resolves a process client only when the current
+// Environment lifecycle epoch matches the caller's accepted execution epoch.
+func (c Connector) DialProcessForEpoch(ctx context.Context, namespace, environment string, environmentUID types.UID, expectedEpoch int64) (sandboxdv1.ProcessServiceClient, func() error, error) {
+	return c.dialProcess(ctx, namespace, environment, environmentUID, &expectedEpoch)
+}
+
+func (c Connector) dialProcess(ctx context.Context, namespace, environment string, environmentUID types.UID, expectedEpoch *int64) (sandboxdv1.ProcessServiceClient, func() error, error) {
+	env, pod, err := c.resolvePod(ctx, namespace, environment, environmentUID, expectedEpoch)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -83,16 +93,36 @@ func (c Connector) DialProcess(ctx context.Context, namespace, environment strin
 	if err != nil {
 		return nil, nil, err
 	}
+	if expectedEpoch != nil {
+		// Re-read after pinning the endpoint, TLS identity, and token. If an
+		// epoch transition raced resolution, reject this client; if transition
+		// starts after this check, the old credentials cannot authenticate to
+		// the replacement pod.
+		var current platformv1alpha1.Environment
+		if err := c.Reader.Get(ctx, types.NamespacedName{Namespace: namespace, Name: environment}, &current); err != nil {
+			_ = conn.Close()
+			return nil, nil, err
+		}
+		if current.UID != environmentUID || current.Status.Lifecycle.Epoch != *expectedEpoch ||
+			current.Spec.Paused || current.Status.Lifecycle.Suspended || !platformv1alpha1.IsEnvironmentReady(&current) ||
+			current.Status.PodName != env.Status.PodName || current.Status.Endpoints.Sandboxd != env.Status.Endpoints.Sandboxd {
+			_ = conn.Close()
+			return nil, nil, fmt.Errorf("environment execution changed while resolving process endpoint")
+		}
+	}
 	return sandboxdv1.NewProcessServiceClient(conn), conn.Close, nil
 }
 
-func (c Connector) resolvePod(ctx context.Context, namespace, environment string, environmentUID types.UID) (*platformv1alpha1.Environment, *corev1.Pod, error) {
+func (c Connector) resolvePod(ctx context.Context, namespace, environment string, environmentUID types.UID, expectedEpoch *int64) (*platformv1alpha1.Environment, *corev1.Pod, error) {
 	var env platformv1alpha1.Environment
 	if err := c.Reader.Get(ctx, types.NamespacedName{Namespace: namespace, Name: environment}, &env); err != nil {
 		return nil, nil, err
 	}
-	if environmentUID != "" && env.UID != environmentUID || !platformv1alpha1.IsEnvironmentReady(&env) || env.Status.PodName == "" || env.Status.Endpoints.Sandboxd == "" {
+	if environmentUID != "" && env.UID != environmentUID || env.Spec.Paused || env.Status.Lifecycle.Suspended || !platformv1alpha1.IsEnvironmentReady(&env) || env.Status.PodName == "" || env.Status.Endpoints.Sandboxd == "" {
 		return nil, nil, fmt.Errorf("environment is not the current reachable incarnation")
+	}
+	if expectedEpoch != nil && env.Status.Lifecycle.Epoch != *expectedEpoch {
+		return nil, nil, fmt.Errorf("environment lifecycle epoch changed: expected %d, got %d", *expectedEpoch, env.Status.Lifecycle.Epoch)
 	}
 	var template platformv1alpha1.EnvironmentTemplate
 	if err := c.Reader.Get(ctx, types.NamespacedName{Namespace: namespace, Name: env.Spec.TemplateRef}, &template); err != nil {

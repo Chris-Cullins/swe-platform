@@ -62,6 +62,51 @@ func TestDialProcessValidatesCurrentEnvironmentPodAndCredentialIncarnation(t *te
 	if err := closeConnection(); err != nil {
 		t.Fatal(err)
 	}
+	freshEpoch := env.DeepCopy()
+	freshEpoch.Status.Lifecycle.Epoch = 1
+	if _, _, err := (Connector{Reader: newClient(freshEpoch, pod.DeepCopy(), secret.DeepCopy())}).DialProcessForEpoch(context.Background(), env.Namespace, env.Name, env.UID, 0); err == nil || !strings.Contains(err.Error(), "lifecycle epoch changed") {
+		t.Fatalf("stale lifecycle epoch error = %v", err)
+	}
+	activityReader := &environmentChangingReader{Reader: newClient(env.DeepCopy(), pod.DeepCopy(), secret.DeepCopy()), mutate: func(environment *platformv1alpha1.Environment) {
+		environment.Annotations = map[string]string{"lifecycle.swe.dev/activity-terminal": `{"id":"activity"}`}
+	}}
+	_, closeActivity, err := (Connector{Reader: activityReader}).DialProcessForEpoch(context.Background(), env.Namespace, env.Name, env.UID, 0)
+	if err != nil || closeActivity == nil || activityReader.environmentGets != 2 {
+		t.Fatalf("metadata-only activity dial: close nil=%t, error=%v, Environment reads=%d", closeActivity == nil, err, activityReader.environmentGets)
+	}
+	if err := closeActivity(); err != nil {
+		t.Fatal(err)
+	}
+	for _, test := range []struct {
+		name   string
+		mutate func(*platformv1alpha1.Environment)
+	}{
+		{name: "epoch changes", mutate: func(environment *platformv1alpha1.Environment) {
+			environment.Status.Lifecycle.Epoch++
+		}},
+		{name: "readiness is withdrawn", mutate: func(environment *platformv1alpha1.Environment) {
+			environment.Status.Phase = platformv1alpha1.EnvironmentPhaseSetup
+			environment.Status.PodName = ""
+			environment.Status.Endpoints.Sandboxd = ""
+		}},
+		{name: "pod and endpoint are replaced", mutate: func(environment *platformv1alpha1.Environment) {
+			environment.Status.PodName = "env-environment-replacement"
+			environment.Status.Endpoints.Sandboxd = "10.0.0.2:50051"
+		}},
+	} {
+		t.Run("final read "+test.name, func(t *testing.T) {
+			reader := &environmentChangingReader{Reader: newClient(env.DeepCopy(), pod.DeepCopy(), secret.DeepCopy()), mutate: test.mutate}
+			if _, _, err := (Connector{Reader: reader}).DialProcessForEpoch(context.Background(), env.Namespace, env.Name, env.UID, 0); err == nil || !strings.Contains(err.Error(), "execution changed while resolving") || reader.environmentGets != 2 {
+				t.Fatalf("racing execution error = %v, Environment reads = %d", err, reader.environmentGets)
+			}
+		})
+	}
+	suspended := env.DeepCopy()
+	suspended.Status.Lifecycle.Suspended = true
+	suspended.Status.Lifecycle.SuspensionReason = platformv1alpha1.EnvironmentSuspensionReasonIdle
+	if _, _, err := (Connector{Reader: newClient(suspended, pod.DeepCopy(), secret.DeepCopy())}).DialProcess(context.Background(), env.Namespace, env.Name, env.UID); err == nil || !strings.Contains(err.Error(), "current reachable incarnation") {
+		t.Fatalf("suspended environment error = %v", err)
+	}
 	longNameEnv := env.DeepCopy()
 	longNameEnv.Name = strings.Repeat("long-environment-", 5)
 	longNamePod := pod.DeepCopy()
@@ -103,6 +148,25 @@ func TestDialProcessValidatesCurrentEnvironmentPodAndCredentialIncarnation(t *te
 	if _, _, err := (Connector{Reader: newClient(env.DeepCopy())}).DialProcess(context.Background(), env.Namespace, env.Name, types.UID("replaced-environment")); err == nil || !strings.Contains(err.Error(), "current reachable incarnation") {
 		t.Fatalf("stale environment UID error = %v", err)
 	}
+}
+
+type environmentChangingReader struct {
+	client.Reader
+	environmentGets int
+	mutate          func(*platformv1alpha1.Environment)
+}
+
+func (r *environmentChangingReader) Get(ctx context.Context, key client.ObjectKey, object client.Object, options ...client.GetOption) error {
+	if err := r.Reader.Get(ctx, key, object, options...); err != nil {
+		return err
+	}
+	if environment, ok := object.(*platformv1alpha1.Environment); ok {
+		r.environmentGets++
+		if r.environmentGets > 1 {
+			r.mutate(environment)
+		}
+	}
+	return nil
 }
 
 func processTestCertificate(t *testing.T, serverName string) []byte {
