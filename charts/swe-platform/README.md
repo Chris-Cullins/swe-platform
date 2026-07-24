@@ -280,23 +280,33 @@ immutable Run UID so a same-name replacement Run's transcript cannot be removed.
 
 ### Backup and restore
 
-The PostgreSQL transcript database is the only component requiring backup for transcript
-durability. Environment workspace PVCs survive pause/resume but are per-environment ephemeral
-disks, not backup targets. Helm reapplies CRD definitions and chart-owned EnvironmentTemplate
-resources on install or upgrade, but user-created Project, Run, and Environment instances are
-Kubernetes objects that would be lost in a cluster-loss scenario; back them up separately if
-full disaster recovery is required.
+Three categories of state require backup planning for a BYOC installation:
 
-Back up the database before every upgrade using your PostgreSQL provider's backup mechanism
-(`pg_dump`, managed-service snapshots, or equivalent). To restore, point the same connection
-URL at the recovered database and restart the control-plane pod. The control plane applies
-ordered embedded migrations under a PostgreSQL advisory lock on startup, so a restored
-database at an older migration version is brought forward automatically.
+| State | Location | Helm reconstructs it? |
+|---|---|---|
+| Transcript events | PostgreSQL database | No |
+| Infrastructure state (Project, Run, Environment, user-created EnvironmentTemplate instances) | Kubernetes API / etcd | No — Helm reapplies CRD definitions and chart-owned EnvironmentTemplate resources only, not user-created custom-resource instances |
+| Workspace contents (cloned repos, agent work, uncommitted changes) | Environment PVCs | No |
 
-This release does not provide a tested restore procedure, RPO, or RTO. The monitoring queries
-above report retained history so you can size backups. Per-Run retention limits bound
-individual Run windows, but total database size is not bounded across Run churn until the
-garbage-collection policy in
+Back up the PostgreSQL transcript database before every upgrade using your provider's backup
+mechanism (`pg_dump`, managed-service snapshots, or equivalent). To restore transcripts only,
+point the same connection URL at the recovered database and restart the control-plane pod.
+The control plane applies ordered embedded migrations under a PostgreSQL advisory lock on
+startup, so a restored database at an older migration version is brought forward automatically.
+This database-only recovery path restores transcript events; it does not reconstruct
+infrastructure state or workspace contents.
+
+Separately, export or back up the custom-resource instances (Project, Run, Environment, and
+any user-created EnvironmentTemplate objects) and snapshot or back up workspace PVCs that your
+recovery objectives require. Helm alone cannot reconstruct either: it reapplies CRD schemas
+and chart-owned templates, not the user-created resources that represent desired and observed
+infrastructure state, and workspace PVCs are per-environment volumes whose contents survive
+pause/resume but are not replicated or backed up by the platform.
+
+A coordinated cluster-loss restore order, RPO, and RTO are not tested or provided by this
+release. The monitoring queries above report retained transcript history so you can size
+database backups. Per-Run retention limits bound individual Run transcript windows, but total
+database size is not bounded across Run churn until the garbage-collection policy in
 [#101](https://github.com/Chris-Cullins/swe-platform/issues/101) ships.
 
 ## BYOC operations
@@ -323,13 +333,15 @@ Validate every production preset before installation. The chart's CI runs the sa
 reproducing them locally confirms that the preset renders against the current chart version:
 
 ```sh
-set -e
-for preset in k3s gke eks; do
-  helm lint ./charts/swe-platform --values "./charts/swe-platform/values-${preset}.yaml"
-  helm template swe-platform ./charts/swe-platform \
-    --namespace swe-platform-system \
-    --values "./charts/swe-platform/values-${preset}.yaml" >/dev/null
-done
+(
+  set -e
+  for preset in k3s gke eks; do
+    helm lint ./charts/swe-platform --values "./charts/swe-platform/values-${preset}.yaml"
+    helm template swe-platform ./charts/swe-platform \
+      --namespace swe-platform-system \
+      --values "./charts/swe-platform/values-${preset}.yaml" >/dev/null
+  done
+)
 ```
 
 The production presets reference the out-of-band PostgreSQL Secret by name; the chart does
