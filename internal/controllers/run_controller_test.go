@@ -1612,6 +1612,37 @@ func TestCredentialProfileBindsExactUIDBeforeAllocation(t *testing.T) {
 	}
 }
 
+type credentiallessOnlyAdapter struct{ scriptedAdapter }
+
+func (*credentiallessOnlyAdapter) SupportsCredentialProfiles() bool { return false }
+
+type countingReader struct{ reads int }
+
+func (r *countingReader) Get(context.Context, client.ObjectKey, client.Object, ...client.GetOption) error {
+	r.reads++
+	return errors.New("unexpected credential read")
+}
+func (r *countingReader) List(context.Context, client.ObjectList, ...client.ListOption) error {
+	r.reads++
+	return errors.New("unexpected credential list")
+}
+
+func TestUnsupportedAdapterCredentialProfileFailsBeforeReadsOrAllocation(t *testing.T) {
+	run := &platformv1alpha1.Run{ObjectMeta: metav1.ObjectMeta{Name: "r", Namespace: "ns", UID: "run-uid"}, Spec: platformv1alpha1.RunSpec{TemplateRef: "small", Agent: "test", CredentialProfileRef: "must-not-read"}}
+	r := reconciler(t, &credentiallessOnlyAdapter{}, run)
+	reader := &countingReader{}
+	r.APIReader = reader
+	got := reconcileRun(t, r, run.Name)
+	var environments platformv1alpha1.EnvironmentList
+	if err := r.List(context.Background(), &environments, client.InNamespace(run.Namespace)); err != nil {
+		t.Fatal(err)
+	}
+	condition := apiMeta.FindStatusCondition(got.Status.Conditions, runConditionCredentialProfileBound)
+	if got.Status.State != platformv1alpha1.RunStateFailed || got.Status.EnvironmentRef != nil || len(environments.Items) != 0 || reader.reads != 0 || condition == nil || condition.Reason != "CredentialProfilesUnsupported" {
+		t.Fatalf("status=%#v environments=%d reads=%d", got.Status, len(environments.Items), reader.reads)
+	}
+}
+
 func TestCredentiallessRunPreservesAllocationBehavior(t *testing.T) {
 	run := &platformv1alpha1.Run{ObjectMeta: metav1.ObjectMeta{Name: "r", Namespace: "ns", UID: "run-uid"}, Spec: platformv1alpha1.RunSpec{TemplateRef: "small", Agent: "test"}}
 	r := reconciler(t, &scriptedAdapter{}, run)
