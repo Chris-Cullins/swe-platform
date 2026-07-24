@@ -21,12 +21,12 @@ provides PostgreSQL-backed durable transcript ingestion and database-polled SSE 
 a development-only bounded memory fallback, opaque process-local browser sessions backed by
 repeated Kubernetes TokenReview/SAR authorization, and typed
 Run/Environment resource APIs for the console.
-Remaining gaps are marked `TODO(P0/P1/P2)` in code — most notably secure agent credential
-injection, additional agent adapters, GitHub App–scoped git tokens, and egress/portal
-networking. The `claude-code` (default), `amp`, `codex`, and `pi` adapters are registered and use sandboxd
-managed processes; Amp's `AMP_API_KEY` delivery remains an unmet prerequisite and adapter
-tests use fake process services; Codex supports process-scoped `CODEX_API_KEY` delivery. Pi
-deliberately supports no credential profiles or credential injection.
+Remaining gaps are marked `TODO(P0/P1/P2)` in code — most notably additional credential forms,
+additional agent adapters, GitHub App–scoped git tokens, and egress/portal networking. The
+`claude-code` (default), `amp`, `codex`, and `pi` adapters are registered and use sandboxd managed
+processes. API-key profiles use process-scoped launch material as `ANTHROPIC_API_KEY`,
+`AMP_API_KEY`, or `CODEX_API_KEY`; tests use fake process services and no provider credentials.
+Pi deliberately supports no credential profiles or credential injection.
 
 ## Architecture invariants — do not violate these
 
@@ -139,7 +139,8 @@ runs both via `make` targets:
   control-plane TokenReview/SAR scoping, opaque browser session exchange/logout and CSRF,
   the embedded console entry point/SPA fallback/static assets, typed Run
   list/get/create/retry/cancel, Environment get, transcript SSE, terminal attach, and
-  process-scoped fake API-key delivery without ambient setup/resume/sandboxd exposure.
+  process-scoped fake Claude and Amp API-key delivery without ambient
+  setup/resume/sandboxd exposure.
   Runs in CI as the `e2e` workflow on relevant PRs and via `workflow_dispatch`.
 - **CRD installation/upgrades:** `make install-crds` uses server-side apply with force-conflicts;
   plain Helm upgrades must apply the chart's `crds/` directory before `helm upgrade`.

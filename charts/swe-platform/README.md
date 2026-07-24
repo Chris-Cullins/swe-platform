@@ -1,10 +1,20 @@
 # swe-platform Helm chart
 
 The bundled environment image provides the default `claude-code` adapter and the explicitly
-selected `amp` adapter (`swe run --agent amp ...`). Amp's `AMP_API_KEY` is not injected by the
-chart or operator yet; secure runtime delivery remains deferred to issue #9. Do not place Amp
-credentials in chart values, Project configuration, or a custom image. The image only pins the
-public Amp CLI and disables its update check.
+selected `amp` adapter (`swe run --agent amp ...`). In accordance with the official
+[Amp non-interactive authentication contract](https://ampcode.com/manual#non-interactive-environments),
+an API-key profile selected for an Amp Run is delivered as `AMP_API_KEY` only to its Run-owned
+managed process through sandboxd launch material. It is not injected by chart values or into the
+operator, sandboxd, setup/resume hooks, ordinary processes, public process specification, or
+workspace by the platform. The image pins the public Amp CLI and disables its update check.
+
+Do not place Amp credentials in chart values, Project configuration, prompts, or custom-image
+ambient environment variables. Profiles are shared within their namespace, the selected agent
+and descendants can read or explicitly output the key, same-UID peers are not strongly isolated,
+and transcript redaction is not guaranteed. A newly created keyed process receives the
+then-current key; duplicate acceptance in the same sandbox epoch ignores rotated launch material,
+while a fresh epoch recreates the process with the current key. Subscription/OAuth login
+persistence, refresh/writeback, leases, and stronger per-user isolation remain unsupported.
 
 The image also bundles the explicitly selected `codex` adapter and pinned Codex CLI. Codex API
 key profiles use sandboxd's process-scoped launch-material path as `CODEX_API_KEY`; never put the
@@ -287,7 +297,8 @@ When the control plane is enabled, the chart projects a rotating `swe-platform`-
 service-account token into the operator and grants that identity `update` on
 `runs/transcript`. The operator uses it only to forward opaque adapter events to the
 control-plane Service. This platform transport credential is separate from agent provider
-credentials, which are never added by the chart or adapter.
+credentials, which the chart never adds to ambient component or Environment state; supported
+API-key adapters deliver them only as write-only process launch material.
 
 For initial self-hosted setup, an optional static bootstrap token provides all control-plane
 API permissions. Create it out of band and reference it during installation:

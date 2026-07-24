@@ -13,6 +13,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
+	platformv1alpha1 "github.com/Chris-Cullins/swe-platform/api/v1alpha1"
 	"github.com/Chris-Cullins/swe-platform/internal/controllers"
 	sandboxdv1 "github.com/Chris-Cullins/swe-platform/sandboxd/gen/proto/sandboxd/v1"
 )
@@ -81,15 +82,24 @@ func (a *Adapter) spec(task controllers.AdapterTask) *sandboxdv1.ProcessSpec {
 
 // EnsureAccepted duplicate-safely starts (or recovers) the Run-keyed process.
 func (a *Adapter) EnsureAccepted(ctx context.Context, task controllers.AdapterTask, sandbox controllers.AdapterSandbox, credential *controllers.AdapterCredential) error {
-	if credential != nil {
-		return fmt.Errorf("%w: Amp credential delivery is not implemented; AMP_API_KEY is a runtime prerequisite", controllers.ErrAdapterTaskRejected)
+	if credential != nil && credential.Type != platformv1alpha1.AgentCredentialTypeAPIKey {
+		return fmt.Errorf("%w: unsupported credential type %q", controllers.ErrAdapterTaskRejected, credential.Type)
 	}
 	client, closeConnection, err := sandbox.DialProcess(ctx)
 	if err != nil {
 		return err
 	}
 	defer closeConnection()
-	_, err = client.Start(ctx, &sandboxdv1.StartProcessRequest{Key: key(task), Spec: a.spec(task)})
+	if credential == nil {
+		_, err = client.Start(ctx, &sandboxdv1.StartProcessRequest{Key: key(task), Spec: a.spec(task)})
+		return err
+	}
+	apiKey := append([]byte(nil), credential.APIKey...)
+	defer clear(apiKey)
+	_, err = client.StartWithLaunchMaterial(ctx, &sandboxdv1.StartProcessWithLaunchMaterialRequest{
+		Key: key(task), Spec: a.spec(task),
+		LaunchMaterial: &sandboxdv1.LaunchMaterial{SecretEnv: map[string][]byte{"AMP_API_KEY": apiKey}},
+	})
 	return err
 }
 

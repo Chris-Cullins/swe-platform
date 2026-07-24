@@ -19,6 +19,7 @@ OPERATOR_IMAGE="ghcr.io/chris-cullins/swe-platform/operator:dev"
 CONTROL_PLANE_IMAGE="ghcr.io/chris-cullins/swe-platform/control-plane:dev"
 E2E_AGENT_API_KEY='!!SWE-E2E-AGENT-API-KEY-DO-NOT-USE!!'
 E2E_ROTATED_AGENT_API_KEY='!!SWE-E2E-ROTATED-AGENT-API-KEY-DO-NOT-USE!!'
+E2E_AMP_API_KEY='!!SWE-E2E-AMP-API-KEY-DO-NOT-USE!!'
 PORT_FORWARD_PID=""
 SANDBOXD_PORT_FORWARD_PID=""
 STREAM_PID=""
@@ -69,7 +70,8 @@ cleanup() {
 trap cleanup EXIT
 
 contains_e2e_key() {
-	grep -aFq -- "$E2E_AGENT_API_KEY" "$1" || grep -aFq -- "$E2E_ROTATED_AGENT_API_KEY" "$1"
+	grep -aFq -- "$E2E_AGENT_API_KEY" "$1" || grep -aFq -- "$E2E_ROTATED_AGENT_API_KEY" "$1" || \
+		grep -aFq -- "$E2E_AMP_API_KEY" "$1"
 }
 
 check_sandboxd_process() {
@@ -140,11 +142,19 @@ cat > "$FAKE_ENV_CONTEXT/amp" <<'EOF'
 #!/bin/sh
 set -eu
 test "$#" -eq 4
-test "$1" = '--execute=fake Amp lifecycle smoke test'
 test "$2" = '--stream-json'
 test "$3" = '--no-ide'
 test "$4" = '--no-notifications'
-test -z "${AMP_API_KEY+x}"
+case "$1" in
+	'--execute=fake Amp lifecycle smoke test')
+		test "${AMP_API_KEY:-}" = '!!SWE-E2E-AMP-API-KEY-DO-NOT-USE!!'
+		printf '%s\n' amp-credential-present
+		;;
+	'--execute=fake Amp credentialless lifecycle smoke test')
+		test -z "${AMP_API_KEY+x}"
+		;;
+	*) exit 45 ;;
+esac
 printf '%s\n' '{"type":"assistant","message":{"content":[{"type":"text","text":"fake-amp-stdout-marker"}]}}'
 printf '%s\n' 'fake-amp-stderr-marker' >&2
 sleep 5
@@ -268,11 +278,11 @@ git -C "$PROJECT_WORKTREE" config user.name "swe e2e"
 git -C "$PROJECT_WORKTREE" config user.email "swe-e2e@example.invalid"
 mkdir -p "$PROJECT_WORKTREE/.agents"
 cat > "$PROJECT_WORKTREE/.agents/setup" <<'EOF'
-if [ -n "${ANTHROPIC_API_KEY+x}" ]; then exit 43; fi
+if [ -n "${ANTHROPIC_API_KEY+x}" ] || [ -n "${AMP_API_KEY+x}" ]; then exit 43; fi
 printf '%s\n' credential-absent >> setup-result
 EOF
 cat > "$PROJECT_WORKTREE/.agents/resume" <<'EOF'
-if [ -n "${ANTHROPIC_API_KEY+x}" ]; then exit 44; fi
+if [ -n "${ANTHROPIC_API_KEY+x}" ] || [ -n "${AMP_API_KEY+x}" ]; then exit 44; fi
 printf '%s\n' credential-absent >> resume-result
 EOF
 git -C "$PROJECT_WORKTREE" add .agents/setup .agents/resume
@@ -870,12 +880,21 @@ if contains_e2e_key /tmp/swe-platform-resumed-workspace.tar; then
 fi
 kubectl delete run "$RESUME_RUN_NAME" --wait=true >/dev/null
 
-echo "==> verifying fake Amp real Run lifecycle without credentials or network"
+echo "==> verifying credentialed fake Amp process scope without network"
 AMP_RUN_NAME=e2e-fake-amp-run
+printf '%s' "$E2E_AMP_API_KEY" | bin/swe credentials create e2e-amp --agent amp --api-key-stdin
 bin/swe run "fake Amp lifecycle smoke test" --name "$AMP_RUN_NAME" --environment "$ENV_NAME" \
-	--agent amp --wait=false
+	--agent amp --credential-profile e2e-amp --wait=false
 kubectl wait --for=jsonpath='{.status.state}'=Running run/"$AMP_RUN_NAME" --timeout=3m
 kubectl wait --for=jsonpath='{.status.state}'=Succeeded run/"$AMP_RUN_NAME" --timeout=3m
+AMP_RUN_UID=$(kubectl get run "$AMP_RUN_NAME" -o jsonpath='{.metadata.uid}')
+AMP_POD_NAME=$(kubectl get environment "$ENV_NAME" -o jsonpath='{.status.podName}')
+if ! kubectl exec "$AMP_POD_NAME" -- sh -c \
+	'test -z "${AMP_API_KEY+x}" && ! tr "\000" "\n" < /proc/1/environ | grep -q "^AMP_API_KEY="'; then
+	echo "FAIL: AMP_API_KEY was not confined to the selected fake Amp process"
+	exit 1
+fi
+check_sandboxd_process "$AMP_POD_NAME" "$AMP_RUN_UID" "$E2E_AMP_API_KEY"
 set +e
 curl --silent --no-buffer --max-time 2 \
 	-H "Authorization: Bearer ${E2E_BOOTSTRAP_TOKEN}" \
@@ -893,12 +912,35 @@ grep -F '"source":"amp"' /tmp/swe-platform-amp-transcript.out | \
 	while IFS= read -r encoded; do printf '%s' "$encoded" | base64 --decode || exit 1; done \
 	> /tmp/swe-platform-amp-process-output.out
 if ! grep -Fq 'fake-amp-stdout-marker' /tmp/swe-platform-amp-process-output.out || \
-	! grep -Fq 'fake-amp-stderr-marker' /tmp/swe-platform-amp-process-output.out; then
+	! grep -Fq 'fake-amp-stderr-marker' /tmp/swe-platform-amp-process-output.out || \
+	! grep -Fq 'amp-credential-present' /tmp/swe-platform-amp-process-output.out; then
 	echo "FAIL: Amp transcript did not retain both output stream markers"
 	cat /tmp/swe-platform-amp-process-output.out
 	exit 1
 fi
+kubectl get run "$AMP_RUN_NAME" -o yaml > /tmp/swe-platform-amp-run.yaml
+kubectl logs -l app.kubernetes.io/component=control-plane --all-containers --prefix --tail=-1 > /tmp/swe-platform-amp-control-plane.log
+kubectl logs -l app.kubernetes.io/component=operator --all-containers --prefix --tail=-1 > /tmp/swe-platform-amp-operator.log
+kubectl logs "$AMP_POD_NAME" -c environment --tail=-1 > /tmp/swe-platform-amp-environment.log
+kubectl exec "$AMP_POD_NAME" -- tar -C /workspace -cf - . > /tmp/swe-platform-amp-workspace.tar
+for artifact in /tmp/swe-platform-amp-transcript.out /tmp/swe-platform-amp-process-output.out \
+	/tmp/swe-platform-amp-run.yaml /tmp/swe-platform-amp-control-plane.log \
+	/tmp/swe-platform-amp-operator.log /tmp/swe-platform-amp-environment.log \
+	/tmp/swe-platform-amp-workspace.tar; do
+	if contains_e2e_key "$artifact"; then
+		echo "FAIL: Amp API key leaked through $artifact"
+		exit 1
+	fi
+done
 kubectl delete run "$AMP_RUN_NAME" --wait=true >/dev/null
+
+echo "==> verifying credentialless fake Amp retains the plain managed-process path"
+AMP_CREDENTIALLESS_RUN_NAME=e2e-fake-amp-credentialless-run
+bin/swe run "fake Amp credentialless lifecycle smoke test" --name "$AMP_CREDENTIALLESS_RUN_NAME" \
+	--environment "$ENV_NAME" --agent amp --wait=false
+kubectl wait --for=jsonpath='{.status.state}'=Running run/"$AMP_CREDENTIALLESS_RUN_NAME" --timeout=3m
+kubectl wait --for=jsonpath='{.status.state}'=Succeeded run/"$AMP_CREDENTIALLESS_RUN_NAME" --timeout=3m
+kubectl delete run "$AMP_CREDENTIALLESS_RUN_NAME" --wait=true >/dev/null
 
 echo "==> verifying fake Codex real Run lifecycle without credentials or network"
 CODEX_RUN_NAME=e2e-fake-codex-run

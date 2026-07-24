@@ -75,7 +75,7 @@ func run() error {
 	ordinary, err := client.Start(ctx, &sandboxdv1.StartProcessRequest{
 		Key: &sandboxdv1.ProcessKey{OwnerId: "e2e-ordinary-" + os.Args[5], Role: "credential-check"},
 		Spec: &sandboxdv1.ProcessSpec{
-			Argv: []string{"sh", "-c", `if [ -n "${ANTHROPIC_API_KEY+x}" ]; then exit 86; fi; printf ordinary-process-credential-absent`},
+			Argv: []string{"sh", "-c", `if [ -n "${ANTHROPIC_API_KEY+x}" ] || [ -n "${AMP_API_KEY+x}" ]; then exit 86; fi; printf ordinary-process-credential-absent`},
 		},
 	})
 	if err != nil {
@@ -133,8 +133,10 @@ func checkPublicProcess(process *sandboxdv1.Process, forbidden []byte) error {
 		return fmt.Errorf("public Process contains launch material")
 	}
 	if spec := process.GetSpec(); spec != nil {
-		if _, exposed := spec.Env["ANTHROPIC_API_KEY"]; exposed {
-			return fmt.Errorf("public ProcessSpec contains secret environment name")
+		for _, name := range []string{"ANTHROPIC_API_KEY", "AMP_API_KEY"} {
+			if _, exposed := spec.Env[name]; exposed {
+				return fmt.Errorf("public ProcessSpec contains secret environment name")
+			}
 		}
 		for _, value := range spec.Env {
 			if bytes.Contains([]byte(value), forbidden) {
