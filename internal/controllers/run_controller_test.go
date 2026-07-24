@@ -2,6 +2,7 @@ package controllers
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"reflect"
@@ -2215,8 +2216,8 @@ func TestLifecycleTimestampsSetOnceAcrossPauseResumeAndTerminal(t *testing.T) {
 	r := reconciler(t, &scriptedAdapter{observations: []AdapterObservation{AdapterObservationRunning}}, run, env)
 
 	// Drive through allocation to AdapterAccepted.
-	reconcileRun(t, r, "r") // EnvironmentReady
-	reconcileRun(t, r, "r") // acceptance attempt marker
+	reconcileRun(t, r, "r")        // EnvironmentReady
+	reconcileRun(t, r, "r")        // acceptance attempt marker
 	got := reconcileRun(t, r, "r") // AdapterAccepted
 	if got.Status.State != platformv1alpha1.RunStateAdapterAccepted {
 		t.Fatalf("state = %s, want AdapterAccepted", got.Status.State)
@@ -2253,7 +2254,7 @@ func TestLifecycleTimestampsSetOnceAcrossPauseResumeAndTerminal(t *testing.T) {
 	// Resume: re-accept and return to Running. StartedAt still unchanged.
 	env.Status.Phase = platformv1alpha1.EnvironmentPhaseReady
 	_ = r.Status().Update(context.Background(), env)
-	reconcileRun(t, r, "r") // EnvironmentReady
+	reconcileRun(t, r, "r")       // EnvironmentReady
 	got = reconcileRun(t, r, "r") // AdapterAccepted (re-accept)
 	if got.Status.State != platformv1alpha1.RunStateAdapterAccepted {
 		t.Fatalf("state = %s after resume, want AdapterAccepted", got.Status.State)
@@ -2291,8 +2292,8 @@ func TestLifecycleTimestampsSetOnImmediateTerminalSuccess(t *testing.T) {
 	env := &platformv1alpha1.Environment{ObjectMeta: metav1.ObjectMeta{Name: "e", Namespace: "ns", UID: "euid"}, Status: platformv1alpha1.EnvironmentStatus{Phase: platformv1alpha1.EnvironmentPhaseReady}}
 	r := reconciler(t, &scriptedAdapter{observations: []AdapterObservation{AdapterObservationSucceeded}}, run, env)
 
-	reconcileRun(t, r, "r") // EnvironmentReady
-	reconcileRun(t, r, "r") // acceptance attempt marker
+	reconcileRun(t, r, "r")        // EnvironmentReady
+	reconcileRun(t, r, "r")        // acceptance attempt marker
 	got := reconcileRun(t, r, "r") // AdapterAccepted — StartedAt set here
 	if got.Status.State != platformv1alpha1.RunStateAdapterAccepted {
 		t.Fatalf("state = %s, want AdapterAccepted", got.Status.State)
@@ -2368,4 +2369,32 @@ func TestLifecycleTimestampsNilForNeverAcceptedFailureAndCancellation(t *testing
 			t.Fatal("FinishedAt is nil after terminal Cancelled")
 		}
 	})
+}
+
+func TestAdapterSandboxEmitEventSendsExactRunUID(t *testing.T) {
+	run := &platformv1alpha1.Run{ObjectMeta: metav1.ObjectMeta{Name: "r", Namespace: "ns", UID: "run-uid"}, Spec: platformv1alpha1.RunSpec{Agent: "test"}}
+	env := &platformv1alpha1.Environment{ObjectMeta: metav1.ObjectMeta{Name: "env", Namespace: "ns", UID: "env-uid"}}
+
+	var gotNamespace, gotName, gotUID string
+	sink := eventSinkFunc(func(ctx context.Context, namespace, name, runUID string, event AdapterEvent) error {
+		gotNamespace, gotName, gotUID = namespace, name, runUID
+		return nil
+	})
+	r := &RunReconciler{EventSink: sink}
+	sandbox := r.adapterSandbox(run, env)
+	if sandbox.EmitEvent == nil {
+		t.Fatal("EmitEvent closure was not wired")
+	}
+	if err := sandbox.EmitEvent(context.Background(), AdapterEvent{Source: "adapter", IdempotencyKey: "k", Type: "output", Data: json.RawMessage(`{}`)}); err != nil {
+		t.Fatal(err)
+	}
+	if gotNamespace != "ns" || gotName != "r" || gotUID != "run-uid" {
+		t.Fatalf("sink received namespace/name/uid = %q/%q/%q, want ns/r/run-uid", gotNamespace, gotName, gotUID)
+	}
+}
+
+type eventSinkFunc func(context.Context, string, string, string, AdapterEvent) error
+
+func (f eventSinkFunc) Append(ctx context.Context, namespace, name, runUID string, event AdapterEvent) error {
+	return f(ctx, namespace, name, runUID, event)
 }

@@ -13,6 +13,7 @@ import (
 	"strings"
 
 	"github.com/Chris-Cullins/swe-platform/internal/controllers"
+	"github.com/Chris-Cullins/swe-platform/internal/controlplane"
 )
 
 // Client is an AdapterEventSink backed by the authenticated transcript API.
@@ -24,7 +25,7 @@ type Client struct {
 	HTTP      *http.Client
 }
 
-func (c Client) Append(ctx context.Context, namespace, run string, event controllers.AdapterEvent) error {
+func (c Client) Append(ctx context.Context, namespace, run, runUID string, event controllers.AdapterEvent) error {
 	token, err := os.ReadFile(c.TokenFile)
 	if err != nil {
 		return fmt.Errorf("read transcript credential: %w", err)
@@ -45,6 +46,7 @@ func (c Client) Append(ctx context.Context, namespace, run string, event control
 	}
 	request.Header.Set("Authorization", "Bearer "+strings.TrimSpace(string(token)))
 	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set(controlplane.RunUIDHeader, runUID)
 	httpClient := c.HTTP
 	if httpClient == nil {
 		httpClient = http.DefaultClient

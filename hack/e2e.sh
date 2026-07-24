@@ -746,6 +746,7 @@ sleep 1
 APPEND_STATUS=$(curl --silent --output /dev/null --write-out '%{http_code}' \
 	-H "Authorization: Bearer ${PRODUCER_TOKEN}" \
 	-H 'Content-Type: application/json' \
+	-H "SWE-Run-UID: ${RUN_UID}" \
 	-d '{"type":"output","data":{"text":"e2e transcript event"}}' \
 	"http://127.0.0.1:18080/api/v1/namespaces/default/runs/${RUN_NAME}/transcript")
 if [[ "$APPEND_STATUS" != "202" ]]; then
@@ -755,10 +756,30 @@ fi
 DENIED_STATUS=$(curl --silent --output /dev/null --write-out '%{http_code}' \
 	-H "Authorization: Bearer ${PRODUCER_TOKEN}" \
 	-H 'Content-Type: application/json' \
+	-H "SWE-Run-UID: ${RUN_UID}" \
 	-d '{"type":"output","data":{"text":"forged"}}' \
 	http://127.0.0.1:18080/api/v1/namespaces/default/runs/auth-scope-run-b/transcript)
 if [[ "$DENIED_STATUS" != "403" ]]; then
 	echo "FAIL: cross-run producer append status was ${DENIED_STATUS}, expected 403"
+	exit 1
+fi
+STALE_UID_STATUS=$(curl --silent --output /dev/null --write-out '%{http_code}' \
+	-H "Authorization: Bearer ${PRODUCER_TOKEN}" \
+	-H 'Content-Type: application/json' \
+	-H 'SWE-Run-UID: stale-uid-not-current' \
+	-d '{"type":"output","data":{"text":"stale"}}' \
+	"http://127.0.0.1:18080/api/v1/namespaces/default/runs/${RUN_NAME}/transcript")
+if [[ "$STALE_UID_STATUS" != "409" ]]; then
+	echo "FAIL: stale UID producer append status was ${STALE_UID_STATUS}, expected 409"
+	exit 1
+fi
+MISSING_UID_STATUS=$(curl --silent --output /dev/null --write-out '%{http_code}' \
+	-H "Authorization: Bearer ${PRODUCER_TOKEN}" \
+	-H 'Content-Type: application/json' \
+	-d '{"type":"output","data":{"text":"unfenced"}}' \
+	"http://127.0.0.1:18080/api/v1/namespaces/default/runs/${RUN_NAME}/transcript")
+if [[ "$MISSING_UID_STATUS" != "428" ]]; then
+	echo "FAIL: missing UID producer append status was ${MISSING_UID_STATUS}, expected 428"
 	exit 1
 fi
 UNKNOWN_STATUS=$(curl --silent --output /dev/null --write-out '%{http_code}' \

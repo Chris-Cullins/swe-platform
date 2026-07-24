@@ -92,10 +92,13 @@ type AdapterEvent struct {
 	Data           json.RawMessage
 }
 
-// AdapterEventSink forwards opaque adapter events for one namespaced Run.
-// Permanent rejection wraps ErrAdapterEventRejected; other errors are retryable.
+// AdapterEventSink forwards opaque adapter events for one namespaced Run. The
+// runUID is the exact reconciled immutable Run UID; the control plane fences
+// append identity against it so a delete/recreate replacement never receives
+// stale events. Permanent rejection wraps ErrAdapterEventRejected; other
+// errors are retryable.
 type AdapterEventSink interface {
-	Append(context.Context, string, string, AdapterEvent) error
+	Append(context.Context, string, string, string, AdapterEvent) error
 }
 
 // AdapterSandbox is the backend-neutral handle exposed to adapters. Adapters
@@ -1068,8 +1071,9 @@ func (r *RunReconciler) adapterSandbox(run *platformv1alpha1.Run, env *platformv
 			return (sandboxclient.Connector{Reader: reader}).DialProcessForEpoch(ctx, current.Namespace, current.Name, current.UID, expectedEpoch)
 		}}
 	if r.EventSink != nil {
+		runUID := string(run.UID)
 		sandbox.EmitEvent = func(ctx context.Context, event AdapterEvent) error {
-			return r.EventSink.Append(ctx, run.Namespace, run.Name, event)
+			return r.EventSink.Append(ctx, run.Namespace, run.Name, runUID, event)
 		}
 	}
 	return sandbox
