@@ -39,6 +39,14 @@ rules:
   - update
   - watch
 - apiGroups:
+  - node.k8s.io
+  resources:
+  - runtimeclasses
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
   - swe.dev
   resources:
   - agentcredentialprofiles

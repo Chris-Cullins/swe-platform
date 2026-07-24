@@ -185,8 +185,11 @@ driver, build and load the platform images, then install
 `charts/swe-platform` with `values-kind.yaml` and the printed
 `environmentTemplates[0].spec.runtimeClass=gvisor` override. The preset creates the
 `small` template in `default`; the explicit override keeps it usable in ordinary CI kind
-clusters that do not install runsc. Production installation assumptions and k3s/GKE/EKS
-presets are documented in the [chart README](charts/swe-platform/README.md).
+clusters that do not install runsc. The operator requires any explicitly named RuntimeClass
+object to exist before execution, but RuntimeClass handler and eligible-node support remain
+cluster prerequisites; `make kind-up` smoke-tests both for its gVisor installation. Production
+installation assumptions and k3s/GKE/EKS presets are documented in the
+[chart README](charts/swe-platform/README.md).
 
 Run the acceptance suite against the bootstrapped cluster with gVisor enabled:
 

@@ -16,6 +16,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
+	nodev1 "k8s.io/api/node/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -1430,6 +1431,146 @@ func TestMissingTemplateIsTerminalValidationFailure(t *testing.T) {
 	}
 }
 
+func TestNamedRuntimeClassMustExistBeforeProvisioningAndRecovers(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	if err := networkingv1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	if err := nodev1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	if err := platformv1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	env := &platformv1alpha1.Environment{
+		ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default", UID: "environment-uid", Generation: 1, Finalizers: []string{environmentFinalizer}},
+		Spec:       platformv1alpha1.EnvironmentSpec{TemplateRef: "isolated"},
+	}
+	template := &platformv1alpha1.EnvironmentTemplate{
+		ObjectMeta: metav1.ObjectMeta{Name: "isolated", Namespace: env.Namespace},
+		Spec:       platformv1alpha1.EnvironmentTemplateSpec{Image: "example/environment:dev", Size: "small", RuntimeClass: "gvisor"},
+	}
+	baseClient := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(env).WithObjects(env, template).Build()
+	reconciler := &EnvironmentReconciler{Client: baseClient, Scheme: scheme}
+	request := ctrl.Request{NamespacedName: client.ObjectKeyFromObject(env)}
+
+	result, err := reconciler.Reconcile(context.Background(), request)
+	if err != nil || result != (ctrl.Result{}) {
+		t.Fatalf("missing RuntimeClass Reconcile() = (%#v, %v), want terminal success", result, err)
+	}
+	var failed platformv1alpha1.Environment
+	if err := baseClient.Get(context.Background(), client.ObjectKeyFromObject(env), &failed); err != nil {
+		t.Fatal(err)
+	}
+	ready := apimeta.FindStatusCondition(failed.Status.Conditions, platformv1alpha1.EnvironmentConditionReady)
+	if failed.Status.Phase != platformv1alpha1.EnvironmentPhaseFailed || ready == nil || ready.Reason != "InvalidConfiguration" ||
+		!strings.Contains(ready.Message, `get RuntimeClass "gvisor" required by template "isolated"`) {
+		t.Fatalf("missing RuntimeClass status = %#v", failed.Status)
+	}
+	for _, child := range []client.Object{
+		&corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: envPVCName(env), Namespace: env.Namespace}},
+		&networkingv1.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{Name: envNetworkPolicyName(env), Namespace: env.Namespace}},
+		&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: envCredentialName(env), Namespace: env.Namespace}},
+		&corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: envPodName(env), Namespace: env.Namespace}},
+	} {
+		if err := baseClient.Get(context.Background(), client.ObjectKeyFromObject(child), child); !apierrors.IsNotFound(err) {
+			t.Fatalf("child %T was created before RuntimeClass validation: %v", child, err)
+		}
+	}
+
+	if err := baseClient.Create(context.Background(), &nodev1.RuntimeClass{ObjectMeta: metav1.ObjectMeta{Name: "gvisor", UID: "runtime-uid"}, Handler: "runsc"}); err != nil {
+		t.Fatal(err)
+	}
+	var pod corev1.Pod
+	for range 5 {
+		if _, err := reconciler.Reconcile(context.Background(), request); err != nil {
+			t.Fatalf("reconcile after RuntimeClass creation: %v", err)
+		}
+		if err := baseClient.Get(context.Background(), types.NamespacedName{Namespace: env.Namespace, Name: envPodName(env)}, &pod); err == nil {
+			break
+		} else if !apierrors.IsNotFound(err) {
+			t.Fatal(err)
+		}
+	}
+	if pod.Spec.RuntimeClassName == nil || *pod.Spec.RuntimeClassName != "gvisor" {
+		t.Fatalf("recovered Pod RuntimeClassName = %v, want gvisor", pod.Spec.RuntimeClassName)
+	}
+	if pod.Annotations[runtimeClassUIDAnnotation] != "runtime-uid" {
+		t.Fatalf("recovered Pod RuntimeClass UID = %q, want runtime-uid", pod.Annotations[runtimeClassUIDAnnotation])
+	}
+}
+
+func TestRuntimeClassReplacementFencesOwnedExecutionInOrder(t *testing.T) {
+	scheme := runtime.NewScheme()
+	for _, add := range []func(*runtime.Scheme) error{corev1.AddToScheme, networkingv1.AddToScheme, nodev1.AddToScheme, platformv1alpha1.AddToScheme} {
+		if err := add(scheme); err != nil {
+			t.Fatal(err)
+		}
+	}
+	env := &platformv1alpha1.Environment{
+		ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default", UID: "environment-uid", Generation: 1, Finalizers: []string{environmentFinalizer}},
+		Spec:       platformv1alpha1.EnvironmentSpec{TemplateRef: "isolated"},
+		Status: platformv1alpha1.EnvironmentStatus{
+			ObservedGeneration: 1, Phase: platformv1alpha1.EnvironmentPhaseReady, PodName: "env-test", ImageID: "example/environment@sha256:old",
+			Endpoints:  platformv1alpha1.EnvironmentEndpoints{Sandboxd: "10.0.0.1:50051"},
+			Conditions: []metav1.Condition{{Type: platformv1alpha1.EnvironmentConditionReady, Status: metav1.ConditionTrue, ObservedGeneration: 1, Reason: "SandboxdReady"}},
+		},
+	}
+	template := &platformv1alpha1.EnvironmentTemplate{
+		ObjectMeta: metav1.ObjectMeta{Name: "isolated", Namespace: env.Namespace},
+		Spec:       platformv1alpha1.EnvironmentTemplateSpec{Image: "example/environment:dev", Size: "small", RuntimeClass: "gvisor"},
+	}
+	runtimeClass := &nodev1.RuntimeClass{ObjectMeta: metav1.ObjectMeta{Name: "gvisor", UID: "runtime-new"}, Handler: "runsc"}
+	controller := true
+	owner := metav1.OwnerReference{APIVersion: platformv1alpha1.GroupVersion.String(), Kind: "Environment", Name: env.Name, UID: env.UID, Controller: &controller}
+	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: envPodName(env), Namespace: env.Namespace, UID: "pod-uid", OwnerReferences: []metav1.OwnerReference{owner}, Annotations: map[string]string{runtimeClassUIDAnnotation: "runtime-old"}}}
+	secret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: envCredentialName(env), Namespace: env.Namespace, UID: "secret-uid", OwnerReferences: []metav1.OwnerReference{owner}}}
+	pvc := &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: envPVCName(env), Namespace: env.Namespace, UID: "pvc-uid", OwnerReferences: []metav1.OwnerReference{owner}}}
+	policy := &networkingv1.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{Name: envNetworkPolicyName(env), Namespace: env.Namespace, UID: "policy-uid", OwnerReferences: []metav1.OwnerReference{owner}}}
+	baseClient := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(env).WithObjects(env, template, runtimeClass, pod, secret, pvc, policy).Build()
+	reconciler := &EnvironmentReconciler{Client: baseClient, Scheme: scheme}
+	request := ctrl.Request{NamespacedName: client.ObjectKeyFromObject(env)}
+
+	if result, err := reconciler.Reconcile(context.Background(), request); err != nil || !result.Requeue {
+		t.Fatalf("withdraw readiness = (%#v, %v)", result, err)
+	}
+	var failed platformv1alpha1.Environment
+	if err := baseClient.Get(context.Background(), client.ObjectKeyFromObject(env), &failed); err != nil {
+		t.Fatal(err)
+	}
+	ready := apimeta.FindStatusCondition(failed.Status.Conditions, platformv1alpha1.EnvironmentConditionReady)
+	if failed.Status.Phase != platformv1alpha1.EnvironmentPhaseFailed || failed.Status.PodName != "" || failed.Status.Endpoints.Sandboxd != "" ||
+		ready == nil || ready.Reason != "InvalidConfiguration" || !strings.Contains(ready.Message, "incarnation does not match") {
+		t.Fatalf("readiness was not withdrawn: %#v", failed.Status)
+	}
+	if err := baseClient.Get(context.Background(), client.ObjectKeyFromObject(pod), &corev1.Pod{}); err != nil {
+		t.Fatal("Pod was deleted before readiness withdrawal")
+	}
+	if result, err := reconciler.Reconcile(context.Background(), request); err != nil || !result.Requeue {
+		t.Fatalf("delete Pod = (%#v, %v)", result, err)
+	}
+	if err := baseClient.Get(context.Background(), client.ObjectKeyFromObject(pod), &corev1.Pod{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("old Pod still exists: %v", err)
+	}
+	if err := baseClient.Get(context.Background(), client.ObjectKeyFromObject(secret), &corev1.Secret{}); err != nil {
+		t.Fatal("credentials were revoked before Pod deletion")
+	}
+	if result, err := reconciler.Reconcile(context.Background(), request); err != nil || !result.Requeue {
+		t.Fatalf("revoke credentials = (%#v, %v)", result, err)
+	}
+	if err := baseClient.Get(context.Background(), client.ObjectKeyFromObject(secret), &corev1.Secret{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("old credentials still exist: %v", err)
+	}
+	for _, retained := range []client.Object{pvc, policy} {
+		if err := baseClient.Get(context.Background(), client.ObjectKeyFromObject(retained), retained); err != nil {
+			t.Fatalf("retained child %T was removed: %v", retained, err)
+		}
+	}
+}
+
 func TestMissingTemplateFencesOwnedExecutionInOrderAndRecovers(t *testing.T) {
 	scheme := runtime.NewScheme()
 	if err := corev1.AddToScheme(scheme); err != nil {
@@ -1658,6 +1799,9 @@ func TestReferenceWatchMappersWakeTerminalEnvironments(t *testing.T) {
 	if err := platformv1alpha1.AddToScheme(scheme); err != nil {
 		t.Fatal(err)
 	}
+	if err := nodev1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
 	templateEnv := &platformv1alpha1.Environment{
 		ObjectMeta: metav1.ObjectMeta{Name: "template-failed", Namespace: "default"},
 		Spec:       platformv1alpha1.EnvironmentSpec{TemplateRef: "small"},
@@ -1668,10 +1812,20 @@ func TestReferenceWatchMappersWakeTerminalEnvironments(t *testing.T) {
 		Spec:       platformv1alpha1.EnvironmentSpec{TemplateRef: "large", ProjectRef: "project"},
 		Status:     platformv1alpha1.EnvironmentStatus{Phase: platformv1alpha1.EnvironmentPhaseFailed},
 	}
+	runtimeEnv := &platformv1alpha1.Environment{
+		ObjectMeta: metav1.ObjectMeta{Name: "runtime-failed", Namespace: "other"},
+		Spec:       platformv1alpha1.EnvironmentSpec{TemplateRef: "isolated"},
+		Status:     platformv1alpha1.EnvironmentStatus{Phase: platformv1alpha1.EnvironmentPhaseFailed},
+	}
+	runtimeTemplate := &platformv1alpha1.EnvironmentTemplate{
+		ObjectMeta: metav1.ObjectMeta{Name: "isolated", Namespace: runtimeEnv.Namespace},
+		Spec:       platformv1alpha1.EnvironmentTemplateSpec{RuntimeClass: "gvisor"},
+	}
 	baseClient := fake.NewClientBuilder().WithScheme(scheme).
 		WithIndex(&platformv1alpha1.Environment{}, templateRefField, environmentTemplateRefIndex).
 		WithIndex(&platformv1alpha1.Environment{}, projectRefField, environmentProjectRefIndex).
-		WithObjects(templateEnv, projectEnv).Build()
+		WithIndex(&platformv1alpha1.EnvironmentTemplate{}, runtimeClassField, templateRuntimeClassIndex).
+		WithObjects(templateEnv, projectEnv, runtimeEnv, runtimeTemplate).Build()
 	reconciler := &EnvironmentReconciler{Client: baseClient}
 
 	templateRequests := reconciler.environmentReferenceRequests(context.Background(), "default", templateRefField, "small")
@@ -1681,6 +1835,10 @@ func TestReferenceWatchMappersWakeTerminalEnvironments(t *testing.T) {
 	projectRequests := reconciler.environmentReferenceRequests(context.Background(), "default", projectRefField, "project")
 	if len(projectRequests) != 1 || projectRequests[0].Name != projectEnv.Name {
 		t.Fatalf("project watch requests = %#v, want %q", projectRequests, projectEnv.Name)
+	}
+	runtimeRequests := reconciler.runtimeClassReferenceRequests(context.Background(), "gvisor")
+	if len(runtimeRequests) != 1 || runtimeRequests[0].Namespace != runtimeEnv.Namespace || runtimeRequests[0].Name != runtimeEnv.Name {
+		t.Fatalf("RuntimeClass watch requests = %#v, want %s/%s", runtimeRequests, runtimeEnv.Namespace, runtimeEnv.Name)
 	}
 }
 
