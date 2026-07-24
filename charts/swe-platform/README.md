@@ -278,6 +278,98 @@ These queries are read-only and report retained history only; they do not advise
 to delete. Manual deletion should be exceptional: take a backup and target the exact namespace and
 immutable Run UID so a same-name replacement Run's transcript cannot be removed.
 
+### Backup and restore
+
+The following categories of state require backup planning for a BYOC installation; the list
+is not exhaustive:
+
+| State | Location | Helm reconstructs it? |
+|---|---|---|
+| Transcript events | PostgreSQL database | No |
+| Infrastructure state (Project, Run, Environment, AgentCredentialProfile, user-created EnvironmentTemplate instances) | Kubernetes API / etcd | No — Helm reapplies CRD definitions and chart-owned EnvironmentTemplate resources only, not user-created custom-resource instances |
+| Workspace contents (cloned repos, agent work, uncommitted changes) | Environment PVCs | No |
+| Installation and credential material (out-of-band PostgreSQL Secret, bootstrap token Secret, chart values overrides) | Kubernetes Secrets and local configuration | No |
+
+Back up the PostgreSQL transcript database before every upgrade using your provider's backup
+mechanism (`pg_dump`, managed-service snapshots, or equivalent). To restore transcripts only,
+point the same connection URL at the recovered database and restart the control-plane pod.
+The control plane applies ordered embedded migrations under a PostgreSQL advisory lock on
+startup, so a restored database at an older migration version is brought forward automatically.
+This database-only recovery path restores transcript events; it does not reconstruct
+infrastructure state, workspace contents, or installation material.
+
+Separately, export or back up the custom-resource instances (Project, Run, Environment,
+AgentCredentialProfile, and any user-created EnvironmentTemplate objects) and snapshot or back
+up workspace PVCs that your recovery objectives require. Helm alone cannot reconstruct either:
+it reapplies CRD schemas and chart-owned templates, not the user-created resources that
+represent desired and observed infrastructure state, and workspace PVCs are per-environment
+volumes whose contents survive pause/resume but are not replicated or backed up by the
+platform. AgentCredentialProfile backing Secrets are controller-created and bound to the
+profile's exact owner UID; do not copy them into a replacement cluster. Instead, preserve or
+re-provision out-of-band secret sources (the PostgreSQL connection Secret, bootstrap token,
+and any chart values overrides), and recreate agent API-key credentials through the supported
+`swe credentials create` / `--api-key-stdin` flow, then rotate if necessary.
+
+A coordinated cluster-loss restore order, RPO, and RTO are not tested or provided by this
+release. The monitoring queries above report retained transcript history so you can size
+database backups. Per-Run retention limits bound individual Run transcript windows, but total
+database size is not bounded across Run churn until the garbage-collection policy in
+[#101](https://github.com/Chris-Cullins/swe-platform/issues/101) ships.
+
+## BYOC operations
+
+The k3s, GKE, and EKS presets are the starting point for running swe-platform in your own
+cluster. This section consolidates the provider-specific prerequisites, pre-flight validation,
+and networking requirements that a BYOC operator needs beyond the [install](#install) and
+[upgrade](#upgrade) procedures above. The acceptance criteria track
+[#79](https://github.com/Chris-Cullins/swe-platform/issues/79); the hosted offering alpha is
+out of scope here and requires separate maintainer product input.
+
+### Provider prerequisites
+
+Each production preset assumes an out-of-band `swe-platform-postgres` Secret (see
+[Install](#install) and [Durable transcript storage](#durable-transcript-storage)) and a
+default StorageClass for environment workspace PVCs. The operator creates PVCs with
+`ReadWriteOnce` access and leaves `spec.storageClassName` unset, so the cluster's default
+StorageClass admission supplies the storage; the chart does not create or manage
+StorageClasses. Provider-specific runtime, replica, and isolation assumptions are
+documented in the [preset table](#environment-image-footprint) above.
+
+### Pre-flight validation
+
+Validate every production preset before installation. The chart's CI runs the same checks;
+reproducing them locally confirms that the preset renders against the current chart version:
+
+```sh
+(
+  set -e
+  for preset in k3s gke eks; do
+    helm lint ./charts/swe-platform --values "./charts/swe-platform/values-${preset}.yaml"
+    helm template swe-platform ./charts/swe-platform \
+      --namespace swe-platform-system \
+      --values "./charts/swe-platform/values-${preset}.yaml" >/dev/null
+  done
+)
+```
+
+The production presets reference the out-of-band PostgreSQL Secret by name; the chart does
+not create it, so the template renders whether or not the Secret exists. A missing Secret
+keeps the control-plane pod from starting after installation.
+
+### Networking requirements
+
+| Requirement | Chart behavior | Operator action |
+|---|---|---|
+| Control-plane exposure | ClusterIP Service on port 80 (HTTP); no Ingress or TLS termination created | Provide a TLS-terminating reverse proxy or load balancer; production browser sessions require HTTPS |
+| Environment sandboxd isolation | Ingress NetworkPolicy per environment pod: port 50051 admitted only from release-namespace control-plane and operator pods | CNI must enforce Kubernetes NetworkPolicy for defense in depth; TLS and capability authorization remain mandatory regardless |
+| Environment egress | No default-deny egress or egress proxy | Environment egress is subject to cluster network configuration; `Project.spec.egressAllowlist` is reserved and rejected when non-empty |
+| Operator → control plane | In-cluster HTTP to the control-plane Service | No external networking required; both components run in the release namespace |
+
+The `controlPlane.auth.trustProxyHeaders` option is available for a trusted reverse proxy
+that overwrites `X-Forwarded-Host` and `X-Forwarded-Proto`; see
+[Control-plane authentication and authorization](#control-plane-authentication-and-authorization)
+for session, CSRF, and WebSocket origin requirements.
+
 ## Control-plane authentication and authorization
 
 Terminal and transcript endpoints require a credential. The control plane authenticates
