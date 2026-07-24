@@ -262,3 +262,29 @@ func TestRunWatchRecognizesIDLessRelistAfterCheckpoint(t *testing.T) {
 		t.Fatalf("StreamRunSummaries() error = %v, want ErrRunRelist", err)
 	}
 }
+
+func TestRunWatchRetriesInitialAdmissionFailure(t *testing.T) {
+	requests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		requests++
+		if requests == 1 {
+			w.Header().Set("Content-Type", "application/problem+json")
+			w.Header().Set("Retry-After", "0")
+			w.WriteHeader(http.StatusTooManyRequests)
+			_, _ = io.WriteString(w, `{"title":"watch capacity reached","status":429}`)
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "event: run\nid: 2\ndata: {\"type\":\"ADDED\",\"resourceVersion\":\"2\",\"run\":{\"name\":\"one\",\"uid\":\"uid-one\"}}\n\n")
+	}))
+	defer server.Close()
+	client, _ := New(server.URL, "token", server.Client())
+	sentinel := errors.New("handled")
+	established := 0
+	err := client.StreamRunSummaries(context.Background(), "ns", "1", func() { established++ }, func(controlplane.RunWatchEvent) error {
+		return sentinel
+	})
+	if !errors.Is(err, sentinel) || requests != 2 || established != 1 {
+		t.Fatalf("error/requests/established = %v/%d/%d", err, requests, established)
+	}
+}

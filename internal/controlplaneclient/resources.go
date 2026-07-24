@@ -105,7 +105,7 @@ func (c *Client) StreamRunSummaries(ctx context.Context, namespace, resourceVers
 	endpoint := c.Endpoint("api", "v1", "namespaces", namespace, "runs")
 	query := url.Values{"watch": {"true"}, "view": {"summary"}, "resourceVersion": {resourceVersion}}
 	connected := false
-	err := c.streamSSEWithReconnectCheck(ctx, endpoint+"?"+query.Encode(), "", nil, func() {
+	err := c.streamSSEWithReconnectCheck(ctx, endpoint+"?"+query.Encode(), "", nil, retryInitialRunWatch, func() {
 		connected = true
 		if established != nil {
 			established()
@@ -154,6 +154,14 @@ func RunWatchCompatibilityFallback(err error) bool {
 func runWatchCompatibilityStatus(err error) bool {
 	var problem *ProblemError
 	return errors.As(err, &problem) && (problem.Problem.Status == http.StatusNotFound || problem.Problem.Status == http.StatusMethodNotAllowed || problem.Problem.Status == http.StatusNotImplemented)
+}
+
+func retryInitialRunWatch(err error) bool {
+	var problem *ProblemError
+	if !errors.As(err, &problem) {
+		return true
+	}
+	return retryableHTTPStatus(problem.Problem.Status) && !runWatchCompatibilityStatus(err)
 }
 
 // GetRun returns an exact namespaced Run.
