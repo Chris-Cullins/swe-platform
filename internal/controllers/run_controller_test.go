@@ -243,6 +243,7 @@ func TestRepeatedAllocationCreatesOneOwnedEnvironment(t *testing.T) {
 
 func TestRunClaimsAndRecoversWarmEnvironment(t *testing.T) {
 	run := &platformv1alpha1.Run{ObjectMeta: metav1.ObjectMeta{Name: "r", Namespace: "ns", UID: "run-uid"}, Spec: platformv1alpha1.RunSpec{TemplateRef: "small", ProjectRef: "project", Agent: "test"}}
+	template := &platformv1alpha1.EnvironmentTemplate{ObjectMeta: metav1.ObjectMeta{Name: "small", Namespace: "ns", UID: "template-uid"}}
 	warm := &platformv1alpha1.Environment{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "warm-small-1",
@@ -256,7 +257,7 @@ func TestRunClaimsAndRecoversWarmEnvironment(t *testing.T) {
 		Spec:   platformv1alpha1.EnvironmentSpec{TemplateRef: "small"},
 		Status: platformv1alpha1.EnvironmentStatus{Phase: platformv1alpha1.EnvironmentPhaseReady},
 	}
-	r := reconciler(t, &scriptedAdapter{}, run, warm)
+	r := reconciler(t, &scriptedAdapter{}, run, template, warm)
 	ref, err := r.allocateEnvironment(context.Background(), run)
 	if err != nil {
 		t.Fatal(err)
@@ -282,6 +283,7 @@ func TestRunClaimsAndRecoversWarmEnvironment(t *testing.T) {
 
 func TestWarmPromotionWithdrawsReadinessBeforeAdapterAcceptance(t *testing.T) {
 	run := &platformv1alpha1.Run{ObjectMeta: metav1.ObjectMeta{Name: "r", Namespace: "ns", UID: "run-uid", Finalizers: []string{runFinalizer}}, Spec: platformv1alpha1.RunSpec{TemplateRef: "small", ProjectRef: "project", Agent: "test"}}
+	template := &platformv1alpha1.EnvironmentTemplate{ObjectMeta: metav1.ObjectMeta{Name: "small", Namespace: "ns", UID: "template-uid"}}
 	warm := &platformv1alpha1.Environment{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: "warm-small-1", Namespace: "ns", UID: "warm-uid", Labels: map[string]string{warmPoolLabel: "small"},
@@ -293,7 +295,7 @@ func TestWarmPromotionWithdrawsReadinessBeforeAdapterAcceptance(t *testing.T) {
 		},
 	}
 	adapter := &scriptedAdapter{}
-	r := reconciler(t, adapter, run, warm)
+	r := reconciler(t, adapter, run, template, warm)
 	got := reconcileRun(t, r, run.Name)
 	if got.Status.State != platformv1alpha1.RunStateAllocating || got.Status.EnvironmentRef == nil {
 		t.Fatalf("Run status = %#v, want allocated but not ready", got.Status)
@@ -301,6 +303,186 @@ func TestWarmPromotionWithdrawsReadinessBeforeAdapterAcceptance(t *testing.T) {
 	got = reconcileRun(t, r, run.Name)
 	if got.Status.State != platformv1alpha1.RunStateAllocating || adapter.accepted != 0 {
 		t.Fatalf("state = %s, adapter accepts = %d", got.Status.State, adapter.accepted)
+	}
+}
+
+func TestWarmClaimRequiresExactCurrentTemplateOwner(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		apiVersion string
+		kind       string
+		ownerName  string
+		ownerUID   types.UID
+		wantClaim  bool
+	}{
+		{name: "exact owner", apiVersion: platformv1alpha1.GroupVersion.String(), kind: "EnvironmentTemplate", ownerName: "small", ownerUID: "current-template", wantClaim: true},
+		{name: "wrong API version", apiVersion: "swe.dev/v1", kind: "EnvironmentTemplate", ownerName: "small", ownerUID: "current-template"},
+		{name: "wrong kind", apiVersion: platformv1alpha1.GroupVersion.String(), kind: "Project", ownerName: "small", ownerUID: "current-template"},
+		{name: "wrong name", apiVersion: platformv1alpha1.GroupVersion.String(), kind: "EnvironmentTemplate", ownerName: "other", ownerUID: "current-template"},
+		{name: "recreated same-name template", apiVersion: platformv1alpha1.GroupVersion.String(), kind: "EnvironmentTemplate", ownerName: "small", ownerUID: "old-template"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			run := &platformv1alpha1.Run{ObjectMeta: metav1.ObjectMeta{Name: "r", Namespace: "ns", UID: "run-uid"}, Spec: platformv1alpha1.RunSpec{TemplateRef: "small", ProjectRef: "project", Agent: "test"}}
+			template := &platformv1alpha1.EnvironmentTemplate{ObjectMeta: metav1.ObjectMeta{Name: "small", Namespace: "ns", UID: "current-template"}}
+			warm := &platformv1alpha1.Environment{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "warm-small", Namespace: "ns", UID: "warm-uid", ResourceVersion: "1", Labels: map[string]string{warmPoolLabel: "small"},
+					OwnerReferences: []metav1.OwnerReference{{APIVersion: test.apiVersion, Kind: test.kind, Name: test.ownerName, UID: test.ownerUID, Controller: ptr(true)}},
+				},
+				Spec:   platformv1alpha1.EnvironmentSpec{TemplateRef: "small"},
+				Status: platformv1alpha1.EnvironmentStatus{Phase: platformv1alpha1.EnvironmentPhaseReady},
+			}
+			r := reconciler(t, &scriptedAdapter{}, run, template, warm)
+			ref, err := r.claimWarmEnvironment(context.Background(), run, template.Name)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if (ref != nil) != test.wantClaim {
+				t.Fatalf("claim reference = %#v, wantClaim = %t", ref, test.wantClaim)
+			}
+			var retained platformv1alpha1.Environment
+			if err := r.Get(context.Background(), client.ObjectKeyFromObject(warm), &retained); err != nil {
+				t.Fatal(err)
+			}
+			if test.wantClaim {
+				if retained.Status.ClaimedBy == nil || retained.Status.ClaimedBy.UID != run.UID || retained.Labels[warmPoolLabel] != "" {
+					t.Fatalf("exact-owned member was not claimed and promoted: %#v", retained)
+				}
+			} else if retained.Status.ClaimedBy != nil || retained.Labels[warmPoolLabel] != template.Name || retained.ResourceVersion == "" {
+				t.Fatalf("ineligible member was mutated: %#v", retained)
+			}
+		})
+	}
+}
+
+func TestWarmClaimRecoveryRejectsRecreatedTemplateOwner(t *testing.T) {
+	run := &platformv1alpha1.Run{ObjectMeta: metav1.ObjectMeta{Name: "r", Namespace: "ns", UID: "run-uid"}, Spec: platformv1alpha1.RunSpec{TemplateRef: "small", Agent: "test"}}
+	template := &platformv1alpha1.EnvironmentTemplate{ObjectMeta: metav1.ObjectMeta{Name: "small", Namespace: "ns", UID: "new-template"}}
+	warm := &platformv1alpha1.Environment{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "warm-small", Namespace: "ns", UID: "warm-uid", Labels: map[string]string{warmPoolLabel: "small"},
+			OwnerReferences: []metav1.OwnerReference{{APIVersion: platformv1alpha1.GroupVersion.String(), Kind: "EnvironmentTemplate", Name: "small", UID: "old-template", Controller: ptr(true)}},
+		},
+		Spec: platformv1alpha1.EnvironmentSpec{TemplateRef: "small"},
+		Status: platformv1alpha1.EnvironmentStatus{
+			Phase: platformv1alpha1.EnvironmentPhaseReady, ClaimedBy: &platformv1alpha1.RunReference{Name: run.Name, UID: run.UID},
+		},
+	}
+	r := reconciler(t, &scriptedAdapter{}, run, template, warm)
+	recovered, err := r.recoverEnvironmentReference(context.Background(), run)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if recovered != nil {
+		t.Fatalf("recovered old template incarnation: %#v", recovered)
+	}
+	var retained platformv1alpha1.Environment
+	if err := r.Get(context.Background(), client.ObjectKeyFromObject(warm), &retained); err != nil {
+		t.Fatal(err)
+	}
+	if retained.Status.ClaimedBy == nil || retained.Status.ClaimedBy.UID != run.UID || retained.Labels[warmPoolLabel] != template.Name {
+		t.Fatalf("recovery mutated rejected member: %#v", retained)
+	}
+}
+
+func TestWarmClaimRechecksTemplateIncarnationBeforePromotion(t *testing.T) {
+	run := &platformv1alpha1.Run{ObjectMeta: metav1.ObjectMeta{Name: "r", Namespace: "ns", UID: "run-uid"}, Spec: platformv1alpha1.RunSpec{TemplateRef: "small", Agent: "test"}}
+	template := &platformv1alpha1.EnvironmentTemplate{ObjectMeta: metav1.ObjectMeta{Name: "small", Namespace: "ns", UID: "old-template"}}
+	replacement := template.DeepCopy()
+	replacement.UID = "new-template"
+	warm := &platformv1alpha1.Environment{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "warm-small", Namespace: "ns", UID: "warm-uid", Labels: map[string]string{warmPoolLabel: "small"},
+			OwnerReferences: []metav1.OwnerReference{{APIVersion: platformv1alpha1.GroupVersion.String(), Kind: "EnvironmentTemplate", Name: template.Name, UID: template.UID, Controller: ptr(true)}},
+		},
+		Spec:   platformv1alpha1.EnvironmentSpec{TemplateRef: template.Name},
+		Status: platformv1alpha1.EnvironmentStatus{Phase: platformv1alpha1.EnvironmentPhaseReady},
+	}
+	r := reconciler(t, &scriptedAdapter{}, run, template, warm)
+	reads := 0
+	r.APIReader = interceptor.NewClient(r.Client.(client.WithWatch), interceptor.Funcs{
+		Get: func(_ context.Context, _ client.WithWatch, key client.ObjectKey, object client.Object, _ ...client.GetOption) error {
+			if key != client.ObjectKeyFromObject(template) {
+				return fmt.Errorf("unexpected live read for %s", key)
+			}
+			reads++
+			if reads == 1 {
+				template.DeepCopyInto(object.(*platformv1alpha1.EnvironmentTemplate))
+			} else {
+				replacement.DeepCopyInto(object.(*platformv1alpha1.EnvironmentTemplate))
+			}
+			return nil
+		},
+	})
+
+	ref, err := r.claimWarmEnvironment(context.Background(), run, template.Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ref != nil || reads != 2 {
+		t.Fatalf("claim = %#v, live Template reads = %d", ref, reads)
+	}
+	var retained platformv1alpha1.Environment
+	if err := r.Get(context.Background(), client.ObjectKeyFromObject(warm), &retained); err != nil {
+		t.Fatal(err)
+	}
+	owner := metav1.GetControllerOf(&retained)
+	if retained.Status.ClaimedBy != nil || retained.Labels[warmPoolLabel] != template.Name || owner == nil || owner.UID != template.UID {
+		t.Fatalf("Template replacement donated or mutated old member: %#v", retained)
+	}
+}
+
+func TestConcurrentWarmClaimPreservesResourceVersionExclusivity(t *testing.T) {
+	template := &platformv1alpha1.EnvironmentTemplate{ObjectMeta: metav1.ObjectMeta{Name: "small", Namespace: "ns", UID: "template-uid"}}
+	warm := &platformv1alpha1.Environment{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "warm-small", Namespace: "ns", UID: "warm-uid", Labels: map[string]string{warmPoolLabel: "small"},
+			OwnerReferences: []metav1.OwnerReference{{APIVersion: platformv1alpha1.GroupVersion.String(), Kind: "EnvironmentTemplate", Name: template.Name, UID: template.UID, Controller: ptr(true)}},
+		},
+		Spec:   platformv1alpha1.EnvironmentSpec{TemplateRef: template.Name},
+		Status: platformv1alpha1.EnvironmentStatus{Phase: platformv1alpha1.EnvironmentPhaseReady},
+	}
+	runs := []*platformv1alpha1.Run{
+		{ObjectMeta: metav1.ObjectMeta{Name: "a", Namespace: "ns", UID: "a-uid"}, Spec: platformv1alpha1.RunSpec{TemplateRef: template.Name, Agent: "test"}},
+		{ObjectMeta: metav1.ObjectMeta{Name: "b", Namespace: "ns", UID: "b-uid"}, Spec: platformv1alpha1.RunSpec{TemplateRef: template.Name, Agent: "test"}},
+	}
+	r := reconciler(t, &scriptedAdapter{}, template, warm, runs[0], runs[1])
+
+	type result struct {
+		ref *platformv1alpha1.RunEnvironmentReference
+		err error
+	}
+	results := make(chan result, len(runs))
+	var wg sync.WaitGroup
+	for _, run := range runs {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			ref, err := r.claimWarmEnvironment(context.Background(), run, template.Name)
+			results <- result{ref: ref, err: err}
+		}()
+	}
+	wg.Wait()
+	close(results)
+
+	winners := 0
+	for result := range results {
+		if result.err != nil {
+			t.Fatal(result.err)
+		}
+		if result.ref != nil {
+			winners++
+		}
+	}
+	if winners != 1 {
+		t.Fatalf("warm claim winners = %d, want 1", winners)
+	}
+	var claimed platformv1alpha1.Environment
+	if err := r.Get(context.Background(), client.ObjectKeyFromObject(warm), &claimed); err != nil {
+		t.Fatal(err)
+	}
+	if claimed.Status.ClaimedBy == nil || (claimed.Status.ClaimedBy.UID != runs[0].UID && claimed.Status.ClaimedBy.UID != runs[1].UID) || claimed.Labels[warmPoolLabel] != "" {
+		t.Fatalf("claimed warm Environment = %#v", claimed)
 	}
 }
 
@@ -1527,6 +1709,7 @@ func TestCleanupRecoveryDoesNotPromoteWarmClaim(t *testing.T) {
 		}
 		t.Run(name, func(t *testing.T) {
 			run := &platformv1alpha1.Run{ObjectMeta: metav1.ObjectMeta{Name: "r", Namespace: "ns", UID: "run-uid", Finalizers: []string{runFinalizer}}, Spec: platformv1alpha1.RunSpec{Agent: "test", TemplateRef: "small", ProjectRef: "project", Cancel: !deleting}}
+			template := &platformv1alpha1.EnvironmentTemplate{ObjectMeta: metav1.ObjectMeta{Name: "small", Namespace: "ns", UID: "template-uid"}}
 			if deleting {
 				now := metav1.Now()
 				run.DeletionTimestamp = &now
@@ -1538,7 +1721,7 @@ func TestCleanupRecoveryDoesNotPromoteWarmClaim(t *testing.T) {
 				ClaimedBy: &platformv1alpha1.RunReference{Name: run.Name, UID: run.UID},
 			}}
 			adapter := &scriptedAdapter{}
-			r := reconciler(t, adapter, run, warm)
+			r := reconciler(t, adapter, run, template, warm)
 			if deleting {
 				if _, err := r.finalize(context.Background(), run); err != nil {
 					t.Fatal(err)

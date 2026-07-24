@@ -940,10 +940,7 @@ func TestReconcileHonorsRecoveryWhenTerminalPodIsMissing(t *testing.T) {
 			if err := controllerutil.SetControllerReference(env, pvc, scheme); err != nil {
 				t.Fatal(err)
 			}
-			objects := []client.Object{env, pvc}
-			if !test.exhausted {
-				objects = append(objects, template)
-			}
+			objects := []client.Object{env, pvc, template}
 			reconciler := &EnvironmentReconciler{
 				Client: fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(env).WithObjects(objects...).Build(),
 				Scheme: scheme, Now: func() time.Time { return now },
@@ -1408,6 +1405,9 @@ func TestOperationalFailureRetriesAndRecoversReadiness(t *testing.T) {
 
 func TestMissingTemplateIsTerminalValidationFailure(t *testing.T) {
 	scheme := runtime.NewScheme()
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
 	if err := platformv1alpha1.AddToScheme(scheme); err != nil {
 		t.Fatal(err)
 	}
@@ -1427,6 +1427,179 @@ func TestMissingTemplateIsTerminalValidationFailure(t *testing.T) {
 	condition := apimeta.FindStatusCondition(failed.Status.Conditions, platformv1alpha1.EnvironmentConditionReady)
 	if failed.Status.Phase != platformv1alpha1.EnvironmentPhaseFailed || condition == nil || condition.Reason != "InvalidConfiguration" || condition.ObservedGeneration != env.Generation {
 		t.Fatalf("validation failure status = phase %q, condition %#v", failed.Status.Phase, condition)
+	}
+}
+
+func TestMissingTemplateFencesOwnedExecutionInOrderAndRecovers(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	if err := networkingv1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	if err := platformv1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	env := &platformv1alpha1.Environment{
+		ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default", UID: "environment-uid", Generation: 2, Finalizers: []string{environmentFinalizer}},
+		Spec:       platformv1alpha1.EnvironmentSpec{TemplateRef: "missing"},
+		Status: platformv1alpha1.EnvironmentStatus{
+			ObservedGeneration: 2, Phase: platformv1alpha1.EnvironmentPhaseReady, PodName: "env-test", ImageID: "example/environment@sha256:old",
+			Endpoints:  platformv1alpha1.EnvironmentEndpoints{Sandboxd: "10.0.0.1:50051"},
+			Conditions: []metav1.Condition{{Type: platformv1alpha1.EnvironmentConditionReady, Status: metav1.ConditionTrue, ObservedGeneration: 2, Reason: "SandboxdReady"}},
+		},
+	}
+	controller := true
+	owner := metav1.OwnerReference{APIVersion: platformv1alpha1.GroupVersion.String(), Kind: "Environment", Name: env.Name, UID: env.UID, Controller: &controller}
+	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: envPodName(env), Namespace: env.Namespace, UID: "pod-uid", OwnerReferences: []metav1.OwnerReference{owner}}}
+	secret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: envCredentialName(env), Namespace: env.Namespace, UID: "secret-uid", OwnerReferences: []metav1.OwnerReference{owner}}}
+	pvc := &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: envPVCName(env), Namespace: env.Namespace, UID: "pvc-uid", OwnerReferences: []metav1.OwnerReference{owner}}}
+	policy := &networkingv1.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{Name: envNetworkPolicyName(env), Namespace: env.Namespace, UID: "policy-uid", OwnerReferences: []metav1.OwnerReference{owner}}}
+	baseClient := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(env).WithObjects(env, pod, secret, pvc, policy).Build()
+	reconciler := &EnvironmentReconciler{Client: baseClient, Scheme: scheme}
+	request := ctrl.Request{NamespacedName: client.ObjectKeyFromObject(env)}
+
+	if result, err := reconciler.Reconcile(context.Background(), request); err != nil || !result.Requeue {
+		t.Fatalf("withdraw readiness = (%#v, %v)", result, err)
+	}
+	var failed platformv1alpha1.Environment
+	if err := baseClient.Get(context.Background(), client.ObjectKeyFromObject(env), &failed); err != nil {
+		t.Fatal(err)
+	}
+	ready := apimeta.FindStatusCondition(failed.Status.Conditions, platformv1alpha1.EnvironmentConditionReady)
+	if failed.Status.Phase != platformv1alpha1.EnvironmentPhaseFailed || failed.Status.PodName != "" || failed.Status.ImageID != "" || failed.Status.Endpoints.Sandboxd != "" ||
+		ready == nil || ready.Status != metav1.ConditionFalse || ready.Reason != "InvalidConfiguration" || !strings.Contains(ready.Message, `get template "missing"`) {
+		t.Fatalf("readiness was not withdrawn: %#v", failed.Status)
+	}
+	if err := baseClient.Get(context.Background(), client.ObjectKeyFromObject(pod), &corev1.Pod{}); err != nil {
+		t.Fatal("Pod was deleted before readiness withdrawal")
+	}
+	if err := baseClient.Get(context.Background(), client.ObjectKeyFromObject(secret), &corev1.Secret{}); err != nil {
+		t.Fatal("credentials were revoked before Pod deletion")
+	}
+	template := &platformv1alpha1.EnvironmentTemplate{
+		ObjectMeta: metav1.ObjectMeta{Name: "missing", Namespace: env.Namespace, UID: "template-uid"},
+		Spec:       platformv1alpha1.EnvironmentTemplateSpec{Image: "example/environment:dev", Size: "small"},
+	}
+	if err := baseClient.Create(context.Background(), template); err != nil {
+		t.Fatal(err)
+	}
+
+	if result, err := reconciler.Reconcile(context.Background(), request); err != nil || !result.Requeue {
+		t.Fatalf("delete Pod = (%#v, %v)", result, err)
+	}
+	if err := baseClient.Get(context.Background(), client.ObjectKeyFromObject(pod), &corev1.Pod{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("owned Pod still exists: %v", err)
+	}
+	if err := baseClient.Get(context.Background(), client.ObjectKeyFromObject(secret), &corev1.Secret{}); err != nil {
+		t.Fatal("credentials were revoked before Pod absence")
+	}
+
+	if result, err := reconciler.Reconcile(context.Background(), request); err != nil || !result.Requeue {
+		t.Fatalf("revoke credentials = (%#v, %v)", result, err)
+	}
+	if err := baseClient.Get(context.Background(), client.ObjectKeyFromObject(secret), &corev1.Secret{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("owned Secret still exists: %v", err)
+	}
+	if err := baseClient.Get(context.Background(), client.ObjectKeyFromObject(pvc), &corev1.PersistentVolumeClaim{}); err != nil {
+		t.Fatal("workspace PVC was not retained")
+	}
+	if err := baseClient.Get(context.Background(), client.ObjectKeyFromObject(policy), &networkingv1.NetworkPolicy{}); err != nil {
+		t.Fatal("NetworkPolicy was not retained")
+	}
+
+	restored := false
+	for range 3 {
+		if _, err := reconciler.Reconcile(context.Background(), request); err != nil {
+			t.Fatalf("reconcile after Template recreation: %v", err)
+		}
+		if err := baseClient.Get(context.Background(), types.NamespacedName{Namespace: env.Namespace, Name: envPodName(env)}, &corev1.Pod{}); err == nil {
+			restored = true
+			break
+		} else if !apierrors.IsNotFound(err) {
+			t.Fatal(err)
+		}
+	}
+	if !restored {
+		t.Fatal("Template recreation did not restore provisioning")
+	}
+	if err := baseClient.Get(context.Background(), client.ObjectKeyFromObject(pvc), &corev1.PersistentVolumeClaim{}); err != nil {
+		t.Fatal("recovery replaced or removed the retained workspace PVC")
+	}
+}
+
+func TestMissingTemplateDoesNotMutateForeignSameNameChildren(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	if err := platformv1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	env := &platformv1alpha1.Environment{
+		ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default", UID: "current-environment", Generation: 1, Finalizers: []string{environmentFinalizer}},
+		Spec:       platformv1alpha1.EnvironmentSpec{TemplateRef: "missing"},
+	}
+	controller := true
+	foreignOwner := metav1.OwnerReference{APIVersion: platformv1alpha1.GroupVersion.String(), Kind: "Environment", Name: env.Name, UID: "old-environment", Controller: &controller}
+	foreignPod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: envPodName(env), Namespace: env.Namespace, UID: "foreign-pod", OwnerReferences: []metav1.OwnerReference{foreignOwner}}}
+	foreignSecret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: envCredentialName(env), Namespace: env.Namespace, UID: "foreign-secret", OwnerReferences: []metav1.OwnerReference{foreignOwner}}}
+	reconciler := &EnvironmentReconciler{
+		Client: fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(env).WithObjects(env, foreignPod, foreignSecret).Build(), Scheme: scheme,
+	}
+
+	result, err := reconciler.Reconcile(context.Background(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(env)})
+	if err != nil || result != (ctrl.Result{}) {
+		t.Fatalf("Reconcile() = (%#v, %v), want stable failed result", result, err)
+	}
+	if err := reconciler.Get(context.Background(), client.ObjectKeyFromObject(foreignPod), &corev1.Pod{}); err != nil {
+		t.Fatal("foreign same-name Pod was mutated")
+	}
+	if err := reconciler.Get(context.Background(), client.ObjectKeyFromObject(foreignSecret), &corev1.Secret{}); err != nil {
+		t.Fatal("foreign same-name Secret was mutated")
+	}
+}
+
+func TestInvalidProvisioningFenceDoesNotStartAfterConcurrentSpecCorrection(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	if err := platformv1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	current := &platformv1alpha1.Environment{
+		ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default", UID: "environment-uid", Generation: 2, Finalizers: []string{environmentFinalizer}},
+		Spec:       platformv1alpha1.EnvironmentSpec{TemplateRef: "corrected"},
+	}
+	stale := current.DeepCopy()
+	stale.Generation = 1
+	stale.Spec.TemplateRef = "missing"
+	controller := true
+	owner := metav1.OwnerReference{APIVersion: platformv1alpha1.GroupVersion.String(), Kind: "Environment", Name: current.Name, UID: current.UID, Controller: &controller}
+	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: envPodName(current), Namespace: current.Namespace, UID: "pod-uid", OwnerReferences: []metav1.OwnerReference{owner}}}
+	secret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: envCredentialName(current), Namespace: current.Namespace, UID: "secret-uid", OwnerReferences: []metav1.OwnerReference{owner}}}
+	reconciler := &EnvironmentReconciler{
+		Client: fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(current).WithObjects(current, pod, secret).Build(), Scheme: scheme,
+	}
+
+	result, err := reconciler.reconcileInvalidProvisioningConfiguration(context.Background(), stale, `get template "missing": not found`)
+	if err != nil || !result.Requeue {
+		t.Fatalf("stale invalid reconcile = (%#v, %v), want a safe requeue", result, err)
+	}
+	if err := reconciler.Get(context.Background(), client.ObjectKeyFromObject(pod), &corev1.Pod{}); err != nil {
+		t.Fatal("stale generation deleted the corrected Environment Pod")
+	}
+	if err := reconciler.Get(context.Background(), client.ObjectKeyFromObject(secret), &corev1.Secret{}); err != nil {
+		t.Fatal("stale generation revoked the corrected Environment credentials")
+	}
+	var retained platformv1alpha1.Environment
+	if err := reconciler.Get(context.Background(), client.ObjectKeyFromObject(current), &retained); err != nil {
+		t.Fatal(err)
+	}
+	if invalidProvisioningFenceStarted(&retained) {
+		t.Fatalf("stale generation published invalid status: %#v", retained.Status)
 	}
 }
 
@@ -2481,18 +2654,31 @@ func TestReconcilePausedWaitsForPodDeletion(t *testing.T) {
 		t.Fatalf("reconcilePaused() error = %v", err)
 	}
 	if !result.Requeue {
-		t.Fatal("reconcilePaused() did not requeue after deleting the pod")
+		t.Fatal("reconcilePaused() did not requeue after withdrawing readiness")
 	}
 	var updated platformv1alpha1.Environment
 	if err := reconciler.Get(context.Background(), client.ObjectKeyFromObject(env), &updated); err != nil {
 		t.Fatal(err)
 	}
-	if updated.Status.Phase != platformv1alpha1.EnvironmentPhaseReady {
-		t.Fatalf("Phase = %q before pod deletion is observed, want Ready", updated.Status.Phase)
+	ready := apimeta.FindStatusCondition(updated.Status.Conditions, platformv1alpha1.EnvironmentConditionReady)
+	if updated.Status.Phase != platformv1alpha1.EnvironmentPhaseIdle || updated.Status.PodName != "" || ready == nil || ready.Status != metav1.ConditionFalse || ready.Reason != "PauseRequested" {
+		t.Fatalf("status before pod deletion = %#v, want readiness withdrawn", updated.Status)
+	}
+	if err := reconciler.Get(context.Background(), client.ObjectKeyFromObject(pod), &corev1.Pod{}); err != nil {
+		t.Fatal("Pod was deleted before readiness withdrawal")
 	}
 
 	if _, err := reconciler.reconcilePaused(context.Background(), &updated); err != nil {
 		t.Fatalf("second reconcilePaused() error = %v", err)
+	}
+	if err := reconciler.Get(context.Background(), client.ObjectKeyFromObject(pod), &corev1.Pod{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("owned Pod still exists: %v", err)
+	}
+	if err := reconciler.Get(context.Background(), client.ObjectKeyFromObject(env), &updated); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reconciler.reconcilePaused(context.Background(), &updated); err != nil {
+		t.Fatalf("third reconcilePaused() error = %v", err)
 	}
 	if err := reconciler.Get(context.Background(), client.ObjectKeyFromObject(env), &updated); err != nil {
 		t.Fatal(err)
@@ -2500,7 +2686,7 @@ func TestReconcilePausedWaitsForPodDeletion(t *testing.T) {
 	if updated.Status.Phase != platformv1alpha1.EnvironmentPhasePaused || updated.Status.PodName != "" {
 		t.Fatalf("Status = %#v, want Paused with no pod name", updated.Status)
 	}
-	ready := apimeta.FindStatusCondition(updated.Status.Conditions, platformv1alpha1.EnvironmentConditionReady)
+	ready = apimeta.FindStatusCondition(updated.Status.Conditions, platformv1alpha1.EnvironmentConditionReady)
 	if ready == nil || ready.Status != metav1.ConditionFalse || ready.Reason != "Paused" {
 		t.Fatalf("Ready while paused = %#v, want false Paused", ready)
 	}
@@ -3166,6 +3352,15 @@ func TestWakeAndHoldReleaseWaitForBackendFence(t *testing.T) {
 			if !fencing.Status.Lifecycle.Suspended || fencing.Status.Phase == platformv1alpha1.EnvironmentPhasePaused || fencing.Status.Lifecycle.LastWakeRequestID != "" {
 				t.Fatalf("release preempted pod teardown: %#v", fencing.Status)
 			}
+			if fencing.Status.PodName != "" || fencing.Status.Endpoints.Sandboxd != "" {
+				t.Fatalf("readiness was not withdrawn before pod teardown: %#v", fencing.Status)
+			}
+			if err := reconciler.Get(context.Background(), client.ObjectKeyFromObject(pod), &corev1.Pod{}); err != nil {
+				t.Fatalf("pod was deleted before readiness withdrawal: %v", err)
+			}
+			if _, err := reconciler.Reconcile(context.Background(), ctrl.Request{NamespacedName: key}); err != nil {
+				t.Fatal(err)
+			}
 			if err := reconciler.Get(context.Background(), client.ObjectKeyFromObject(pod), &corev1.Pod{}); !apierrors.IsNotFound(err) {
 				t.Fatalf("pod was not deleted before credentials: %v", err)
 			}
@@ -3333,6 +3528,15 @@ func TestHoldAcceptsSuspendFenceAndAllowsRunCleanupInEitherOrdering(t *testing.T
 			}
 			if err := kubeClient.Get(context.Background(), client.ObjectKeyFromObject(credentials), &corev1.Secret{}); err != nil {
 				t.Fatalf("credentials disappeared before suspend receipt persisted: %v", err)
+			}
+
+			reconcileEnvironment()
+			var withdrawing platformv1alpha1.Environment
+			if err := kubeClient.Get(context.Background(), key, &withdrawing); err != nil || withdrawing.Status.PodName != "" || withdrawing.Status.Endpoints.Sandboxd != "" {
+				t.Fatalf("readiness was not withdrawn before pod teardown: environment=%#v error=%v", withdrawing, err)
+			}
+			if err := kubeClient.Get(context.Background(), client.ObjectKeyFromObject(pod), &corev1.Pod{}); err != nil {
+				t.Fatalf("pod disappeared before readiness withdrawal: %v", err)
 			}
 
 			reconcileEnvironment()
@@ -3655,14 +3859,52 @@ func TestPauseFencesEnvironmentWithoutReadableTemplate(t *testing.T) {
 	env := &platformv1alpha1.Environment{
 		ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default", UID: "env-uid", Finalizers: []string{environmentFinalizer}},
 		Spec:       platformv1alpha1.EnvironmentSpec{TemplateRef: "deleted-template", Lifecycle: platformv1alpha1.EnvironmentLifecycleSpec{Hold: &platformv1alpha1.EnvironmentHoldPolicy{Enabled: true, Revision: 1}}},
-		Status:     platformv1alpha1.EnvironmentStatus{Phase: platformv1alpha1.EnvironmentPhaseFailed, PodName: "missing-pod", Lifecycle: platformv1alpha1.EnvironmentLifecycleStatus{Suspended: true, SuspensionReason: platformv1alpha1.EnvironmentSuspensionReasonHold, Epoch: 1, ObservedHoldPolicyRevision: 1}},
+		Status: platformv1alpha1.EnvironmentStatus{
+			Phase: platformv1alpha1.EnvironmentPhaseReady, PodName: "missing-pod", Endpoints: platformv1alpha1.EnvironmentEndpoints{Sandboxd: "10.0.0.1:50051"},
+			Lifecycle:  platformv1alpha1.EnvironmentLifecycleStatus{Suspended: true, SuspensionReason: platformv1alpha1.EnvironmentSuspensionReasonHold, Epoch: 1, ObservedHoldPolicyRevision: 1},
+			Conditions: []metav1.Condition{{Type: platformv1alpha1.EnvironmentConditionReady, Status: metav1.ConditionTrue, Reason: "SandboxdReady"}},
+		},
 	}
+	controller := true
+	owner := metav1.OwnerReference{APIVersion: platformv1alpha1.GroupVersion.String(), Kind: "Environment", Name: env.Name, UID: env.UID, Controller: &controller}
+	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: envPodName(env), Namespace: env.Namespace, UID: "pod-uid", OwnerReferences: []metav1.OwnerReference{owner}}}
+	secret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: envCredentialName(env), Namespace: env.Namespace, UID: "secret-uid", OwnerReferences: []metav1.OwnerReference{owner}}}
 	reconciler := &EnvironmentReconciler{
-		Client: fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(env).WithObjects(env).Build(),
+		Client: fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(env).WithObjects(env, pod, secret).Build(),
 		Scheme: scheme,
 	}
-	if _, err := reconciler.Reconcile(context.Background(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(env)}); err != nil {
-		t.Fatalf("paused reconcile depended on deleted template: %v", err)
+	request := ctrl.Request{NamespacedName: client.ObjectKeyFromObject(env)}
+	if _, err := reconciler.Reconcile(context.Background(), request); err != nil {
+		t.Fatalf("paused readiness withdrawal depended on deleted template: %v", err)
+	}
+	var withdrawing platformv1alpha1.Environment
+	if err := reconciler.Get(context.Background(), client.ObjectKeyFromObject(env), &withdrawing); err != nil {
+		t.Fatal(err)
+	}
+	ready := apimeta.FindStatusCondition(withdrawing.Status.Conditions, platformv1alpha1.EnvironmentConditionReady)
+	if withdrawing.Status.PodName != "" || withdrawing.Status.Endpoints.Sandboxd != "" || ready == nil || ready.Status != metav1.ConditionFalse || ready.Reason != "PauseRequested" {
+		t.Fatalf("pause did not withdraw readiness first: %#v", withdrawing.Status)
+	}
+	if err := reconciler.Get(context.Background(), client.ObjectKeyFromObject(pod), &corev1.Pod{}); err != nil {
+		t.Fatal("paused Pod was deleted before readiness withdrawal")
+	}
+	if _, err := reconciler.Reconcile(context.Background(), request); err != nil {
+		t.Fatalf("paused Pod fence depended on deleted template: %v", err)
+	}
+	if err := reconciler.Get(context.Background(), client.ObjectKeyFromObject(pod), &corev1.Pod{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("paused exact-owned Pod still exists: %v", err)
+	}
+	if err := reconciler.Get(context.Background(), client.ObjectKeyFromObject(secret), &corev1.Secret{}); err != nil {
+		t.Fatal("paused credentials were revoked before Pod absence")
+	}
+	if _, err := reconciler.Reconcile(context.Background(), request); err != nil {
+		t.Fatalf("paused credential fence depended on deleted template: %v", err)
+	}
+	if err := reconciler.Get(context.Background(), client.ObjectKeyFromObject(secret), &corev1.Secret{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("paused exact-owned Secret still exists: %v", err)
+	}
+	if _, err := reconciler.Reconcile(context.Background(), request); err != nil {
+		t.Fatalf("paused status convergence depended on deleted template: %v", err)
 	}
 	var fenced platformv1alpha1.Environment
 	if err := reconciler.Get(context.Background(), client.ObjectKeyFromObject(env), &fenced); err != nil {

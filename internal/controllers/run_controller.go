@@ -170,12 +170,21 @@ func (r *RunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.R
 			if err := r.Get(ctx, types.NamespacedName{Namespace: run.Namespace, Name: ref.Name}, &recovered); err != nil {
 				return ctrl.Result{}, err
 			}
-			if unpromotedWarmClaim(&recovered, &run) {
+			currentWarmClaim, err := r.currentUnpromotedWarmClaim(ctx, &recovered, &run)
+			if err != nil {
+				return ctrl.Result{}, err
+			}
+			if recovered.Labels[warmPoolLabel] != "" && !currentWarmClaim {
+				ref = nil
+			} else if currentWarmClaim {
 				if err := r.releaseClaim(ctx, &run, &recovered); err != nil {
 					return ctrl.Result{}, err
 				}
 				return ctrl.Result{}, r.setRunState(ctx, &run, platformv1alpha1.RunStateCancelled, "Cancelled", "cancelled before warm environment promotion", false)
 			}
+		}
+		if ref == nil {
+			return ctrl.Result{}, r.setRunState(ctx, &run, platformv1alpha1.RunStateCancelled, "Cancelled", "cancelled before allocation", false)
 		}
 		run.Status.EnvironmentRef = ref
 		return ctrl.Result{Requeue: true}, r.setRunState(ctx, &run, platformv1alpha1.RunStateAllocating, "EnvironmentRecovered", fmt.Sprintf("recovered environment %s before cancellation", ref.Name), false)
@@ -215,9 +224,16 @@ func (r *RunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.R
 						return ctrl.Result{}, releaseErr
 					}
 				}
-			} else {
+			} else if currentWarmClaim, currentErr := r.currentUnpromotedWarmClaim(ctx, &recovered, &run); currentErr != nil {
+				err = currentErr
+			} else if recovered.Labels[warmPoolLabel] != "" && !currentWarmClaim {
+				ref = nil
+			} else if currentWarmClaim {
 				err = r.promoteWarmEnvironment(ctx, &run, &recovered)
 			}
+		}
+		if ref == nil && err == nil {
+			ref, err = r.allocateEnvironment(ctx, &run)
 		}
 		if err != nil {
 			if errors.Is(err, errExplicitEnvironmentClaimed) || errors.Is(err, errExplicitEnvironmentHeld) || errors.Is(err, errExplicitEnvironmentSuspensionNotWakeable) {
@@ -629,6 +645,15 @@ func (r *RunReconciler) recoverEnvironmentReference(ctx context.Context, run *pl
 	for i := range environments.Items {
 		env := &environments.Items[i]
 		if env.Status.ClaimedBy != nil && env.Status.ClaimedBy.Name == run.Name && env.Status.ClaimedBy.UID == run.UID {
+			if env.Labels[warmPoolLabel] != "" {
+				current, err := r.currentUnpromotedWarmClaim(ctx, env, run)
+				if err != nil {
+					return nil, err
+				}
+				if !current {
+					continue
+				}
+			}
 			return &platformv1alpha1.RunEnvironmentReference{Name: env.Name, UID: env.UID, Ownership: platformv1alpha1.EnvironmentOwnershipClaimed}, nil
 		}
 	}
@@ -664,10 +689,20 @@ func (r *RunReconciler) claimWarmEnvironment(ctx context.Context, run *platformv
 	if err := r.List(ctx, &environments, client.InNamespace(run.Namespace), client.MatchingLabels{warmPoolLabel: template}); err != nil {
 		return nil, fmt.Errorf("list warm environments: %w", err)
 	}
+	if len(environments.Items) == 0 {
+		return nil, nil
+	}
+	var currentTemplate platformv1alpha1.EnvironmentTemplate
+	if err := r.apiReader().Get(ctx, types.NamespacedName{Namespace: run.Namespace, Name: template}, &currentTemplate); err != nil {
+		return nil, fmt.Errorf("get warm environment template %q: %w", template, err)
+	}
+	if !currentTemplate.DeletionTimestamp.IsZero() {
+		return nil, nil
+	}
 	for i := range environments.Items {
 		env := &environments.Items[i]
-		owner := metav1.GetControllerOf(env)
-		if env.Spec.TemplateRef != template || environmentSuspended(env) || !platformv1alpha1.IsEnvironmentReady(env) || env.Status.ClaimedBy != nil || owner == nil || owner.Kind != "EnvironmentTemplate" || owner.Name != template {
+		if env.Spec.TemplateRef != template || environmentSuspended(env) || !platformv1alpha1.IsEnvironmentReady(env) || env.Status.ClaimedBy != nil ||
+			!exactControllerOwner(env, platformv1alpha1.GroupVersion.String(), "EnvironmentTemplate", currentTemplate.Name, currentTemplate.UID) {
 			continue
 		}
 		now := metav1.Now()
@@ -678,6 +713,17 @@ func (r *RunReconciler) claimWarmEnvironment(ctx context.Context, run *platformv
 				continue
 			}
 			return nil, fmt.Errorf("claim warm environment %q: %w", env.Name, err)
+		}
+		var confirmedTemplate platformv1alpha1.EnvironmentTemplate
+		if err := r.apiReader().Get(ctx, types.NamespacedName{Namespace: run.Namespace, Name: template}, &confirmedTemplate); err != nil ||
+			!confirmedTemplate.DeletionTimestamp.IsZero() || confirmedTemplate.UID != currentTemplate.UID {
+			if releaseErr := r.releaseClaim(ctx, run, env); releaseErr != nil {
+				return nil, fmt.Errorf("release warm environment %q after template changed: %w", env.Name, releaseErr)
+			}
+			if err != nil && !apierrors.IsNotFound(err) {
+				return nil, fmt.Errorf("confirm warm environment template %q: %w", template, err)
+			}
+			continue
 		}
 		if err := r.promoteWarmEnvironment(ctx, run, env); err != nil {
 			return nil, err
@@ -757,12 +803,23 @@ func exactControllerOwner(object metav1.Object, apiVersion, kind, name string, u
 	return owner != nil && owner.APIVersion == apiVersion && owner.Kind == kind && owner.Name == name && owner.UID == uid
 }
 
-func unpromotedWarmClaim(env *platformv1alpha1.Environment, run *platformv1alpha1.Run) bool {
-	template := env.Labels[warmPoolLabel]
-	owner := metav1.GetControllerOf(env)
-	return template != "" && env.Spec.TemplateRef == template && env.Status.ClaimedBy != nil &&
-		env.Status.ClaimedBy.Name == run.Name && env.Status.ClaimedBy.UID == run.UID &&
-		owner != nil && owner.APIVersion == platformv1alpha1.GroupVersion.String() && owner.Kind == "EnvironmentTemplate" && owner.Name == template
+func (r *RunReconciler) currentUnpromotedWarmClaim(ctx context.Context, env *platformv1alpha1.Environment, run *platformv1alpha1.Run) (bool, error) {
+	templateName := env.Labels[warmPoolLabel]
+	if templateName == "" || env.Spec.TemplateRef != templateName || env.Status.ClaimedBy == nil ||
+		env.Status.ClaimedBy.Name != run.Name || env.Status.ClaimedBy.UID != run.UID {
+		return false, nil
+	}
+	var template platformv1alpha1.EnvironmentTemplate
+	if err := r.apiReader().Get(ctx, types.NamespacedName{Namespace: env.Namespace, Name: templateName}, &template); err != nil {
+		if apierrors.IsNotFound(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	if !template.DeletionTimestamp.IsZero() {
+		return false, nil
+	}
+	return exactControllerOwner(env, platformv1alpha1.GroupVersion.String(), "EnvironmentTemplate", template.Name, template.UID), nil
 }
 
 func environmentFenced(env *platformv1alpha1.Environment) bool {
@@ -889,7 +946,13 @@ func (r *RunReconciler) finalize(ctx context.Context, run *platformv1alpha1.Run)
 			if err := r.Get(ctx, types.NamespacedName{Namespace: run.Namespace, Name: ref.Name}, &recovered); err != nil {
 				return ctrl.Result{}, err
 			}
-			if unpromotedWarmClaim(&recovered, run) {
+			currentWarmClaim, currentErr := r.currentUnpromotedWarmClaim(ctx, &recovered, run)
+			if currentErr != nil {
+				return ctrl.Result{}, currentErr
+			}
+			if recovered.Labels[warmPoolLabel] != "" && !currentWarmClaim {
+				ref = nil
+			} else if currentWarmClaim {
 				if err := r.releaseClaim(ctx, run, &recovered); err != nil {
 					return ctrl.Result{}, err
 				}
