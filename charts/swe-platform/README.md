@@ -280,13 +280,15 @@ immutable Run UID so a same-name replacement Run's transcript cannot be removed.
 
 ### Backup and restore
 
-Three categories of state require backup planning for a BYOC installation:
+The following categories of state require backup planning for a BYOC installation; the list
+is not exhaustive:
 
 | State | Location | Helm reconstructs it? |
 |---|---|---|
 | Transcript events | PostgreSQL database | No |
-| Infrastructure state (Project, Run, Environment, user-created EnvironmentTemplate instances) | Kubernetes API / etcd | No — Helm reapplies CRD definitions and chart-owned EnvironmentTemplate resources only, not user-created custom-resource instances |
+| Infrastructure state (Project, Run, Environment, AgentCredentialProfile, user-created EnvironmentTemplate instances) | Kubernetes API / etcd | No — Helm reapplies CRD definitions and chart-owned EnvironmentTemplate resources only, not user-created custom-resource instances |
 | Workspace contents (cloned repos, agent work, uncommitted changes) | Environment PVCs | No |
+| Installation and credential material (out-of-band PostgreSQL Secret, bootstrap token Secret, chart values overrides) | Kubernetes Secrets and local configuration | No |
 
 Back up the PostgreSQL transcript database before every upgrade using your provider's backup
 mechanism (`pg_dump`, managed-service snapshots, or equivalent). To restore transcripts only,
@@ -294,14 +296,19 @@ point the same connection URL at the recovered database and restart the control-
 The control plane applies ordered embedded migrations under a PostgreSQL advisory lock on
 startup, so a restored database at an older migration version is brought forward automatically.
 This database-only recovery path restores transcript events; it does not reconstruct
-infrastructure state or workspace contents.
+infrastructure state, workspace contents, or installation material.
 
-Separately, export or back up the custom-resource instances (Project, Run, Environment, and
-any user-created EnvironmentTemplate objects) and snapshot or back up workspace PVCs that your
-recovery objectives require. Helm alone cannot reconstruct either: it reapplies CRD schemas
-and chart-owned templates, not the user-created resources that represent desired and observed
-infrastructure state, and workspace PVCs are per-environment volumes whose contents survive
-pause/resume but are not replicated or backed up by the platform.
+Separately, export or back up the custom-resource instances (Project, Run, Environment,
+AgentCredentialProfile, and any user-created EnvironmentTemplate objects) and snapshot or back
+up workspace PVCs that your recovery objectives require. Helm alone cannot reconstruct either:
+it reapplies CRD schemas and chart-owned templates, not the user-created resources that
+represent desired and observed infrastructure state, and workspace PVCs are per-environment
+volumes whose contents survive pause/resume but are not replicated or backed up by the
+platform. AgentCredentialProfile backing Secrets are controller-created and bound to the
+profile's exact owner UID; do not copy them into a replacement cluster. Instead, preserve or
+re-provision out-of-band secret sources (the PostgreSQL connection Secret, bootstrap token,
+and any chart values overrides), and recreate agent API-key credentials through the supported
+`swe credentials create` / `--api-key-stdin` flow, then rotate if necessary.
 
 A coordinated cluster-loss restore order, RPO, and RTO are not tested or provided by this
 release. The monitoring queries above report retained transcript history so you can size
@@ -323,8 +330,9 @@ out of scope here and requires separate maintainer product input.
 Each production preset assumes an out-of-band `swe-platform-postgres` Secret (see
 [Install](#install) and [Durable transcript storage](#durable-transcript-storage)) and a
 default StorageClass for environment workspace PVCs. The operator creates PVCs with
-`ReadWriteOnce` access and the cluster's default `storageClassName`; it does not create or
-manage StorageClasses. Provider-specific runtime, replica, and isolation assumptions are
+`ReadWriteOnce` access and leaves `spec.storageClassName` unset, so the cluster's default
+StorageClass admission supplies the storage; the chart does not create or manage
+StorageClasses. Provider-specific runtime, replica, and isolation assumptions are
 documented in the [preset table](#environment-image-footprint) above.
 
 ### Pre-flight validation
