@@ -25,6 +25,7 @@ const (
 // SSEEvent is one decoded Server-Sent Event. Data remains application-owned.
 type SSEEvent struct {
 	ID    string
+	HasID bool
 	Event string
 	Data  []byte
 }
@@ -201,6 +202,7 @@ func consumeSSE(reader io.Reader, cursor string, handle func(SSEEvent) error) (s
 		}
 		if len(data) != 0 {
 			event.ID = nextCursor
+			event.HasID = hasBlockID
 			if event.Event == "" {
 				event.Event = "message"
 			}

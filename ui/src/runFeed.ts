@@ -1,5 +1,5 @@
 import React from 'react'
-import { useQuery, useQueryClient } from '@tanstack/react-query'
+import { useQuery, useQueryClient, type QueryClient } from '@tanstack/react-query'
 import { api, ApiProblem, fallbackPollInterval, notifyUnauthorized, queryKeys } from './api'
 import type { Run, RunSummary, RunSummaryList, RunWatchEvent } from './contracts'
 
@@ -89,9 +89,12 @@ export function applyRunEvent(snapshot: RunSummaryList, event: RunWatchEvent): R
   return { ...snapshot, resourceVersion: event.resourceVersion, items }
 }
 
-function refreshMatchingDetail(queryClient: ReturnType<typeof useQueryClient>, namespace: string, summary: RunSummary) {
+export function refreshMatchingDetail(queryClient: QueryClient, namespace: string, summary: RunSummary) {
   const detail = queryClient.getQueryData<Run>(queryKeys.run(namespace, summary.name))
-  if (!detail) return
+  if (!detail) {
+    void queryClient.resetQueries({ queryKey: queryKeys.run(namespace, summary.name), exact: true })
+    return
+  }
   if (detail.uid !== summary.uid) {
     void queryClient.invalidateQueries({ queryKey: queryKeys.run(namespace, summary.name), exact: true })
     return

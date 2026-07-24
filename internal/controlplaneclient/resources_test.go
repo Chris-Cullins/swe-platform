@@ -246,3 +246,19 @@ func TestRunWatchFallbackOnlyBeforeFirstSuccessfulConnection(t *testing.T) {
 		}
 	})
 }
+
+func TestRunWatchRecognizesIDLessRelistAfterCheckpoint(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "event: run-checkpoint\nid: 2\ndata: {\"resourceVersion\":\"2\"}\n\nevent: run-relist\ndata: {}\n\n")
+	}))
+	defer server.Close()
+	client, _ := New(server.URL, "token", server.Client())
+	err := client.StreamRunSummaries(context.Background(), "ns", "1", nil, func(controlplane.RunWatchEvent) error {
+		t.Fatal("unexpected Run event")
+		return nil
+	})
+	if !errors.Is(err, ErrRunRelist) {
+		t.Fatalf("StreamRunSummaries() error = %v, want ErrRunRelist", err)
+	}
+}

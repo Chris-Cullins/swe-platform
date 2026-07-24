@@ -116,13 +116,13 @@ func (c *Client) StreamRunSummaries(ctx context.Context, namespace, resourceVers
 		}
 		switch event.Event {
 		case "run-relist":
-			if event.ID != "" {
+			if event.HasID {
 				return fmt.Errorf("Run relist event must not carry an ID")
 			}
 			return ErrRunRelist
 		case "run-checkpoint":
 			var checkpoint controlplane.RunWatchCheckpoint
-			if err := json.Unmarshal(event.Data, &checkpoint); err != nil || checkpoint.ResourceVersion == "" || checkpoint.ResourceVersion != event.ID {
+			if err := json.Unmarshal(event.Data, &checkpoint); err != nil || !event.HasID || checkpoint.ResourceVersion == "" || checkpoint.ResourceVersion != event.ID {
 				return fmt.Errorf("invalid Run watch checkpoint")
 			}
 			return nil
@@ -131,7 +131,7 @@ func (c *Client) StreamRunSummaries(ctx context.Context, namespace, resourceVers
 			if err := json.Unmarshal(event.Data, &update); err != nil {
 				return fmt.Errorf("decode Run watch event: %w", err)
 			}
-			if update.ResourceVersion == "" || update.ResourceVersion != event.ID || (update.Type != "ADDED" && update.Type != "MODIFIED" && update.Type != "DELETED") {
+			if !event.HasID || update.ResourceVersion == "" || update.ResourceVersion != event.ID || (update.Type != "ADDED" && update.Type != "MODIFIED" && update.Type != "DELETED") {
 				return fmt.Errorf("invalid Run watch event")
 			}
 			return handle(update)

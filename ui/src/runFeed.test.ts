@@ -1,7 +1,8 @@
+import { QueryClient, QueryObserver } from '@tanstack/react-query'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { api, ApiProblem } from './api'
 import type { RunSummary, RunSummaryList, RunWatchEvent } from './contracts'
-import { applyRunEvent, consumeSSE, listRunSnapshot } from './runFeed'
+import { applyRunEvent, consumeSSE, listRunSnapshot, refreshMatchingDetail } from './runFeed'
 
 afterEach(() => vi.restoreAllMocks())
 
@@ -59,5 +60,27 @@ describe('Run summary watch', () => {
     controller.abort()
     resolve({ items: [summary('private')], resourceVersion: '9' })
     await expect(snapshot).rejects.toHaveProperty('name', 'AbortError')
+  })
+
+  it('cancels and replaces a matching detail query while its first request is still loading', async () => {
+    const client = new QueryClient()
+    let resolveFirst!: (value: { uid: string; generation: number }) => void
+    let firstSignal: AbortSignal | undefined
+    const queryFn = vi.fn(({ signal }: { signal: AbortSignal }) => {
+      if (!firstSignal) {
+        firstSignal = signal
+        return new Promise<{ uid: string; generation: number }>(resolve => { resolveFirst = resolve })
+      }
+      return Promise.resolve({ uid: 'one-uid', generation: 1 })
+    })
+    const observer = new QueryObserver(client, { queryKey: ['run', 'ns', 'one'], queryFn, retry: false })
+    const unsubscribe = observer.subscribe(() => undefined)
+    await vi.waitFor(() => expect(queryFn).toHaveBeenCalledOnce())
+    refreshMatchingDetail(client, 'ns', summary('one'))
+    await vi.waitFor(() => expect(queryFn).toHaveBeenCalledTimes(2))
+    expect(firstSignal?.aborted).toBe(true)
+    resolveFirst({ uid: 'stale-uid', generation: 0 })
+    await vi.waitFor(() => expect(client.getQueryData(['run', 'ns', 'one'])).toEqual({ uid: 'one-uid', generation: 1 }))
+    unsubscribe()
   })
 })
