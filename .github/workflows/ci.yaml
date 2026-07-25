@@ -101,6 +101,9 @@ jobs:
         working-directory: sandboxd
         run: go test ./...
 
+      - name: Argo CD port-forward helper regression
+        run: ./hack/argocd-port-forward_test.sh
+
       - name: Generated code is current
         run: |
           make generate manifests
