@@ -143,6 +143,10 @@ func (a *Adapter) Observe(ctx context.Context, task controllers.AdapterTask, san
 		}
 		output, err := readRetainedOutput(ctx, client, processKey(task), process.ExecutionId, sandboxdv1.OutputStream_OUTPUT_STREAM_STDOUT)
 		if err != nil {
+			var truncated *outputTruncatedError
+			if errors.As(err, &truncated) {
+				return controllers.AdapterObservationFailed, processMessage("Claude Code stdout was truncated before terminal validation", truncated.Error()), nil
+			}
 			return "", "", err
 		}
 		result, ok := finalResult(output)
@@ -236,12 +240,23 @@ func readRetainedOutput(ctx context.Context, client sandboxdv1.ProcessServiceCli
 		if err != nil {
 			return nil, err
 		}
+		if response.GapBytes != 0 || response.Offset != offset {
+			return nil, &outputTruncatedError{retainedFrom: response.RetainedStart}
+		}
 		output.Write(response.Data)
 		offset = response.NextOffset
 		if response.Eof || offset >= response.ProducedEnd {
 			return output.Bytes(), nil
 		}
 	}
+}
+
+type outputTruncatedError struct {
+	retainedFrom uint64
+}
+
+func (e *outputTruncatedError) Error() string {
+	return fmt.Sprintf("retained from offset %d", e.retainedFrom)
 }
 
 func finalResult(output []byte) (resultEvent, bool) {

@@ -22,7 +22,6 @@ type fakeClient struct {
 	process         *sandboxdv1.Process
 	stdout          []byte
 	stderr          []byte
-	gapBytes        uint64
 	retainedFrom    uint64
 	getErr          error
 	starts          int
@@ -90,24 +89,26 @@ func (f *fakeClient) Stop(_ context.Context, request *sandboxdv1.StopProcessRequ
 }
 func (f *fakeClient) ReadOutput(_ context.Context, request *sandboxdv1.ReadOutputRequest, _ ...grpc.CallOption) (*sandboxdv1.ReadOutputResponse, error) {
 	f.readRequests = append(f.readRequests, request)
-	data := f.stdout
+	data, retainedFrom := f.stdout, f.retainedFrom
 	if request.Stream == sandboxdv1.OutputStream_OUTPUT_STREAM_STDERR {
-		data = f.stderr
+		data, retainedFrom = f.stderr, 0
 	}
-	gapBytes, retainedFrom := f.gapBytes, f.retainedFrom
-	if request.Stream == sandboxdv1.OutputStream_OUTPUT_STREAM_STDERR {
-		gapBytes, retainedFrom = 0, 0
+	producedEnd := retainedFrom + uint64(len(data))
+	offset := request.Offset
+	var gapBytes uint64
+	if offset < retainedFrom {
+		gapBytes, offset = retainedFrom-offset, retainedFrom
 	}
-	start := request.Offset
-	if start > uint64(len(data)) {
+	if offset > producedEnd {
 		return nil, status.Error(codes.OutOfRange, "offset")
 	}
+	start := offset - retainedFrom
 	end := min(len(data), int(start)+int(request.MaxBytes))
-	return &sandboxdv1.ReadOutputResponse{Data: append([]byte(nil), data[start:end]...), Offset: start, NextOffset: uint64(end), GapBytes: gapBytes, RetainedStart: retainedFrom, ProducedEnd: uint64(len(data)), Eof: end == len(data)}, nil
+	return &sandboxdv1.ReadOutputResponse{Data: append([]byte(nil), data[start:end]...), Offset: offset, NextOffset: retainedFrom + uint64(end), GapBytes: gapBytes, RetainedStart: retainedFrom, ProducedEnd: producedEnd, Eof: end == len(data)}, nil
 }
 
 func TestOutputIncludesGapMetadata(t *testing.T) {
-	client := &fakeClient{process: &sandboxdv1.Process{State: sandboxdv1.ProcessState_PROCESS_STATE_RUNNING, ExecutionId: "execution"}, stdout: []byte("kept"), gapBytes: 9, retainedFrom: 9}
+	client := &fakeClient{process: &sandboxdv1.Process{State: sandboxdv1.ProcessState_PROCESS_STATE_RUNNING, ExecutionId: "execution"}, stdout: []byte("kept"), retainedFrom: 9}
 	var event controllers.AdapterEvent
 	sandbox := testSandbox(client)
 	sandbox.EmitEvent = func(_ context.Context, got controllers.AdapterEvent) error { event = got; return nil }
@@ -124,6 +125,22 @@ func testSandbox(client sandboxdv1.ProcessServiceClient) controllers.AdapterSand
 	return controllers.AdapterSandbox{EnvironmentUID: "epoch", DialProcess: func(context.Context) (sandboxdv1.ProcessServiceClient, func() error, error) {
 		return client, func() error { return nil }, nil
 	}}
+}
+
+func TestTerminalValidationFailsOnRetainedOutputGap(t *testing.T) {
+	exit0 := int32(0)
+	// sandboxd dropped the first 1024 bytes of stdout before the requested
+	// offset; the retained tail still contains a valid-looking success event,
+	// but the transport-reported gap makes the terminal result untrustworthy.
+	client := &fakeClient{
+		process: &sandboxdv1.Process{State: sandboxdv1.ProcessState_PROCESS_STATE_EXITED, ExecutionId: "execution", ExitCode: &exit0},
+		stdout:  []byte(`{"type":"result","subtype":"success","is_error":false,"result":"done"}` + "\n"),
+		retainedFrom: 1024,
+	}
+	got, detail, err := (&Adapter{}).Observe(context.Background(), controllers.AdapterTask{ID: "run"}, testSandbox(client))
+	if err != nil || got != controllers.AdapterObservationFailed || !strings.Contains(detail, "truncated before terminal validation") || !strings.Contains(detail, "retained from offset 1024") {
+		t.Fatalf("Observe = %q, %q, %v", got, detail, err)
+	}
 }
 
 func TestAcceptanceIsDuplicateSafePromptSafeAndFreshEpoch(t *testing.T) {
