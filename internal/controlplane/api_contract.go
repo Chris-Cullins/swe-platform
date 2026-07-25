@@ -121,10 +121,9 @@ type RunWatchRelist struct {
 	Reason string `json:"reason"`
 }
 
-// CancelRunRequest optionally fences cancellation to one immutable Run.
-// An empty request remains supported for existing browser clients.
+// CancelRunRequest fences cancellation to one immutable Run.
 type CancelRunRequest struct {
-	RunUID string `json:"runUID,omitempty"`
+	RunUID string `json:"runUID"`
 }
 
 // RunTerminalAssociation is the exact server-validated Run-to-Environment

@@ -86,6 +86,27 @@ func TestResourceClientUsesAuthenticatedTypedEndpoints(t *testing.T) {
 	}
 }
 
+func TestResourceClientAlwaysSendsCancelUIDPrecondition(t *testing.T) {
+	var body []byte
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var err error
+		body, err = io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		w.Header().Set("Content-Type", "application/problem+json")
+		w.WriteHeader(http.StatusPreconditionRequired)
+		_, _ = io.WriteString(w, `{"title":"Run UID required","status":428}`)
+	}))
+	defer server.Close()
+	client, _ := New(server.URL, "token", server.Client())
+	_, err := client.CancelRun(context.Background(), "ns", "run", "")
+	var problem *ProblemError
+	if !errors.As(err, &problem) || string(body) != `{"runUID":""}` {
+		t.Fatalf("error/body = %#v/%s", err, body)
+	}
+}
+
 func TestResourceClientSurfacesAPIStatusesWithoutCredentialDisclosure(t *testing.T) {
 	statuses := []int{http.StatusUnauthorized, http.StatusForbidden, http.StatusConflict, http.StatusServiceUnavailable}
 	for _, status := range statuses {

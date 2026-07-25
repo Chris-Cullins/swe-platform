@@ -87,9 +87,12 @@ func TestAPIContractFixturesAreCanonicalHandlerAndMapperOutput(t *testing.T) {
 			cancelled := run.DeepCopy()
 			cancelled.Spec.Cancel = true
 			resources := &fakeResources{cancel: runDTO(cancelled)}
-			request := httptest.NewRequest(http.MethodPost, "https://console.test/api/v1/namespaces/default/runs/fix-flaky-42/cancel", nil)
+			request := httptest.NewRequest(http.MethodPost, "https://console.test/api/v1/namespaces/default/runs/fix-flaky-42/cancel", bytes.NewReader(readCanonicalFixture(t, "cancel-run-request.json", nil)))
 			request.Header.Set("Authorization", "Bearer fixture")
 			NewServer(nil, ServerOptions{Access: &recordingAccess{}, Resources: resources}).Handler().ServeHTTP(w, request)
+			if resources.cancelUID != string(run.UID) {
+				t.Fatalf("cancel UID = %q, want %q", resources.cancelUID, run.UID)
+			}
 		}},
 		{name: "environment handler and mapper", fixture: "environment.json", status: http.StatusOK, contentType: "application/json", write: func(w http.ResponseWriter) {
 			resources := &fakeResources{environment: environmentDTO(environment)}
@@ -122,6 +125,20 @@ func TestCreateRunContractFixturePassesStrictRequestValidation(t *testing.T) {
 	request := httptest.NewRequest(http.MethodPost, "/api/v1/namespaces/default/runs", bytes.NewReader(fixture))
 	response := httptest.NewRecorder()
 	got, err := decodeCreateRun(response, request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(got, expected) {
+		t.Fatalf("decoded request = %#v, want %#v", got, expected)
+	}
+}
+
+func TestCancelRunContractFixturePassesStrictRequestValidation(t *testing.T) {
+	var expected CancelRunRequest
+	fixture := readCanonicalFixture(t, "cancel-run-request.json", &expected)
+	request := httptest.NewRequest(http.MethodPost, "/api/v1/namespaces/default/runs/fix-flaky-42/cancel", bytes.NewReader(fixture))
+	response := httptest.NewRecorder()
+	got, err := decodeCancelRun(response, request)
 	if err != nil {
 		t.Fatal(err)
 	}

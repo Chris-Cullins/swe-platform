@@ -116,7 +116,7 @@ func TestResourceServiceCreateCollisionComparesFullRunSpec(t *testing.T) {
 
 func TestResourceServiceCancelIdempotentRetriesAndErrors(t *testing.T) {
 	scheme := resourceScheme(t)
-	run := &platformv1alpha1.Run{ObjectMeta: metav1.ObjectMeta{Name: "r", Namespace: "ns"}}
+	run := &platformv1alpha1.Run{ObjectMeta: metav1.ObjectMeta{Name: "r", Namespace: "ns", UID: "run-uid"}}
 	base := fake.NewClientBuilder().WithScheme(scheme).WithObjects(run).Build()
 	updates := 0
 	c := interceptor.NewClient(base, interceptor.Funcs{Update: func(ctx context.Context, underlying client.WithWatch, obj client.Object, opts ...client.UpdateOption) error {
@@ -127,11 +127,11 @@ func TestResourceServiceCancelIdempotentRetriesAndErrors(t *testing.T) {
 		return underlying.Update(ctx, obj, opts...)
 	}})
 	service := &KubernetesResourceService{Client: c}
-	got, err := service.CancelRun(context.Background(), "ns", "r", "")
+	got, err := service.CancelRun(context.Background(), "ns", "r", "run-uid")
 	if err != nil || !got.CancelRequested || updates != 3 {
 		t.Fatalf("run = %#v, updates = %d, err = %v", got, updates, err)
 	}
-	if _, err := service.CancelRun(context.Background(), "ns", "r", ""); err != nil || updates != 3 {
+	if _, err := service.CancelRun(context.Background(), "ns", "r", "run-uid"); err != nil || updates != 3 {
 		t.Fatalf("idempotent updates = %d, err = %v", updates, err)
 	}
 
@@ -143,7 +143,7 @@ func TestResourceServiceCancelIdempotentRetriesAndErrors(t *testing.T) {
 			return final
 		},
 	})
-	_, err = (&KubernetesResourceService{Client: alwaysConflict}).CancelRun(context.Background(), "ns", "r", "")
+	_, err = (&KubernetesResourceService{Client: alwaysConflict}).CancelRun(context.Background(), "ns", "r", "run-uid")
 	if err != final || attempts != 5 {
 		t.Fatalf("final error = %v, attempts = %d", err, attempts)
 	}
@@ -158,6 +158,25 @@ func TestResourceServiceCancelRunFencesEveryRetryByUID(t *testing.T) {
 	newRun := func(uid types.UID, cancel bool) *platformv1alpha1.Run {
 		return &platformv1alpha1.Run{ObjectMeta: metav1.ObjectMeta{Name: "r", Namespace: "ns", UID: uid}, Spec: platformv1alpha1.RunSpec{Cancel: cancel}}
 	}
+
+	t.Run("missing and overlong UIDs fail before lookup", func(t *testing.T) {
+		gets := 0
+		base := fake.NewClientBuilder().WithScheme(scheme).WithObjects(newRun("current", false)).Build()
+		wrapped := interceptor.NewClient(base, interceptor.Funcs{Get: func(context.Context, client.WithWatch, client.ObjectKey, client.Object, ...client.GetOption) error {
+			gets++
+			return nil
+		}})
+		service := &KubernetesResourceService{Client: wrapped}
+		if _, err := service.CancelRun(context.Background(), "ns", "r", ""); !errors.Is(err, errRunUIDRequired) {
+			t.Fatalf("missing UID error = %v", err)
+		}
+		if _, err := service.CancelRun(context.Background(), "ns", "r", strings.Repeat("u", maxRunUIDLength+1)); !errors.Is(err, errRunUIDTooLong) {
+			t.Fatalf("overlong UID error = %v", err)
+		}
+		if gets != 0 {
+			t.Fatalf("invalid preconditions performed %d lookups", gets)
+		}
+	})
 
 	t.Run("wrong UID conflicts without mutation", func(t *testing.T) {
 		updates := 0

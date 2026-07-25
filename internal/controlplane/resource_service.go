@@ -17,6 +17,8 @@ import (
 
 var (
 	errRunIntentConflict      = errors.New("run already exists with different immutable intent")
+	errRunUIDRequired         = errors.New("expected Run UID is required")
+	errRunUIDTooLong          = errors.New("expected Run UID exceeds 128 bytes")
 	errRunUIDConflict         = errors.New("run UID does not match the current Run")
 	errRunTerminalAssociation = errors.New("run is not associated with the exact environment")
 )
@@ -24,6 +26,7 @@ var (
 const (
 	runPromptPreviewRunes = 160
 	runAgentSummaryRunes  = 128
+	maxRunUIDLength       = 128
 )
 
 // ResourceService is the Kubernetes-independent resource API used by HTTP
@@ -148,13 +151,19 @@ func desiredRunSpec(request CreateRunRequest) platformv1alpha1.RunSpec {
 }
 
 func (s *KubernetesResourceService) CancelRun(ctx context.Context, namespace, name, expectedUID string) (Run, error) {
+	if expectedUID == "" {
+		return Run{}, errRunUIDRequired
+	}
+	if len(expectedUID) > maxRunUIDLength {
+		return Run{}, errRunUIDTooLong
+	}
 	key := types.NamespacedName{Namespace: namespace, Name: name}
 	for attempt := 0; attempt < 5; attempt++ {
 		var run platformv1alpha1.Run
 		if err := s.Client.Get(ctx, key, &run); err != nil {
 			return Run{}, err
 		}
-		if expectedUID != "" && string(run.UID) != expectedUID {
+		if string(run.UID) != expectedUID {
 			return Run{}, errRunUIDConflict
 		}
 		if run.Spec.Cancel {
