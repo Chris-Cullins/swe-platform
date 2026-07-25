@@ -1449,6 +1449,186 @@ func TestReconcileDropsStaleEnvironmentIncarnationStatusWrites(t *testing.T) {
 	}
 }
 
+func TestReconcileUsesUncachedEnvironmentWithLiveExecution(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		mutate func(*platformv1alpha1.Environment)
+	}{
+		{name: "cached status generation is stale", mutate: func(stale *platformv1alpha1.Environment) {
+			stale.Status.ExecutionGeneration--
+		}},
+		{name: "cached spec generation is stale", mutate: func(stale *platformv1alpha1.Environment) {
+			stale.Generation--
+			stale.Spec.TemplateRef = "old-template"
+			stale.Status.ExecutionGeneration--
+		}},
+		{name: "cached UID is stale", mutate: func(stale *platformv1alpha1.Environment) {
+			stale.UID = "old-env-uid"
+			stale.Status.ExecutionGeneration--
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			scheme := runtime.NewScheme()
+			if err := corev1.AddToScheme(scheme); err != nil {
+				t.Fatal(err)
+			}
+			if err := networkingv1.AddToScheme(scheme); err != nil {
+				t.Fatal(err)
+			}
+			if err := platformv1alpha1.AddToScheme(scheme); err != nil {
+				t.Fatal(err)
+			}
+			current := &platformv1alpha1.Environment{
+				ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default", UID: "env-uid", Generation: 2, Finalizers: []string{environmentFinalizer}},
+				Spec:       platformv1alpha1.EnvironmentSpec{TemplateRef: "small"},
+				Status: platformv1alpha1.EnvironmentStatus{
+					ObservedGeneration: 2, ExecutionGeneration: 2, Phase: platformv1alpha1.EnvironmentPhaseCreating,
+				},
+			}
+			stale := current.DeepCopy()
+			test.mutate(stale)
+			template := &platformv1alpha1.EnvironmentTemplate{
+				ObjectMeta: metav1.ObjectMeta{Name: "small", Namespace: current.Namespace},
+				Spec:       platformv1alpha1.EnvironmentTemplateSpec{Image: "example/environment:latest", Size: "small"},
+			}
+			pod := &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: envPodName(current), Namespace: current.Namespace, UID: "pod-uid",
+					Annotations: map[string]string{
+						executionGenerationAnnotation:     "2",
+						sandboxdRevisionAnnotation:        sandboxdSecurityRevision,
+						sandboxdauth.IdentityAnnotation:   "current.sandboxd.swe.dev",
+						sandboxdauth.TrustAnnotation:      "trust",
+						sandboxdauth.TokenAnnotation:      "terminal-token",
+						sandboxdauth.SecretNameAnnotation: envCredentialName(current),
+						sandboxdauth.SecretUIDAnnotation:  "secret-uid",
+					},
+				},
+				Spec: corev1.PodSpec{RestartPolicy: corev1.RestartPolicyNever},
+				Status: corev1.PodStatus{
+					Phase: corev1.PodRunning, PodIP: "10.0.0.2",
+					Conditions:        []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}},
+					ContainerStatuses: []corev1.ContainerStatus{{Name: "environment", ImageID: "example/environment@sha256:current"}},
+				},
+			}
+			secret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{
+				Name: envCredentialName(current), Namespace: current.Namespace, UID: "secret-uid",
+				Annotations: map[string]string{sandboxdauth.IdentityAnnotation: "current.sandboxd.swe.dev", sandboxdauth.PodUIDAnnotation: string(pod.UID)},
+			}, Data: map[string][]byte{
+				sandboxdauth.TLSCertKey: []byte("cert"), sandboxdauth.TLSKeyKey: []byte("key"), sandboxdauth.CapabilitiesKey: []byte("capabilities"),
+				sandboxdauth.HealthTokenKey: []byte("health"), sandboxdauth.ProcessTokenKey: []byte("process"),
+			}}
+			for _, object := range []client.Object{pod, secret} {
+				if err := controllerutil.SetControllerReference(current, object, scheme); err != nil {
+					t.Fatal(err)
+				}
+			}
+			live := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(current).WithObjects(current, template, pod, secret).Build()
+			podDeletes := 0
+			cached := interceptor.NewClient(live, interceptor.Funcs{
+				Get: func(ctx context.Context, underlying client.WithWatch, key client.ObjectKey, object client.Object, options ...client.GetOption) error {
+					if environment, ok := object.(*platformv1alpha1.Environment); ok && key == client.ObjectKeyFromObject(current) {
+						*environment = *stale.DeepCopy()
+						return nil
+					}
+					return underlying.Get(ctx, key, object, options...)
+				},
+				Delete: func(ctx context.Context, underlying client.WithWatch, object client.Object, options ...client.DeleteOption) error {
+					if _, ok := object.(*corev1.Pod); ok {
+						podDeletes++
+					}
+					return underlying.Delete(ctx, object, options...)
+				},
+			})
+			reconciler := &EnvironmentReconciler{Client: cached, APIReader: live, Scheme: scheme}
+
+			if _, err := reconciler.Reconcile(context.Background(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(current)}); err != nil {
+				t.Fatal(err)
+			}
+			if podDeletes != 0 {
+				t.Fatalf("valid live Pod was deleted %d times", podDeletes)
+			}
+			if err := live.Get(context.Background(), client.ObjectKeyFromObject(pod), &corev1.Pod{}); err != nil {
+				t.Fatalf("valid live Pod was not retained: %v", err)
+			}
+			var published platformv1alpha1.Environment
+			if err := live.Get(context.Background(), client.ObjectKeyFromObject(current), &published); err != nil {
+				t.Fatal(err)
+			}
+			ready := apimeta.FindStatusCondition(published.Status.Conditions, platformv1alpha1.EnvironmentConditionReady)
+			if published.UID != current.UID || published.Generation != current.Generation || published.Spec.TemplateRef != current.Spec.TemplateRef ||
+				published.Status.ExecutionGeneration != 2 || published.Status.PodName != pod.Name || ready == nil || ready.Status != metav1.ConditionTrue {
+				t.Fatalf("status publication did not preserve live Environment identity: %#v", published)
+			}
+		})
+	}
+}
+
+func TestExecutionFencesUseUncachedPodReads(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		deleting  bool
+		reconcile func(context.Context, *EnvironmentReconciler, *platformv1alpha1.Environment) (ctrl.Result, error)
+	}{
+		{name: "pause", reconcile: func(ctx context.Context, reconciler *EnvironmentReconciler, env *platformv1alpha1.Environment) (ctrl.Result, error) {
+			return reconciler.reconcilePaused(ctx, env)
+		}},
+		{name: "deletion", deleting: true, reconcile: func(ctx context.Context, reconciler *EnvironmentReconciler, env *platformv1alpha1.Environment) (ctrl.Result, error) {
+			return reconciler.reconcileDeleting(ctx, env)
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			scheme := runtime.NewScheme()
+			if err := corev1.AddToScheme(scheme); err != nil {
+				t.Fatal(err)
+			}
+			if err := platformv1alpha1.AddToScheme(scheme); err != nil {
+				t.Fatal(err)
+			}
+			env := &platformv1alpha1.Environment{
+				ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default", UID: "env-uid", Finalizers: []string{environmentFinalizer}},
+				Status: platformv1alpha1.EnvironmentStatus{
+					ExecutionGeneration: 3, Phase: platformv1alpha1.EnvironmentPhaseIdle,
+					Lifecycle: platformv1alpha1.EnvironmentLifecycleStatus{Suspended: true},
+				},
+			}
+			if test.deleting {
+				deletedAt := metav1.Now()
+				env.DeletionTimestamp = &deletedAt
+			}
+			pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: envPodName(env), Namespace: env.Namespace, UID: "live-pod"}}
+			if err := controllerutil.SetControllerReference(env, pod, scheme); err != nil {
+				t.Fatal(err)
+			}
+			live := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(env).WithObjects(env, pod).Build()
+			cached := interceptor.NewClient(live, interceptor.Funcs{Get: func(ctx context.Context, underlying client.WithWatch, key client.ObjectKey, object client.Object, options ...client.GetOption) error {
+				if _, ok := object.(*corev1.Pod); ok {
+					return apierrors.NewNotFound(schema.GroupResource{Resource: "pods"}, key.Name)
+				}
+				return underlying.Get(ctx, key, object, options...)
+			}})
+			reconciler := &EnvironmentReconciler{Client: cached, APIReader: live, Scheme: scheme}
+
+			result, err := test.reconcile(context.Background(), reconciler, env.DeepCopy())
+			if err != nil || !result.Requeue {
+				t.Fatalf("execution fence = (%#v, %v), want requeue after live Pod deletion", result, err)
+			}
+			if err := live.Get(context.Background(), client.ObjectKeyFromObject(pod), &corev1.Pod{}); !apierrors.IsNotFound(err) {
+				t.Fatalf("live Pod survived cached NotFound: %v", err)
+			}
+			if test.deleting {
+				var retained platformv1alpha1.Environment
+				if err := live.Get(context.Background(), client.ObjectKeyFromObject(env), &retained); err != nil {
+					t.Fatal(err)
+				}
+				if !controllerutil.ContainsFinalizer(&retained, environmentFinalizer) {
+					t.Fatal("deletion finalizer was removed before uncached Pod fence")
+				}
+			}
+		})
+	}
+}
+
 func TestNewEnvironmentRefusesTerminatingPriorIncarnationPVC(t *testing.T) {
 	scheme := runtime.NewScheme()
 	if err := corev1.AddToScheme(scheme); err != nil {

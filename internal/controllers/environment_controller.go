@@ -165,7 +165,7 @@ func (r *EnvironmentReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	}()
 
 	var env platformv1alpha1.Environment
-	if err := r.Get(ctx, req.NamespacedName, &env); err != nil {
+	if err := r.apiReader().Get(ctx, req.NamespacedName, &env); err != nil {
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 
@@ -269,7 +269,7 @@ func (r *EnvironmentReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		}
 		runtimeClassUID = runtimeClass.UID
 		var pod corev1.Pod
-		if err := r.Get(ctx, types.NamespacedName{Namespace: env.Namespace, Name: envPodName(&env)}, &pod); err == nil {
+		if err := r.apiReader().Get(ctx, types.NamespacedName{Namespace: env.Namespace, Name: envPodName(&env)}, &pod); err == nil {
 			if exactControllerOwner(&pod, platformv1alpha1.GroupVersion.String(), "Environment", env.Name, env.UID) &&
 				pod.Annotations[runtimeClassUIDAnnotation] != string(runtimeClassUID) {
 				message := fmt.Sprintf("environment pod RuntimeClass %q incarnation does not match the current RuntimeClass; execution must be replaced", tmpl.Spec.RuntimeClass)
@@ -609,7 +609,7 @@ func (r *EnvironmentReconciler) reconcileInvalidProvisioningConfiguration(ctx co
 // concurrent spec correction wins without allowing stale teardown to begin.
 func (r *EnvironmentReconciler) setInvalidProvisioningStatus(ctx context.Context, env *platformv1alpha1.Environment, message string) (bool, error) {
 	var current platformv1alpha1.Environment
-	if err := r.Get(ctx, client.ObjectKeyFromObject(env), &current); err != nil {
+	if err := r.apiReader().Get(ctx, client.ObjectKeyFromObject(env), &current); err != nil {
 		return false, err
 	}
 	if current.UID != env.UID {
@@ -641,7 +641,7 @@ func invalidProvisioningFenceStarted(env *platformv1alpha1.Environment) bool {
 
 func (r *EnvironmentReconciler) reconcileInvalidProvisioningFence(ctx context.Context, env *platformv1alpha1.Environment) (ctrl.Result, bool, error) {
 	var pod corev1.Pod
-	if err := r.Get(ctx, types.NamespacedName{Namespace: env.Namespace, Name: envPodName(env)}, &pod); err == nil {
+	if err := r.apiReader().Get(ctx, types.NamespacedName{Namespace: env.Namespace, Name: envPodName(env)}, &pod); err == nil {
 		if exactControllerOwner(&pod, platformv1alpha1.GroupVersion.String(), "Environment", env.Name, env.UID) {
 			if err := r.deleteObservedChild(ctx, &pod); err != nil && !errors.IsNotFound(err) {
 				return ctrl.Result{}, true, fmt.Errorf("delete pod for invalid provisioning configuration: %w", err)
@@ -681,7 +681,7 @@ func (r *EnvironmentReconciler) reconcileUnsupportedBackend(ctx context.Context,
 	}
 
 	var pod corev1.Pod
-	if err := r.Get(ctx, types.NamespacedName{Namespace: env.Namespace, Name: envPodName(env)}, &pod); err == nil {
+	if err := r.apiReader().Get(ctx, types.NamespacedName{Namespace: env.Namespace, Name: envPodName(env)}, &pod); err == nil {
 		if !metav1.IsControlledBy(&pod, env) {
 			return ctrl.Result{}, nil
 		}
@@ -781,7 +781,7 @@ func (r *EnvironmentReconciler) reconcileDeleting(ctx context.Context, env *plat
 		return ctrl.Result{}, fmt.Errorf("withdraw readiness during environment deletion: %w", err)
 	}
 	var pod corev1.Pod
-	if err := r.Get(ctx, types.NamespacedName{Namespace: env.Namespace, Name: envPodName(env)}, &pod); err == nil {
+	if err := r.apiReader().Get(ctx, types.NamespacedName{Namespace: env.Namespace, Name: envPodName(env)}, &pod); err == nil {
 		if !metav1.IsControlledBy(&pod, env) {
 			// A foreign fixed-name object must not be destroyed by this finalizer.
 		} else if err := r.deleteObservedChild(ctx, &pod); err != nil && !errors.IsNotFound(err) {
@@ -842,7 +842,7 @@ func (r *EnvironmentReconciler) reconcilePaused(ctx context.Context, env *platfo
 	}
 	podName := envPodName(env)
 	var pod corev1.Pod
-	err := r.Get(ctx, types.NamespacedName{Namespace: env.Namespace, Name: podName}, &pod)
+	err := r.apiReader().Get(ctx, types.NamespacedName{Namespace: env.Namespace, Name: podName}, &pod)
 	if err == nil {
 		if !exactControllerOwner(&pod, platformv1alpha1.GroupVersion.String(), "Environment", env.Name, env.UID) {
 			return ctrl.Result{}, &childOwnershipCollisionError{kind: "Pod", name: podName}
@@ -1645,7 +1645,7 @@ func (r *EnvironmentReconciler) updateEnvironmentStatus(ctx context.Context, env
 	expectedGeneration := env.Generation
 	var updated platformv1alpha1.Environment
 	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
-		if err := r.Get(ctx, key, &updated); err != nil {
+		if err := r.apiReader().Get(ctx, key, &updated); err != nil {
 			return err
 		}
 		if updated.UID != expectedUID {
@@ -1723,7 +1723,7 @@ func (r *EnvironmentReconciler) updatePodRecoveryStatus(ctx context.Context, env
 	expected := env.Status
 	var updated platformv1alpha1.Environment
 	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
-		if err := r.Get(ctx, key, &updated); err != nil {
+		if err := r.apiReader().Get(ctx, key, &updated); err != nil {
 			return err
 		}
 		if updated.UID != expectedUID {
