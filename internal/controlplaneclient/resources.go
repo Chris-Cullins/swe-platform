@@ -186,10 +186,7 @@ func (c *Client) CreateRun(ctx context.Context, namespace string, value controlp
 // CancelRun requests idempotent cancellation of an exact namespaced Run.
 func (c *Client) CancelRun(ctx context.Context, namespace, name, expectedUID string) (controlplane.Run, error) {
 	var run controlplane.Run
-	var body any
-	if expectedUID != "" {
-		body = controlplane.CancelRunRequest{RunUID: expectedUID}
-	}
+	body := controlplane.CancelRunRequest{RunUID: expectedUID}
 	err := c.sendJSON(ctx, http.MethodPost, c.Endpoint("api", "v1", "namespaces", namespace, "runs", name, "cancel"), body, &run)
 	return run, err
 }
