@@ -392,10 +392,10 @@ exact namespace, resource name, and subresource on every request:
 This permits producer credentials to be restricted to one Run using an RBAC Role with
 `resourceNames`. The namespace is part of the URL only as a resource selector; it becomes
 authoritative only after RBAC authorizes that exact namespaced identity. Unknown Runs are
-rejected before transcript state is allocated; POST appends additionally require the exact
-`SWE-Run-UID` header so a recreated Run never receives stale events. An already-open stream
-is not continuously reauthorized or closed when its Run is deleted. Transcript event `data`
-remains opaque, adapter-owned JSON.
+rejected before transcript state is allocated; every transcript read and append additionally
+requires the exact `SWE-Run-UID` header so a recreated Run never receives stale events or
+readers. An already-open stream is not continuously reauthorized or closed when its Run is
+deleted. Transcript event `data` remains opaque, adapter-owned JSON.
 
 Service clients send `Authorization: Bearer <token>`. A browser exchanges an explicit,
 non-bootstrap bearer credential with `POST /api/v1/session`. After a successful TokenReview,
@@ -530,8 +530,8 @@ same-name Run replacement returns `409 Conflict`.
 Run and Environment responses omit raw CRDs, managed fields, conditions, transcript storage
 references, sandboxd/terminal endpoints, pod names, image IDs, and secrets. Environment
 `ready` is derived only from the current generation's Ready condition. New REST errors use
-`application/problem+json`; existing transcript SSE and terminal WebSocket wire contracts are
-unchanged.
+`application/problem+json`; transcript event framing and terminal WebSocket wire contracts are
+unchanged. Transcript GET identity now requires the exact Run UID header described below.
 
 ## Transcript API
 
@@ -542,7 +542,7 @@ and clients can consume replay plus live events as an SSE stream:
 kubectl port-forward service/swe-platform-swe-platform-control-plane 8080:80
 TOKEN="$(kubectl create token my-reader -n project-a --audience=swe-platform)"
 RUN_UID="$(kubectl get run run-123 -n project-a -o jsonpath='{.metadata.uid}')"
-curl -N -H "Authorization: Bearer ${TOKEN}" \
+curl -N -H "Authorization: Bearer ${TOKEN}" -H "SWE-Run-UID: ${RUN_UID}" \
   http://127.0.0.1:8080/api/v1/namespaces/project-a/runs/run-123/transcript
 curl -H "Authorization: Bearer ${TOKEN}" -H 'Content-Type: application/json' \
   -H "SWE-Run-UID: ${RUN_UID}" \
@@ -553,12 +553,13 @@ curl -H "Authorization: Bearer ${TOKEN}" -H 'Content-Type: application/json' \
 The platform envelope owns transport metadata only:
 
 - A transcript belongs to the immutable `(namespace, Run UID)` identity, so names reused
-  across namespaces or after Run recreation never collide. POST append requests must carry
-  the exact current Run UID in the `SWE-Run-UID` header; a missing header returns
+  across namespaces or after Run recreation never collide. Every GET stream and POST append
+  must carry the exact current Run UID in the `SWE-Run-UID` header; a missing header returns
   `428 Precondition Required`, a mismatch with the currently resolved Run UID returns
-  `409 Conflict`, and both are rejected before store access so a delete/recreate replacement
-  never receives stale events. GET streaming stays name-addressed and binds once to the
-  current resolved UID; it does not require the header.
+  `409 Conflict`, and an overlong UID returns `400 Bad Request`. Authentication and exact
+  transcript authorization happen before identity validation; identity rejection happens
+  before store access. Readers must retain the same expected UID on every reconnect so a
+  delete/recreate replacement never receives stale events or readers.
 - `source` is a bounded, producer-selected idempotency partition, not authenticated
   provenance. `sourceSequence` is optional producer metadata and does not determine order.
 - `(Run identity, source, idempotencyKey)` identifies one append while that event remains

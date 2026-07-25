@@ -466,8 +466,37 @@ subjects:
   - kind: ServiceAccount
     name: e2e-transcript-producer
     namespace: default
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: e2e-transcript-reader
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: e2e-transcript-reader
+rules:
+  - apiGroups: ["swe.dev"]
+    resources: ["runs/transcript"]
+    resourceNames: ["${RUN_NAME}"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: e2e-transcript-reader
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: e2e-transcript-reader
+subjects:
+  - kind: ServiceAccount
+    name: e2e-transcript-reader
+    namespace: default
 EOF
 PRODUCER_TOKEN=$(kubectl create token e2e-transcript-producer --audience=swe-platform)
+READER_TOKEN=$(kubectl create token e2e-transcript-reader --audience=swe-platform)
 
 echo "==> configuring a console API user"
 cat <<'EOF' | kubectl apply -f -
@@ -738,11 +767,12 @@ if [[ "$ANONYMOUS_STATUS" != "401" ]]; then
 	exit 1
 fi
 curl --fail --silent --no-buffer --max-time 10 \
-	-H "Authorization: Bearer ${E2E_BOOTSTRAP_TOKEN}" \
+	-H "Authorization: Bearer ${READER_TOKEN}" \
+	-H "SWE-Run-UID: ${RUN_UID}" \
 	"http://127.0.0.1:18080/api/v1/namespaces/default/runs/${RUN_NAME}/transcript" > /tmp/swe-platform-transcript.out &
 STREAM_PID=$!
-SWE_CONTROL_PLANE_URL=http://127.0.0.1:18080 SWE_CONTROL_PLANE_TOKEN="$E2E_BOOTSTRAP_TOKEN" \
-	timeout 10 bin/swe logs --run "$RUN_NAME" > /tmp/swe-platform-cli-transcript.out &
+SWE_CONTROL_PLANE_URL=http://127.0.0.1:18080 SWE_CONTROL_PLANE_TOKEN="$READER_TOKEN" \
+	timeout 10 bin/swe logs --run "$RUN_NAME" --run-uid "$RUN_UID" > /tmp/swe-platform-cli-transcript.out &
 CLI_STREAM_PID=$!
 sleep 1
 APPEND_STATUS=$(curl --silent --output /dev/null --write-out '%{http_code}' \
@@ -784,8 +814,32 @@ if [[ "$MISSING_UID_STATUS" != "428" ]]; then
 	echo "FAIL: missing UID producer append status was ${MISSING_UID_STATUS}, expected 428"
 	exit 1
 fi
+MISSING_READ_UID_STATUS=$(curl --silent --output /dev/null --write-out '%{http_code}' \
+	-H "Authorization: Bearer ${E2E_BOOTSTRAP_TOKEN}" \
+	"http://127.0.0.1:18080/api/v1/namespaces/default/runs/${RUN_NAME}/transcript")
+OVERLONG_READ_UID_STATUS=$(curl --silent --output /dev/null --write-out '%{http_code}' \
+	-H "Authorization: Bearer ${E2E_BOOTSTRAP_TOKEN}" \
+	-H "SWE-Run-UID: $(printf 'x%.0s' $(seq 1 129))" \
+	"http://127.0.0.1:18080/api/v1/namespaces/default/runs/${RUN_NAME}/transcript")
+STALE_READ_UID_STATUS=$(curl --silent --output /dev/null --write-out '%{http_code}' \
+	-H "Authorization: Bearer ${E2E_BOOTSTRAP_TOKEN}" \
+	-H 'SWE-Run-UID: stale-uid-not-current' \
+	"http://127.0.0.1:18080/api/v1/namespaces/default/runs/${RUN_NAME}/transcript")
+DENIED_READ_STATUS=$(curl --silent --output /dev/null --write-out '%{http_code}' \
+	-H "Authorization: Bearer ${PRODUCER_TOKEN}" \
+	-H "SWE-Run-UID: $(printf 'x%.0s' $(seq 1 129))" \
+	"http://127.0.0.1:18080/api/v1/namespaces/default/runs/${RUN_NAME}/transcript")
+READER_BASE_RUN_STATUS=$(curl --silent --output /dev/null --write-out '%{http_code}' \
+	-H "Authorization: Bearer ${READER_TOKEN}" \
+	"http://127.0.0.1:18080/api/v1/namespaces/default/runs/${RUN_NAME}")
+if [[ "$MISSING_READ_UID_STATUS" != "428" || "$OVERLONG_READ_UID_STATUS" != "400" || \
+	"$STALE_READ_UID_STATUS" != "409" || "$DENIED_READ_STATUS" != "403" || "$READER_BASE_RUN_STATUS" != "403" ]]; then
+	echo "FAIL: transcript read identity statuses missing=${MISSING_READ_UID_STATUS} overlong=${OVERLONG_READ_UID_STATUS} stale=${STALE_READ_UID_STATUS} denied=${DENIED_READ_STATUS} base-run=${READER_BASE_RUN_STATUS}"
+	exit 1
+fi
 UNKNOWN_STATUS=$(curl --silent --output /dev/null --write-out '%{http_code}' \
 	-H "Authorization: Bearer ${E2E_BOOTSTRAP_TOKEN}" \
+	-H 'SWE-Run-UID: unknown-run-uid' \
 	http://127.0.0.1:18080/api/v1/namespaces/default/runs/unknown-run/transcript)
 if [[ "$UNKNOWN_STATUS" != "404" ]]; then
 	echo "FAIL: unknown Run transcript status was ${UNKNOWN_STATUS}, expected 404"
@@ -825,7 +879,7 @@ echo "==> verifying local authenticated MCP stdio tools"
 		"{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\",\"params\":{\"name\":\"read_transcript\",\"arguments\":{\"runName\":\"${RUN_NAME}\",\"runUID\":\"${RUN_UID}\",\"maxEvents\":100,\"waitMilliseconds\":1000}}}"
 	sleep 2
 } | \
-	SWE_CONTROL_PLANE_URL=http://127.0.0.1:18080 SWE_CONTROL_PLANE_TOKEN="$E2E_BOOTSTRAP_TOKEN" \
+	SWE_CONTROL_PLANE_URL=http://127.0.0.1:18080 SWE_CONTROL_PLANE_TOKEN="$READER_TOKEN" \
 	timeout 10 bin/swe mcp > /tmp/swe-platform-mcp.out || {
 	echo "FAIL: local MCP stdio process did not complete cleanly"
 	cat /tmp/swe-platform-mcp.out
@@ -837,7 +891,7 @@ if ! grep -F '"id":2' /tmp/swe-platform-mcp.out | grep -Fq '"name":"create_run"'
 	! grep -F '"id":3' /tmp/swe-platform-mcp.out | grep -Fq '"event":"transcript"' || \
 	! grep -F '"id":3' /tmp/swe-platform-mcp.out | grep -Fq '"nextCursor"' || \
 	! grep -F '"id":3' /tmp/swe-platform-mcp.out | grep -Fq 'e2e transcript event' || \
-	grep -Fq "$E2E_BOOTSTRAP_TOKEN" /tmp/swe-platform-mcp.out; then
+	grep -Fq "$READER_TOKEN" /tmp/swe-platform-mcp.out; then
 	echo "FAIL: local MCP stdio server did not list tools and return a UID-fenced transcript batch"
 	cat /tmp/swe-platform-mcp.out
 	exit 1
@@ -981,6 +1035,7 @@ check_sandboxd_process "$POD_NAME" "$RESUME_RUN_UID" "$E2E_ROTATED_AGENT_API_KEY
 set +e
 curl --silent --no-buffer --max-time 2 \
 	-H "Authorization: Bearer ${E2E_BOOTSTRAP_TOKEN}" \
+	-H "SWE-Run-UID: ${RESUME_RUN_UID}" \
 	"http://127.0.0.1:18080/api/v1/namespaces/default/runs/${RESUME_RUN_NAME}/transcript" \
 	> /tmp/swe-platform-resume-transcript.out
 RESUME_TRANSCRIPT_STATUS=$?
@@ -1024,6 +1079,7 @@ check_sandboxd_process "$AMP_POD_NAME" "$AMP_RUN_UID" "$E2E_AMP_API_KEY"
 set +e
 curl --silent --no-buffer --max-time 2 \
 	-H "Authorization: Bearer ${E2E_BOOTSTRAP_TOKEN}" \
+	-H "SWE-Run-UID: ${AMP_RUN_UID}" \
 	"http://127.0.0.1:18080/api/v1/namespaces/default/runs/${AMP_RUN_NAME}/transcript" \
 	> /tmp/swe-platform-amp-transcript.out
 AMP_TRANSCRIPT_STATUS=$?
@@ -1073,8 +1129,9 @@ CODEX_RUN_NAME=e2e-fake-codex-run
 bin/swe run "fake Codex lifecycle smoke test" --name "$CODEX_RUN_NAME" --environment "$ENV_NAME" --agent codex --wait=false
 kubectl wait --for=jsonpath='{.status.state}'=Running run/"$CODEX_RUN_NAME" --timeout=3m
 kubectl wait --for=jsonpath='{.status.state}'=Succeeded run/"$CODEX_RUN_NAME" --timeout=3m
+CODEX_RUN_UID=$(kubectl get run "$CODEX_RUN_NAME" -o jsonpath='{.metadata.uid}')
 set +e
-curl --silent --no-buffer --max-time 2 -H "Authorization: Bearer ${E2E_BOOTSTRAP_TOKEN}" \
+curl --silent --no-buffer --max-time 2 -H "Authorization: Bearer ${E2E_BOOTSTRAP_TOKEN}" -H "SWE-Run-UID: ${CODEX_RUN_UID}" \
 	"http://127.0.0.1:18080/api/v1/namespaces/default/runs/${CODEX_RUN_NAME}/transcript" > /tmp/swe-platform-codex-transcript.out
 CODEX_TRANSCRIPT_STATUS=$?
 set -e
@@ -1095,8 +1152,9 @@ PI_RUN_NAME=e2e-fake-pi-run
 bin/swe run "fake Pi lifecycle smoke test" --name "$PI_RUN_NAME" --environment "$ENV_NAME" --agent pi --wait=false
 kubectl wait --for=jsonpath='{.status.state}'=Running run/"$PI_RUN_NAME" --timeout=3m
 kubectl wait --for=jsonpath='{.status.state}'=Succeeded run/"$PI_RUN_NAME" --timeout=3m
+PI_RUN_UID=$(kubectl get run "$PI_RUN_NAME" -o jsonpath='{.metadata.uid}')
 set +e
-curl --silent --no-buffer --max-time 2 -H "Authorization: Bearer ${E2E_BOOTSTRAP_TOKEN}" \
+curl --silent --no-buffer --max-time 2 -H "Authorization: Bearer ${E2E_BOOTSTRAP_TOKEN}" -H "SWE-Run-UID: ${PI_RUN_UID}" \
 	"http://127.0.0.1:18080/api/v1/namespaces/default/runs/${PI_RUN_NAME}/transcript" > /tmp/swe-platform-pi-transcript.out
 PI_TRANSCRIPT_STATUS=$?
 set -e

@@ -105,7 +105,7 @@ func (c *Client) StreamRunSummaries(ctx context.Context, namespace, resourceVers
 	endpoint := c.Endpoint("api", "v1", "namespaces", namespace, "runs")
 	query := url.Values{"watch": {"true"}, "view": {"summary"}, "resourceVersion": {resourceVersion}}
 	connected := false
-	err := c.streamSSEWithReconnectCheck(ctx, endpoint+"?"+query.Encode(), "", nil, retryInitialRunWatch, func() {
+	err := c.streamSSEWithReconnectCheck(ctx, endpoint+"?"+query.Encode(), "", "", nil, retryInitialRunWatch, func() {
 		connected = true
 		if established != nil {
 			established()

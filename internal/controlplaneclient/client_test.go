@@ -261,6 +261,45 @@ func TestStreamSSEReconnectUsesCommittedLastEventID(t *testing.T) {
 	}
 }
 
+func TestStreamRunTranscriptRetainsExactUIDOnReconnect(t *testing.T) {
+	requests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		if r.URL.EscapedPath() != "/api/v1/namespaces/team%2Fa/runs/run%20one/transcript" {
+			t.Errorf("path = %q", r.URL.EscapedPath())
+		}
+		if r.Header.Get("Authorization") != "Bearer reader" || r.Header.Get("SWE-Run-UID") != "exact-uid" {
+			t.Errorf("request %d auth/UID = %q/%q", requests, r.Header.Get("Authorization"), r.Header.Get("SWE-Run-UID"))
+		}
+		switch requests {
+		case 1:
+			if r.URL.Query().Get("after") != "starting cursor" || r.Header.Get("Last-Event-ID") != "" {
+				t.Errorf("initial cursor query/header = %q/%q", r.URL.Query().Get("after"), r.Header.Get("Last-Event-ID"))
+			}
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = io.WriteString(w, "retry: 1\n\nid: committed\nevent: transcript\ndata: {}\n\nid: partial\ndata: {}")
+		case 2:
+			if _, present := r.URL.Query()["after"]; present || r.Header.Get("Last-Event-ID") != "committed" {
+				t.Errorf("reconnect cursor query/header = %q/%q", r.URL.RawQuery, r.Header.Get("Last-Event-ID"))
+			}
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			t.Errorf("unexpected request %d", requests)
+		}
+	}))
+	defer server.Close()
+	client, err := New(server.URL, "reader", server.Client())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := client.StreamRunTranscript(context.Background(), "team/a", "run one", "exact-uid", "starting cursor", func(SSEEvent) error { return nil }); err != nil {
+		t.Fatal(err)
+	}
+	if requests != 2 {
+		t.Fatalf("requests = %d, want 2", requests)
+	}
+}
+
 func TestStreamSSEReconnectCheckFencesNameBasedIdentity(t *testing.T) {
 	requests := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {

@@ -18,6 +18,7 @@ import (
 func newLogsCommand() *cobra.Command {
 	var (
 		run             string
+		runUID          string
 		controlPlaneURL string
 		token           string
 		cursor          string
@@ -36,12 +37,15 @@ Transcript and transcript-gap data remains adapter-owned JSON.`,
 				if len(args) != 0 {
 					return fmt.Errorf("an environment argument cannot be combined with --run")
 				}
-				return streamRunTranscript(cmd, controlPlaneURL, token, namespace, run, cursor)
+				if runUID == "" {
+					return fmt.Errorf("--run-uid is required with --run")
+				}
+				return streamRunTranscript(cmd, controlPlaneURL, token, namespace, run, runUID, cursor)
 			}
 			if len(args) == 0 {
 				return fmt.Errorf("an environment argument or --run is required")
 			}
-			for _, flag := range []string{"control-plane", "token", "after"} {
+			for _, flag := range []string{"run-uid", "control-plane", "token", "after"} {
 				if cmd.Flags().Changed(flag) {
 					return fmt.Errorf("--%s requires --run", flag)
 				}
@@ -50,6 +54,7 @@ Transcript and transcript-gap data remains adapter-owned JSON.`,
 		},
 	}
 	cmd.Flags().StringVar(&run, "run", "", "Run whose transcript to stream instead of Environment pod logs")
+	cmd.Flags().StringVar(&runUID, "run-uid", "", "Exact immutable Run UID (required with --run)")
 	cmd.Flags().StringVar(&controlPlaneURL, "control-plane", os.Getenv("SWE_CONTROL_PLANE_URL"), "Control-plane base URL (or SWE_CONTROL_PLANE_URL; requires --run)")
 	cmd.Flags().StringVar(&token, "token", os.Getenv("SWE_CONTROL_PLANE_TOKEN"), "Control-plane bearer token (or SWE_CONTROL_PLANE_TOKEN; requires --run)")
 	cmd.Flags().StringVar(&cursor, "after", "", "Opaque transcript cursor to resume after (requires --run)")
@@ -92,13 +97,12 @@ func streamLogs(cmd *cobra.Command, namespace, envName string) error {
 	return err
 }
 
-func streamRunTranscript(cmd *cobra.Command, controlPlaneURL, token, namespace, run, cursor string) error {
+func streamRunTranscript(cmd *cobra.Command, controlPlaneURL, token, namespace, run, runUID, cursor string) error {
 	client, err := controlplaneclient.New(controlPlaneURL, token, nil)
 	if err != nil {
 		return err
 	}
-	endpoint := client.Endpoint("api", "v1", "namespaces", namespace, "runs", run, "transcript")
-	return client.StreamSSE(cmd.Context(), endpoint, cursor, func(event controlplaneclient.SSEEvent) error {
+	return client.StreamRunTranscript(cmd.Context(), namespace, run, runUID, cursor, func(event controlplaneclient.SSEEvent) error {
 		return writeTranscriptOutput(cmd.OutOrStdout(), event)
 	})
 }

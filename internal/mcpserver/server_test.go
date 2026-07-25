@@ -18,11 +18,13 @@ type fakeControlPlaneClient struct {
 	createdRequest   controlplane.CreateRunRequest
 	createResult     controlplane.Run
 	createErr        error
-	run              controlplane.Run
-	streamEndpoint   string
+	streamNamespace  string
+	streamRun        string
+	streamRunUID     string
 	streamCursor     string
 	streamEvents     []controlplaneclient.SSEEvent
 	streamCalls      int
+	streamErr        error
 }
 
 func (f *fakeControlPlaneClient) CreateRun(_ context.Context, namespace string, request controlplane.CreateRunRequest) (controlplane.Run, error) {
@@ -30,22 +32,11 @@ func (f *fakeControlPlaneClient) CreateRun(_ context.Context, namespace string, 
 	return f.createResult, f.createErr
 }
 
-func (f *fakeControlPlaneClient) GetRun(context.Context, string, string) (controlplane.Run, error) {
-	return f.run, nil
-}
-
-func (f *fakeControlPlaneClient) Endpoint(segments ...string) string {
-	return "https://control.example/" + strings.Join(segments, "/")
-}
-
-func (f *fakeControlPlaneClient) StreamSSEWithReconnectCheck(ctx context.Context, endpoint, cursor string, check func(context.Context) error, handle func(controlplaneclient.SSEEvent) error) error {
+func (f *fakeControlPlaneClient) StreamRunTranscript(ctx context.Context, namespace, run, runUID, cursor string, handle func(controlplaneclient.SSEEvent) error) error {
 	f.streamCalls++
-	f.streamEndpoint, f.streamCursor = endpoint, cursor
-	if err := check(ctx); err != nil {
-		return err
-	}
-	if err := check(ctx); err != nil {
-		return err
+	f.streamNamespace, f.streamRun, f.streamRunUID, f.streamCursor = namespace, run, runUID, cursor
+	if f.streamErr != nil {
+		return f.streamErr
 	}
 	for _, event := range f.streamEvents {
 		if err := handle(event); err != nil {
@@ -125,7 +116,6 @@ func TestMCPInputSchemasEnforceBoundsBeforeControlPlaneCalls(t *testing.T) {
 
 func TestReadTranscriptReturnsBoundedOpaqueBatchAndCursor(t *testing.T) {
 	fake := &fakeControlPlaneClient{
-		run: controlplane.Run{Name: "task-1", UID: "run-uid"},
 		streamEvents: []controlplaneclient.SSEEvent{
 			{Event: "transcript-gap", Data: []byte(`{"resumeAfter":"gap-cursor"}`)},
 			{Event: "transcript", ID: "cursor-2", HasID: true, Data: []byte(`{"source":"adapter","type":"owned","data":{"value":1}}`)},
@@ -138,8 +128,8 @@ func TestReadTranscriptReturnsBoundedOpaqueBatchAndCursor(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if fake.streamEndpoint != "https://control.example/api/v1/namespaces/team-a/runs/task-1/transcript" || fake.streamCursor != "cursor-1" {
-		t.Fatalf("stream = %q after %q", fake.streamEndpoint, fake.streamCursor)
+	if fake.streamNamespace != "team-a" || fake.streamRun != "task-1" || fake.streamRunUID != "run-uid" || fake.streamCursor != "cursor-1" {
+		t.Fatalf("stream = %q/%q uid %q after %q", fake.streamNamespace, fake.streamRun, fake.streamRunUID, fake.streamCursor)
 	}
 	if len(output.Events) != 2 || !output.LimitReached || output.TimedOut || output.NextCursor != "cursor-2" {
 		t.Fatalf("output = %#v", output)
@@ -151,20 +141,18 @@ func TestReadTranscriptReturnsBoundedOpaqueBatchAndCursor(t *testing.T) {
 
 func TestReadTranscriptRejectsReplacedRunBeforeEvents(t *testing.T) {
 	fake := &fakeControlPlaneClient{
-		run:          controlplane.Run{Name: "task-1", UID: "replacement-uid"},
-		streamEvents: []controlplaneclient.SSEEvent{{Event: "transcript", ID: "cursor", HasID: true, Data: []byte(`{}`)}},
+		streamErr: errors.New("control plane returned 409 Conflict: Run UID mismatch"),
 	}
 	output, err := readTranscript(context.Background(), fake, "team-a", ReadTranscriptInput{
 		RunName: "task-1", RunUID: "original-uid", MaxEvents: 1, WaitMilliseconds: 10,
 	})
-	if err == nil || !strings.Contains(err.Error(), "was replaced") || len(output.Events) != 0 {
+	if err == nil || !strings.Contains(err.Error(), "Run UID mismatch") || len(output.Events) != 0 {
 		t.Fatalf("output/error = %#v/%v", output, err)
 	}
 }
 
 func TestReadTranscriptGapAdvancesSafeCursor(t *testing.T) {
 	fake := &fakeControlPlaneClient{
-		run: controlplane.Run{Name: "task-1", UID: "run-uid"},
 		streamEvents: []controlplaneclient.SSEEvent{
 			{Event: "transcript-gap", ID: "stale-cursor", Data: []byte(`{"resumeAfter":"safe-cursor","earliestSequence":4}`)},
 		},
@@ -182,7 +170,6 @@ func TestReadTranscriptGapAdvancesSafeCursor(t *testing.T) {
 
 func TestReadTranscriptRejectsMalformedGapCursor(t *testing.T) {
 	fake := &fakeControlPlaneClient{
-		run:          controlplane.Run{Name: "task-1", UID: "run-uid"},
 		streamEvents: []controlplaneclient.SSEEvent{{Event: "transcript-gap", Data: []byte(`{"earliestSequence":4}`)}},
 	}
 	_, err := readTranscript(context.Background(), fake, "team-a", ReadTranscriptInput{
@@ -196,7 +183,6 @@ func TestReadTranscriptRejectsMalformedGapCursor(t *testing.T) {
 func TestReadTranscriptDoesNotAdvancePastOmittedGap(t *testing.T) {
 	firstData := []byte(`{"payload":"` + strings.Repeat("x", maxTranscriptResultData-32) + `"}`)
 	fake := &fakeControlPlaneClient{
-		run: controlplane.Run{Name: "task-1", UID: "run-uid"},
 		streamEvents: []controlplaneclient.SSEEvent{
 			{Event: "transcript", ID: "accepted-cursor", HasID: true, Data: firstData},
 			{Event: "transcript-gap", Data: []byte(`{"resumeAfter":"gap-cursor","earliestSequence":4}`)},
@@ -229,7 +215,7 @@ func TestValidateCreateRunRejectsUnboundedOrAmbiguousIntent(t *testing.T) {
 }
 
 func TestReadTranscriptPropagatesCallerCancellation(t *testing.T) {
-	fake := &fakeControlPlaneClient{run: controlplane.Run{Name: "task", UID: "uid"}}
+	fake := &fakeControlPlaneClient{}
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	_, err := readTranscript(ctx, fake, "team-a", ReadTranscriptInput{RunName: "task", RunUID: "uid"})

@@ -719,22 +719,11 @@ func (m *tuiModel) startTranscript(identity runIdentity) tea.Cmd {
 	cursor := m.streamCursor
 	messages := make(chan tea.Msg)
 	m.transcriptMessages = messages
-	endpoint := m.client.Endpoint("api", "v1", "namespaces", identity.namespace, "runs", identity.name, "transcript")
 	stream := func() tea.Msg {
 		defer cancel()
 		defer close(done)
 		defer close(messages)
-		checkIdentity := func(checkCtx context.Context) error {
-			run, err := m.client.GetRun(checkCtx, identity.namespace, identity.name)
-			if err != nil {
-				return fmt.Errorf("verify Run identity before transcript connection: %w", err)
-			}
-			if run.UID != identity.uid {
-				return fmt.Errorf("Run %s was replaced; refreshing transcript identity", safeText(identity.name))
-			}
-			return nil
-		}
-		err := m.client.StreamSSEWithReconnectCheck(ctx, endpoint, cursor, checkIdentity, func(event controlplaneclient.SSEEvent) error {
+		err := m.client.StreamRunTranscript(ctx, identity.namespace, identity.name, identity.uid, cursor, func(event controlplaneclient.SSEEvent) error {
 			select {
 			case messages <- transcriptMsg{identity: identity, generation: generation, event: event}:
 				return nil

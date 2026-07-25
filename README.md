@@ -488,11 +488,11 @@ The initial tool surface is deliberately finite:
   Run name, and immutable Run UID. The control plane authorizes `create` on Runs and, when an
   exact-intent same-name retry is recovered while that Run still exists, `get` on that exact Run.
 - `read_transcript` requires both the Run name and expected Run UID. It checks that identity
-  before and after every SSE connection is bound, accepts an opaque `after` cursor, and returns
+  on every server-bound SSE request and reconnect, accepts an opaque `after` cursor, and returns
   at most 100 events, 128 KiB of adapter-owned event JSON, and 256 KiB of encoded structured
   output after a wait of at most 10 seconds.
   `dataJSON` is the unmodified JSON text, not a platform transcript schema. This tool requires
-  `get` on the exact Run and `get` on its `transcript` subresource.
+  `get` on the exact Run's `transcript` subresource; it does not add a separate base-Run read.
 
 Interactive `attach` is intentionally not an MCP tool in this slice. The existing endpoint is a
 bidirectional shared terminal with wake and activity side effects, not a bounded request/result
@@ -527,18 +527,19 @@ Run transcripts use the same explicit control-plane URL and bearer credential:
 
 ```sh
 SWE_CONTROL_PLANE_URL=https://swe.example.com \
-SWE_CONTROL_PLANE_TOKEN="$TOKEN" swe logs --run fix-flaky-42
+SWE_CONTROL_PLANE_TOKEN="$TOKEN" swe logs --run fix-flaky-42 --run-uid "$RUN_UID"
 ```
 
-`swe logs --run RUN` selects that exact Run in `--namespace` and emits one NDJSON
+`swe logs --run RUN --run-uid UID` selects that exact immutable Run in `--namespace` and emits one NDJSON
 record per SSE event:
 `{"event":"transcript","id":"<opaque cursor>","data":<server envelope>}`. The
 `data` value remains opaque, adapter-owned JSON; the CLI does not interpret it as a
 shared transcript schema. Retention loss is explicit in records whose `event` is
 `transcript-gap`. Use `--after <opaque cursor>` to resume explicitly. After a
 successfully opened stream drops, the CLI reconnects with the event ID from the last
-complete block successfully emitted. Invalid and expired cursors are reported rather
-than silently skipped.
+complete block successfully emitted and the same expected Run UID. The UID is required
+explicitly so transcript-only RBAC does not gain a hidden base-Run read dependency.
+Invalid and expired cursors are reported rather than silently skipped.
 
 For compatibility, `swe logs <environment>` is not deprecated and still follows the
 current Environment pod's `environment` container using kubeconfig authentication. It
