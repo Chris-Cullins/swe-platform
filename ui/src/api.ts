@@ -86,6 +86,15 @@ export const api = {
   cancelRun: (namespace: string, name: string, runUID: string) => request<Run>(`${base(namespace)}/runs/${encodeURIComponent(name)}/cancel`, { method: 'POST', body: JSON.stringify({ runUID }) }),
   environment: (namespace: string, name: string) => request<Environment>(`${base(namespace)}/environments/${encodeURIComponent(name)}`),
   transcriptUrl: (namespace: string, name: string) => `${base(namespace)}/runs/${encodeURIComponent(name)}/transcript`,
+  transcript: async (namespace: string, name: string, runUID: string, signal: AbortSignal, lastEventID?: string) => {
+    const headers: Record<string, string> = { Accept: 'text/event-stream', 'SWE-Run-UID': runUID }
+    if (lastEventID) headers['Last-Event-ID'] = lastEventID
+    const response = await fetch(`${base(namespace)}/runs/${encodeURIComponent(name)}/transcript`, {
+      headers, credentials: 'same-origin', signal,
+    })
+    if (response.status === 401) notifyUnauthorized()
+    return response
+  },
   terminalPath: (namespace: string, environment: string) => `${base(namespace)}/environments/${encodeURIComponent(environment)}/terminal`,
 }
 

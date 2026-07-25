@@ -12,6 +12,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/Chris-Cullins/swe-platform/internal/controlplane"
 )
 
 const (
@@ -34,17 +36,24 @@ type SSEEvent struct {
 // the first successful connection. The initial cursor is sent as ?after=; a
 // reconnect carries the last completely committed event ID in Last-Event-ID.
 func (c *Client) StreamSSE(ctx context.Context, endpoint, cursor string, handle func(SSEEvent) error) error {
-	return c.streamSSEWithReconnectCheck(ctx, endpoint, cursor, nil, nil, nil, handle)
+	return c.streamSSEWithReconnectCheck(ctx, endpoint, cursor, "", nil, nil, nil, handle)
 }
 
 // StreamSSEWithReconnectCheck is StreamSSE with a check immediately before
 // every connection attempt. Callers can use it to fence a name-based endpoint
 // to an immutable resource identity across reconnects.
 func (c *Client) StreamSSEWithReconnectCheck(ctx context.Context, endpoint, cursor string, check func(context.Context) error, handle func(SSEEvent) error) error {
-	return c.streamSSEWithReconnectCheck(ctx, endpoint, cursor, check, nil, nil, handle)
+	return c.streamSSEWithReconnectCheck(ctx, endpoint, cursor, "", check, nil, nil, handle)
 }
 
-func (c *Client) streamSSEWithReconnectCheck(ctx context.Context, endpoint, cursor string, check func(context.Context) error, retryInitial func(error) bool, established func(), handle func(SSEEvent) error) error {
+// StreamRunTranscript consumes one immutable Run's transcript. The exact Run
+// UID is attached to every physical request, including reconnects.
+func (c *Client) StreamRunTranscript(ctx context.Context, namespace, run, runUID, cursor string, handle func(SSEEvent) error) error {
+	endpoint := c.Endpoint("api", "v1", "namespaces", namespace, "runs", run, "transcript")
+	return c.streamSSEWithReconnectCheck(ctx, endpoint, cursor, runUID, nil, nil, nil, handle)
+}
+
+func (c *Client) streamSSEWithReconnectCheck(ctx context.Context, endpoint, cursor, runUID string, check func(context.Context) error, retryInitial func(error) bool, established func(), handle func(SSEEvent) error) error {
 	connected := false
 	reconnectWait := c.reconnectWait
 	for {
@@ -62,6 +71,9 @@ func (c *Client) streamSSEWithReconnectCheck(ctx context.Context, endpoint, curs
 			return err
 		}
 		request.Header.Set("Accept", "text/event-stream")
+		if runUID != "" {
+			request.Header.Set(controlplane.RunUIDHeader, runUID)
+		}
 		if connected && cursor != "" {
 			request.Header.Set("Last-Event-ID", cursor)
 		}

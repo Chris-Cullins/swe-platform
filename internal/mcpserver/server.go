@@ -29,9 +29,7 @@ var errBatchComplete = errors.New("transcript batch complete")
 
 type controlPlaneClient interface {
 	CreateRun(context.Context, string, controlplane.CreateRunRequest) (controlplane.Run, error)
-	GetRun(context.Context, string, string) (controlplane.Run, error)
-	Endpoint(...string) string
-	StreamSSEWithReconnectCheck(context.Context, string, string, func(context.Context) error, func(controlplaneclient.SSEEvent) error) error
+	StreamRunTranscript(context.Context, string, string, string, string, func(controlplaneclient.SSEEvent) error) error
 }
 
 // CreateRunInput is the bounded immutable Run intent exposed to MCP clients.
@@ -193,22 +191,10 @@ func readTranscript(ctx context.Context, client controlPlaneClient, namespace st
 		Namespace: namespace, RunName: input.RunName, RunUID: input.RunUID,
 		Events: make([]TranscriptEnvelope, 0, maxEvents), NextCursor: input.After,
 	}
-	checkIdentity := func(checkCtx context.Context) error {
-		run, err := client.GetRun(checkCtx, namespace, input.RunName)
-		if err != nil {
-			return fmt.Errorf("get Run identity: %w", err)
-		}
-		if run.UID != input.RunUID {
-			return fmt.Errorf("Run %s/%s was replaced: expected UID %q, got %q", namespace, input.RunName, input.RunUID, run.UID)
-		}
-		return nil
-	}
-
 	batchCtx, cancel := context.WithTimeout(ctx, wait)
 	defer cancel()
 	dataBytes := 0
-	endpoint := client.Endpoint("api", "v1", "namespaces", namespace, "runs", input.RunName, "transcript")
-	err := client.StreamSSEWithReconnectCheck(batchCtx, endpoint, input.After, checkIdentity, func(event controlplaneclient.SSEEvent) error {
+	err := client.StreamRunTranscript(batchCtx, namespace, input.RunName, input.RunUID, input.After, func(event controlplaneclient.SSEEvent) error {
 		if !json.Valid(event.Data) {
 			return fmt.Errorf("control plane returned non-JSON %q event data", event.Event)
 		}
@@ -240,7 +226,7 @@ func readTranscript(ctx context.Context, client controlPlaneClient, namespace st
 		}
 		if dataBytes+len(event.Data) > maxTranscriptResultData {
 			if len(output.Events) == 0 {
-				return fmt.Errorf("first transcript event exceeds the %d-byte MCP batch bound; use swe logs --run for streaming output", maxTranscriptResultData)
+				return fmt.Errorf("first transcript event exceeds the %d-byte MCP batch bound; use swe logs --run with its exact --run-uid for streaming output", maxTranscriptResultData)
 			}
 			output.LimitReached = true
 			return errBatchComplete

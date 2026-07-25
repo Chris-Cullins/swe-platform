@@ -313,10 +313,8 @@ func TestTUIAdvertisesTerminalOnlyForExactEnvironmentIncarnation(t *testing.T) {
 func TestTUITranscriptStreamStopsWithContext(t *testing.T) {
 	connected := make(chan struct{})
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if !strings.HasSuffix(r.URL.Path, "/transcript") {
-			w.Header().Set("Content-Type", "application/json")
-			_, _ = io.WriteString(w, `{"name":"run-one","uid":"uid-one","createdAt":"2026-07-24T00:00:00Z","intent":{"selector":{"template":"small"},"agent":"future","prompt":"task"},"cancelRequested":false,"state":"Running","usage":{"cpuSeconds":0,"tokensIn":0,"tokensOut":0}}`)
-			return
+		if !strings.HasSuffix(r.URL.Path, "/transcript") || r.Header.Get("SWE-Run-UID") != "uid-one" {
+			t.Errorf("transcript request path/UID = %q/%q", r.URL.Path, r.Header.Get("SWE-Run-UID"))
 		}
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.WriteHeader(http.StatusOK)

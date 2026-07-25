@@ -26,20 +26,7 @@ function show(path: string, state?: unknown) {
   return { client, ...render(<QueryClientProvider client={client}><MemoryRouter initialEntries={[entry]}><LocationProbe /><App /></MemoryRouter></QueryClientProvider>) }
 }
 
-class TestEventSource {
-  static instances: TestEventSource[] = []
-  static CONNECTING = 0
-  static OPEN = 1
-  static CLOSED = 2
-  readyState = TestEventSource.CONNECTING
-  onopen: (() => void) | null = null
-  onerror: (() => void) | null = null
-  close = vi.fn()
-  constructor(public url: string) { TestEventSource.instances.push(this) }
-  addEventListener() {}
-}
-
-afterEach(() => { TestEventSource.instances = []; vi.useRealTimers(); vi.restoreAllMocks(); vi.unstubAllGlobals() })
+afterEach(() => { vi.useRealTimers(); vi.restoreAllMocks(); vi.unstubAllGlobals() })
 describe('App frozen API integration', () => {
   it('lands on the default namespace Run feed from the root route', async () => {
     const fetch = vi.spyOn(globalThis, 'fetch').mockImplementation(async path => path === '/api/v1/session' ? response({ authenticated: true, username: 'alex' }) : response({ items: [] }))
@@ -179,21 +166,24 @@ describe('App frozen API integration', () => {
   })
 
   it('keeps the transcript stream mounted when cancellation only advances Run generation', async () => {
-    vi.stubGlobal('EventSource', TestEventSource)
     const detail = { ...run, environment: undefined, generation: 1 }
-    vi.spyOn(globalThis, 'fetch').mockImplementation(async path => {
+    const transcriptRequests: RequestInit[] = []
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (path, init = {}) => {
       if (path === '/api/v1/session') return response({ authenticated: true, username: 'alex' })
       if (path === '/api/v1/namespaces/default/runs?limit=200&view=summary') return response({ items: [detail] })
       if (path === '/api/v1/namespaces/default/runs/repair-ui') return response(detail)
+      if (path === '/api/v1/namespaces/default/runs/repair-ui/transcript') {
+        transcriptRequests.push(init)
+        return new Response(new ReadableStream())
+      }
       throw new Error(`Unexpected request: ${path}`)
     })
     const { client } = show('/namespaces/default/runs/repair-ui/transcript')
-    await waitFor(() => expect(TestEventSource.instances).toHaveLength(1))
-    const stream = TestEventSource.instances[0]
+    await waitFor(() => expect(transcriptRequests).toHaveLength(1))
     act(() => client.setQueryData(queryKeys.run('default', 'repair-ui'), { ...detail, generation: 2, cancelRequested: true }))
     await waitFor(() => expect(client.getQueryData<Run>(queryKeys.run('default', 'repair-ui'))?.generation).toBe(2))
-    expect(TestEventSource.instances).toHaveLength(1)
-    expect(stream.close).not.toHaveBeenCalled()
+    expect(transcriptRequests).toHaveLength(1)
+    expect((transcriptRequests[0].signal as AbortSignal).aborted).toBe(false)
   })
 
   it('shows accessible loading and problem error states', async () => {

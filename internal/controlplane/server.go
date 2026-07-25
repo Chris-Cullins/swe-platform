@@ -249,27 +249,22 @@ func (s *Server) handleTranscript(w http.ResponseWriter, r *http.Request, namesp
 		writeAccessError(w, err)
 		return
 	}
+	// Every transcript operation carries the exact expected Run UID so a
+	// delete/recreate replacement never receives stale events or readers.
+	// Authorization is deliberately checked first, then identity validation
+	// happens before the resolver or store is touched.
+	expectedUID := types.UID(strings.TrimSpace(r.Header.Get(RunUIDHeader)))
+	if expectedUID == "" {
+		writeProblem(w, http.StatusPreconditionRequired, "run_uid_required", "Run UID required", "the "+RunUIDHeader+" header is required for transcript requests")
+		return
+	}
+	if len(expectedUID) > 128 {
+		http.Error(w, "run UID exceeds its size limit", http.StatusBadRequest)
+		return
+	}
 	if s.runs == nil {
 		http.Error(w, "run resolver is unavailable", http.StatusServiceUnavailable)
 		return
-	}
-
-	// POST carries the exact expected Run UID so a delete/recreate replacement
-	// never receives stale events. Authorization is checked first (anonymous and
-	// cross-run denials remain 401/403), then the header is validated before the
-	// resolver or store is touched. GET stays name-addressed and binds once to
-	// the current resolved UID; it does not require the header.
-	var expectedUID types.UID
-	if r.Method == http.MethodPost {
-		expectedUID = types.UID(strings.TrimSpace(r.Header.Get(RunUIDHeader)))
-		if expectedUID == "" {
-			writeProblem(w, http.StatusPreconditionRequired, "run_uid_required", "Run UID required", "the "+RunUIDHeader+" header is required to append transcript events")
-			return
-		}
-		if len(expectedUID) > 128 {
-			http.Error(w, "run UID exceeds its size limit", http.StatusBadRequest)
-			return
-		}
 	}
 
 	resolvedUID, err := s.runs.ResolveRun(r.Context(), namespace, run)
@@ -288,18 +283,13 @@ func (s *Server) handleTranscript(w http.ResponseWriter, r *http.Request, namesp
 		return
 	}
 
-	// For POST, build the store identity from the verified header UID (which
-	// equals the current resolved UID) so the race argument is explicit: a
-	// stale producer referencing an old incarnation is rejected before append.
-	uid := resolvedUID
-	if r.Method == http.MethodPost {
-		if expectedUID != resolvedUID {
-			writeTranscriptProblem(w, http.StatusConflict, "run_uid_mismatch", "Run UID mismatch")
-			return
-		}
-		uid = expectedUID
+	if expectedUID != resolvedUID {
+		writeTranscriptProblem(w, http.StatusConflict, "run_uid_mismatch", "Run UID mismatch")
+		return
 	}
-	identity := RunIdentity{Namespace: namespace, UID: uid}
+	// Bind storage to the verified caller expectation, not merely the value
+	// returned by name resolution.
+	identity := RunIdentity{Namespace: namespace, UID: expectedUID}
 
 	switch r.Method {
 	case http.MethodGet:

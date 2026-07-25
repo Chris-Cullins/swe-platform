@@ -77,24 +77,44 @@ interface TranscriptState {
   claude: ClaudeTranscriptReduction
 }
 
+const MAX_SSE_BUFFER = 8 << 20
+
+function sseBoundary(buffer: string): { index: number; length: number } | undefined {
+  const match = /\r\n\r\n|\n\n|\r\r/.exec(buffer)
+  return match ? { index: match.index, length: match[0].length } : undefined
+}
+
 function emptyTranscriptState(): TranscriptState {
   const timeline: TranscriptRenderItem[] = []
   return { timeline, claude: updateClaudeTranscript(undefined, timeline) }
 }
 
-export function Transcript({ namespace, run, identity }: { namespace: string; run: string; identity?: string }) {
+export function Transcript({ namespace, run, identity }: { namespace: string; run: string; identity: string }) {
   const [status, setStatus] = useState('Connecting')
   const [transcript, setTranscript] = useState<TranscriptState>(emptyTranscriptState)
   useEffect(() => {
     setTranscript(emptyTranscriptState())
     setStatus('Connecting')
-    const url = api.transcriptUrl(namespace, run)
-    let stream: EventSource | undefined
+    const controller = new AbortController()
     let disposed = false
+    let lastEventID = ''
+    let established = false
     let freshRecoveryUsed = false
+    let reconnectWait = 250
     let queuedTimeline: TranscriptRenderItem[] = []
     let frame: number | undefined
     let timer: number | undefined
+    const reconnectDelay = () => new Promise<void>(resolve => {
+      const onAbort = () => {
+        window.clearTimeout(reconnect)
+        resolve()
+      }
+      const reconnect = window.setTimeout(() => {
+        controller.signal.removeEventListener('abort', onAbort)
+        resolve()
+      }, reconnectWait)
+      controller.signal.addEventListener('abort', onAbort, { once: true })
+    })
     const flushTimeline = () => {
       frame = undefined
       timer = undefined
@@ -132,49 +152,94 @@ export function Transcript({ namespace, run, identity }: { namespace: string; ru
       queuedTimeline = appendTimelineItem(queuedTimeline, next)
       scheduleTimelineFlush()
     }
-    const connect = () => {
-      const next = new EventSource(url)
-      stream = next
-      let opened = false
-      next.onopen = () => {
-        if (disposed || stream !== next) return
-        opened = true
-        freshRecoveryUsed = false
-        setStatus('Connected')
-      }
-      next.onerror = async () => {
-        if (disposed || stream !== next) return
-        if (next.readyState === EventSource.CONNECTING) {
-          setStatus('Reconnecting')
-          return
-        }
-        if (next.readyState !== EventSource.CLOSED) return
-        setStatus('Checking session')
+    const connect = async () => {
+      while (!disposed) {
         try {
-          await api.session()
+          const response = await api.transcript(namespace, run, identity, controller.signal, lastEventID || undefined)
+          if (response.status === 401) return
+          if (!response.ok || !response.body) {
+            if (established && lastEventID && !freshRecoveryUsed && (response.status === 400 || response.status === 410)) {
+              lastEventID = ''
+              freshRecoveryUsed = true
+              setStatus('Recovering transcript')
+              await reconnectDelay()
+              continue
+            }
+            if (response.status === 408 || response.status === 429 || response.status >= 500) {
+              setStatus('Reconnecting')
+              await reconnectDelay()
+              continue
+            }
+            setStatus(response.statusText || `Request failed (${response.status})`)
+            return
+          }
+          const mediaType = response.headers.get('Content-Type')?.split(';', 1)[0].trim().toLowerCase()
+          if (mediaType !== 'text/event-stream') {
+            setStatus(`Expected transcript event stream, got ${mediaType || 'unknown content type'}`)
+            return
+          }
+          established = true
+          freshRecoveryUsed = false
+          setStatus('Connected')
+          const reader = response.body.getReader()
+          const decoder = new TextDecoder()
+          let buffer = ''
+          while (!disposed) {
+            const { value, done } = await reader.read()
+            if (value) buffer += decoder.decode(value, { stream: true })
+            let boundary: { index: number; length: number } | undefined
+            while ((boundary = sseBoundary(buffer)) !== undefined) {
+              if (boundary.index > MAX_SSE_BUFFER) throw new Error(`Transcript event exceeds ${MAX_SSE_BUFFER} bytes`)
+              const block = buffer.slice(0, boundary.index)
+              buffer = buffer.slice(boundary.index + boundary.length)
+              let type = 'message'
+              let id = ''
+              let hasID = false
+              const data: string[] = []
+              for (const line of block.split(/\r\n|\n|\r/)) {
+                if (!line || line.startsWith(':')) continue
+                const colon = line.indexOf(':')
+                const field = colon < 0 ? line : line.slice(0, colon)
+                const fieldValue = colon < 0 ? '' : line.slice(colon + 1).replace(/^ /, '')
+                if (field === 'event') type = fieldValue
+                else if (field === 'id' && !fieldValue.includes('\0')) { id = fieldValue; hasID = true }
+                else if (field === 'data') data.push(fieldValue)
+                else if (field === 'retry' && /^\d+$/.test(fieldValue)) reconnectWait = Math.min(Number(fieldValue), 30_000)
+              }
+              if (hasID) lastEventID = id
+              if (!data.length) continue
+              const event = new MessageEvent(type, { data: data.join('\n'), lastEventId: lastEventID })
+              if (type === 'transcript') onTranscript(event)
+              else if (type === 'transcript-gap') onGap(event)
+            }
+            if (buffer.length > MAX_SSE_BUFFER) throw new Error(`Transcript event exceeds ${MAX_SSE_BUFFER} bytes`)
+            if (done) {
+              decoder.decode()
+              break
+            }
+          }
+          if (!disposed) {
+            setStatus('Reconnecting')
+            await reconnectDelay()
+          }
         } catch (error) {
-          if (!disposed && stream === next) setStatus(error instanceof Error ? error.message : 'Disconnected')
+          if (disposed || controller.signal.aborted) return
+          if (established && !(error instanceof Error && error.message.startsWith('Transcript event exceeds'))) {
+            setStatus('Reconnecting')
+            await reconnectDelay()
+            continue
+          }
+          setStatus(error instanceof Error ? error.message : 'Disconnected')
           return
         }
-        if (disposed || stream !== next || next.readyState !== EventSource.CLOSED) return
-        if (!opened || freshRecoveryUsed) {
-          setStatus('Disconnected')
-          return
-        }
-        freshRecoveryUsed = true
-        next.close()
-        setStatus('Recovering transcript')
-        connect()
       }
-      next.addEventListener('transcript', onTranscript)
-      next.addEventListener('transcript-gap', onGap)
     }
-    connect()
+    void connect()
     return () => {
       disposed = true
       if (frame !== undefined) window.cancelAnimationFrame(frame)
       if (timer !== undefined) window.clearTimeout(timer)
-      stream?.close()
+      controller.abort()
     }
   }, [namespace, run, identity])
   const { timeline, claude } = transcript

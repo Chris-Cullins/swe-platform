@@ -18,8 +18,8 @@ func TestStreamRunTranscriptWritesOpaqueNDJSON(t *testing.T) {
 	requests := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		requests++
-		if r.URL.EscapedPath() != "/api/v1/namespaces/team%2Fa/runs/run%20one/transcript" || r.Header.Get("Authorization") != "Bearer reader" {
-			t.Errorf("request path/token = %q/%q", r.URL.EscapedPath(), r.Header.Get("Authorization"))
+		if r.URL.EscapedPath() != "/api/v1/namespaces/team%2Fa/runs/run%20one/transcript" || r.Header.Get("Authorization") != "Bearer reader" || r.Header.Get("SWE-Run-UID") != "uid-one" {
+			t.Errorf("request path/token/UID = %q/%q/%q", r.URL.EscapedPath(), r.Header.Get("Authorization"), r.Header.Get("SWE-Run-UID"))
 		}
 		if requests > 1 {
 			w.WriteHeader(http.StatusNoContent)
@@ -34,7 +34,7 @@ func TestStreamRunTranscriptWritesOpaqueNDJSON(t *testing.T) {
 	command.SetContext(context.Background())
 	var output bytes.Buffer
 	command.SetOut(&output)
-	if err := streamRunTranscript(command, server.URL, "reader", "team/a", "run one", ""); err != nil {
+	if err := streamRunTranscript(command, server.URL, "reader", "team/a", "run one", "uid-one", ""); err != nil {
 		t.Fatal(err)
 	}
 	wantOutput := "{\"event\":\"transcript\",\"id\":\"cursor-1\",\"data\":{\"source\":\"adapter\",\"type\":\"adapter.owned\",\"data\":{\"anything\":true}}}\n" +
@@ -75,6 +75,8 @@ func TestLogsCommandRequiresExactlyOneMode(t *testing.T) {
 	for _, args := range [][]string{
 		{},
 		{"environment", "--run", "run"},
+		{"--run", "run"},
+		{"environment", "--run-uid", "uid"},
 		{"environment", "--control-plane", "https://control.example"},
 		{"environment", "--token", "token"},
 		{"environment", "--after="},

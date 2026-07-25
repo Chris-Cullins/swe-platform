@@ -32,6 +32,7 @@ func TestTranscriptReplayAndLiveStream(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	request.Header.Set(RunUIDHeader, "run-1-uid")
 	response, err := http.DefaultClient.Do(request)
 	if err != nil {
 		t.Fatal(err)
@@ -78,6 +79,7 @@ func TestTranscriptStreamSendsHeartbeat(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	request.Header.Set(RunUIDHeader, "run-1-uid")
 	response, err := http.DefaultClient.Do(request)
 	if err != nil {
 		t.Fatal(err)
@@ -105,7 +107,12 @@ func TestTranscriptStreamLifecycleUnsubscribes(t *testing.T) {
 	server := httptest.NewServer(api.Handler())
 	defer server.Close()
 
-	response, err := http.Get(server.URL + transcriptURL)
+	request, err := http.NewRequest(http.MethodGet, server.URL+transcriptURL, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set(RunUIDHeader, "run-1-uid")
+	response, err := http.DefaultClient.Do(request)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -154,6 +161,7 @@ func TestTranscriptSharedStoreFansOutAcrossServers(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	request.Header.Set(RunUIDHeader, "run-1-uid")
 	response, err := http.DefaultClient.Do(request)
 	if err != nil {
 		t.Fatal(err)
@@ -273,6 +281,7 @@ func TestTranscriptReconnectUsesLastEventID(t *testing.T) {
 		t.Fatal(err)
 	}
 	request.Header.Set("Last-Event-ID", first.Event.ID)
+	request.Header.Set(RunUIDHeader, "run-1-uid")
 	response, err := http.DefaultClient.Do(request)
 	if err != nil {
 		t.Fatal(err)
@@ -304,6 +313,26 @@ func TestTranscriptRejectsAnonymousBeforeRunResolutionOrStoreAccess(t *testing.T
 	store := api.store.(*memoryTranscriptStore)
 	if resolver.calls != 0 || len(store.runs) != 0 || len(store.subscribers) != 0 {
 		t.Fatalf("unauthorized request reached backend: resolves=%d runs=%d subscribers=%d", resolver.calls, len(store.runs), len(store.subscribers))
+	}
+}
+
+func TestTranscriptRejectsForbiddenBeforeUIDValidation(t *testing.T) {
+	resolver := &fakeRunResolver{}
+	store := NewMemoryTranscriptStore(MemoryTranscriptStoreOptions{})
+	api := NewServer(nil, ServerOptions{Access: &fakeAccess{err: errForbidden}, Runs: resolver, TranscriptStore: store})
+	for _, method := range []string{http.MethodGet, http.MethodPost} {
+		request := httptest.NewRequest(method, transcriptURL, nil)
+		request.Header.Set("Authorization", "Bearer denied")
+		request.Header.Set(RunUIDHeader, strings.Repeat("x", 129))
+		response := httptest.NewRecorder()
+		api.Handler().ServeHTTP(response, request)
+		if response.Code != http.StatusForbidden {
+			t.Fatalf("%s status = %d, want %d", method, response.Code, http.StatusForbidden)
+		}
+	}
+	memStore := store.(*memoryTranscriptStore)
+	if resolver.calls != 0 || len(memStore.runs) != 0 || len(memStore.subscribers) != 0 {
+		t.Fatalf("forbidden request reached backend: resolves=%d runs=%d subscribers=%d", resolver.calls, len(memStore.runs), len(memStore.subscribers))
 	}
 }
 
@@ -382,36 +411,35 @@ func TestRecreatedRunUsesNewTranscriptIdentity(t *testing.T) {
 	}
 }
 
-func TestTranscriptAppendRequiresRunUID(t *testing.T) {
-	resolver := &fakeRunResolver{}
-	store := NewMemoryTranscriptStore(MemoryTranscriptStoreOptions{})
-	api := NewServer(nil, ServerOptions{Access: &fakeAccess{}, Runs: resolver, TranscriptStore: store})
-
-	request := httptest.NewRequest(http.MethodPost, transcriptURL, strings.NewReader(`{"source":"adapter","idempotencyKey":"event-1","type":"output","data":{}}`))
-	request.Header.Set("Authorization", "Bearer producer")
-	response := httptest.NewRecorder()
-	api.Handler().ServeHTTP(response, request)
-	if response.Code != http.StatusPreconditionRequired {
-		t.Fatalf("missing UID status = %d, want %d", response.Code, http.StatusPreconditionRequired)
-	}
-	if response.Header().Get("Content-Type") != "application/problem+json" {
-		t.Fatalf("Content-Type = %q, want application/problem+json", response.Header().Get("Content-Type"))
-	}
-	memStore := store.(*memoryTranscriptStore)
-	if resolver.calls != 0 || len(memStore.runs) != 0 {
-		t.Fatalf("missing-UID request reached resolver/store: resolves=%d runs=%d", resolver.calls, len(memStore.runs))
-	}
-}
-
-func TestTranscriptAppendRejectsOverlongRunUID(t *testing.T) {
-	api := newTestServer(&fakeAccess{})
-	request := httptest.NewRequest(http.MethodPost, transcriptURL, strings.NewReader(`{"source":"adapter","idempotencyKey":"event-1","type":"output","data":{}}`))
-	request.Header.Set("Authorization", "Bearer producer")
-	request.Header.Set(RunUIDHeader, strings.Repeat("x", 129))
-	response := httptest.NewRecorder()
-	api.Handler().ServeHTTP(response, request)
-	if response.Code != http.StatusBadRequest {
-		t.Fatalf("overlong UID status = %d, want %d", response.Code, http.StatusBadRequest)
+func TestTranscriptRequestsRequireBoundedRunUIDBeforeBackendAccess(t *testing.T) {
+	for _, method := range []string{http.MethodGet, http.MethodPost} {
+		for _, test := range []struct {
+			name   string
+			uid    string
+			status int
+		}{
+			{name: "missing", status: http.StatusPreconditionRequired},
+			{name: "whitespace", uid: "  ", status: http.StatusPreconditionRequired},
+			{name: "overlong", uid: strings.Repeat("x", 129), status: http.StatusBadRequest},
+		} {
+			t.Run(method+"/"+test.name, func(t *testing.T) {
+				resolver := &fakeRunResolver{}
+				store := NewMemoryTranscriptStore(MemoryTranscriptStoreOptions{})
+				api := NewServer(nil, ServerOptions{Access: &fakeAccess{}, Runs: resolver, TranscriptStore: store})
+				request := httptest.NewRequest(method, transcriptURL, strings.NewReader(`{"source":"adapter","idempotencyKey":"event-1","type":"output","data":{}}`))
+				request.Header.Set("Authorization", "Bearer transcript-user")
+				request.Header.Set(RunUIDHeader, test.uid)
+				response := httptest.NewRecorder()
+				api.Handler().ServeHTTP(response, request)
+				if response.Code != test.status {
+					t.Fatalf("status = %d, want %d", response.Code, test.status)
+				}
+				memStore := store.(*memoryTranscriptStore)
+				if resolver.calls != 0 || len(memStore.runs) != 0 || len(memStore.subscribers) != 0 {
+					t.Fatalf("rejected request reached backend: resolves=%d runs=%d subscribers=%d", resolver.calls, len(memStore.runs), len(memStore.subscribers))
+				}
+			})
+		}
 	}
 }
 
@@ -448,6 +476,24 @@ func TestTranscriptAppendRejectsStaleRunUIDAfterReplacement(t *testing.T) {
 	}
 	if _, exists := memStore.runs[newIdentity]; exists {
 		t.Fatalf("stale append allocated store state for the replacement Run: %+v", memStore.runs)
+	}
+}
+
+func TestTranscriptReadRejectsStaleRunUIDAfterReplacementBeforeStoreAccess(t *testing.T) {
+	resolver := &fakeRunResolver{uid: "replacement-uid"}
+	store := NewMemoryTranscriptStore(MemoryTranscriptStoreOptions{})
+	api := NewServer(nil, ServerOptions{Access: &fakeAccess{}, Runs: resolver, TranscriptStore: store})
+	request := httptest.NewRequest(http.MethodGet, transcriptURL, nil)
+	request.Header.Set("Authorization", "Bearer reader")
+	request.Header.Set(RunUIDHeader, "original-uid")
+	response := httptest.NewRecorder()
+	api.Handler().ServeHTTP(response, request)
+	if response.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want %d", response.Code, http.StatusConflict)
+	}
+	memStore := store.(*memoryTranscriptStore)
+	if resolver.calls != 1 || len(memStore.runs) != 0 || len(memStore.subscribers) != 0 {
+		t.Fatalf("stale read reached store: resolves=%d runs=%d subscribers=%d", resolver.calls, len(memStore.runs), len(memStore.subscribers))
 	}
 }
 
