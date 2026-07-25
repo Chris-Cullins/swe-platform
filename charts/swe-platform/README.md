@@ -180,8 +180,8 @@ that separate smoke test for its pinned gVisor installation. Templates that omit
 continue to select the cluster default runtime as documented in the preset table above.
 
 The operator creates a default ingress NetworkPolicy for each environment. It permits the
-environment's sandboxd port only from this release's control-plane-labeled pods in the release
-namespace. The cluster CNI must enforce
+environment's sandboxd port only from this release's control-plane- and operator-labeled pods
+in the configured control-plane namespace. The cluster CNI must enforce
 Kubernetes NetworkPolicy for this defense in depth; TLS identity and capability authorization
 remain mandatory regardless. See [the security model](../../SECURITY.md) for credential
 lifecycle and backend requirements.
