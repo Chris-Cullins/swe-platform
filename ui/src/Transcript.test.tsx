@@ -213,6 +213,20 @@ describe('Transcript', () => {
     }))
   })
 
+  it('retries an initial transport failure with the same exact UID', async () => {
+    let requests = 0
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (path, init = {}) => {
+      requests += 1
+      if (requests === 1) throw new TypeError('network unavailable')
+      return new Events(String(path), init).response()
+    })
+    render(<Transcript namespace="n" run="r" identity="uid-exact" />)
+    await waitFor(() => expect(Events.instances).toHaveLength(1))
+    expect(requests).toBe(2)
+    expect(Events.current.init.headers).toEqual(expect.objectContaining({ 'SWE-Run-UID': 'uid-exact' }))
+    expect(Events.current.init.headers).not.toHaveProperty('Last-Event-ID')
+  })
+
   it('recovers an expired reconnect cursor once without dropping the UID', async () => {
     let requests = 0
     vi.spyOn(globalThis, 'fetch').mockImplementation(async (path, init = {}) => {

@@ -224,7 +224,7 @@ export function Transcript({ namespace, run, identity }: { namespace: string; ru
           }
         } catch (error) {
           if (disposed || controller.signal.aborted) return
-          if (established && !(error instanceof Error && error.message.startsWith('Transcript event exceeds'))) {
+          if (!(error instanceof Error && error.message.startsWith('Transcript event exceeds'))) {
             setStatus('Reconnecting')
             await reconnectDelay()
             continue
