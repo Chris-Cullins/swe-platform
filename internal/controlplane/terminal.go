@@ -12,7 +12,6 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
-	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -352,17 +351,11 @@ func (d KubernetesTerminalDialer) readTerminalPolicy(ctx context.Context, key ty
 	}
 	if boundExecution != nil {
 		if execution, bound := boundExecution(); bound {
-			if environment.UID != execution.EnvironmentUID || environment.Status.Lifecycle.Suspended || environment.Status.Lifecycle.Epoch != execution.LifecycleEpoch || environment.Status.PodName != execution.PodName {
-				return 0, false, errTerminalEnvironmentIncarnationChanged
-			}
-			var pod corev1.Pod
-			if err := d.Client.Get(ctx, types.NamespacedName{Namespace: key.Namespace, Name: execution.PodName}, &pod); err != nil {
-				if apierrors.IsNotFound(err) {
-					return 0, false, errTerminalEnvironmentIncarnationChanged
-				}
+			current, err := (sandboxclient.Connector{Reader: d.Client}).TerminalExecutionCurrent(ctx, key.Namespace, key.Name, execution)
+			if err != nil {
 				return 0, false, err
 			}
-			if pod.UID != execution.PodUID {
+			if !current {
 				return 0, false, errTerminalEnvironmentIncarnationChanged
 			}
 		}
