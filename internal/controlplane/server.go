@@ -48,6 +48,8 @@ type Server struct {
 	heartbeat             time.Duration
 	streams               context.Context
 	watchAdmission        *watchAdmission
+	terminalOpenTimeout   time.Duration
+	terminalWriteTimeout  time.Duration
 }
 
 // RunResolver verifies that a namespaced Run exists before transcript state is used.
@@ -115,6 +117,8 @@ func NewServer(log *slog.Logger, options ServerOptions) *Server {
 		heartbeat:             heartbeat,
 		streams:               streams,
 		watchAdmission:        processWatchAdmission,
+		terminalOpenTimeout:   terminalHandshakeTimeout,
+		terminalWriteTimeout:  terminalStreamingWriteTimeout,
 	}
 }
 
