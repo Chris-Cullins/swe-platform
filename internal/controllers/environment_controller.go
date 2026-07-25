@@ -14,8 +14,10 @@ import (
 	"encoding/pem"
 	stderrors "errors"
 	"fmt"
+	"math"
 	"math/big"
 	"net"
+	"strconv"
 	"strings"
 	"time"
 
@@ -52,18 +54,19 @@ var sizePresets = map[string]corev1.ResourceList{
 }
 
 const (
-	defaultDiskSize           = "40Gi"
-	defaultIdleTimeout        = 15 * time.Minute
-	projectHookTimeout        = "30m"
-	hookKillAfter             = "5s"
-	podRecoveryLimit          = int32(3)
-	podRecoveryDelay          = 5 * time.Second
-	templateRefField          = "spec.templateRef"
-	projectRefField           = "spec.projectRef"
-	runtimeClassField         = "spec.runtimeClass"
-	warmPoolLabel             = "swe.dev/warm-pool"
-	projectAnnotation         = "swe.dev/project"
-	runtimeClassUIDAnnotation = "swe.dev/runtime-class-uid"
+	defaultDiskSize               = "40Gi"
+	defaultIdleTimeout            = 15 * time.Minute
+	projectHookTimeout            = "30m"
+	hookKillAfter                 = "5s"
+	podRecoveryLimit              = int32(3)
+	podRecoveryDelay              = 5 * time.Second
+	templateRefField              = "spec.templateRef"
+	projectRefField               = "spec.projectRef"
+	runtimeClassField             = "spec.runtimeClass"
+	warmPoolLabel                 = "swe.dev/warm-pool"
+	projectAnnotation             = "swe.dev/project"
+	runtimeClassUIDAnnotation     = "swe.dev/runtime-class-uid"
+	executionGenerationAnnotation = "swe.dev/execution-generation"
 )
 
 var (
@@ -132,6 +135,7 @@ fi
 // EnvironmentReconciler reconciles Environment objects into pods + workspace volumes.
 type EnvironmentReconciler struct {
 	client.Client
+	APIReader             client.Reader
 	Scheme                *runtime.Scheme
 	ControlPlaneNamespace string
 	ControlPlaneName      string
@@ -355,10 +359,11 @@ func (r *EnvironmentReconciler) reconcileLifecycleIntent(ctx context.Context, en
 	now := metav1.NewTime(r.now())
 	for i := range activityRequests {
 		request := &activityRequests[i]
-		if !valid(&request.EnvironmentLifecycleRequest) || activityReceipt(lifecycleStatus.ActivityReceipts, request.Source) == request.ID {
+		if !valid(&request.EnvironmentLifecycleRequest) || request.ExecutionGeneration != env.Status.ExecutionGeneration ||
+			activityReceipt(lifecycleStatus.ActivityReceipts, request.Source, request.ExecutionGeneration) == request.ID {
 			continue
 		}
-		setActivityReceipt(&lifecycleStatus.ActivityReceipts, request.Source, request.ID)
+		setActivityReceipt(&lifecycleStatus.ActivityReceipts, request.Source, request.ExecutionGeneration, request.ID)
 		if env.Status.LastActiveAt == nil || now.After(env.Status.LastActiveAt.Time) {
 			env.Status.LastActiveAt = &now
 		}
@@ -444,23 +449,24 @@ func validLifecycleRequest(env *platformv1alpha1.Environment, request *platformv
 	return request.EnvironmentUID == env.UID && request.HoldPolicyRevision == policyRevision
 }
 
-func activityReceipt(receipts []platformv1alpha1.EnvironmentActivityReceipt, source platformv1alpha1.EnvironmentActivitySource) string {
+func activityReceipt(receipts []platformv1alpha1.EnvironmentActivityReceipt, source platformv1alpha1.EnvironmentActivitySource, executionGeneration int64) string {
 	for i := range receipts {
-		if receipts[i].Source == source {
+		if receipts[i].Source == source && receipts[i].ExecutionGeneration == executionGeneration {
 			return receipts[i].RequestID
 		}
 	}
 	return ""
 }
 
-func setActivityReceipt(receipts *[]platformv1alpha1.EnvironmentActivityReceipt, source platformv1alpha1.EnvironmentActivitySource, requestID string) {
+func setActivityReceipt(receipts *[]platformv1alpha1.EnvironmentActivityReceipt, source platformv1alpha1.EnvironmentActivitySource, executionGeneration int64, requestID string) {
 	for i := range *receipts {
 		if (*receipts)[i].Source == source {
 			(*receipts)[i].RequestID = requestID
+			(*receipts)[i].ExecutionGeneration = executionGeneration
 			return
 		}
 	}
-	*receipts = append(*receipts, platformv1alpha1.EnvironmentActivityReceipt{Source: source, RequestID: requestID})
+	*receipts = append(*receipts, platformv1alpha1.EnvironmentActivityReceipt{Source: source, RequestID: requestID, ExecutionGeneration: executionGeneration})
 }
 
 // reconcilePendingPodRecovery advances persisted recovery before ensurePod can
@@ -982,8 +988,9 @@ func unsupportedEgressAllowlistMessage(projectName string) string {
 
 func (r *EnvironmentReconciler) ensurePodForProject(ctx context.Context, env *platformv1alpha1.Environment, tmpl *platformv1alpha1.EnvironmentTemplate, project *platformv1alpha1.Project, runtimeClassUID types.UID) (*corev1.Pod, error) {
 	podName := envPodName(env)
+	resuming := env.Status.Phase == platformv1alpha1.EnvironmentPhaseResuming
 	var pod corev1.Pod
-	err := r.Get(ctx, types.NamespacedName{Namespace: env.Namespace, Name: podName}, &pod)
+	err := r.apiReader().Get(ctx, types.NamespacedName{Namespace: env.Namespace, Name: podName}, &pod)
 	if err == nil {
 		if metav1.IsControlledBy(&pod, env) && !pod.DeletionTimestamp.IsZero() {
 			if pod.Status.Phase == corev1.PodFailed || pod.Status.Phase == corev1.PodSucceeded {
@@ -1060,6 +1067,10 @@ func (r *EnvironmentReconciler) ensurePodForProject(ctx context.Context, env *pl
 	if err := r.Get(ctx, types.NamespacedName{Namespace: env.Namespace, Name: envCredentialName(env)}, &credentials); err != nil {
 		return nil, fmt.Errorf("get rotated sandboxd credentials: %w", err)
 	}
+	executionGeneration, err := r.reserveExecutionGeneration(ctx, env)
+	if err != nil {
+		return nil, fmt.Errorf("reserve execution generation: %w", err)
+	}
 
 	resources, ok := sizePresets[tmpl.Spec.Size]
 	if !ok {
@@ -1073,6 +1084,7 @@ func (r *EnvironmentReconciler) ensurePodForProject(ctx context.Context, env *pl
 			Labels:    envLabels(env),
 			Annotations: map[string]string{
 				projectAnnotation:                 env.Spec.ProjectRef,
+				executionGenerationAnnotation:     strconv.FormatInt(executionGeneration, 10),
 				sandboxdauth.IdentityAnnotation:   identity,
 				sandboxdauth.TrustAnnotation:      string(trust),
 				sandboxdauth.TokenAnnotation:      terminalToken,
@@ -1082,7 +1094,7 @@ func (r *EnvironmentReconciler) ensurePodForProject(ctx context.Context, env *pl
 			},
 		},
 		Spec: corev1.PodSpec{
-			RestartPolicy:                corev1.RestartPolicyAlways,
+			RestartPolicy:                corev1.RestartPolicyNever,
 			AutomountServiceAccountToken: ptr(false),
 			SecurityContext: &corev1.PodSecurityContext{
 				SeccompProfile: &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault},
@@ -1165,7 +1177,7 @@ func (r *EnvironmentReconciler) ensurePodForProject(ctx context.Context, env *pl
 			{Name: "SWE_HOOK_TIMEOUT", Value: projectHookTimeout},
 			{Name: "SWE_HOOK_KILL_AFTER", Value: hookKillAfter},
 		}
-		if env.Status.Phase == platformv1alpha1.EnvironmentPhaseResuming {
+		if resuming {
 			projectEnv = append(projectEnv, corev1.EnvVar{Name: "SWE_RESUMING", Value: "true"})
 		}
 		pod.Spec.InitContainers = []corev1.Container{{
@@ -1206,7 +1218,10 @@ func (r *EnvironmentReconciler) ensurePodForProject(ctx context.Context, env *pl
 }
 
 func (r *EnvironmentReconciler) currentSandboxdPod(ctx context.Context, env *platformv1alpha1.Environment, pod *corev1.Pod) (bool, error) {
-	if !metav1.IsControlledBy(pod, env) || pod.Annotations[sandboxdRevisionAnnotation] != sandboxdSecurityRevision ||
+	executionGeneration, generationValid := podExecutionGeneration(pod)
+	if !metav1.IsControlledBy(pod, env) || pod.Spec.RestartPolicy != corev1.RestartPolicyNever ||
+		!generationValid || executionGeneration != env.Status.ExecutionGeneration ||
+		pod.Annotations[sandboxdRevisionAnnotation] != sandboxdSecurityRevision ||
 		pod.Annotations[sandboxdauth.IdentityAnnotation] == "" || pod.Annotations[sandboxdauth.TrustAnnotation] == "" ||
 		pod.Annotations[sandboxdauth.TokenAnnotation] == "" || pod.Annotations[sandboxdauth.SecretNameAnnotation] != envCredentialName(env) {
 		return false, nil
@@ -1427,6 +1442,10 @@ func (r *EnvironmentReconciler) ensureSandboxdNetworkPolicy(ctx context.Context,
 // syncStatus maps Kubernetes-native pod readiness and container failure state
 // onto the Environment's generation-aware readiness contract.
 func (r *EnvironmentReconciler) syncStatus(ctx context.Context, env *platformv1alpha1.Environment, pod *corev1.Pod) error {
+	executionGeneration, ok := podExecutionGeneration(pod)
+	if !ok || executionGeneration != env.Status.ExecutionGeneration {
+		return fmt.Errorf("environment pod execution generation is not current")
+	}
 	phase, reason, message := environmentPodState(env, pod)
 	sandboxdEndpoint := ""
 	if phase == platformv1alpha1.EnvironmentPhaseReady {
@@ -1648,6 +1667,47 @@ func (r *EnvironmentReconciler) updateEnvironmentStatus(ctx context.Context, env
 	return err
 }
 
+func (r *EnvironmentReconciler) apiReader() client.Reader {
+	if r.APIReader != nil {
+		return r.APIReader
+	}
+	return r.Client
+}
+
+// reserveExecutionGeneration durably allocates a fresh backend-neutral
+// execution identity before a Pod creation attempt. Values may be skipped
+// after failed or uncertain creates, but are never reused.
+func (r *EnvironmentReconciler) reserveExecutionGeneration(ctx context.Context, env *platformv1alpha1.Environment) (int64, error) {
+	var current platformv1alpha1.Environment
+	if err := r.apiReader().Get(ctx, client.ObjectKeyFromObject(env), &current); err != nil {
+		return 0, err
+	}
+	if current.UID != env.UID {
+		return 0, errEnvironmentIncarnationChanged
+	}
+	if current.Generation != env.Generation || !current.DeletionTimestamp.IsZero() || current.Spec.Paused || current.Status.Lifecycle.Suspended {
+		return 0, fmt.Errorf("environment changed before backend creation")
+	}
+	if current.Status.ExecutionGeneration == math.MaxInt64 {
+		return 0, terminalEnvironment(fmt.Errorf("execution generation is exhausted"))
+	}
+	next := current.Status.ExecutionGeneration + 1
+	before := current.DeepCopy()
+	applyEnvironmentStatus(&current, platformv1alpha1.EnvironmentPhaseCreating, "", "", "ExecutionProvisioning", fmt.Sprintf("backend execution generation %d is being provisioned", next), current.Status.LastActiveAt)
+	current.Status.ExecutionGeneration = next
+	if err := r.Status().Patch(ctx, &current, client.MergeFromWithOptions(before, client.MergeFromWithOptimisticLock{})); err != nil {
+		return 0, err
+	}
+	env.Status = current.Status
+	return next, nil
+}
+
+func podExecutionGeneration(pod *corev1.Pod) (int64, bool) {
+	value := pod.Annotations[executionGenerationAnnotation]
+	generation, err := strconv.ParseInt(value, 10, 64)
+	return generation, err == nil && generation > 0 && strconv.FormatInt(generation, 10) == value
+}
+
 // updatePodRecoveryStatus permits spec generation changes while refusing to
 // overwrite a concurrent recovery transition. Recovery is incarnation state:
 // only sandboxd readiness, not an ordinary spec edit, resets it.
@@ -1851,6 +1911,7 @@ func (r *EnvironmentReconciler) runtimeClassReferenceRequests(ctx context.Contex
 
 // SetupWithManager registers the controller with the manager.
 func (r *EnvironmentReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	r.APIReader = mgr.GetAPIReader()
 	if err := mgr.GetFieldIndexer().IndexField(context.Background(), &platformv1alpha1.Environment{}, templateRefField, environmentTemplateRefIndex); err != nil {
 		return fmt.Errorf("index environments by template: %w", err)
 	}

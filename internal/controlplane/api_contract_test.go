@@ -43,11 +43,12 @@ func TestAPIContractFixturesAreCanonicalHandlerAndMapperOutput(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{Name: "run-fix-flaky-42", UID: "676d16c3-e625-4c36-a97c-e93065d05121", CreationTimestamp: metav1.NewTime(environmentCreated), Generation: 2},
 		Spec:       platformv1alpha1.EnvironmentSpec{ProjectRef: "org-repo", TemplateRef: "small", Backend: platformv1alpha1.EnvironmentBackendPod},
 		Status: platformv1alpha1.EnvironmentStatus{
-			ObservedGeneration: 2,
-			Phase:              platformv1alpha1.EnvironmentPhaseRunning,
-			ClaimedBy:          &platformv1alpha1.RunReference{Name: "fix-flaky-42", UID: types.UID("eb7e3ff7-8117-4caf-912d-167b70eaee21")},
-			LastActiveAt:       &lastActive,
-			Conditions:         []metav1.Condition{{Type: platformv1alpha1.EnvironmentConditionReady, Status: metav1.ConditionTrue, ObservedGeneration: 2}},
+			ObservedGeneration:  2,
+			ExecutionGeneration: 1,
+			Phase:               platformv1alpha1.EnvironmentPhaseRunning,
+			ClaimedBy:           &platformv1alpha1.RunReference{Name: "fix-flaky-42", UID: types.UID("eb7e3ff7-8117-4caf-912d-167b70eaee21")},
+			LastActiveAt:        &lastActive,
+			Conditions:          []metav1.Condition{{Type: platformv1alpha1.EnvironmentConditionReady, Status: metav1.ConditionTrue, ObservedGeneration: 2}},
 		},
 	}
 

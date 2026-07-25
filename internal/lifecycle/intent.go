@@ -17,6 +17,7 @@ import (
 )
 
 var ErrEnvironmentIncarnationChanged = errors.New("environment incarnation changed")
+var ErrExecutionGenerationChanged = errors.New("environment execution generation changed")
 var ErrHoldPolicyChanged = errors.New("environment hold policy changed")
 
 const activityAnnotationPrefix = "lifecycle.swe.dev/activity-"
@@ -76,12 +77,13 @@ func RequestSuspend(ctx context.Context, kube client.Client, key types.Namespace
 // RecordActivity publishes one source's latest activity intent. Activity uses
 // fixed metadata slots so heartbeats are durable without advancing generation;
 // only execution-contract changes make Environment status stale.
-func RecordActivity(ctx context.Context, kube client.Client, key types.NamespacedName, expectedUID types.UID, policyRevision int64, source platformv1alpha1.EnvironmentActivitySource, requestID string) error {
+func RecordActivity(ctx context.Context, kube client.Client, key types.NamespacedName, expectedUID types.UID, executionGeneration, policyRevision int64, source platformv1alpha1.EnvironmentActivitySource, requestID string) error {
 	request := platformv1alpha1.EnvironmentActivityRequest{
 		Source: source,
 		EnvironmentLifecycleRequest: platformv1alpha1.EnvironmentLifecycleRequest{
 			ID: requestID, EnvironmentUID: expectedUID, HoldPolicyRevision: policyRevision,
 		},
+		ExecutionGeneration: executionGeneration,
 	}
 	if err := validateActivityRequest(request); err != nil {
 		return err
@@ -90,7 +92,7 @@ func RecordActivity(ctx context.Context, kube client.Client, key types.Namespace
 	if err != nil {
 		return fmt.Errorf("encode activity request: %w", err)
 	}
-	return patchIntent(ctx, kube, key, expectedUID, policyRevision, func(environment *platformv1alpha1.Environment) {
+	return patchActivityIntent(ctx, kube, key, expectedUID, executionGeneration, policyRevision, func(environment *platformv1alpha1.Environment) {
 		if environment.Annotations == nil {
 			environment.Annotations = make(map[string]string)
 		}
@@ -114,7 +116,8 @@ func ActivityRequests(environment *platformv1alpha1.Environment) []platformv1alp
 		}
 		var request platformv1alpha1.EnvironmentActivityRequest
 		if json.Unmarshal([]byte(value), &request) != nil || request.Source != source || validateActivityRequest(request) != nil ||
-			request.EnvironmentUID != environment.UID || request.HoldPolicyRevision != HoldPolicyRevision(environment) {
+			request.EnvironmentUID != environment.UID || request.ExecutionGeneration != environment.Status.ExecutionGeneration ||
+			request.HoldPolicyRevision != HoldPolicyRevision(environment) {
 			continue
 		}
 		requests[request.Source] = request
@@ -145,6 +148,9 @@ func validateActivityRequest(request platformv1alpha1.EnvironmentActivityRequest
 	}
 	if request.EnvironmentUID == "" {
 		return fmt.Errorf("activity Environment UID must not be empty")
+	}
+	if request.ExecutionGeneration < 1 {
+		return fmt.Errorf("activity execution generation must be positive")
 	}
 	if request.HoldPolicyRevision < 0 {
 		return fmt.Errorf("activity hold policy revision must not be negative")
@@ -181,6 +187,30 @@ func patchIntent(ctx context.Context, kube client.Client, key types.NamespacedNa
 		before := environment.DeepCopy()
 		mutate(&environment)
 		if apiequality.Semantic.DeepEqual(before.Spec, environment.Spec) && apiequality.Semantic.DeepEqual(before.Annotations, environment.Annotations) {
+			return nil
+		}
+		return kube.Patch(ctx, &environment, client.MergeFromWithOptions(before, client.MergeFromWithOptimisticLock{}))
+	})
+}
+
+func patchActivityIntent(ctx context.Context, kube client.Client, key types.NamespacedName, expectedUID types.UID, expectedExecutionGeneration, expectedPolicyRevision int64, mutate func(*platformv1alpha1.Environment)) error {
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		var environment platformv1alpha1.Environment
+		if err := kube.Get(ctx, key, &environment); err != nil {
+			return err
+		}
+		if environment.UID != expectedUID {
+			return ErrEnvironmentIncarnationChanged
+		}
+		if expectedExecutionGeneration < 1 || environment.Status.ExecutionGeneration != expectedExecutionGeneration {
+			return ErrExecutionGenerationChanged
+		}
+		if HoldPolicyRevision(&environment) != expectedPolicyRevision {
+			return ErrHoldPolicyChanged
+		}
+		before := environment.DeepCopy()
+		mutate(&environment)
+		if apiequality.Semantic.DeepEqual(before.Annotations, environment.Annotations) {
 			return nil
 		}
 		return kube.Patch(ctx, &environment, client.MergeFromWithOptions(before, client.MergeFromWithOptimisticLock{}))

@@ -62,8 +62,8 @@ All current CRDs are namespaced:
 |---|---|
 | `Project` | One repository URL (represented as a one-item list), a same-namespace default Template reference, changes-workflow metadata, and a reserved egress allowlist. A non-empty allowlist is rejected when an Environment uses the Project. |
 | `EnvironmentTemplate` | Pod image, size/resources, disk, runtime class, idle timeout, warm-pool minimum, and backend. Admission currently permits only the `pod` backend. |
-| `Environment` | Template/Project selection, explicit hold policy and bounded wake/suspend/activity intents; status owns readiness, lifecycle suspension and epoch, exact Run claim, Pod endpoint observations, activity, and recovery state. |
-| `Run` | Immutable agent task and Environment/Project/Template/credential selection plus monotonic cancellation; status records normalized lifecycle, exact Environment name/UID and ownership, exact credential profile identity, and accepted lifecycle epoch. `notify` and `parentRef` are schema placeholders without an implemented inbox. |
+| `Environment` | Template/Project selection, explicit hold policy and bounded wake/suspend/activity intents; status owns readiness, lifecycle suspension and epoch, backend-neutral execution generation, exact Run claim, backend observations, activity, and recovery state. |
+| `Run` | Immutable agent task and Environment/Project/Template/credential selection plus monotonic cancellation; status records normalized lifecycle, exact Environment name/UID and ownership, exact credential profile identity, accepted lifecycle epoch, and accepted execution generation. `notify` and `parentRef` are schema placeholders without an implemented inbox. |
 | `AgentCredentialProfile` | Immutable adapter and `APIKey` type metadata. Key bytes live in an owner-linked Secret whose name is derived from the profile UID. |
 
 The current ownership/reference shape is:
@@ -116,7 +116,9 @@ Windows coverage for process containment and filesystem behavior; the current sh
 backend is tmux, not ConPTY.
 
 Only the Kubernetes **Pod backend** is implemented. The connector currently resolves an exact
-owned Pod, Pod IP, Pod UID, and per-Pod credential Secret behind its consumer interface.
+owned Pod, Pod IP, Pod UID, execution-generation annotation, restart policy, and per-Pod
+credential Secret behind its consumer interface. It also exposes an opaque, non-dialing
+execution handle/currentness check; Pod identity remains private to the connector.
 `kubevirt` and `external-runner` names are retained as planned Go API values, but CRD admission
 rejects them and the controller fails unsupported existing resources before provisioning.
 Backend pluggability is an invariant on interfaces, not a claim that those backends ship.
@@ -140,6 +142,16 @@ suspend, or source-keyed activity intents. The controller owns observed suspensi
 Automatic idle suspension is prevented by an exact non-terminal Run owner or claim. Ordinary
 wakes cannot clear an explicit hold, and terminal traffic wakes only an Idle suspension.
 
+The Environment lifecycle controller also owns a monotonically increasing, backend-neutral
+execution generation distinct from the suspension epoch. It reserves a fresh positive value
+before every actual backend creation attempt; failed or uncertain attempts may leave gaps, but
+values are never reused. Initial provision, pause/resume, terminal recovery, Project or security
+replacement, and equivalent future-backend replacement paths all pass through that reservation.
+Pod executions additionally require `restartPolicy: Never` and an exact canonical generation
+annotation, so one generation cannot silently contain a container restart. Legacy generation
+zero, missing/malformed annotations, and pre-generation activity intents or receipts fail closed
+until the lifecycle controller provisions a fresh execution.
+
 Pause is disk plus transcript, not process checkpointing:
 
 1. the lifecycle epoch increases before suspension;
@@ -149,10 +161,15 @@ Pause is disk plus transcript, not process checkpointing:
 5. resume creates a fresh pod/credential epoch, runs the repository resume hook, and repeats
    idempotent adapter acceptance with the same Run UID.
 
-The lifecycle epoch currently identifies suspension cycles; it is **not** a complete backend
-execution-generation contract for every Pod recovery. Terminal attachment additionally pins
-the exact Pod UID and revalidates Environment UID, lifecycle epoch, hold revision, and Run
-association. The approved general execution generation is described below and is not shipped.
+Terminal attachment captures Environment UID, execution generation, lifecycle epoch, and hold
+revision before publishing activity, then atomically rejects stale activity. Its connector-owned
+opaque handle also revalidates the exact live backend execution throughout the lease. Run adapter
+acceptance, observation, and cancellation similarly capture the allocated Environment UID,
+execution generation, epoch, and an opaque non-dialing connector execution handle. After each
+adapter call, the controller uncached-reads the exact allocation and asks the connector to prove
+that the same live backend execution remains current before publishing Run state, releasing a
+claim, or removing a finalizer. Delayed results from disappeared or same-name replacement Pods
+are therefore discarded even if Environment status has not yet advanced.
 
 Only the Pod backend performs execution today. Project-backed initialization clones the
 Project's single repository into `/workspace`, runs `.agents/setup` once per workspace when
@@ -340,26 +357,12 @@ The maintainer approved the [outbound-network contract in #68](https://github.co
 The current non-empty Project allowlist rejection remains until identity, proxy readiness, and
 path forcing ship together after Project namespace claims.
 
-### Backend-neutral execution generation
-
-The maintainer approved the matching [Run observation decision in #122](https://github.com/Chris-Cullins/swe-platform/issues/122#issuecomment-5078805815)
-and [terminal activity decision in #125](https://github.com/Chris-Cullins/swe-platform/issues/125#issuecomment-5078805886):
-
-- add a dedicated backend-neutral execution generation, separate from lifecycle epoch;
-- increment it for every actual backend execution replacement, including initial provision,
-  pause/resume, recovery, security replacement, and equivalent non-Pod transitions;
-- delayed operations capture Environment UID plus execution generation and, where relevant,
-  hold-policy revision;
-- stale adapter observations are discarded before Run status publication, and terminal activity
-  updates reject stale Environment/execution/hold identity atomically; and
-- service observations, portal routes, and egress identity use the same fence, while Pod names,
-  IPs, endpoints, and UIDs remain backend-specific connector observations.
-
 ## Remaining decisions and open work
 
 The approved contracts above still require reviewable API sketches, migration/rollout plans,
-controller ownership, and acceptance tests before implementation. This document intentionally
-does not invent those details.
+controller ownership, and acceptance tests before implementation. The execution-generation
+contract is implemented above; future service observations, portal routes, and egress identity
+must consume the same backend-neutral fence without exposing backend-specific identity.
 
 Other unimplemented areas include portal transport, inbox and child-run semantics, changes
 publication, transcript garbage collection, additional credential forms, ConPTY, non-Pod

@@ -304,7 +304,7 @@ func TestResourceServiceEnvironmentReadinessDefaultAndRedaction(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{Name: "env", Namespace: "ns", UID: "uid", Generation: 2},
 		Spec:       platformv1alpha1.EnvironmentSpec{TemplateRef: "small"},
 		Status: platformv1alpha1.EnvironmentStatus{
-			ObservedGeneration: 1, Phase: platformv1alpha1.EnvironmentPhaseReady,
+			ObservedGeneration: 1, ExecutionGeneration: 1, Phase: platformv1alpha1.EnvironmentPhaseReady,
 			Endpoints: platformv1alpha1.EnvironmentEndpoints{Sandboxd: "secret:123"}, PodName: "pod", ImageID: "sha256:secret", LastActiveAt: &now,
 			Conditions: []metav1.Condition{{Type: platformv1alpha1.EnvironmentConditionReady, Status: metav1.ConditionTrue, ObservedGeneration: 1}},
 		},

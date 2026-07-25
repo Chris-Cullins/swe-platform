@@ -245,8 +245,36 @@ git fetch --depth=1 origin "$PRE_SCOPED_CREDENTIALS_SHA"
 for resource in environments environmenttemplates projects runs; do
 	git show FETCH_HEAD:"config/crd/bases/swe.dev_${resource}.yaml" | kubectl create -f -
 done
+
+# Exercise the immediate pre-execution-generation schema with persisted nested
+# activity. The new nested fields must remain optional so this live object can
+# survive structural-schema replacement; controller handling fails closed.
+PRE_EXECUTION_GENERATION_SHA=c115faf13ab62aead857e44c135fae6c2777f38e
+git fetch --depth=1 origin "$PRE_EXECUTION_GENERATION_SHA"
+for resource in environments runs; do
+	git show "$PRE_EXECUTION_GENERATION_SHA:config/crd/bases/swe.dev_${resource}.yaml" | kubectl apply --server-side --force-conflicts -f -
+done
+cat <<'EOF' | kubectl create -f -
+apiVersion: swe.dev/v1alpha1
+kind: Environment
+metadata:
+  name: legacy-execution-generation-migration
+spec:
+  templateRef: small
+  lifecycle:
+    activity:
+    - source: Terminal
+      id: legacy-terminal-activity
+      environmentUID: legacy-environment-uid
+      holdPolicyRevision: 0
+EOF
+kubectl patch environment legacy-execution-generation-migration --subresource=status --type=merge -p \
+	'{"status":{"lifecycle":{"activityReceipts":[{"source":"Terminal","requestID":"legacy-terminal-activity"}]}}}'
 kubectl apply --server-side --force-conflicts -f charts/swe-platform/crds
 kubectl get crd agentcredentialprofiles.swe.dev >/dev/null
+kubectl get environment legacy-execution-generation-migration -o json | jq -e \
+	'.spec.lifecycle.activity[0].executionGeneration == null and .status.lifecycle.activityReceipts[0].executionGeneration == null' >/dev/null
+kubectl delete environment legacy-execution-generation-migration --wait=false
 
 echo "==> installing operator and kind template through Helm with upgraded CRDs"
 E2E_BOOTSTRAP_TOKEN="$(openssl rand -hex 32)"

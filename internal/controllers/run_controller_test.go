@@ -32,11 +32,30 @@ type scriptedAdapter struct {
 	accepted, observed    int
 	cancelled             int
 	acceptErr             error
+	onAccept              func()
 	onCancel              func()
 	cancelErr             error
 	acceptedCredentials   [][]byte
 	retainedCredentialKey []byte
 }
+
+type blockingObserveAdapter struct {
+	observation AdapterObservation
+	started     chan struct{}
+	release     chan struct{}
+}
+
+func (*blockingObserveAdapter) EnsureAccepted(context.Context, AdapterTask, AdapterSandbox, *AdapterCredential) error {
+	return nil
+}
+
+func (a *blockingObserveAdapter) Observe(context.Context, AdapterTask, AdapterSandbox) (AdapterObservation, string, error) {
+	close(a.started)
+	<-a.release
+	return a.observation, string(a.observation), nil
+}
+
+func (*blockingObserveAdapter) Cancel(context.Context, AdapterTask, AdapterSandbox) error { return nil }
 
 type failAcceptedStatusClient struct {
 	client.Client
@@ -93,6 +112,9 @@ func (a *serviceAdapter) Cancel(context.Context, AdapterTask, AdapterSandbox) er
 
 func (a *scriptedAdapter) EnsureAccepted(_ context.Context, _ AdapterTask, _ AdapterSandbox, credential *AdapterCredential) error {
 	a.accepted++
+	if a.onAccept != nil {
+		a.onAccept()
+	}
 	if credential == nil {
 		a.acceptedCredentials = append(a.acceptedCredentials, nil)
 	} else {
@@ -132,9 +154,19 @@ func runScheme(t *testing.T) *runtime.Scheme {
 func reconciler(t *testing.T, adapter AdapterLifecycle, objects ...client.Object) *RunReconciler {
 	t.Helper()
 	s := runScheme(t)
+	templates := make(map[types.NamespacedName]bool)
+	for _, object := range objects {
+		if template, ok := object.(*platformv1alpha1.EnvironmentTemplate); ok {
+			templates[types.NamespacedName{Namespace: template.Namespace, Name: template.Name}] = true
+		}
+	}
 	for _, object := range objects {
 		env, ok := object.(*platformv1alpha1.Environment)
 		if ok && (env.Status.Phase == platformv1alpha1.EnvironmentPhaseReady || env.Status.Phase == platformv1alpha1.EnvironmentPhaseRunning) {
+			if env.Spec.TemplateRef == "" {
+				env.Spec.TemplateRef = "default"
+			}
+			env.Status.ExecutionGeneration = 1
 			applyEnvironmentStatus(env, env.Status.Phase, env.Status.PodName, env.Status.Endpoints.Sandboxd, "SandboxdReady", "sandboxd is ready", env.Status.LastActiveAt)
 		}
 	}
@@ -143,7 +175,7 @@ func reconciler(t *testing.T, adapter AdapterLifecycle, objects ...client.Object
 	// reachable endpoint; mismatch tests construct their reconciler directly.
 	for _, object := range objects {
 		run, ok := object.(*platformv1alpha1.Run)
-		if !ok || run.Status.EnvironmentRef == nil || run.Status.EnvironmentRef.Ownership != platformv1alpha1.EnvironmentOwnershipOwned {
+		if !ok || run.Status.EnvironmentRef == nil {
 			continue
 		}
 		for _, candidate := range objects {
@@ -151,15 +183,67 @@ func reconciler(t *testing.T, adapter AdapterLifecycle, objects ...client.Object
 			if !ok || env.Name != run.Status.EnvironmentRef.Name || env.UID != run.Status.EnvironmentRef.UID {
 				continue
 			}
-			env.OwnerReferences = []metav1.OwnerReference{{APIVersion: platformv1alpha1.GroupVersion.String(), Kind: "Run", Name: run.Name, UID: run.UID, Controller: ptr(true)}}
+			if run.Status.EnvironmentRef.Ownership == platformv1alpha1.EnvironmentOwnershipOwned {
+				env.OwnerReferences = []metav1.OwnerReference{{APIVersion: platformv1alpha1.GroupVersion.String(), Kind: "Run", Name: run.Name, UID: run.UID, Controller: ptr(true)}}
+			}
 			if env.Status.Phase == platformv1alpha1.EnvironmentPhaseReady || env.Status.Phase == platformv1alpha1.EnvironmentPhaseRunning {
 				env.Status.PodName = "env-" + env.Name
 				env.Status.Endpoints.Sandboxd = "10.0.0.1:50051"
+				if runAccepted(run) && run.Status.AcceptedEnvironmentExecutionGeneration == nil {
+					acceptedExecutionGeneration := env.Status.ExecutionGeneration
+					run.Status.AcceptedEnvironmentExecutionGeneration = &acceptedExecutionGeneration
+				}
 			}
 		}
 	}
+	for _, object := range append([]client.Object(nil), objects...) {
+		env, ok := object.(*platformv1alpha1.Environment)
+		if !ok || !environmentReachable(env) {
+			continue
+		}
+		key := types.NamespacedName{Namespace: env.Namespace, Name: env.Spec.TemplateRef}
+		if !templates[key] {
+			objects = append(objects, &platformv1alpha1.EnvironmentTemplate{ObjectMeta: metav1.ObjectMeta{Name: key.Name, Namespace: key.Namespace}})
+			templates[key] = true
+		}
+		objects = append(objects, runExecutionPod(env, types.UID("pod-"+env.Name), "10.0.0.1"))
+	}
 	c := fake.NewClientBuilder().WithScheme(s).WithStatusSubresource(&platformv1alpha1.Run{}, &platformv1alpha1.Environment{}).WithObjects(objects...).Build()
 	return &RunReconciler{Client: c, Scheme: s, Adapters: map[string]AdapterLifecycle{"test": adapter}}
+}
+
+func runExecutionPod(env *platformv1alpha1.Environment, uid types.UID, podIP string) *corev1.Pod {
+	return &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: env.Status.PodName, Namespace: env.Namespace, UID: uid,
+			Annotations: map[string]string{executionGenerationAnnotation: fmt.Sprintf("%d", env.Status.ExecutionGeneration)},
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: platformv1alpha1.GroupVersion.String(), Kind: "Environment", Name: env.Name,
+				UID: env.UID, Controller: ptr(true),
+			}},
+		},
+		Spec: corev1.PodSpec{RestartPolicy: corev1.RestartPolicyNever},
+		Status: corev1.PodStatus{
+			PodIP: podIP, Conditions: []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}},
+		},
+	}
+}
+
+func runExecutionBackendObjects(t *testing.T, r *RunReconciler, env *platformv1alpha1.Environment) []client.Object {
+	t.Helper()
+	var current platformv1alpha1.Environment
+	if err := r.Get(context.Background(), client.ObjectKeyFromObject(env), &current); err != nil {
+		t.Fatal(err)
+	}
+	var template platformv1alpha1.EnvironmentTemplate
+	if err := r.Get(context.Background(), types.NamespacedName{Namespace: current.Namespace, Name: current.Spec.TemplateRef}, &template); err != nil {
+		t.Fatal(err)
+	}
+	var pod corev1.Pod
+	if err := r.Get(context.Background(), types.NamespacedName{Namespace: current.Namespace, Name: current.Status.PodName}, &pod); err != nil {
+		t.Fatal(err)
+	}
+	return []client.Object{current.DeepCopy(), template.DeepCopy(), pod.DeepCopy()}
 }
 
 func credentialProfileAndSecret(run *platformv1alpha1.Run, value []byte) (*platformv1alpha1.AgentCredentialProfile, *corev1.Secret) {
@@ -608,28 +692,34 @@ func TestAcceptedRunIgnoresActivityWithoutRereadingCredentials(t *testing.T) {
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			acceptedEpoch := int64(0)
+			acceptedExecutionGeneration := int64(1)
 			run := &platformv1alpha1.Run{
 				ObjectMeta: metav1.ObjectMeta{Name: "r", Namespace: "ns", UID: "run-uid", Finalizers: []string{runFinalizer}},
 				Spec:       platformv1alpha1.RunSpec{Agent: "test", CredentialProfileRef: "removed-profile"},
 				Status: platformv1alpha1.RunStatus{
-					State:                    test.state,
-					AcceptedEnvironmentEpoch: &acceptedEpoch,
-					EnvironmentRef:           &platformv1alpha1.RunEnvironmentReference{Name: "e", UID: "env-uid", Ownership: platformv1alpha1.EnvironmentOwnershipOwned},
-					CredentialProfileRef:     &platformv1alpha1.RunCredentialProfileReference{Name: "removed-profile", UID: "removed-profile-uid"},
-					Conditions:               []metav1.Condition{{Type: runConditionAdapterAccepted, Status: metav1.ConditionTrue, Reason: "AdapterAccepted"}},
+					State:                                  test.state,
+					AcceptedEnvironmentEpoch:               &acceptedEpoch,
+					AcceptedEnvironmentExecutionGeneration: &acceptedExecutionGeneration,
+					EnvironmentRef:                         &platformv1alpha1.RunEnvironmentReference{Name: "e", UID: "env-uid", Ownership: platformv1alpha1.EnvironmentOwnershipOwned},
+					CredentialProfileRef:                   &platformv1alpha1.RunCredentialProfileReference{Name: "removed-profile", UID: "removed-profile-uid"},
+					Conditions:                             []metav1.Condition{{Type: runConditionAdapterAccepted, Status: metav1.ConditionTrue, Reason: "AdapterAccepted"}},
 				},
 			}
 			environment := &platformv1alpha1.Environment{ObjectMeta: metav1.ObjectMeta{Name: "e", Namespace: "ns", UID: "env-uid", Generation: 1}}
+			environment.Status.ExecutionGeneration = 1
 			applyEnvironmentStatus(environment, platformv1alpha1.EnvironmentPhaseReady, "env-e", "10.0.0.1:50051", "SandboxdReady", "ready", nil)
 			adapter := &scriptedAdapter{observations: []AdapterObservation{test.observation}}
 			r := reconciler(t, adapter, run, environment)
 			credentialReads := 0
-			r.APIReader = interceptor.NewClient(r.Client.(client.WithWatch), interceptor.Funcs{Get: func(context.Context, client.WithWatch, client.ObjectKey, client.Object, ...client.GetOption) error {
+			r.APIReader = interceptor.NewClient(r.Client.(client.WithWatch), interceptor.Funcs{Get: func(ctx context.Context, delegate client.WithWatch, key client.ObjectKey, object client.Object, options ...client.GetOption) error {
+				if _, ok := object.(*platformv1alpha1.Environment); ok {
+					return delegate.Get(ctx, key, object, options...)
+				}
 				credentialReads++
 				return apierrors.NewNotFound(platformv1alpha1.GroupVersion.WithResource("agentcredentialprofiles").GroupResource(), "removed-profile")
 			}})
 
-			if err := lifecycle.RecordActivity(context.Background(), r.Client, client.ObjectKeyFromObject(environment), environment.UID, 0, platformv1alpha1.EnvironmentActivitySourceTerminal, "terminal-1"); err != nil {
+			if err := lifecycle.RecordActivity(context.Background(), r.Client, client.ObjectKeyFromObject(environment), environment.UID, 1, 0, platformv1alpha1.EnvironmentActivitySourceTerminal, "terminal-1"); err != nil {
 				t.Fatal(err)
 			}
 			var activity platformv1alpha1.Environment
@@ -984,10 +1074,11 @@ func TestNonterminalAdapterObservationSchedulesPolling(t *testing.T) {
 
 func TestEnvironmentReachableRequiresCurrentGenerationReady(t *testing.T) {
 	env := &platformv1alpha1.Environment{ObjectMeta: metav1.ObjectMeta{Generation: 2}, Status: platformv1alpha1.EnvironmentStatus{
-		ObservedGeneration: 1,
-		Phase:              platformv1alpha1.EnvironmentPhaseReady,
-		PodName:            "env-test",
-		Endpoints:          platformv1alpha1.EnvironmentEndpoints{Sandboxd: "10.0.0.1:50051"},
+		ObservedGeneration:  1,
+		ExecutionGeneration: 1,
+		Phase:               platformv1alpha1.EnvironmentPhaseReady,
+		PodName:             "env-test",
+		Endpoints:           platformv1alpha1.EnvironmentEndpoints{Sandboxd: "10.0.0.1:50051"},
 		Conditions: []metav1.Condition{{
 			Type: platformv1alpha1.EnvironmentConditionReady, Status: metav1.ConditionTrue,
 			ObservedGeneration: 1, Reason: "SandboxdReady", Message: "stale readiness",
@@ -2024,7 +2115,8 @@ func TestCredentialAcceptanceUsesUncachedCurrentKeyAndClearsCopy(t *testing.T) {
 	_, currentSecret := credentialProfileAndSecret(run, []byte("!!CURRENT-UNCACHED-KEY!!"))
 	adapter := &scriptedAdapter{}
 	r := reconciler(t, adapter, run, env, profile, staleSecret)
-	liveReader := fake.NewClientBuilder().WithScheme(r.Scheme).WithObjects(profile.DeepCopy(), currentSecret).Build()
+	liveObjects := append(runExecutionBackendObjects(t, r, env), profile.DeepCopy(), currentSecret)
+	liveReader := fake.NewClientBuilder().WithScheme(r.Scheme).WithObjects(liveObjects...).Build()
 	r.APIReader = liveReader
 
 	if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(run)}); err != nil {
@@ -2093,9 +2185,20 @@ func TestCredentialRotationIsRematerializedAfterResumeEpoch(t *testing.T) {
 		t.Fatal(err)
 	}
 	applyEnvironmentStatus(&currentEnv, platformv1alpha1.EnvironmentPhaseReady, "env-e", "10.0.0.2:50051", "SandboxdReady", "ready", nil)
+	currentEnv.Status.ExecutionGeneration = 2
 	currentEnv.Status.Lifecycle.Suspended = false
 	currentEnv.Status.Lifecycle.SuspensionReason = ""
 	if err := r.Status().Update(context.Background(), &currentEnv); err != nil {
+		t.Fatal(err)
+	}
+	var oldPod corev1.Pod
+	if err := r.Get(context.Background(), types.NamespacedName{Namespace: currentEnv.Namespace, Name: "env-e"}, &oldPod); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Delete(context.Background(), &oldPod); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Create(context.Background(), runExecutionPod(&currentEnv, "pod-e-resumed", "10.0.0.2")); err != nil {
 		t.Fatal(err)
 	}
 	reconcileRun(t, r, run.Name) // Paused -> EnvironmentReady.
@@ -2139,7 +2242,6 @@ func TestMissedPauseTransitionReacceptsFreshEnvironmentEpoch(t *testing.T) {
 			_, rotatedSecret := credentialProfileAndSecret(run, []byte("!!EPOCH-ONE-KEY!!"))
 			adapter := &scriptedAdapter{observations: []AdapterObservation{test.observation}}
 			r := reconciler(t, adapter, run, env, profile, staleSecret)
-			r.APIReader = fake.NewClientBuilder().WithScheme(r.Scheme).WithObjects(profile.DeepCopy(), rotatedSecret).Build()
 
 			// The Environment completes an entire pause/resume while the Run
 			// controller is unavailable. No Run reconcile occurs in this window.
@@ -2168,12 +2270,16 @@ func TestMissedPauseTransitionReacceptsFreshEnvironmentEpoch(t *testing.T) {
 				t.Fatal(err)
 			}
 			applyEnvironmentStatus(&currentEnv, platformv1alpha1.EnvironmentPhaseReady, "env-e-1", "10.0.0.2:50051", "SandboxdReady", "ready", nil)
+			currentEnv.Status.ExecutionGeneration = 2
 			currentEnv.Status.Lifecycle.Suspended = false
 			currentEnv.Status.Lifecycle.SuspensionReason = ""
 			currentEnv.Status.Lifecycle.Epoch = 1
 			if err := r.Status().Update(context.Background(), &currentEnv); err != nil {
 				t.Fatal(err)
 			}
+			livePod := runExecutionPod(&currentEnv, "pod-e-1", "10.0.0.2")
+			template := &platformv1alpha1.EnvironmentTemplate{ObjectMeta: metav1.ObjectMeta{Name: currentEnv.Spec.TemplateRef, Namespace: currentEnv.Namespace}}
+			r.APIReader = fake.NewClientBuilder().WithScheme(r.Scheme).WithObjects(currentEnv.DeepCopy(), template, livePod, profile.DeepCopy(), rotatedSecret).Build()
 
 			fenced := reconcileRun(t, r, run.Name)
 			if fenced.Status.State != platformv1alpha1.RunStateEnvironmentReady || adapter.accepted != 0 || adapter.observed != 0 {
@@ -2190,6 +2296,334 @@ func TestMissedPauseTransitionReacceptsFreshEnvironmentEpoch(t *testing.T) {
 				t.Fatalf("post-accept observation = state %s, acceptances %d, observations %d", observed.Status.State, adapter.accepted, adapter.observed)
 			}
 		})
+	}
+}
+
+func TestObserveDiscardsStaleExecutionResults(t *testing.T) {
+	for _, ownership := range []platformv1alpha1.EnvironmentOwnership{
+		platformv1alpha1.EnvironmentOwnershipOwned,
+		platformv1alpha1.EnvironmentOwnershipClaimed,
+	} {
+		for _, observation := range []AdapterObservation{AdapterObservationNeedsInput, AdapterObservationSucceeded} {
+			t.Run(string(ownership)+"/"+string(observation), func(t *testing.T) {
+				epoch := int64(0)
+				executionGeneration := int64(1)
+				run := &platformv1alpha1.Run{
+					ObjectMeta: metav1.ObjectMeta{Name: "run", Namespace: "ns", UID: "run-uid", Finalizers: []string{runFinalizer}},
+					Spec:       platformv1alpha1.RunSpec{Agent: "test"},
+					Status: platformv1alpha1.RunStatus{
+						State:                                  platformv1alpha1.RunStateRunning,
+						EnvironmentRef:                         &platformv1alpha1.RunEnvironmentReference{Name: "environment", UID: "env-uid", Ownership: ownership},
+						AcceptedEnvironmentEpoch:               &epoch,
+						AcceptedEnvironmentExecutionGeneration: &executionGeneration,
+						Conditions: []metav1.Condition{{
+							Type: runConditionAdapterAccepted, Status: metav1.ConditionTrue, Reason: "AdapterAccepted",
+						}},
+					},
+				}
+				environment := &platformv1alpha1.Environment{
+					ObjectMeta: metav1.ObjectMeta{Name: "environment", Namespace: "ns", UID: "env-uid"},
+					Status: platformv1alpha1.EnvironmentStatus{
+						ExecutionGeneration: 1, Phase: platformv1alpha1.EnvironmentPhaseReady,
+					},
+				}
+				if ownership == platformv1alpha1.EnvironmentOwnershipClaimed {
+					environment.Status.ClaimedBy = &platformv1alpha1.RunReference{Name: run.Name, UID: run.UID}
+				}
+				adapter := &blockingObserveAdapter{observation: observation, started: make(chan struct{}), release: make(chan struct{})}
+				r := reconciler(t, adapter, run, environment)
+				done := make(chan struct{})
+				var result ctrl.Result
+				var reconcileErr error
+				go func() {
+					result, reconcileErr = r.Reconcile(context.Background(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(run)})
+					close(done)
+				}()
+				<-adapter.started
+
+				var replaced platformv1alpha1.Environment
+				if err := r.Get(context.Background(), client.ObjectKeyFromObject(environment), &replaced); err != nil {
+					t.Fatal(err)
+				}
+				replaced.Status.ExecutionGeneration = 2
+				if err := r.Status().Update(context.Background(), &replaced); err != nil {
+					t.Fatal(err)
+				}
+				close(adapter.release)
+				<-done
+				if reconcileErr != nil || !result.Requeue {
+					t.Fatalf("stale Observe reconcile = (%#v, %v)", result, reconcileErr)
+				}
+				var retained platformv1alpha1.Run
+				if err := r.Get(context.Background(), client.ObjectKeyFromObject(run), &retained); err != nil {
+					t.Fatal(err)
+				}
+				if retained.Status.State != platformv1alpha1.RunStateRunning || retained.Status.FinishedAt != nil ||
+					retained.Status.AcceptedEnvironmentExecutionGeneration == nil || *retained.Status.AcceptedEnvironmentExecutionGeneration != 1 {
+					t.Fatalf("stale %s observation mutated Run status: %#v", observation, retained.Status)
+				}
+			})
+		}
+	}
+}
+
+func TestAdapterResultsRequireSameLivePodWithUnchangedStatus(t *testing.T) {
+	for _, ownership := range []platformv1alpha1.EnvironmentOwnership{
+		platformv1alpha1.EnvironmentOwnershipOwned,
+		platformv1alpha1.EnvironmentOwnershipClaimed,
+	} {
+		for _, acceptErr := range []error{nil, ErrAdapterTaskRejected} {
+			name := "successful accept"
+			if acceptErr != nil {
+				name = "rejected accept"
+			}
+			t.Run(string(ownership)+"/"+name+" Pod disappears", func(t *testing.T) {
+				run, environment := adapterRaceObjects(ownership, platformv1alpha1.RunStateEnvironmentReady)
+				apiMeta.SetStatusCondition(&run.Status.Conditions, metav1.Condition{Type: runConditionAdapterAcceptanceAttempted, Status: metav1.ConditionTrue, Reason: "AcceptancePending"})
+				adapter := &scriptedAdapter{acceptErr: acceptErr}
+				r := reconciler(t, adapter, run, environment)
+				adapter.onAccept = func() { deleteRunExecutionPod(t, r, environment) }
+
+				result, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(run)})
+				if err != nil || !result.Requeue || adapter.accepted != 1 {
+					t.Fatalf("stale acceptance = (%#v, %v), calls %d", result, err, adapter.accepted)
+				}
+				var retained platformv1alpha1.Run
+				if err := r.Get(context.Background(), client.ObjectKeyFromObject(run), &retained); err != nil {
+					t.Fatal(err)
+				}
+				if retained.Status.State != platformv1alpha1.RunStateEnvironmentReady || retained.Status.AcceptedEnvironmentExecutionGeneration != nil {
+					t.Fatalf("stale acceptance mutated Run: %#v", retained.Status)
+				}
+			})
+		}
+
+		t.Run(string(ownership)+"/observe Pod replaced", func(t *testing.T) {
+			run, environment := adapterRaceObjects(ownership, platformv1alpha1.RunStateRunning)
+			epoch, generation := int64(0), int64(1)
+			run.Status.AcceptedEnvironmentEpoch = &epoch
+			run.Status.AcceptedEnvironmentExecutionGeneration = &generation
+			apiMeta.SetStatusCondition(&run.Status.Conditions, metav1.Condition{Type: runConditionAdapterAccepted, Status: metav1.ConditionTrue, Reason: "AdapterAccepted"})
+			adapter := &scriptedAdapter{observations: []AdapterObservation{AdapterObservationSucceeded}}
+			r := reconciler(t, adapter, run, environment)
+			// scripted Observe is synchronous, so replace the Pod from its
+			// observation hook by using a one-shot wrapper.
+			wrapped := &mutatingObserveAdapter{scriptedAdapter: adapter, mutate: func() { replaceRunExecutionPod(t, r, environment) }}
+			r.Adapters["test"] = wrapped
+
+			result, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(run)})
+			if err != nil || !result.Requeue || adapter.observed != 1 {
+				t.Fatalf("stale observation = (%#v, %v), calls %d", result, err, adapter.observed)
+			}
+			var retained platformv1alpha1.Run
+			if err := r.Get(context.Background(), client.ObjectKeyFromObject(run), &retained); err != nil {
+				t.Fatal(err)
+			}
+			if retained.Status.State != platformv1alpha1.RunStateRunning || retained.Status.FinishedAt != nil {
+				t.Fatalf("stale observation mutated Run: %#v", retained.Status)
+			}
+		})
+	}
+}
+
+type mutatingObserveAdapter struct {
+	*scriptedAdapter
+	mutate func()
+}
+
+func (a *mutatingObserveAdapter) Observe(ctx context.Context, task AdapterTask, sandbox AdapterSandbox) (AdapterObservation, string, error) {
+	observation, message, err := a.scriptedAdapter.Observe(ctx, task, sandbox)
+	a.mutate()
+	return observation, message, err
+}
+
+func adapterRaceObjects(ownership platformv1alpha1.EnvironmentOwnership, state platformv1alpha1.RunState) (*platformv1alpha1.Run, *platformv1alpha1.Environment) {
+	run := &platformv1alpha1.Run{
+		ObjectMeta: metav1.ObjectMeta{Name: "run", Namespace: "ns", UID: "run-uid", Finalizers: []string{runFinalizer}},
+		Spec:       platformv1alpha1.RunSpec{Agent: "test"},
+		Status: platformv1alpha1.RunStatus{State: state, EnvironmentRef: &platformv1alpha1.RunEnvironmentReference{
+			Name: "environment", UID: "env-uid", Ownership: ownership,
+		}},
+	}
+	environment := &platformv1alpha1.Environment{
+		ObjectMeta: metav1.ObjectMeta{Name: "environment", Namespace: "ns", UID: "env-uid"},
+		Status:     platformv1alpha1.EnvironmentStatus{Phase: platformv1alpha1.EnvironmentPhaseReady},
+	}
+	if ownership == platformv1alpha1.EnvironmentOwnershipClaimed {
+		environment.Status.ClaimedBy = &platformv1alpha1.RunReference{Name: run.Name, UID: run.UID}
+	}
+	return run, environment
+}
+
+func deleteRunExecutionPod(t *testing.T, r *RunReconciler, environment *platformv1alpha1.Environment) {
+	t.Helper()
+	var pod corev1.Pod
+	if err := r.Get(context.Background(), types.NamespacedName{Namespace: environment.Namespace, Name: "env-environment"}, &pod); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Delete(context.Background(), &pod); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func replaceRunExecutionPod(t *testing.T, r *RunReconciler, environment *platformv1alpha1.Environment) {
+	t.Helper()
+	deleteRunExecutionPod(t, r, environment)
+	var current platformv1alpha1.Environment
+	if err := r.Get(context.Background(), client.ObjectKeyFromObject(environment), &current); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Create(context.Background(), runExecutionPod(&current, "replacement-pod", "10.0.0.1")); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestCancelDiscardsResultWhenLiveExecutionDisappears(t *testing.T) {
+	for _, ownership := range []platformv1alpha1.EnvironmentOwnership{
+		platformv1alpha1.EnvironmentOwnershipOwned,
+		platformv1alpha1.EnvironmentOwnershipClaimed,
+	} {
+		t.Run(string(ownership), func(t *testing.T) {
+			epoch, executionGeneration := int64(0), int64(1)
+			run := &platformv1alpha1.Run{
+				ObjectMeta: metav1.ObjectMeta{Name: "run", Namespace: "ns", UID: "run-uid", Finalizers: []string{runFinalizer}},
+				Spec:       platformv1alpha1.RunSpec{Agent: "test", Cancel: true},
+				Status: platformv1alpha1.RunStatus{
+					State: platformv1alpha1.RunStateRunning,
+					EnvironmentRef: &platformv1alpha1.RunEnvironmentReference{
+						Name: "environment", UID: "env-uid", Ownership: ownership,
+					},
+					AcceptedEnvironmentEpoch:               &epoch,
+					AcceptedEnvironmentExecutionGeneration: &executionGeneration,
+					Conditions:                             []metav1.Condition{{Type: runConditionAdapterAccepted, Status: metav1.ConditionTrue, Reason: "AdapterAccepted"}},
+				},
+			}
+			environment := &platformv1alpha1.Environment{
+				ObjectMeta: metav1.ObjectMeta{Name: "environment", Namespace: "ns", UID: "env-uid"},
+				Status:     platformv1alpha1.EnvironmentStatus{Phase: platformv1alpha1.EnvironmentPhaseReady},
+			}
+			if ownership == platformv1alpha1.EnvironmentOwnershipClaimed {
+				environment.Status.ClaimedBy = &platformv1alpha1.RunReference{Name: run.Name, UID: run.UID}
+			}
+			adapter := &scriptedAdapter{}
+			r := reconciler(t, adapter, run, environment)
+			adapter.onCancel = func() {
+				var pod corev1.Pod
+				if err := r.Get(context.Background(), types.NamespacedName{Namespace: environment.Namespace, Name: "env-environment"}, &pod); err != nil {
+					t.Fatal(err)
+				}
+				if err := r.Delete(context.Background(), &pod); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			result, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(run)})
+			if err != nil || !result.Requeue || adapter.cancelled != 1 {
+				t.Fatalf("stale Cancel reconcile = (%#v, %v), calls %d", result, err, adapter.cancelled)
+			}
+			var retainedRun platformv1alpha1.Run
+			if err := r.Get(context.Background(), client.ObjectKeyFromObject(run), &retainedRun); err != nil {
+				t.Fatal(err)
+			}
+			if retainedRun.Status.State != platformv1alpha1.RunStateRunning || retainedRun.Status.FinishedAt != nil || !controllerutil.ContainsFinalizer(&retainedRun, runFinalizer) {
+				t.Fatalf("stale Cancel published terminal state or removed finalizer: %#v", retainedRun)
+			}
+			if ownership == platformv1alpha1.EnvironmentOwnershipClaimed {
+				var retainedEnvironment platformv1alpha1.Environment
+				if err := r.Get(context.Background(), client.ObjectKeyFromObject(environment), &retainedEnvironment); err != nil {
+					t.Fatal(err)
+				}
+				if retainedEnvironment.Status.ClaimedBy == nil || retainedEnvironment.Status.ClaimedBy.UID != run.UID {
+					t.Fatalf("stale Cancel released claim: %#v", retainedEnvironment.Status.ClaimedBy)
+				}
+			}
+		})
+	}
+}
+
+func TestTerminalCleanupRetainsClaimWhenExecutionChangesDuringCancel(t *testing.T) {
+	run, environment := adapterRaceObjects(platformv1alpha1.EnvironmentOwnershipClaimed, platformv1alpha1.RunStateSucceeded)
+	epoch, generation := int64(0), int64(1)
+	run.Status.AcceptedEnvironmentEpoch = &epoch
+	run.Status.AcceptedEnvironmentExecutionGeneration = &generation
+	apiMeta.SetStatusCondition(&run.Status.Conditions, metav1.Condition{Type: runConditionAdapterAccepted, Status: metav1.ConditionTrue, Reason: "AdapterAccepted"})
+	adapter := &scriptedAdapter{}
+	r := reconciler(t, adapter, run, environment)
+	adapter.onCancel = func() { replaceRunExecutionPod(t, r, environment) }
+
+	result, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(run)})
+	if err != nil || !result.Requeue || adapter.cancelled != 1 {
+		t.Fatalf("terminal cleanup stale Cancel = (%#v, %v), calls %d", result, err, adapter.cancelled)
+	}
+	var retainedEnvironment platformv1alpha1.Environment
+	if err := r.Get(context.Background(), client.ObjectKeyFromObject(environment), &retainedEnvironment); err != nil {
+		t.Fatal(err)
+	}
+	if retainedEnvironment.Status.ClaimedBy == nil || retainedEnvironment.Status.ClaimedBy.UID != run.UID {
+		t.Fatalf("terminal cleanup released claim after stale Cancel: %#v", retainedEnvironment.Status.ClaimedBy)
+	}
+	var retainedRun platformv1alpha1.Run
+	if err := r.Get(context.Background(), client.ObjectKeyFromObject(run), &retainedRun); err != nil {
+		t.Fatal(err)
+	}
+	condition := apiMeta.FindStatusCondition(retainedRun.Status.Conditions, runConditionEnvironmentReady)
+	if condition != nil && condition.Reason == "EnvironmentReleased" {
+		t.Fatalf("terminal cleanup published release after stale Cancel: %#v", condition)
+	}
+}
+
+func TestFinalizerRetainsClaimWhenExecutionChangesDuringCancel(t *testing.T) {
+	now := metav1.Now()
+	epoch, executionGeneration := int64(0), int64(1)
+	run := &platformv1alpha1.Run{
+		ObjectMeta: metav1.ObjectMeta{Name: "run", Namespace: "ns", UID: "run-uid", Finalizers: []string{runFinalizer}, DeletionTimestamp: &now},
+		Spec:       platformv1alpha1.RunSpec{Agent: "test"},
+		Status: platformv1alpha1.RunStatus{
+			State: platformv1alpha1.RunStateRunning,
+			EnvironmentRef: &platformv1alpha1.RunEnvironmentReference{
+				Name: "environment", UID: "env-uid", Ownership: platformv1alpha1.EnvironmentOwnershipClaimed,
+			},
+			AcceptedEnvironmentEpoch:               &epoch,
+			AcceptedEnvironmentExecutionGeneration: &executionGeneration,
+			Conditions:                             []metav1.Condition{{Type: runConditionAdapterAccepted, Status: metav1.ConditionTrue, Reason: "AdapterAccepted"}},
+		},
+	}
+	environment := &platformv1alpha1.Environment{
+		ObjectMeta: metav1.ObjectMeta{Name: "environment", Namespace: "ns", UID: "env-uid"},
+		Status: platformv1alpha1.EnvironmentStatus{
+			Phase: platformv1alpha1.EnvironmentPhaseReady, ClaimedBy: &platformv1alpha1.RunReference{Name: run.Name, UID: run.UID},
+		},
+	}
+	adapter := &scriptedAdapter{}
+	r := reconciler(t, adapter, run, environment)
+	adapter.onCancel = func() {
+		var pod corev1.Pod
+		if err := r.Get(context.Background(), types.NamespacedName{Namespace: environment.Namespace, Name: "env-environment"}, &pod); err != nil {
+			t.Fatal(err)
+		}
+		pod.UID = "replacement-pod"
+		if err := r.Update(context.Background(), &pod); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	result, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(run)})
+	if err != nil || !result.Requeue || adapter.cancelled != 1 {
+		t.Fatalf("finalizer stale Cancel reconcile = (%#v, %v), calls %d", result, err, adapter.cancelled)
+	}
+	var retainedRun platformv1alpha1.Run
+	if err := r.Get(context.Background(), client.ObjectKeyFromObject(run), &retainedRun); err != nil {
+		t.Fatal(err)
+	}
+	if !controllerutil.ContainsFinalizer(&retainedRun, runFinalizer) {
+		t.Fatal("stale finalizer Cancel removed finalizer")
+	}
+	var retainedEnvironment platformv1alpha1.Environment
+	if err := r.Get(context.Background(), client.ObjectKeyFromObject(environment), &retainedEnvironment); err != nil {
+		t.Fatal(err)
+	}
+	if retainedEnvironment.Status.ClaimedBy == nil || retainedEnvironment.Status.ClaimedBy.UID != run.UID {
+		t.Fatalf("stale finalizer Cancel released claim: %#v", retainedEnvironment.Status.ClaimedBy)
 	}
 }
 

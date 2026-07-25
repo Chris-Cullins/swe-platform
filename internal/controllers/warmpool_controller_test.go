@@ -388,6 +388,7 @@ func TestWarmPoolTransientFailureRecoversDuringGrace(t *testing.T) {
 	if err := baseClient.Get(context.Background(), client.ObjectKeyFromObject(env), &recovering); err != nil {
 		t.Fatal(err)
 	}
+	recovering.Status.ExecutionGeneration = 1
 	applyEnvironmentStatus(&recovering, platformv1alpha1.EnvironmentPhaseReady, "pod", "10.0.0.1:50051", "SandboxdReady", "ready", nil)
 	if err := baseClient.Status().Update(context.Background(), &recovering); err != nil {
 		t.Fatal(err)
@@ -639,6 +640,7 @@ func TestWarmPoolLiveMembershipSnapshotBoundsSurgeWithStaleCache(t *testing.T) {
 		if env.Status.Phase == platformv1alpha1.EnvironmentPhaseFailed {
 			continue
 		}
+		env.Status.ExecutionGeneration = 1
 		applyEnvironmentStatus(env, platformv1alpha1.EnvironmentPhaseReady, "pod-"+env.Name, "10.0.0.1:50051", "SandboxdReady", "ready", nil)
 		if err := liveClient.Status().Update(context.Background(), env); err != nil {
 			t.Fatal(err)
@@ -848,6 +850,9 @@ func TestWarmPoolTemplateGenerationChangePreventsMemberCreation(t *testing.T) {
 
 func setWarmPoolOwner(t *testing.T, scheme *runtime.Scheme, tmpl *platformv1alpha1.EnvironmentTemplate, env *platformv1alpha1.Environment) {
 	t.Helper()
+	if env.Status.Phase == platformv1alpha1.EnvironmentPhaseReady || env.Status.Phase == platformv1alpha1.EnvironmentPhaseRunning {
+		env.Status.ExecutionGeneration = 1
+	}
 	if err := controllerutil.SetControllerReference(tmpl, env, scheme, controllerutil.WithBlockOwnerDeletion(false)); err != nil {
 		t.Fatal(err)
 	}
