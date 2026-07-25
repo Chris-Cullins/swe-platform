@@ -24,6 +24,81 @@ import (
 	sandboxdauth "github.com/Chris-Cullins/swe-platform/sandboxd/auth"
 )
 
+func TestDialTerminalBindsExactExecutionAfterFinalRead(t *testing.T) {
+	const identity = "pod-a.sandboxd.swe.dev"
+	scheme := runtime.NewScheme()
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	if err := platformv1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	environment := &platformv1alpha1.Environment{
+		ObjectMeta: metav1.ObjectMeta{Name: "environment", Namespace: "ns", UID: "env-uid"},
+		Spec:       platformv1alpha1.EnvironmentSpec{TemplateRef: "default"},
+		Status: platformv1alpha1.EnvironmentStatus{
+			Lifecycle: platformv1alpha1.EnvironmentLifecycleStatus{Epoch: 7},
+			Phase:     platformv1alpha1.EnvironmentPhaseReady,
+			PodName:   "env-environment",
+			Endpoints: platformv1alpha1.EnvironmentEndpoints{Sandboxd: "10.0.0.1:50051"},
+			Conditions: []metav1.Condition{{
+				Type: platformv1alpha1.EnvironmentConditionReady, Status: metav1.ConditionTrue,
+				Reason: "SandboxdReady", Message: "sandboxd is ready",
+			}},
+		},
+	}
+	template := &platformv1alpha1.EnvironmentTemplate{ObjectMeta: metav1.ObjectMeta{Name: "default", Namespace: environment.Namespace}}
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: environment.Status.PodName, Namespace: environment.Namespace, UID: "pod-uid-1",
+			Annotations: map[string]string{
+				sandboxdauth.IdentityAnnotation: identity,
+				sandboxdauth.TrustAnnotation:    string(processTestCertificate(t, identity)),
+				sandboxdauth.TokenAnnotation:    "terminal-token",
+			},
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: platformv1alpha1.GroupVersion.String(), Kind: "Environment", Name: environment.Name,
+				UID: environment.UID, Controller: processTestPtr(true),
+			}},
+		},
+		Status: corev1.PodStatus{
+			PodIP:      "10.0.0.1",
+			Conditions: []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}},
+		},
+	}
+	newClient := func() client.Client {
+		return fake.NewClientBuilder().WithScheme(scheme).WithObjects(environment.DeepCopy(), template.DeepCopy(), pod.DeepCopy()).Build()
+	}
+
+	terminal, health, execution, closeConnection, err := (Connector{Reader: newClient()}).DialTerminal(context.Background(), environment.Namespace, environment.Name, environment.UID)
+	if err != nil || terminal == nil || health == nil || closeConnection == nil {
+		t.Fatalf("valid terminal dial: terminal nil=%t, health nil=%t, close nil=%t, error=%v", terminal == nil, health == nil, closeConnection == nil, err)
+	}
+	if execution.EnvironmentUID != environment.UID || execution.LifecycleEpoch != 7 || execution.PodName != pod.Name || execution.PodUID != pod.UID {
+		t.Fatalf("terminal execution = %#v", execution)
+	}
+	if err := closeConnection(); err != nil {
+		t.Fatal(err)
+	}
+
+	epochRace := &environmentChangingReader{Reader: newClient(), mutate: func(current *platformv1alpha1.Environment) {
+		current.Status.Lifecycle.Epoch++
+		current.Status.Lifecycle.Suspended = true
+	}}
+	terminal, health, execution, closeConnection, err = (Connector{Reader: epochRace}).DialTerminal(context.Background(), environment.Namespace, environment.Name, environment.UID)
+	if err == nil || !strings.Contains(err.Error(), "execution changed while resolving terminal endpoint") || epochRace.environmentGets != 2 || terminal != nil || health != nil || closeConnection != nil || execution != (TerminalExecution{}) {
+		t.Fatalf("post-dial lifecycle race: terminal nil=%t, health nil=%t, execution=%#v, close nil=%t, error=%v, Environment reads=%d", terminal == nil, health == nil, execution, closeConnection == nil, err, epochRace.environmentGets)
+	}
+
+	podRace := &podChangingReader{Reader: newClient(), mutate: func(current *corev1.Pod) {
+		current.UID = "pod-uid-2"
+	}}
+	terminal, health, execution, closeConnection, err = (Connector{Reader: podRace}).DialTerminal(context.Background(), environment.Namespace, environment.Name, environment.UID)
+	if err == nil || !strings.Contains(err.Error(), "execution changed while resolving terminal endpoint") || podRace.podGets != 2 || terminal != nil || health != nil || closeConnection != nil || execution != (TerminalExecution{}) {
+		t.Fatalf("post-dial same-name Pod race: terminal nil=%t, health nil=%t, execution=%#v, close nil=%t, error=%v, Pod reads=%d", terminal == nil, health == nil, execution, closeConnection == nil, err, podRace.podGets)
+	}
+}
+
 func TestDialProcessValidatesCurrentEnvironmentPodAndCredentialIncarnation(t *testing.T) {
 	const identity = "pod-a.sandboxd.swe.dev"
 	certificate := processTestCertificate(t, identity)
@@ -154,6 +229,25 @@ type environmentChangingReader struct {
 	client.Reader
 	environmentGets int
 	mutate          func(*platformv1alpha1.Environment)
+}
+
+type podChangingReader struct {
+	client.Reader
+	podGets int
+	mutate  func(*corev1.Pod)
+}
+
+func (r *podChangingReader) Get(ctx context.Context, key client.ObjectKey, object client.Object, options ...client.GetOption) error {
+	if err := r.Reader.Get(ctx, key, object, options...); err != nil {
+		return err
+	}
+	if pod, ok := object.(*corev1.Pod); ok {
+		r.podGets++
+		if r.podGets > 1 {
+			r.mutate(pod)
+		}
+	}
+	return nil
 }
 
 func (r *environmentChangingReader) Get(ctx context.Context, key client.ObjectKey, object client.Object, options ...client.GetOption) error {
