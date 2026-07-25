@@ -26,7 +26,7 @@ class Events {
     Events.current = this
     Events.instances.push(this)
   }
-  response() { return new Response(new ReadableStream({ start: controller => { this.controller = controller }, cancel: this.cancel }), { headers: { 'Content-Type': 'text/event-stream' } }) }
+  response(status = 200, statusText = '', contentType = 'text/event-stream') { return new Response(new ReadableStream({ start: controller => { this.controller = controller }, cancel: this.cancel }), { status, statusText, headers: { 'Content-Type': contentType } }) }
   emit(type: string, data: string, id = '') {
     this.controller.enqueue(new TextEncoder().encode(`${id ? `id: ${id}\n` : ''}event: ${type}\ndata: ${data}\n\n`))
   }
@@ -238,6 +238,27 @@ describe('Transcript', () => {
     await waitFor(() => expect(screen.getByRole('status')).toHaveTextContent('Transcript event exceeds'))
     expect(stream.cancel).toHaveBeenCalledOnce()
     expect(Events.instances).toHaveLength(1)
+  })
+
+  it('cancels a retryable error response before reconnecting with the same UID', async () => {
+    let requests = 0
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (path, init = {}) => {
+      requests += 1
+      const stream = new Events(String(path), init)
+      return requests === 1 ? stream.response(503, 'Unavailable') : stream.response()
+    })
+    render(<Transcript namespace="n" run="r" identity="uid-exact" />)
+    await waitFor(() => expect(Events.instances).toHaveLength(2))
+    expect(Events.instances[0].cancel).toHaveBeenCalledOnce()
+    expect(Events.instances[1].init.headers).toEqual(expect.objectContaining({ 'SWE-Run-UID': 'uid-exact' }))
+  })
+
+  it('cancels a terminal wrong-content-type response', async () => {
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (path, init = {}) => new Events(String(path), init).response(200, '', 'application/json'))
+    render(<Transcript namespace="n" run="r" identity="uid-exact" />)
+    await waitFor(() => expect(screen.getByRole('status')).toHaveTextContent('Expected transcript event stream'))
+    expect(Events.instances).toHaveLength(1)
+    expect(Events.instances[0].cancel).toHaveBeenCalledOnce()
   })
 
   it('recovers an expired reconnect cursor once without dropping the UID', async () => {

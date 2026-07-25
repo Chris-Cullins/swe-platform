@@ -156,9 +156,16 @@ export function Transcript({ namespace, run, identity }: { namespace: string; ru
       while (!disposed) {
         try {
           const response = await api.transcript(namespace, run, identity, controller.signal, lastEventID || undefined)
-          if (response.status === 401) return
+          const cancelResponse = async () => {
+            if (response.body) await response.body.cancel().catch(() => undefined)
+          }
+          if (response.status === 401) {
+            await cancelResponse()
+            return
+          }
           if (!response.ok || !response.body) {
             if (established && lastEventID && !freshRecoveryUsed && (response.status === 400 || response.status === 410)) {
+              await cancelResponse()
               lastEventID = ''
               freshRecoveryUsed = true
               setStatus('Recovering transcript')
@@ -166,15 +173,18 @@ export function Transcript({ namespace, run, identity }: { namespace: string; ru
               continue
             }
             if (response.status === 408 || response.status === 429 || response.status >= 500) {
+              await cancelResponse()
               setStatus('Reconnecting')
               await reconnectDelay()
               continue
             }
+            await cancelResponse()
             setStatus(response.statusText || `Request failed (${response.status})`)
             return
           }
           const mediaType = response.headers.get('Content-Type')?.split(';', 1)[0].trim().toLowerCase()
           if (mediaType !== 'text/event-stream') {
+            await cancelResponse()
             setStatus(`Expected transcript event stream, got ${mediaType || 'unknown content type'}`)
             return
           }
