@@ -78,6 +78,12 @@ func (a *watchAdmission) release(namespace, principal string) {
 	a.active--
 	a.namespaces[namespace]--
 	a.principals[principal]--
+	if a.namespaces[namespace] == 0 {
+		delete(a.namespaces, namespace)
+	}
+	if a.principals[principal] == 0 {
+		delete(a.principals, principal)
+	}
 }
 
 func runWatchQuery(r *http.Request) (string, error) {
