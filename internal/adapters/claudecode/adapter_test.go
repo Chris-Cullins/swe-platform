@@ -20,6 +20,7 @@ type fakeProcessClient struct {
 	process       *sandboxdv1.Process
 	stdout        []byte
 	stderr        []byte
+	retainedFrom  uint64
 	startCalls    int
 	launches      int
 	startedKey    *sandboxdv1.ProcessKey
@@ -78,17 +79,22 @@ func (f *fakeProcessClient) Stop(_ context.Context, request *sandboxdv1.StopProc
 
 func (f *fakeProcessClient) ReadOutput(_ context.Context, request *sandboxdv1.ReadOutputRequest, _ ...grpc.CallOption) (*sandboxdv1.ReadOutputResponse, error) {
 	f.readRequests = append(f.readRequests, request)
-	data := f.stdout
+	data, retainedFrom := f.stdout, f.retainedFrom
 	if request.Stream == sandboxdv1.OutputStream_OUTPUT_STREAM_STDERR {
-		data = f.stderr
+		data, retainedFrom = f.stderr, 0
 	}
+	producedEnd := retainedFrom + uint64(len(data))
 	offset := request.Offset
-	if offset > uint64(len(data)) {
+	var gapBytes uint64
+	if offset < retainedFrom {
+		gapBytes, offset = retainedFrom-offset, retainedFrom
+	}
+	if offset > producedEnd {
 		return nil, status.Error(codes.OutOfRange, "offset")
 	}
-	end := min(len(data), int(offset)+int(request.MaxBytes))
-	chunk := append([]byte(nil), data[offset:end]...)
-	return &sandboxdv1.ReadOutputResponse{Data: chunk, Offset: offset, NextOffset: uint64(end), ProducedEnd: uint64(len(data)), Eof: end == len(data)}, nil
+	start := offset - retainedFrom
+	end := min(len(data), int(start)+int(request.MaxBytes))
+	return &sandboxdv1.ReadOutputResponse{Data: append([]byte(nil), data[start:end]...), Offset: offset, NextOffset: retainedFrom + uint64(end), GapBytes: gapBytes, RetainedStart: retainedFrom, ProducedEnd: producedEnd, Eof: end == len(data)}, nil
 }
 
 func sandboxFor(client sandboxdv1.ProcessServiceClient) controllers.AdapterSandbox {
@@ -319,6 +325,22 @@ func TestPermanentOutputRejectionFailsObservation(t *testing.T) {
 	got, message, err := (&Adapter{}).Observe(context.Background(), controllers.AdapterTask{ID: "run"}, sandbox)
 	if err != nil || got != controllers.AdapterObservationFailed || !strings.Contains(message, "permanently rejected") {
 		t.Fatalf("Observe() = (%q, %q, %v)", got, message, err)
+	}
+}
+
+func TestTerminalValidationFailsOnRetainedOutputGap(t *testing.T) {
+	exit0 := int32(0)
+	// sandboxd dropped the first 512 bytes of stdout before the requested
+	// offset; the retained tail still contains a valid-looking success event,
+	// but the transport-reported gap makes the terminal result untrustworthy.
+	client := &fakeProcessClient{
+		process:      &sandboxdv1.Process{State: sandboxdv1.ProcessState_PROCESS_STATE_EXITED, ExitCode: &exit0, ExecutionId: "execution"},
+		stdout:       []byte(`{"type":"result","subtype":"success","is_error":false,"result":"done"}` + "\n"),
+		retainedFrom: 512,
+	}
+	got, detail, err := (&Adapter{}).Observe(context.Background(), controllers.AdapterTask{ID: "run"}, sandboxFor(client))
+	if err != nil || got != controllers.AdapterObservationFailed || !strings.Contains(detail, "truncated before terminal validation") || !strings.Contains(detail, "retained from offset 512") {
+		t.Fatalf("Observe() = (%q, %q, %v)", got, detail, err)
 	}
 }
 
