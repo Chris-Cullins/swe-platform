@@ -184,39 +184,43 @@ export function Transcript({ namespace, run, identity }: { namespace: string; ru
           const reader = response.body.getReader()
           const decoder = new TextDecoder()
           let buffer = ''
-          while (!disposed) {
-            const { value, done } = await reader.read()
-            if (value) buffer += decoder.decode(value, { stream: true })
-            let boundary: { index: number; length: number } | undefined
-            while ((boundary = sseBoundary(buffer)) !== undefined) {
-              if (boundary.index > MAX_SSE_BUFFER) throw new Error(`Transcript event exceeds ${MAX_SSE_BUFFER} bytes`)
-              const block = buffer.slice(0, boundary.index)
-              buffer = buffer.slice(boundary.index + boundary.length)
-              let type = 'message'
-              let id = ''
-              let hasID = false
-              const data: string[] = []
-              for (const line of block.split(/\r\n|\n|\r/)) {
-                if (!line || line.startsWith(':')) continue
-                const colon = line.indexOf(':')
-                const field = colon < 0 ? line : line.slice(0, colon)
-                const fieldValue = colon < 0 ? '' : line.slice(colon + 1).replace(/^ /, '')
-                if (field === 'event') type = fieldValue
-                else if (field === 'id' && !fieldValue.includes('\0')) { id = fieldValue; hasID = true }
-                else if (field === 'data') data.push(fieldValue)
-                else if (field === 'retry' && /^\d+$/.test(fieldValue)) reconnectWait = Math.min(Number(fieldValue), 30_000)
+          try {
+            while (!disposed) {
+              const { value, done } = await reader.read()
+              if (value) buffer += decoder.decode(value, { stream: true })
+              let boundary: { index: number; length: number } | undefined
+              while ((boundary = sseBoundary(buffer)) !== undefined) {
+                if (boundary.index > MAX_SSE_BUFFER) throw new Error(`Transcript event exceeds ${MAX_SSE_BUFFER} bytes`)
+                const block = buffer.slice(0, boundary.index)
+                buffer = buffer.slice(boundary.index + boundary.length)
+                let type = 'message'
+                let id = ''
+                let hasID = false
+                const data: string[] = []
+                for (const line of block.split(/\r\n|\n|\r/)) {
+                  if (!line || line.startsWith(':')) continue
+                  const colon = line.indexOf(':')
+                  const field = colon < 0 ? line : line.slice(0, colon)
+                  const fieldValue = colon < 0 ? '' : line.slice(colon + 1).replace(/^ /, '')
+                  if (field === 'event') type = fieldValue
+                  else if (field === 'id' && !fieldValue.includes('\0')) { id = fieldValue; hasID = true }
+                  else if (field === 'data') data.push(fieldValue)
+                  else if (field === 'retry' && /^\d+$/.test(fieldValue)) reconnectWait = Math.min(Number(fieldValue), 30_000)
+                }
+                if (hasID) lastEventID = id
+                if (!data.length) continue
+                const event = new MessageEvent(type, { data: data.join('\n'), lastEventId: lastEventID })
+                if (type === 'transcript') onTranscript(event)
+                else if (type === 'transcript-gap') onGap(event)
               }
-              if (hasID) lastEventID = id
-              if (!data.length) continue
-              const event = new MessageEvent(type, { data: data.join('\n'), lastEventId: lastEventID })
-              if (type === 'transcript') onTranscript(event)
-              else if (type === 'transcript-gap') onGap(event)
+              if (buffer.length > MAX_SSE_BUFFER) throw new Error(`Transcript event exceeds ${MAX_SSE_BUFFER} bytes`)
+              if (done) {
+                decoder.decode()
+                break
+              }
             }
-            if (buffer.length > MAX_SSE_BUFFER) throw new Error(`Transcript event exceeds ${MAX_SSE_BUFFER} bytes`)
-            if (done) {
-              decoder.decode()
-              break
-            }
+          } finally {
+            await reader.cancel().catch(() => undefined)
           }
           if (!disposed) {
             setStatus('Reconnecting')

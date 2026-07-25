@@ -21,15 +21,17 @@ class Events {
   static instances: Events[] = []
   controller!: ReadableStreamDefaultController<Uint8Array>
   close = vi.fn(() => this.controller.close())
+  cancel = vi.fn()
   constructor(public url: string, public init: RequestInit) {
     Events.current = this
     Events.instances.push(this)
   }
-  response() { return new Response(new ReadableStream({ start: controller => { this.controller = controller } }), { headers: { 'Content-Type': 'text/event-stream' } }) }
+  response() { return new Response(new ReadableStream({ start: controller => { this.controller = controller }, cancel: this.cancel }), { headers: { 'Content-Type': 'text/event-stream' } }) }
   emit(type: string, data: string, id = '') {
     this.controller.enqueue(new TextEncoder().encode(`${id ? `id: ${id}\n` : ''}event: ${type}\ndata: ${data}\n\n`))
   }
   fail(error = new Error('stream interrupted')) { this.controller.error(error) }
+  write(data: Uint8Array) { this.controller.enqueue(data) }
 }
 
 function mockStreams() {
@@ -225,6 +227,17 @@ describe('Transcript', () => {
     expect(requests).toBe(2)
     expect(Events.current.init.headers).toEqual(expect.objectContaining({ 'SWE-Run-UID': 'uid-exact' }))
     expect(Events.current.init.headers).not.toHaveProperty('Last-Event-ID')
+  })
+
+  it('cancels the response reader after a terminal oversized event', async () => {
+    mockStreams()
+    render(<Transcript namespace="n" run="r" identity="uid-exact" />)
+    await waitFor(() => expect(Events.instances).toHaveLength(1))
+    const stream = Events.current
+    act(() => stream.write(new Uint8Array((8 << 20) + 1).fill(120)))
+    await waitFor(() => expect(screen.getByRole('status')).toHaveTextContent('Transcript event exceeds'))
+    expect(stream.cancel).toHaveBeenCalledOnce()
+    expect(Events.instances).toHaveLength(1)
   })
 
   it('recovers an expired reconnect cursor once without dropping the UID', async () => {
