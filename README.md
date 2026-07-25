@@ -424,20 +424,40 @@ values on existing resources fail with an `UnsupportedBackend` Ready-condition r
 before the operator creates a Pod or PVC. CRD admission rejects unsupported values for
 new Environments and templates.
 
-The authenticated control plane exposes a browser terminal at
-`GET /api/v1/namespaces/{namespace}/environments/{name}/terminal`. The WebSocket client
-first sends `{"type":"open","cols":80,"rows":24}`, then uses binary frames for terminal
-input and output. Send `{"type":"resize","cols":120,"rows":40}` to resize the shared
-terminal. Kubernetes TokenReview authenticates bearer credentials and SubjectAccessReview
-authorizes the exact namespaced environment; the namespace is never accepted from a query
-parameter. See the [Helm chart documentation](charts/swe-platform/README.md#control-plane-authentication-and-authorization)
+The authenticated control plane exposes a direct terminal at
+`GET /api/v1/namespaces/{namespace}/environments/{name}/terminal`; native clients must send
+the expected immutable Environment identity in `SWE-Environment-UID`. The browser console
+uses the Run-scoped route
+`GET /api/v1/namespaces/{namespace}/runs/{run}/terminal/{runUID}/{environmentUID}` instead.
+Each UID is a separately percent-encoded path segment. These UIDs are non-secret identity
+preconditions and can appear in browser devtools, proxy access logs, and tracing; bearer
+credentials and session identifiers must never be placed in the URL. The existing native
+Run route, `/runs/{run}/terminal`, remains available with `SWE-Run-UID` and
+`SWE-Environment-UID` headers.
+
+All terminal WebSocket clients first send `{"type":"open","cols":80,"rows":24}`, then use
+binary frames for terminal input and output. Send `{"type":"resize","cols":120,"rows":40}`
+to resize the shared terminal. Kubernetes TokenReview authenticates bearer credentials and
+SubjectAccessReview authorizes exact namespaced resources; the namespace is never accepted
+from a query parameter. The browser route authorizes the exact Run before decoding or
+validating bounded UIDs, resolves its exact current Environment association, authorizes that
+Environment's terminal subresource, and only then applies origin/upgrade checks and the
+existing repeatedly fenced terminal dial. See the
+[Helm chart documentation](charts/swe-platform/README.md#control-plane-authentication-and-authorization)
 for credentials, browser sessions, RBAC, and self-hosted bootstrap setup.
-The CLI uses this gateway rather than Kubernetes pod discovery or port forwarding:
+The CLI uses this gateway rather than Kubernetes pod discovery or port forwarding. Direct
+attach deliberately requires an explicit UID and does not perform a hidden base-Environment
+GET, so a credential restricted to `environments/terminal` remains sufficient:
 
 ```sh
+ENV_UID="$(kubectl get environment my-environment -o jsonpath='{.metadata.uid}')"
 SWE_CONTROL_PLANE_URL=https://swe.example.com \
-SWE_CONTROL_PLANE_TOKEN="$TOKEN" swe attach my-environment
+SWE_CONTROL_PLANE_TOKEN="$TOKEN" swe attach my-environment --environment-uid "$ENV_UID"
 ```
+
+Name-only direct clients now fail with a terminal-identity error rather than selecting a
+same-name replacement. A stale UID is rejected before terminal activity, wake, readiness,
+backend resolution, or WebSocket upgrade.
 
 ### Terminal operations console
 
@@ -460,7 +480,9 @@ attached terminal and restores the dashboard. Run details show normalized status
 wall-time timestamps (started/finished), and usage, Environment readiness/pause state, and a
 bounded raw transcript view. Transcript source, type,
 payload, and retention gaps are displayed generically; adapter-owned payloads are not parsed as
-a common event schema.
+a common event schema. Both native and browser consoles show terminal navigation only when the
+Run API returns `terminalAvailable` with an exact `environment.uid`; reconnects and component
+remounts retain that same Run and Environment identity and never follow same-name replacements.
 
 For a non-interactive authentication/connectivity check (including CI), use `swe tui --check`.
 It validates namespaced Run-list access without starting a terminal UI or printing credentials.

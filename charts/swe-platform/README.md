@@ -387,7 +387,8 @@ exact namespace, resource name, and subresource on every request:
 | Read an Environment | `get` on `environments` with the requested Environment `resourceName` |
 | Read a transcript | `get` on `runs/transcript` with the requested Run `resourceName` |
 | Append a transcript event | `update` on `runs/transcript` with the requested Run `resourceName` |
-| Open a terminal | `get` on `environments/terminal` with the requested Environment `resourceName` |
+| Open a direct Environment terminal | `get` on `environments/terminal` with the requested Environment `resourceName` |
+| Open a Run terminal | `get` on the requested base `runs` `resourceName`, then `get` on the resolved `environments/terminal` `resourceName` |
 
 This permits producer credentials to be restricted to one Run using an RBAC Role with
 `resourceNames`. The namespace is part of the URL only as a resource selector; it becomes
@@ -422,6 +423,26 @@ plane then requires single-valued `X-Forwarded-Host` and `X-Forwarded-Proto` hea
 the proxy must overwrite (not append or pass through) both. Non-browser WebSocket clients
 without `Origin` are allowed only with an explicit bearer credential. Tokens are never
 accepted in query parameters.
+
+Direct Environment WebSockets use
+`/api/v1/namespaces/{namespace}/environments/{name}/terminal` and require the exact bounded
+Environment UID in `SWE-Environment-UID`. This keeps terminal-subresource-only RBAC viable:
+`swe attach ENVIRONMENT --environment-uid UID` never performs a base-Environment read.
+The native Run terminal route `/runs/{run}/terminal` retains its bounded `SWE-Run-UID` and
+`SWE-Environment-UID` headers. Browsers, which cannot set those headers in the WebSocket
+constructor, use `/runs/{run}/terminal/{runUID}/{environmentUID}` with each UID encoded as one
+path segment. UIDs are non-secret identity preconditions whose URL/log/devtools visibility is
+intentional; credentials and tickets are never accepted there.
+
+For the browser route, authentication and exact base-Run authorization precede UID decoding,
+bounds, and staleness checks. The server then resolves the exact current Run/Environment
+association, authorizes the exact Environment terminal, checks WebSocket origin and upgrade,
+and enters the same repeatedly association-, hold-, revision-, execution-, and backend-fenced
+dial path used by native Run clients. Direct stale/missing identities and stale, released, or
+reassigned Run associations fail before activity, wake, readiness polling, connector/backend
+resolution, health checks, or upgrade. The Run DTO exposes `environment.uid` and
+`terminalAvailable` only for an exact current association; browser terminal navigation must be
+absent otherwise and must retain both identities on remount.
 
 When the control plane is enabled, the chart projects a rotating `swe-platform`-audience
 service-account token into the operator and grants that identity `update` on

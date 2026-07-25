@@ -4,7 +4,7 @@ import { FitAddon } from '@xterm/addon-fit'
 import '@xterm/xterm/css/xterm.css'
 import { api } from './api'
 
-export default function Terminal({ namespace, environment }: { namespace: string; environment: string }) {
+export default function Terminal({ namespace, run, runUID, environment, environmentUID }: { namespace: string; run: string; runUID: string; environment: string; environmentUID: string }) {
   const host = useRef<HTMLDivElement>(null)
   const [status, setStatus] = useState('Connecting')
 
@@ -16,7 +16,7 @@ export default function Terminal({ namespace, environment }: { namespace: string
     terminal.open(host.current)
 
     const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:'
-    const socket = new WebSocket(`${protocol}//${location.host}${api.terminalPath(namespace, environment)}`)
+    const socket = new WebSocket(`${protocol}//${location.host}${api.terminalPath(namespace, run, runUID, environmentUID)}`)
     socket.binaryType = 'arraybuffer'
     let opened = false
     let disposed = false
@@ -61,7 +61,7 @@ export default function Terminal({ namespace, environment }: { namespace: string
       fit.dispose()
       terminal.dispose()
     }
-  }, [namespace, environment])
+  }, [namespace, run, runUID, environment, environmentUID])
 
   return <section>
     <p role="status" aria-live="polite">Terminal: {status}</p>

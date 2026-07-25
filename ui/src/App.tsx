@@ -207,7 +207,7 @@ function Detail() {
   if (query.isPending) return <main><Busy label="Loading run" /></main>
   if (query.error) return <main><Failure error={query.error} /></main>
   return <main><div className="title"><div><Link to={`/namespaces/${encodeURIComponent(namespace)}/runs`}>← Runs</Link><h1>{run}</h1></div><span className="pill">{query.data.state}</span></div>
-    <nav aria-label="Run sections"><NavLink to="overview">Overview</NavLink><NavLink to="transcript">Transcript</NavLink>{query.data.environment && <NavLink to="terminal">Terminal</NavLink>}</nav>
+    <nav aria-label="Run sections"><NavLink to="overview">Overview</NavLink><NavLink to="transcript">Transcript</NavLink>{query.data.terminalAvailable && query.data.environment?.uid && <NavLink to="terminal">Terminal</NavLink>}</nav>
     <Outlet context={query.data} />
   </main>
 }
@@ -246,7 +246,7 @@ function Overview() {
 }
 
 function TranscriptRoute() { const run = useOutletRun(); const { namespace = '' } = useParams(); return <Transcript key={`${namespace}/${run.name}/${run.uid}`} namespace={namespace} run={run.name} identity={run.uid} /> }
-function TerminalRoute() { const run = useOutletRun(); const { namespace = '' } = useParams(); return run.environment ? <Suspense fallback={<Busy label="Loading terminal" />}><Terminal namespace={namespace} environment={run.environment.name} /></Suspense> : <p role="status">No environment allocated.</p> }
+function TerminalRoute() { const run = useOutletRun(); const { namespace = '' } = useParams(); return run.terminalAvailable && run.environment?.uid ? <Suspense fallback={<Busy label="Loading terminal" />}><Terminal key={`${namespace}/${run.name}/${run.uid}/${run.environment.uid}`} namespace={namespace} run={run.name} runUID={run.uid} environment={run.environment.name} environmentUID={run.environment.uid} /></Suspense> : <p role="status">Terminal unavailable for this Run identity.</p> }
 
 export function App() {
   return <Routes>

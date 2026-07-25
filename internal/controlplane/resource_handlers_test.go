@@ -14,13 +14,17 @@ import (
 )
 
 type recordingAccess struct {
-	calls   []ResourceAccess
-	err     error
-	denyGet bool
+	calls                   []ResourceAccess
+	err                     error
+	denyGet                 bool
+	denyEnvironmentTerminal bool
 }
 
 func (a *recordingAccess) Authorize(_ *http.Request, x ResourceAccess, _ bool) error {
 	a.calls = append(a.calls, x)
+	if a.denyEnvironmentTerminal && x.Resource == "environments" && x.Subresource == "terminal" {
+		return errForbidden
+	}
 	if a.denyGet && x.Verb == "get" {
 		return errForbidden
 	}
@@ -312,6 +316,97 @@ func TestRunTerminalRouteRequiresExactIdentityAndPreservesEnvironmentSAR(t *test
 	}
 	if !reflect.DeepEqual(access.calls, want) {
 		t.Fatalf("authorization calls = %#v, want %#v", access.calls, want)
+	}
+}
+
+func TestBrowserRunTerminalRouteDecodesExactIdentityAndPreservesEnvironmentSAR(t *testing.T) {
+	access := &recordingAccess{}
+	resources := &fakeResources{terminalAssociation: RunTerminalAssociation{RunName: "run", RunUID: "run/uid", EnvironmentName: "env", EnvironmentUID: "env/uid"}}
+	server := NewServer(nil, ServerOptions{Access: access, Resources: resources, TerminalDialer: &terminalTestDialer{}})
+	request := httptest.NewRequest(http.MethodGet, "/api/v1/namespaces/ns/runs/run/terminal/run%2Fuid/env%2Fuid", nil)
+	request.Header.Set("Authorization", "Bearer x")
+	response := httptest.NewRecorder()
+	server.Handler().ServeHTTP(response, request)
+	if response.Code != http.StatusBadRequest || resources.terminalRunUID != "run/uid" || resources.terminalEnvironmentUID != "env/uid" {
+		t.Fatalf("response/identity = %d/%q/%q", response.Code, resources.terminalRunUID, resources.terminalEnvironmentUID)
+	}
+	want := []ResourceAccess{
+		{Namespace: "ns", Verb: "get", Resource: "runs", Name: "run"},
+		{Namespace: "ns", Verb: "get", Resource: "environments", Subresource: "terminal", Name: "env"},
+	}
+	if !reflect.DeepEqual(access.calls, want) {
+		t.Fatalf("authorization calls = %#v, want %#v", access.calls, want)
+	}
+}
+
+func TestBrowserRunTerminalAuthorizesRunBeforeIdentityValidation(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		access *recordingAccess
+		path   string
+		want   int
+	}{
+		{name: "unauthorized empty identity", access: &recordingAccess{err: errForbidden}, path: "/api/v1/namespaces/ns/runs/run/terminal/%20/%20", want: http.StatusForbidden},
+		{name: "authorized overlong identity", access: &recordingAccess{}, path: "/api/v1/namespaces/ns/runs/run/terminal/" + strings.Repeat("r", 129) + "/env-uid", want: http.StatusBadRequest},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			resources := &fakeResources{}
+			dialer := &terminalTestDialer{}
+			request := httptest.NewRequest(http.MethodGet, test.path, nil)
+			request.Header.Set("Authorization", "Bearer x")
+			response := httptest.NewRecorder()
+			NewServer(nil, ServerOptions{Access: test.access, Resources: resources, TerminalDialer: dialer}).Handler().ServeHTTP(response, request)
+			if response.Code != test.want || len(test.access.calls) != 1 || resources.terminalRunUID != "" || dialer.calls != 0 {
+				t.Fatalf("response/access/identity/dials = %d/%v/%q/%d", response.Code, test.access.calls, resources.terminalRunUID, dialer.calls)
+			}
+		})
+	}
+}
+
+func TestBrowserRunTerminalChecksAssociationAndEnvironmentAuthorizationBeforeOrigin(t *testing.T) {
+	access := &recordingAccess{}
+	resources := &fakeResources{terminalAssociation: RunTerminalAssociation{RunName: "run", RunUID: "run-uid", EnvironmentName: "env", EnvironmentUID: "env-uid"}}
+	dialer := &terminalTestDialer{}
+	request := httptest.NewRequest(http.MethodGet, "https://api.test/api/v1/namespaces/ns/runs/run/terminal/run-uid/env-uid", nil)
+	request.Header.Set("Origin", "https://other.test")
+	request.AddCookie(&http.Cookie{Name: sessionCookieName, Value: "session"})
+	setWebSocketUpgrade(request)
+	request.Header.Del("Authorization")
+	response := httptest.NewRecorder()
+	NewServer(nil, ServerOptions{Access: access, Resources: resources, TerminalDialer: dialer}).Handler().ServeHTTP(response, request)
+	want := []ResourceAccess{
+		{Namespace: "ns", Verb: "get", Resource: "runs", Name: "run"},
+		{Namespace: "ns", Verb: "get", Resource: "environments", Subresource: "terminal", Name: "env"},
+	}
+	if response.Code != http.StatusForbidden || !reflect.DeepEqual(access.calls, want) || resources.terminalRunUID != "run-uid" || dialer.calls != 0 {
+		t.Fatalf("response/access/identity/dials = %d/%v/%q/%d", response.Code, access.calls, resources.terminalRunUID, dialer.calls)
+	}
+}
+
+func TestBrowserRunTerminalPreservesAssociationConflictFromRepeatedDialFence(t *testing.T) {
+	for _, dialErr := range []error{errRunUIDConflict, errRunTerminalAssociation} {
+		access := &recordingAccess{}
+		resources := &fakeResources{terminalAssociation: RunTerminalAssociation{RunName: "run", RunUID: "run-uid", EnvironmentName: "env", EnvironmentUID: "env-uid"}}
+		dialer := &terminalTestDialer{err: dialErr}
+		request := httptest.NewRequest(http.MethodGet, "/api/v1/namespaces/ns/runs/run/terminal/run-uid/env-uid", nil)
+		setWebSocketUpgrade(request)
+		response := httptest.NewRecorder()
+		NewServer(nil, ServerOptions{Access: access, Resources: resources, TerminalDialer: dialer}).Handler().ServeHTTP(response, request)
+		if response.Code != http.StatusConflict || !strings.Contains(response.Body.String(), "/run-terminal-association-conflict") || dialer.calls != 1 {
+			t.Fatalf("dial error %v response/dials = %d/%s/%d", dialErr, response.Code, response.Body.String(), dialer.calls)
+		}
+	}
+}
+
+func TestBrowserRunTerminalAuthorizesEnvironmentBeforeGatewayAvailability(t *testing.T) {
+	access := &recordingAccess{denyEnvironmentTerminal: true}
+	resources := &fakeResources{terminalAssociation: RunTerminalAssociation{RunName: "run", RunUID: "run-uid", EnvironmentName: "env", EnvironmentUID: "env-uid"}}
+	request := httptest.NewRequest(http.MethodGet, "/api/v1/namespaces/ns/runs/run/terminal/run-uid/env-uid", nil)
+	setWebSocketUpgrade(request)
+	response := httptest.NewRecorder()
+	NewServer(nil, ServerOptions{Access: access, Resources: resources}).Handler().ServeHTTP(response, request)
+	if response.Code != http.StatusForbidden || len(access.calls) != 2 || resources.terminalRunUID != "run-uid" {
+		t.Fatalf("response/access/identity = %d/%v/%q", response.Code, access.calls, resources.terminalRunUID)
 	}
 }
 

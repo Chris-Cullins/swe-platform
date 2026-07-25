@@ -25,6 +25,7 @@ SANDBOXD_PORT_FORWARD_PID=""
 STREAM_PID=""
 CLI_STREAM_PID=""
 WEB_TERMINAL_CLIENT=""
+WEB_TERMINAL_SOURCE=""
 PROJECT_REPO=""
 PROJECT_WORKTREE=""
 FAKE_ENV_CONTEXT=""
@@ -49,6 +50,9 @@ cleanup() {
 	fi
 	if [[ -n "$WEB_TERMINAL_CLIENT" ]]; then
 		rm -f "$WEB_TERMINAL_CLIENT"
+	fi
+	if [[ -n "$WEB_TERMINAL_SOURCE" ]]; then
+		rm -f "$WEB_TERMINAL_SOURCE"
 	fi
 	if [[ -n "$PROJECT_REPO" ]]; then
 		rm -rf "$PROJECT_REPO"
@@ -134,7 +138,20 @@ fi
 printf '%s\n' credential-present >> /workspace/agent-credential-marker
 printf '%s\n' '{"type":"system","subtype":"init","session_id":"fake-e2e"}'
 printf '%s\n' '{"type":"assistant","session_id":"fake-e2e","message":{"id":"msg-fake-e2e","type":"message","role":"assistant","model":"claude-e2e","content":[{"type":"text","text":"fake Claude Code is working"},{"type":"tool_use","id":"tool-fake-e2e","name":"Read","input":{"file_path":"README.md"}}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":2}},"parent_tool_use_id":null}'
-sleep 5
+WAIT_FOR_BROWSER=false
+for arg in "$@"; do
+	if [ "$arg" = 'resume credential smoke test' ]; then WAIT_FOR_BROWSER=true; fi
+done
+if [ "$WAIT_FOR_BROWSER" = true ]; then
+	attempt=0
+	while [ "$attempt" -lt 60 ]; do
+		if [ -f /workspace/browser-terminal-opened ]; then break; fi
+		attempt=$((attempt + 1))
+		sleep 1
+	done
+else
+	sleep 5
+fi
 printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"result":"fake Claude Code completed"}'
 EOF
 chmod 0755 "$FAKE_ENV_CONTEXT/claude"
@@ -404,6 +421,7 @@ if [[ -n "${CLAIM_UID:-}" ]]; then
 fi
 kubectl wait --for=jsonpath='{.status.phase}'=Ready environment/"$RUN_ENV_NAME" --timeout=3m
 ENV_NAME=$RUN_ENV_NAME
+ENV_UID=$(kubectl get environment "$ENV_NAME" -o jsonpath='{.metadata.uid}')
 for _ in $(seq 1 60); do
 	REPLACEMENT_NAME=$(kubectl get environments -l swe.dev/warm-pool=small -o jsonpath='{range .items[*]}{.metadata.name}{end}' 2>/dev/null || true)
 	REPLACEMENT_PHASE=$(kubectl get environments -l swe.dev/warm-pool=small -o jsonpath='{range .items[*]}{.status.phase}{end}' 2>/dev/null || true)
@@ -494,9 +512,38 @@ subjects:
   - kind: ServiceAccount
     name: e2e-transcript-reader
     namespace: default
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: e2e-terminal
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: e2e-terminal
+rules:
+  - apiGroups: ["swe.dev"]
+    resources: ["environments/terminal"]
+    resourceNames: ["${ENV_NAME}"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: e2e-terminal
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: e2e-terminal
+subjects:
+  - kind: ServiceAccount
+    name: e2e-terminal
+    namespace: default
 EOF
 PRODUCER_TOKEN=$(kubectl create token e2e-transcript-producer --audience=swe-platform)
 READER_TOKEN=$(kubectl create token e2e-transcript-reader --audience=swe-platform)
+TERMINAL_TOKEN=$(kubectl create token e2e-terminal --audience=swe-platform)
 
 echo "==> configuring a console API user"
 cat <<'EOF' | kubectl apply -f -
@@ -515,6 +562,9 @@ rules:
     verbs: ["create", "get", "list", "update", "watch"]
   - apiGroups: ["swe.dev"]
     resources: ["environments"]
+    verbs: ["get"]
+  - apiGroups: ["swe.dev"]
+    resources: ["environments/terminal"]
     verbs: ["get"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
@@ -581,6 +631,83 @@ for _ in $(seq 1 30); do
 	fi
 	sleep 1
 done
+
+WEB_TERMINAL_SOURCE="$(mktemp /tmp/swe-browser-terminal-XXXXXX.go)"
+WEB_TERMINAL_CLIENT="${WEB_TERMINAL_SOURCE%.go}"
+cat > "$WEB_TERMINAL_SOURCE" <<'EOF'
+package main
+
+import (
+	"fmt"
+	"io"
+	"net/http"
+	"net/url"
+	"os"
+	"strings"
+	"time"
+
+	"github.com/gorilla/websocket"
+)
+
+func main() {
+	if len(os.Args) != 6 {
+		panic("usage: browser-terminal BASE_URL TOKEN PATH COMMAND MARKER")
+	}
+	base, token, path, command, marker := os.Args[1], os.Args[2], os.Args[3], os.Args[4], os.Args[5]
+	request, err := http.NewRequest(http.MethodPost, base+"/api/v1/session", nil)
+	if err != nil {
+		panic(err)
+	}
+	request.Header.Set("Authorization", "Bearer "+token)
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		panic(err)
+	}
+	_, _ = io.Copy(io.Discard, response.Body)
+	_ = response.Body.Close()
+	if response.StatusCode != http.StatusOK || len(response.Cookies()) == 0 {
+		panic(fmt.Sprintf("session exchange returned %s", response.Status))
+	}
+	parsed, err := url.Parse(base)
+	if err != nil {
+		panic(err)
+	}
+	parsed.Scheme = "ws"
+	parsed.Path = path
+	header := http.Header{"Origin": []string{base}}
+	for _, cookie := range response.Cookies() {
+		header.Add("Cookie", cookie.Name+"="+cookie.Value)
+	}
+	connection, dialResponse, err := websocket.DefaultDialer.Dial(parsed.String(), header)
+	if err != nil {
+		if dialResponse != nil {
+			panic(fmt.Sprintf("terminal handshake returned %s", dialResponse.Status))
+		}
+		panic(err)
+	}
+	defer connection.Close()
+	if err := connection.WriteJSON(map[string]any{"type": "open", "cols": 80, "rows": 24}); err != nil {
+		panic(err)
+	}
+	if err := connection.WriteMessage(websocket.BinaryMessage, []byte(command)); err != nil {
+		panic(err)
+	}
+	_ = connection.SetReadDeadline(time.Now().Add(30 * time.Second))
+	var output strings.Builder
+	for !strings.Contains(output.String(), marker) {
+		messageType, payload, err := connection.ReadMessage()
+		if err != nil {
+			panic(err)
+		}
+		if messageType == websocket.BinaryMessage {
+			output.Write(payload)
+		}
+	}
+}
+EOF
+go build -o "$WEB_TERMINAL_CLIENT" "$WEB_TERMINAL_SOURCE"
+rm -f "$WEB_TERMINAL_SOURCE"
+WEB_TERMINAL_SOURCE=""
 
 echo "==> verifying terminal console authenticated client path"
 SWE_CONTROL_PLANE_URL=http://127.0.0.1:18080 SWE_CONTROL_PLANE_TOKEN="$CONSOLE_TOKEN" \
@@ -935,9 +1062,20 @@ if ! kubectl get environment "$RUN_ENV_NAME" >/dev/null 2>&1; then
 fi
 
 echo "==> verifying shared terminal through swe attach"
+MISSING_TERMINAL_UID_STATUS=$(curl --silent --output /dev/null --write-out '%{http_code}' \
+	-H "Authorization: Bearer ${TERMINAL_TOKEN}" \
+	"http://127.0.0.1:18080/api/v1/namespaces/default/environments/${ENV_NAME}/terminal")
+UNAUTHORIZED_TERMINAL_STATUS=$(curl --silent --output /dev/null --write-out '%{http_code}' \
+	-H "Authorization: Bearer ${READER_TOKEN}" \
+	-H 'SWE-Environment-UID: stale-environment-uid' \
+	"http://127.0.0.1:18080/api/v1/namespaces/default/environments/${ENV_NAME}/terminal")
+if [[ "$MISSING_TERMINAL_UID_STATUS" != "400" || "$UNAUTHORIZED_TERMINAL_STATUS" != "403" ]]; then
+	echo "FAIL: direct terminal auth/identity ordering statuses missing=${MISSING_TERMINAL_UID_STATUS} unauthorized=${UNAUTHORIZED_TERMINAL_STATUS}"
+	exit 1
+fi
 printf 'printf terminal-e2e-ok; if [ -n "${ANTHROPIC_API_KEY+x}" ]; then printf credential-present; else printf credential-absent; fi; exit\n' | \
-	SWE_CONTROL_PLANE_URL=http://127.0.0.1:18080 SWE_CONTROL_PLANE_TOKEN="$E2E_BOOTSTRAP_TOKEN" \
-	bin/swe attach "$ENV_NAME" > /tmp/swe-platform-terminal.out
+	SWE_CONTROL_PLANE_URL=http://127.0.0.1:18080 SWE_CONTROL_PLANE_TOKEN="$TERMINAL_TOKEN" \
+	bin/swe attach "$ENV_NAME" --environment-uid "$ENV_UID" > /tmp/swe-platform-terminal.out
 if ! grep -q 'terminal-e2e-ok' /tmp/swe-platform-terminal.out; then
 	echo "FAIL: terminal output was not received through swe attach"
 	cat /tmp/swe-platform-terminal.out
@@ -1024,8 +1162,38 @@ RESUME_RUN_NAME=e2e-resume-credential-run
 bin/swe run "resume credential smoke test" --name "$RESUME_RUN_NAME" --environment "$ENV_NAME" \
 	--credential-profile e2e-claude --wait=false
 kubectl wait --for=jsonpath='{.status.state}'=Running run/"$RESUME_RUN_NAME" --timeout=3m
-kubectl wait --for=jsonpath='{.status.state}'=Succeeded run/"$RESUME_RUN_NAME" --timeout=3m
 RESUME_RUN_UID=$(kubectl get run "$RESUME_RUN_NAME" -o jsonpath='{.metadata.uid}')
+RESUME_ENV_UID=$(kubectl get run "$RESUME_RUN_NAME" -o jsonpath='{.status.environmentRef.uid}')
+RUN_TERMINAL_PATH="/api/v1/namespaces/default/runs/${RESUME_RUN_NAME}/terminal/${RESUME_RUN_UID}/${RESUME_ENV_UID}"
+echo "==> verifying exact browser Run terminal through a same-origin session"
+"$WEB_TERMINAL_CLIENT" http://127.0.0.1:18080 "$CONSOLE_TOKEN" "$RUN_TERMINAL_PATH" \
+	$'touch /workspace/browser-terminal-opened; printf browser-run-terminal-e2e-ok; exit\n' browser-run-terminal-e2e-ok
+STALE_RUN_ENVIRONMENT_STATUS=$(curl --silent --output /dev/null --write-out '%{http_code}' \
+	-H "Authorization: Bearer ${CONSOLE_TOKEN}" \
+	"http://127.0.0.1:18080/api/v1/namespaces/default/runs/${RESUME_RUN_NAME}/terminal/${RESUME_RUN_UID}/stale-environment-uid")
+if [[ "$STALE_RUN_ENVIRONMENT_STATUS" != "409" ]]; then
+	echo "FAIL: browser Run terminal stale Environment status was ${STALE_RUN_ENVIRONMENT_STATUS}, expected 409"
+	exit 1
+fi
+kubectl wait --for=jsonpath='{.status.state}'=Succeeded run/"$RESUME_RUN_NAME" --timeout=3m
+for _ in $(seq 1 60); do
+	RELEASED_CLAIM_UID=$(kubectl get environment "$ENV_NAME" -o jsonpath='{.status.claimedBy.uid}' 2>/dev/null || true)
+	if [[ -z "$RELEASED_CLAIM_UID" || "$RELEASED_CLAIM_UID" != "$RESUME_RUN_UID" ]]; then
+		break
+	fi
+	sleep 1
+done
+if [[ "${RELEASED_CLAIM_UID:-}" == "$RESUME_RUN_UID" ]]; then
+	echo "FAIL: completed Run retained its Environment claim"
+	exit 1
+fi
+RELEASED_RUN_TERMINAL_STATUS=$(curl --silent --output /dev/null --write-out '%{http_code}' \
+	-H "Authorization: Bearer ${CONSOLE_TOKEN}" \
+	"http://127.0.0.1:18080/api/v1/namespaces/default/runs/${RESUME_RUN_NAME}/terminal/${RESUME_RUN_UID}/${RESUME_ENV_UID}")
+if [[ "$RELEASED_RUN_TERMINAL_STATUS" != "409" ]]; then
+	echo "FAIL: released browser Run terminal status was ${RELEASED_RUN_TERMINAL_STATUS}, expected 409"
+	exit 1
+fi
 if ! kubectl exec "$POD_NAME" -- sh -c \
 	'test "$(wc -l < /workspace/agent-credential-marker)" -eq 2 && test -z "${ANTHROPIC_API_KEY+x}" && ! tr "\000" "\n" < /proc/1/environ | grep -q "^ANTHROPIC_API_KEY="'; then
 	echo "FAIL: fresh agent launch did not receive the rotated profile in isolation"
@@ -1059,7 +1227,6 @@ if contains_e2e_key /tmp/swe-platform-resumed-workspace.tar; then
 	echo "FAIL: resumed workspace contains an agent API key"
 	exit 1
 fi
-kubectl delete run "$RESUME_RUN_NAME" --wait=true >/dev/null
 
 echo "==> verifying credentialed fake Amp process scope without network"
 AMP_RUN_NAME=e2e-fake-amp-run
@@ -1067,6 +1234,14 @@ printf '%s' "$E2E_AMP_API_KEY" | bin/swe credentials create e2e-amp --agent amp 
 bin/swe run "fake Amp lifecycle smoke test" --name "$AMP_RUN_NAME" --environment "$ENV_NAME" \
 	--agent amp --credential-profile e2e-amp --wait=false
 kubectl wait --for=jsonpath='{.status.state}'=Running run/"$AMP_RUN_NAME" --timeout=3m
+REASSIGNED_RUN_TERMINAL_STATUS=$(curl --silent --output /dev/null --write-out '%{http_code}' \
+	-H "Authorization: Bearer ${CONSOLE_TOKEN}" \
+	"http://127.0.0.1:18080/api/v1/namespaces/default/runs/${RESUME_RUN_NAME}/terminal/${RESUME_RUN_UID}/${RESUME_ENV_UID}")
+if [[ "$REASSIGNED_RUN_TERMINAL_STATUS" != "409" ]]; then
+	echo "FAIL: reassigned browser Run terminal status was ${REASSIGNED_RUN_TERMINAL_STATUS}, expected 409"
+	exit 1
+fi
+kubectl delete run "$RESUME_RUN_NAME" --wait=true >/dev/null
 kubectl wait --for=jsonpath='{.status.state}'=Succeeded run/"$AMP_RUN_NAME" --timeout=3m
 AMP_RUN_UID=$(kubectl get run "$AMP_RUN_NAME" -o jsonpath='{.metadata.uid}')
 AMP_POD_NAME=$(kubectl get environment "$ENV_NAME" -o jsonpath='{.status.podName}')
@@ -1183,8 +1358,8 @@ if [[ "${PHASE:-}" != "Paused" ]] || kubectl get pod "$POD_NAME" >/dev/null 2>&1
 	exit 1
 fi
 printf 'printf web-terminal-e2e-ok; exit\n' | \
-	SWE_CONTROL_PLANE_URL=http://127.0.0.1:18080 SWE_CONTROL_PLANE_TOKEN="$E2E_BOOTSTRAP_TOKEN" \
-	bin/swe attach "$ENV_NAME" > /tmp/swe-platform-web-terminal.out
+	SWE_CONTROL_PLANE_URL=http://127.0.0.1:18080 SWE_CONTROL_PLANE_TOKEN="$TERMINAL_TOKEN" \
+	bin/swe attach "$ENV_NAME" --environment-uid "$ENV_UID" > /tmp/swe-platform-web-terminal.out
 if ! grep -q 'web-terminal-e2e-ok' /tmp/swe-platform-web-terminal.out; then
 	echo "FAIL: terminal output was not received through the control-plane websocket"
 	cat /tmp/swe-platform-web-terminal.out
@@ -1204,6 +1379,32 @@ if [[ "$POST_WAKE_POD_UID" == "$PRE_IDLE_POD_UID" ]]; then
 	exit 1
 fi
 
+echo "==> verifying direct attach rejects a same-name Environment replacement without side effects"
+kubectl patch environmenttemplate small --type=merge -p '{"spec":{"idleTimeout":"15m"}}' >/dev/null
+kubectl delete environment "$ENV_NAME" --wait=true >/dev/null
+cat <<EOF | kubectl apply -f -
+apiVersion: swe.dev/v1alpha1
+kind: Environment
+metadata:
+  name: ${ENV_NAME}
+spec:
+  projectRef: e2e
+  templateRef: small
+EOF
+kubectl wait --for=jsonpath='{.status.phase}'=Ready environment/"$ENV_NAME" --timeout=3m
+REPLACEMENT_ENV_UID=$(kubectl get environment "$ENV_NAME" -o jsonpath='{.metadata.uid}')
+REPLACEMENT_LIFECYCLE_BEFORE=$(kubectl get environment "$ENV_NAME" -o jsonpath='{.spec.lifecycle}')
+STALE_REPLACEMENT_STATUS=$(curl --silent --output /dev/null --write-out '%{http_code}' \
+	-H "Authorization: Bearer ${TERMINAL_TOKEN}" \
+	-H "SWE-Environment-UID: ${ENV_UID}" \
+	-H 'Connection: Upgrade' -H 'Upgrade: websocket' \
+	"http://127.0.0.1:18080/api/v1/namespaces/default/environments/${ENV_NAME}/terminal")
+REPLACEMENT_LIFECYCLE_AFTER=$(kubectl get environment "$ENV_NAME" -o jsonpath='{.spec.lifecycle}')
+if [[ "$REPLACEMENT_ENV_UID" == "$ENV_UID" || "$STALE_REPLACEMENT_STATUS" != "409" || "$REPLACEMENT_LIFECYCLE_AFTER" != "$REPLACEMENT_LIFECYCLE_BEFORE" ]]; then
+	echo "FAIL: replacement terminal fence uid=${REPLACEMENT_ENV_UID} status=${STALE_REPLACEMENT_STATUS} lifecycle-before=${REPLACEMENT_LIFECYCLE_BEFORE} lifecycle-after=${REPLACEMENT_LIFECYCLE_AFTER}"
+	exit 1
+fi
+POD_NAME=$(kubectl get environment "$ENV_NAME" -o jsonpath='{.status.podName}')
 POD_PHASE=$(kubectl get pod "$POD_NAME" -o jsonpath='{.status.phase}')
 if [[ "$POD_PHASE" != "Running" ]]; then
 	echo "FAIL: pod ${POD_NAME} is ${POD_PHASE}, expected Running"
