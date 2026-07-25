@@ -10,6 +10,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	platformv1alpha1 "github.com/Chris-Cullins/swe-platform/api/v1alpha1"
+	"github.com/Chris-Cullins/swe-platform/internal/lifecycle"
 )
 
 func newEnvironmentCommand() *cobra.Command {
@@ -49,10 +50,20 @@ func newEnvironmentHoldCommand(enabled bool) *cobra.Command {
 
 func setEnvironmentHold(ctx context.Context, kube client.Client, key types.NamespacedName, enabled bool) (int64, error) {
 	revision := int64(0)
+	var pinnedUID types.UID
+	pinned := false
 	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		var environment platformv1alpha1.Environment
 		if err := kube.Get(ctx, key, &environment); err != nil {
 			return err
+		}
+		// Pin the immutable UID on the first successful read so a conflict
+		// retry cannot patch a same-name replacement incarnation.
+		if !pinned {
+			pinnedUID = environment.UID
+			pinned = true
+		} else if environment.UID != pinnedUID {
+			return lifecycle.ErrEnvironmentIncarnationChanged
 		}
 		if environment.Spec.Paused {
 			return fmt.Errorf("environment has a legacy pause awaiting controller migration")
