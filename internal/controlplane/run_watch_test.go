@@ -183,3 +183,64 @@ func TestWatchAdmissionBoundsAndReleases(t *testing.T) {
 	}
 	a.release("ns", "principal")
 }
+
+func TestWatchAdmissionDeletesZeroCountKeysOnFinalRelease(t *testing.T) {
+	a := newWatchAdmission()
+	if !a.reserve("ns-a", "principal-x") || !a.reserve("ns-b", "principal-y") {
+		t.Fatal("reservations rejected")
+	}
+	if a.active != 2 || len(a.namespaces) != 2 || len(a.principals) != 2 {
+		t.Fatalf("active/namespaces/principals = %d/%d/%d", a.active, len(a.namespaces), len(a.principals))
+	}
+	a.release("ns-a", "principal-x")
+	if _, ok := a.namespaces["ns-a"]; ok {
+		t.Fatal("ns-a key retained after final release")
+	}
+	if _, ok := a.principals["principal-x"]; ok {
+		t.Fatal("principal-x key retained after final release")
+	}
+	if a.namespaces["ns-b"] != 1 || a.principals["principal-y"] != 1 || a.active != 1 {
+		t.Fatalf("remaining counts = ns-b:%d principal-y:%d active:%d", a.namespaces["ns-b"], a.principals["principal-y"], a.active)
+	}
+	a.release("ns-b", "principal-y")
+	if len(a.namespaces) != 0 || len(a.principals) != 0 || a.active != 0 {
+		t.Fatalf("maps/active after final release = %d/%d/%d", len(a.namespaces), len(a.principals), a.active)
+	}
+}
+
+func TestWatchAdmissionOverlappingReleaseRetainsPositiveCounts(t *testing.T) {
+	a := newWatchAdmission()
+	for _, r := range []struct{ namespace, principal string }{
+		{"ns", "principal-a"},
+		{"ns", "principal-b"},
+		{"ns", "principal-c"},
+	} {
+		if !a.reserve(r.namespace, r.principal) {
+			t.Fatalf("reservation %v rejected", r)
+		}
+	}
+	if a.namespaces["ns"] != 3 || len(a.principals) != 3 || a.active != 3 {
+		t.Fatalf("initial counts = ns:%d principals:%d active:%d", a.namespaces["ns"], len(a.principals), a.active)
+	}
+	a.release("ns", "principal-a")
+	if _, ok := a.principals["principal-a"]; ok {
+		t.Fatal("principal-a key retained after final release")
+	}
+	if a.namespaces["ns"] != 2 {
+		t.Fatalf("ns count = %d, want 2 retained for overlapping watches", a.namespaces["ns"])
+	}
+	if a.principals["principal-b"] != 1 || a.principals["principal-c"] != 1 || a.active != 2 {
+		t.Fatalf("remaining counts = principal-b:%d principal-c:%d active:%d", a.principals["principal-b"], a.principals["principal-c"], a.active)
+	}
+	a.release("ns", "principal-b")
+	if a.namespaces["ns"] != 1 || len(a.principals) != 1 || a.principals["principal-c"] != 1 {
+		t.Fatalf("counts after second release = ns:%d principals:%d principal-c:%d", a.namespaces["ns"], len(a.principals), a.principals["principal-c"])
+	}
+	a.release("ns", "principal-c")
+	if _, ok := a.namespaces["ns"]; ok {
+		t.Fatal("ns key retained after final overlapping release")
+	}
+	if len(a.principals) != 0 || a.active != 0 {
+		t.Fatalf("maps/active after final release = %d/%d", len(a.principals), a.active)
+	}
+}
