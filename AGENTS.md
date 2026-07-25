@@ -8,9 +8,10 @@ Guidance for coding agents working in this repository.
 ephemeral, isolated Kubernetes environments. Read `README.md` first for the product
 shape and core concepts.
 
-**Detailed design docs live in `docs/` (`ARCHITECTURE.md`, `TODO.md`) — that folder is
-gitignored and local-only.** If `docs/` is present, read it before doing anything
-architectural. If it's missing, ask the maintainer instead of guessing at design intent.
+[`ARCHITECTURE.md`](ARCHITECTURE.md) is the canonical tracked architecture source. Read it
+before architectural work and keep implemented behavior, approved future contracts, and
+open work clearly separated. Do not guess at design intent that is not recorded there or in
+an approved maintainer decision.
 
 ## Current state
 
@@ -24,10 +25,11 @@ Run/Environment resource APIs for the console.
 The CLI also provides a local stdio `swe mcp` server with bounded `create_run` and
 UID-fenced `read_transcript` tools that act through the caller's existing explicit
 control-plane bearer credential; interactive terminal attach is intentionally not an MCP tool.
-Remaining gaps are marked `TODO(P0/P1/P2)` in code — most notably additional credential forms,
-additional agent adapters, GitHub App–scoped git tokens, and egress/portal networking. The
-`claude-code` (default), `amp`, `codex`, and `pi` adapters are registered and use sandboxd managed
-processes. API-key profiles use process-scoped launch material as `ANTHROPIC_API_KEY`,
+Remaining gaps are tracked in `ARCHITECTURE.md`, code comments, and linked issues — most notably
+additional credential forms, additional agent adapters, GitHub App–scoped git tokens, and
+egress/portal networking. The `claude-code` (default), `amp`, `codex`, and `pi` adapters are
+registered and use sandboxd managed processes. API-key profiles use process-scoped launch
+material as `ANTHROPIC_API_KEY`,
 `AMP_API_KEY`, or `CODEX_API_KEY`; tests use fake process services and no provider credentials.
 Pi deliberately supports no credential profiles or credential injection.
 
@@ -39,13 +41,14 @@ Pi deliberately supports no credential profiles or credential injection.
    internals; integrations go through the adapter interface.
 3. **Pause = disk + transcript.** Delete the pod, retain the PVC, resume onto a fresh
    pod. No CRIU/process checkpointing.
-4. **CRDs are the source of truth for infrastructure state.** Postgres (when it lands)
-   is only for transcripts/events, not desired/observed state.
+4. **CRDs are the source of truth for infrastructure state.** PostgreSQL is only for
+   transcripts/events, not desired/observed infrastructure state.
 5. **gVisor RuntimeClass by default** wherever it's possible; isolation is a feature.
-6. **Namespace-per-project tenancy.** `Project.spec.repositories` is a list from day
-   one even though v1 executes single-repo.
-7. **Inter-agent messaging is a platform primitive** (inbox + wake + notify). Transcript
-   formats stay adapter-owned; don't build a shared transcript schema.
+6. **Namespace-per-project tenancy is the approved target.** Do not build an alternate
+   tenancy boundary; current gaps and the approved claim model are in `ARCHITECTURE.md`.
+   `Project.spec.repositories` is a list from day one even though v1 executes single-repo.
+7. **Inter-agent messaging is a future platform primitive** (inbox + wake + notify).
+   Transcript formats stay adapter-owned; don't build a shared transcript schema.
 8. **Environment backends are pluggable** (`pod` / `kubevirt` / `external-runner`) and
    `sandboxd` must stay OS-portable: no Linux-only assumptions in its API; abstract
    terminal (tmux vs ConPTY), paths, and exec.
@@ -57,11 +60,11 @@ Pi deliberately supports no credential profiles or credential injection.
   `internal/controllers/`, `cmd/{operator,swe}`. Shared fenced Environment intent
   publication and validation belongs in `internal/lifecycle/`; controllers remain
   the sole owners of observed lifecycle transitions. `sandboxd/` is a **separate Go
-  module** with its own `go.mod`: keep its dependencies minimal (gRPC + protobuf
-  only) so it stays portable and the environment base image stays small.
+  module** with its own `go.mod`: keep its dependencies minimal so it stays portable and
+  the environment base image stays small.
   Generated protobuf code lives in `sandboxd/gen/` and is committed.
-- **APIs:** CRDs are `v1alpha1`; breaking changes are acceptable pre-1.0, but migrate
-  the CRD sketch in `docs/ARCHITECTURE.md` when you change fields.
+- **APIs:** CRDs are `v1alpha1`; breaking changes are acceptable pre-1.0, but update
+  the current CRD sketch in root [`ARCHITECTURE.md`](ARCHITECTURE.md) when fields change.
 - **CLI-first:** every user-facing feature needs a CLI path before any UI work.
 - **Minimal changes:** match existing style; don't refactor beyond the task.
 
@@ -72,8 +75,8 @@ When a change touches one side of a row, update the other side **in the same
 commit**:
 
 - **CRD field changes** → `make generate manifests` (deepcopy + CRDs + RBAC; CI
-  diffs `charts/swe-platform/crds`) and migrate the CRD sketch in
-  `docs/ARCHITECTURE.md`.
+  diffs `charts/swe-platform/crds`) and update the current CRD sketch in root
+  [`ARCHITECTURE.md`](ARCHITECTURE.md).
 - **Chart values/template changes** → review every `values-*.yaml` preset —
   `kind` uses locally loaded `:dev`, `argocd` tracks `:latest` for the Argo
   mirror, `k3s`/`gke`/`eks` stay immutable on the chart `appVersion` — plus the
@@ -166,5 +169,5 @@ commit.**
 
 ## Safety
 
-- Never commit secrets, tokens, or the `docs/` folder (gitignored — leave it that way).
+- Never commit secrets or tokens.
 - Don't create git commits/pushes unless the maintainer explicitly asks.

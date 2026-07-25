@@ -3,9 +3,9 @@
 Open-source platform for running coding agents unattended in ephemeral, isolated Kubernetes environments.
 
 Give an agent a task — from the CLI, web UI, or an MCP call — and the platform provisions a
-fresh environment (repo clone, toolchain, secrets, setup hooks), runs the agent in it,
-streams everything back live, auto-pauses when idle so compute cost drops to ~$0, and ends
-with a reviewable diff, branch, or PR.
+fresh environment (repo clone, toolchain, process-scoped agent credentials, setup hooks), runs
+the agent in it, streams everything back live, and auto-pauses when idle so compute cost drops
+to ~$0. Reviewable diff, branch, and PR publication remain planned work.
 
 > **Status: early.** The P0 scaffold is in — CRDs, operator, `sandboxd`, CLI — with a
 > passing kind end-to-end (`./hack/e2e.sh`). A first control-plane service accepts and
@@ -27,7 +27,7 @@ with a reviewable diff, branch, or PR.
   hardened containers, sandboxd authentication, restricted sandboxd ingress, and optional
   RuntimeClasses such as gVisor. Default-deny egress is not implemented yet.
 - **Pause economics** — idle environments are paused (pod deleted, disk retained) and
-  woken on demand. An agent waiting on its children costs ~$0.
+  woken on demand. A suspended Environment costs ~$0 in compute.
 - **Agent-agnostic** — existing agents plug in via adapters; the platform never depends
   on one agent's internals.
 - **Self-hosted** — your cluster, your credentials, your data. Runs on anything from a
@@ -41,29 +41,32 @@ with a reviewable diff, branch, or PR.
 | **Run** | One agent task executing in an environment |
 | **Project** | One or more git repos + config: setup hooks, size, changes workflow |
 | **Template** | Environment class: image, size, runtime, warm pool |
-| **Inbox** | Addressable message queue per run — how agents talk to each other |
-| **Portal** | Authenticated URL exposing a dev server inside an environment |
+| **Inbox** | Planned addressable message queue per Run |
+| **Portal** | Planned authenticated URL exposing a dev server inside an Environment |
 
 ## Architecture (short version)
+
+See [`ARCHITECTURE.md`](ARCHITECTURE.md) for the canonical tracked description of what is
+implemented today, approved next contracts, and remaining open work.
 
 - **`sandboxd`** — a small daemon inside every environment exposing one gRPC contract:
   exec, filesystem, terminal, port registry, health. The control plane never touches a
   pod except through it.
 - **Operator + CRDs** — `Environment`, `EnvironmentTemplate`, `Run`, `Project`, with
   controllers for lifecycle, warm pools (pre-booted environments), and idle reaping.
-- **Control plane** — API, auth, transcripts, and wake-on-request: any traffic to a
-  paused environment resumes it.
-- **Gateway** — live output streaming, a web terminal sharing a tmux session with the
-  agent, and reverse proxying for portals.
-- **Runs as actors** — every run has an address and an inbox. Agents can spawn child
-  runs, message each other, and get resumed when a message arrives.
+- **Control plane** — API, auth, transcripts, resource watches, and a web terminal sharing
+  the Environment's tmux session; terminal requests can wake Idle suspension.
+- **Planned gateway** — authenticated portal URLs and reverse proxying are not implemented.
+- **Planned Run actors** — inboxes, child spawning, messaging, and wake-on-message are not
+  implemented.
 
 ```
    CLI · Web UI · MCP
           │
-   Control plane ──► CRDs ──► Operator ──► Environment pods (gVisor)
+   Control plane ──► CRDs ──► Operator ──► Environment pods
           │                                    │  agent + sandboxd
-   Gateway (stream/terminal/portals) ◄─────────┘  workspace volume
+          └──────── terminal via sandboxd ─────┘  workspace volume
+                    (gVisor when configured)
 ```
 
 ### Run and process lifecycle
@@ -88,9 +91,10 @@ sandboxd process dial handle.
 Every adapter lifecycle operation is idempotent. A foreground CLI adapter can map one
 managed agent process's state to Run status; a long-lived service adapter can keep an
 Environment-scoped service process and map its task-acknowledgement/events instead. The
-platform does not assume that agent-process exit means task completion. The same contract
-maps to pod, KubeVirt, Windows, and external-runner backends because it exposes no Pod,
-container, PID, tmux, or OS-signal semantics.
+platform does not assume that agent-process exit means task completion. The same contract is
+intended to map to Pod, KubeVirt, Windows, and external-runner backends because it exposes no
+Pod, container, PID, tmux, or OS-signal semantics. Only the Pod backend is currently
+implemented.
 
 The committed sandboxd process contract is documented beside its protobuf in
 [`PROCESS_LIFECYCLE.md`](sandboxd/proto/sandboxd/v1/PROCESS_LIFECYCLE.md). In short,
