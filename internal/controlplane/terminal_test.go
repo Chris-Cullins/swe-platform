@@ -616,7 +616,9 @@ func TestTerminalHeartbeatRevokesConnectionWhenBoundExecutionChanges(t *testing.
 			pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: environment.Status.PodName, Namespace: environment.Namespace, UID: "pod-uid-1"}}
 			baseClient := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(environment).WithObjects(environment, pod).Build()
 			kubeClient := &activityCountingClient{Client: baseClient}
-			dialer := KubernetesTerminalDialer{Client: kubeClient, policyPollInterval: time.Millisecond}
+			// Delay the ordinary policy poll so only the activity timer's
+			// immediate execution check can revoke this stale lease.
+			dialer := KubernetesTerminalDialer{Client: kubeClient, policyPollInterval: time.Hour}
 			lease := &terminalConnectionLease{}
 			closed := make(chan struct{})
 			execution := sandboxclient.TerminalExecution{EnvironmentUID: environment.UID, LifecycleEpoch: 4, PodName: pod.Name, PodUID: pod.UID}
@@ -625,7 +627,7 @@ func TestTerminalHeartbeatRevokesConnectionWhenBoundExecutionChanges(t *testing.
 			}
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
-			go dialer.heartbeatActivity(ctx, client.ObjectKeyFromObject(environment), environment.UID, 0, 40*time.Millisecond, nil, lease.boundExecution, func() { _ = lease.Close() })
+			go dialer.heartbeatActivity(ctx, client.ObjectKeyFromObject(environment), environment.UID, 0, 10*time.Millisecond, nil, lease.boundExecution, func() { _ = lease.Close() })
 
 			if err := test.mutate(context.Background(), baseClient, environment, pod); err != nil {
 				t.Fatal(err)
@@ -635,10 +637,8 @@ func TestTerminalHeartbeatRevokesConnectionWhenBoundExecutionChanges(t *testing.
 			case <-time.After(time.Second):
 				t.Fatal("bound execution change did not revoke terminal")
 			}
-			writes := kubeClient.count()
-			time.Sleep(80 * time.Millisecond)
-			if got := kubeClient.count(); got != writes {
-				t.Fatalf("stale terminal activity continued after replacement: got %d writes, want %d", got, writes)
+			if writes := kubeClient.count(); writes != 0 {
+				t.Fatalf("stale terminal activity reached replacement execution: got %d writes, want 0", writes)
 			}
 		})
 	}

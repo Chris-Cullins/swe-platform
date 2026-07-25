@@ -270,8 +270,24 @@ func (d KubernetesTerminalDialer) heartbeatActivity(ctx context.Context, key typ
 			}
 		case <-timer.C:
 			for {
+				revision, held, err := d.readTerminalPolicy(ctx, key, expectedUID, boundExecution)
+				if err != nil {
+					if errors.Is(err, errTerminalEnvironmentIncarnationChanged) {
+						revoke()
+						return
+					}
+					timer.Reset(retryInterval)
+					break
+				}
+				if held || revision < policyRevision {
+					revoke()
+					return
+				}
+				if revision > policyRevision {
+					policyRevision = revision
+				}
 				environment := platformv1alpha1.Environment{ObjectMeta: metav1.ObjectMeta{Namespace: key.Namespace, Name: key.Name}}
-				err := d.markActive(ctx, &environment, expectedUID, policyRevision)
+				err = d.markActive(ctx, &environment, expectedUID, policyRevision)
 				if err == nil {
 					timer.Reset(interval)
 					break
