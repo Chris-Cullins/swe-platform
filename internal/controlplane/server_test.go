@@ -182,6 +182,7 @@ func TestTranscriptAppendIsIdempotent(t *testing.T) {
 			t.Fatal(err)
 		}
 		request.Header.Set("Authorization", "Bearer producer")
+		request.Header.Set(RunUIDHeader, "run-1-uid")
 		response, err := http.DefaultClient.Do(request)
 		if err != nil {
 			t.Fatal(err)
@@ -211,6 +212,7 @@ func TestTranscriptLegacyAppendRemainsNonIdempotent(t *testing.T) {
 	for range 2 {
 		request := httptest.NewRequest(http.MethodPost, transcriptURL, strings.NewReader(body))
 		request.Header.Set("Authorization", "Bearer producer")
+		request.Header.Set(RunUIDHeader, "run-1-uid")
 		response := httptest.NewRecorder()
 		api.Handler().ServeHTTP(response, request)
 		if response.Code != http.StatusAccepted {
@@ -228,6 +230,7 @@ func TestTranscriptValidation(t *testing.T) {
 	handler := newTestServer(&fakeAccess{}).Handler()
 	request := httptest.NewRequest(http.MethodPost, transcriptURL, bytes.NewBufferString(`{"type":"output"}`))
 	request.Header.Set("Authorization", "Bearer producer")
+	request.Header.Set(RunUIDHeader, "run-1-uid")
 	response := httptest.NewRecorder()
 
 	handler.ServeHTTP(response, request)
@@ -241,6 +244,7 @@ func TestTranscriptRejectsOversizedRequest(t *testing.T) {
 	body := `{"source":"adapter","idempotencyKey":"large","type":"output","data":"` + strings.Repeat("x", (1<<20)+1) + `"}`
 	request := httptest.NewRequest(http.MethodPost, transcriptURL, strings.NewReader(body))
 	request.Header.Set("Authorization", "Bearer producer")
+	request.Header.Set(RunUIDHeader, "run-1-uid")
 	response := httptest.NewRecorder()
 
 	handler.ServeHTTP(response, request)
@@ -311,6 +315,7 @@ func TestTranscriptAuthorizationScopesNamespaceAndRun(t *testing.T) {
 
 	allowed := httptest.NewRequest(http.MethodPost, "/api/v1/namespaces/project-a/runs/run-1/transcript", strings.NewReader(`{"source":"adapter","idempotencyKey":"event-1","type":"output","data":{"source":"a"}}`))
 	allowed.Header.Set("Authorization", "Bearer producer-a")
+	allowed.Header.Set(RunUIDHeader, "run-1-uid")
 	allowedResponse := httptest.NewRecorder()
 	api.Handler().ServeHTTP(allowedResponse, allowed)
 	if allowedResponse.Code != http.StatusCreated {
@@ -323,6 +328,7 @@ func TestTranscriptAuthorizationScopesNamespaceAndRun(t *testing.T) {
 	} {
 		request := httptest.NewRequest(http.MethodPost, path, strings.NewReader(`{"source":"adapter","idempotencyKey":"forged","type":"output","data":{"forged":true}}`))
 		request.Header.Set("Authorization", "Bearer producer-a")
+		request.Header.Set(RunUIDHeader, "run-1-uid")
 		response := httptest.NewRecorder()
 		api.Handler().ServeHTTP(response, request)
 		if response.Code != http.StatusForbidden {
@@ -340,6 +346,7 @@ func TestUnknownRunRejectedBeforeTranscriptState(t *testing.T) {
 	api := NewServer(nil, ServerOptions{Access: &fakeAccess{}, Runs: &fakeRunResolver{err: apierrors.NewNotFound(schema.GroupResource{Group: "swe.dev", Resource: "runs"}, "run-1")}, TranscriptStore: NewMemoryTranscriptStore(MemoryTranscriptStoreOptions{})})
 	request := httptest.NewRequest(http.MethodPost, transcriptURL, strings.NewReader(`{"source":"adapter","idempotencyKey":"event-1","type":"output","data":{}}`))
 	request.Header.Set("Authorization", "Bearer producer")
+	request.Header.Set(RunUIDHeader, "run-1-uid")
 	response := httptest.NewRecorder()
 	api.Handler().ServeHTTP(response, request)
 	if response.Code != http.StatusNotFound {
@@ -354,23 +361,93 @@ func TestUnknownRunRejectedBeforeTranscriptState(t *testing.T) {
 func TestRecreatedRunUsesNewTranscriptIdentity(t *testing.T) {
 	resolver := &fakeRunResolver{uid: "run-uid-1"}
 	api := NewServer(nil, ServerOptions{Access: &fakeAccess{}, Runs: resolver, TranscriptStore: NewMemoryTranscriptStore(MemoryTranscriptStoreOptions{})})
-	appendEvent := func() {
+	appendEvent := func(uid string) {
 		request := httptest.NewRequest(http.MethodPost, transcriptURL, strings.NewReader(`{"source":"adapter","idempotencyKey":"event-1","type":"output","data":{}}`))
 		request.Header.Set("Authorization", "Bearer producer")
+		request.Header.Set(RunUIDHeader, uid)
 		response := httptest.NewRecorder()
 		api.Handler().ServeHTTP(response, request)
 		if response.Code != http.StatusCreated {
 			t.Fatalf("append status = %d, want %d", response.Code, http.StatusCreated)
 		}
 	}
-	appendEvent()
+	appendEvent("run-uid-1")
 	resolver.uid = "run-uid-2"
-	appendEvent()
+	appendEvent("run-uid-2")
 	store := api.store.(*memoryTranscriptStore)
 	first := RunIdentity{Namespace: "project-1", UID: "run-uid-1"}
 	second := RunIdentity{Namespace: "project-1", UID: "run-uid-2"}
 	if len(store.runs[first].events) != 1 || len(store.runs[second].events) != 1 {
 		t.Fatalf("recreated Run transcripts were not isolated by UID: %+v", store.runs)
+	}
+}
+
+func TestTranscriptAppendRequiresRunUID(t *testing.T) {
+	resolver := &fakeRunResolver{}
+	store := NewMemoryTranscriptStore(MemoryTranscriptStoreOptions{})
+	api := NewServer(nil, ServerOptions{Access: &fakeAccess{}, Runs: resolver, TranscriptStore: store})
+
+	request := httptest.NewRequest(http.MethodPost, transcriptURL, strings.NewReader(`{"source":"adapter","idempotencyKey":"event-1","type":"output","data":{}}`))
+	request.Header.Set("Authorization", "Bearer producer")
+	response := httptest.NewRecorder()
+	api.Handler().ServeHTTP(response, request)
+	if response.Code != http.StatusPreconditionRequired {
+		t.Fatalf("missing UID status = %d, want %d", response.Code, http.StatusPreconditionRequired)
+	}
+	if response.Header().Get("Content-Type") != "application/problem+json" {
+		t.Fatalf("Content-Type = %q, want application/problem+json", response.Header().Get("Content-Type"))
+	}
+	memStore := store.(*memoryTranscriptStore)
+	if resolver.calls != 0 || len(memStore.runs) != 0 {
+		t.Fatalf("missing-UID request reached resolver/store: resolves=%d runs=%d", resolver.calls, len(memStore.runs))
+	}
+}
+
+func TestTranscriptAppendRejectsOverlongRunUID(t *testing.T) {
+	api := newTestServer(&fakeAccess{})
+	request := httptest.NewRequest(http.MethodPost, transcriptURL, strings.NewReader(`{"source":"adapter","idempotencyKey":"event-1","type":"output","data":{}}`))
+	request.Header.Set("Authorization", "Bearer producer")
+	request.Header.Set(RunUIDHeader, strings.Repeat("x", 129))
+	response := httptest.NewRecorder()
+	api.Handler().ServeHTTP(response, request)
+	if response.Code != http.StatusBadRequest {
+		t.Fatalf("overlong UID status = %d, want %d", response.Code, http.StatusBadRequest)
+	}
+}
+
+func TestTranscriptAppendRejectsStaleRunUIDAfterReplacement(t *testing.T) {
+	resolver := &fakeRunResolver{uid: "run-uid-1"}
+	store := NewMemoryTranscriptStore(MemoryTranscriptStoreOptions{})
+	api := NewServer(nil, ServerOptions{Access: &fakeAccess{}, Runs: resolver, TranscriptStore: store})
+
+	first := httptest.NewRequest(http.MethodPost, transcriptURL, strings.NewReader(`{"source":"adapter","idempotencyKey":"event-1","type":"output","data":{"text":"original"}}`))
+	first.Header.Set("Authorization", "Bearer producer")
+	first.Header.Set(RunUIDHeader, "run-uid-1")
+	firstResponse := httptest.NewRecorder()
+	api.Handler().ServeHTTP(firstResponse, first)
+	if firstResponse.Code != http.StatusCreated {
+		t.Fatalf("first append status = %d, want %d", firstResponse.Code, http.StatusCreated)
+	}
+
+	// The Run was deleted and recreated under the same name with a new UID.
+	resolver.uid = "run-uid-2"
+	stale := httptest.NewRequest(http.MethodPost, transcriptURL, strings.NewReader(`{"source":"adapter","idempotencyKey":"event-2","type":"output","data":{"text":"stale"}}`))
+	stale.Header.Set("Authorization", "Bearer producer")
+	stale.Header.Set(RunUIDHeader, "run-uid-1")
+	staleResponse := httptest.NewRecorder()
+	api.Handler().ServeHTTP(staleResponse, stale)
+	if staleResponse.Code != http.StatusConflict {
+		t.Fatalf("stale UID status = %d, want %d", staleResponse.Code, http.StatusConflict)
+	}
+
+	memStore := store.(*memoryTranscriptStore)
+	oldIdentity := RunIdentity{Namespace: "project-1", UID: "run-uid-1"}
+	newIdentity := RunIdentity{Namespace: "project-1", UID: "run-uid-2"}
+	if len(memStore.runs[oldIdentity].events) != 1 {
+		t.Fatalf("original Run transcript events = %d, want 1", len(memStore.runs[oldIdentity].events))
+	}
+	if _, exists := memStore.runs[newIdentity]; exists {
+		t.Fatalf("stale append allocated store state for the replacement Run: %+v", memStore.runs)
 	}
 }
 
@@ -395,6 +472,7 @@ func postEvent(t *testing.T, baseURL, body string) {
 	}
 	request.Header.Set("Content-Type", "application/json")
 	request.Header.Set("Authorization", "Bearer producer")
+	request.Header.Set(RunUIDHeader, "run-1-uid")
 	response, err := http.DefaultClient.Do(request)
 	if err != nil {
 		t.Fatal(err)

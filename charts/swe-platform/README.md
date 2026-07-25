@@ -392,9 +392,10 @@ exact namespace, resource name, and subresource on every request:
 This permits producer credentials to be restricted to one Run using an RBAC Role with
 `resourceNames`. The namespace is part of the URL only as a resource selector; it becomes
 authoritative only after RBAC authorizes that exact namespaced identity. Unknown Runs are
-rejected before transcript state is allocated; an already-open stream is not continuously
-reauthorized or closed when its Run is deleted. Transcript event `data` remains opaque,
-adapter-owned JSON.
+rejected before transcript state is allocated; POST appends additionally require the exact
+`SWE-Run-UID` header so a recreated Run never receives stale events. An already-open stream
+is not continuously reauthorized or closed when its Run is deleted. Transcript event `data`
+remains opaque, adapter-owned JSON.
 
 Service clients send `Authorization: Bearer <token>`. A browser exchanges an explicit,
 non-bootstrap bearer credential with `POST /api/v1/session`. After a successful TokenReview,
@@ -537,9 +538,11 @@ and clients can consume replay plus live events as an SSE stream:
 ```sh
 kubectl port-forward service/swe-platform-swe-platform-control-plane 8080:80
 TOKEN="$(kubectl create token my-reader -n project-a --audience=swe-platform)"
+RUN_UID="$(kubectl get run run-123 -n project-a -o jsonpath='{.metadata.uid}')"
 curl -N -H "Authorization: Bearer ${TOKEN}" \
   http://127.0.0.1:8080/api/v1/namespaces/project-a/runs/run-123/transcript
 curl -H "Authorization: Bearer ${TOKEN}" -H 'Content-Type: application/json' \
+  -H "SWE-Run-UID: ${RUN_UID}" \
   -d '{"source":"adapter","sourceSequence":1,"idempotencyKey":"event-1","type":"output","data":{"text":"hello"}}' \
   http://127.0.0.1:8080/api/v1/namespaces/project-a/runs/run-123/transcript
 ```
@@ -547,7 +550,12 @@ curl -H "Authorization: Bearer ${TOKEN}" -H 'Content-Type: application/json' \
 The platform envelope owns transport metadata only:
 
 - A transcript belongs to the immutable `(namespace, Run UID)` identity, so names reused
-  across namespaces or after Run recreation never collide.
+  across namespaces or after Run recreation never collide. POST append requests must carry
+  the exact current Run UID in the `SWE-Run-UID` header; a missing header returns
+  `428 Precondition Required`, a mismatch with the currently resolved Run UID returns
+  `409 Conflict`, and both are rejected before store access so a delete/recreate replacement
+  never receives stale events. GET streaming stays name-addressed and binds once to the
+  current resolved UID; it does not require the header.
 - `source` is a bounded, producer-selected idempotency partition, not authenticated
   provenance. `sourceSequence` is optional producer metadata and does not determine order.
 - `(Run identity, source, idempotencyKey)` identifies one append while that event remains
