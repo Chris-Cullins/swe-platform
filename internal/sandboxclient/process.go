@@ -31,22 +31,49 @@ type Connector struct {
 	Reader client.Reader
 }
 
+// TerminalExecution identifies the exact backend execution reached by a
+// terminal connection. PodName locates the backend, while PodUID is its
+// immutable execution fence because Environment Pod names are reused.
+type TerminalExecution struct {
+	EnvironmentUID types.UID
+	LifecycleEpoch int64
+	PodName        string
+	PodUID         types.UID
+}
+
 // DialTerminal resolves the current ready Environment incarnation and returns
 // terminal and health clients sharing one authenticated, pod-pinned connection.
-func (c Connector) DialTerminal(ctx context.Context, namespace, environment string, environmentUID types.UID) (sandboxdv1.TerminalServiceClient, sandboxdv1.HealthServiceClient, func() error, error) {
+func (c Connector) DialTerminal(ctx context.Context, namespace, environment string, environmentUID types.UID) (sandboxdv1.TerminalServiceClient, sandboxdv1.HealthServiceClient, TerminalExecution, func() error, error) {
 	env, pod, err := c.resolvePod(ctx, namespace, environment, environmentUID, nil)
 	if err != nil {
-		return nil, nil, nil, err
+		return nil, nil, TerminalExecution{}, nil, err
 	}
 	dialOptions, err := DialOptions(pod)
 	if err != nil {
-		return nil, nil, nil, err
+		return nil, nil, TerminalExecution{}, nil, err
 	}
 	conn, err := grpc.NewClient(env.Status.Endpoints.Sandboxd, dialOptions...)
 	if err != nil {
-		return nil, nil, nil, err
+		return nil, nil, TerminalExecution{}, nil, err
 	}
-	return sandboxdv1.NewTerminalServiceClient(conn), sandboxdv1.NewHealthServiceClient(conn), conn.Close, nil
+	execution := TerminalExecution{
+		EnvironmentUID: env.UID,
+		LifecycleEpoch: env.Status.Lifecycle.Epoch,
+		PodName:        pod.Name,
+		PodUID:         pod.UID,
+	}
+	// Re-read after pinning the endpoint and credentials. A lifecycle transition
+	// or same-name Pod replacement racing the dial must not produce an attachment
+	// whose independent activity heartbeat can outlive that execution.
+	currentEnvironment, currentPod, err := c.resolvePod(ctx, namespace, environment, environmentUID, &execution.LifecycleEpoch)
+	if err != nil || currentEnvironment.Status.PodName != execution.PodName || currentPod.UID != execution.PodUID {
+		_ = conn.Close()
+		if err != nil {
+			return nil, nil, TerminalExecution{}, nil, fmt.Errorf("environment execution changed while resolving terminal endpoint: %w", err)
+		}
+		return nil, nil, TerminalExecution{}, nil, fmt.Errorf("environment execution changed while resolving terminal endpoint")
+	}
+	return sandboxdv1.NewTerminalServiceClient(conn), sandboxdv1.NewHealthServiceClient(conn), execution, conn.Close, nil
 }
 
 // DialProcess resolves the exact Environment UID immediately before dialing

@@ -36,6 +36,7 @@ import (
 
 	platformv1alpha1 "github.com/Chris-Cullins/swe-platform/api/v1alpha1"
 	"github.com/Chris-Cullins/swe-platform/internal/lifecycle"
+	"github.com/Chris-Cullins/swe-platform/internal/sandboxclient"
 	sandboxdauth "github.com/Chris-Cullins/swe-platform/sandboxd/auth"
 	sandboxdv1 "github.com/Chris-Cullins/swe-platform/sandboxd/gen/proto/sandboxd/v1"
 )
@@ -391,7 +392,7 @@ func TestTerminalHeartbeatRecoversAfterTransientGetFailure(t *testing.T) {
 	dialer := KubernetesTerminalDialer{Client: transient}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go dialer.heartbeatActivity(ctx, client.ObjectKeyFromObject(environment), environment.UID, 0, 5*time.Millisecond, nil, func() {})
+	go dialer.heartbeatActivity(ctx, client.ObjectKeyFromObject(environment), environment.UID, 0, 5*time.Millisecond, nil, nil, func() {})
 
 	deadline := time.Now().Add(time.Second)
 	for time.Now().Before(deadline) {
@@ -423,7 +424,7 @@ func TestTerminalHeartbeatAdoptsNewerDisabledHoldRevision(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	revoked := atomic.Bool{}
-	go dialer.heartbeatActivity(ctx, client.ObjectKeyFromObject(environment), environment.UID, 1, 20*time.Millisecond, nil, func() { revoked.Store(true) })
+	go dialer.heartbeatActivity(ctx, client.ObjectKeyFromObject(environment), environment.UID, 1, 20*time.Millisecond, nil, nil, func() { revoked.Store(true) })
 
 	var updated platformv1alpha1.Environment
 	if err := kubeClient.Get(context.Background(), client.ObjectKeyFromObject(environment), &updated); err != nil {
@@ -457,10 +458,10 @@ func TestTerminalHeartbeatRevokesConnectionWhenHoldEnabled(t *testing.T) {
 	defer cancel()
 	closed := make(chan struct{})
 	lease := &terminalConnectionLease{}
-	if !lease.attach(closeFunc(func() error { close(closed); return nil })) {
+	if !lease.attach(closeFunc(func() error { close(closed); return nil }), sandboxclient.TerminalExecution{}) {
 		t.Fatal("failed to attach test terminal connection")
 	}
-	go dialer.heartbeatActivity(ctx, client.ObjectKeyFromObject(environment), environment.UID, 1, time.Hour, nil, func() { _ = lease.Close() })
+	go dialer.heartbeatActivity(ctx, client.ObjectKeyFromObject(environment), environment.UID, 1, time.Hour, nil, nil, func() { _ = lease.Close() })
 
 	var updated platformv1alpha1.Environment
 	if err := kubeClient.Get(context.Background(), client.ObjectKeyFromObject(environment), &updated); err != nil {
@@ -498,7 +499,7 @@ func TestTerminalPolicyPollRetriesTransientFailuresAndRevokesRecoveredHold(t *te
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	closed := make(chan struct{})
-	go dialer.heartbeatActivity(ctx, client.ObjectKeyFromObject(environment), environment.UID, 1, time.Hour, nil, func() { close(closed) })
+	go dialer.heartbeatActivity(ctx, client.ObjectKeyFromObject(environment), environment.UID, 1, time.Hour, nil, nil, func() { close(closed) })
 
 	for range 2 {
 		select {
@@ -539,10 +540,10 @@ func TestTerminalHeartbeatRevokesConnectionForReplacementUID(t *testing.T) {
 	defer cancel()
 	closed := make(chan struct{})
 	lease := &terminalConnectionLease{}
-	if !lease.attach(closeFunc(func() error { close(closed); return nil })) {
+	if !lease.attach(closeFunc(func() error { close(closed); return nil }), sandboxclient.TerminalExecution{}) {
 		t.Fatal("failed to attach test terminal connection")
 	}
-	go dialer.heartbeatActivity(ctx, client.ObjectKeyFromObject(environment), environment.UID, 0, time.Hour, nil, func() { _ = lease.Close() })
+	go dialer.heartbeatActivity(ctx, client.ObjectKeyFromObject(environment), environment.UID, 0, time.Hour, nil, nil, func() { _ = lease.Close() })
 
 	if err := kubeClient.Delete(context.Background(), environment); err != nil {
 		t.Fatal(err)
@@ -562,6 +563,132 @@ func TestTerminalHeartbeatRevokesConnectionForReplacementUID(t *testing.T) {
 	}
 	if requests := lifecycle.ActivityRequests(&retained); len(requests) != 0 {
 		t.Fatalf("replacement received stale terminal activity: %#v", requests)
+	}
+}
+
+func TestTerminalHeartbeatRevokesConnectionWhenBoundExecutionChanges(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		mutate func(context.Context, client.Client, *platformv1alpha1.Environment, *corev1.Pod) error
+	}{
+		{name: "suspension", mutate: func(ctx context.Context, kubeClient client.Client, environment *platformv1alpha1.Environment, _ *corev1.Pod) error {
+			var updated platformv1alpha1.Environment
+			if err := kubeClient.Get(ctx, client.ObjectKeyFromObject(environment), &updated); err != nil {
+				return err
+			}
+			updated.Status.Lifecycle.Suspended = true
+			return kubeClient.Status().Update(ctx, &updated)
+		}},
+		{name: "epoch", mutate: func(ctx context.Context, kubeClient client.Client, environment *platformv1alpha1.Environment, _ *corev1.Pod) error {
+			var updated platformv1alpha1.Environment
+			if err := kubeClient.Get(ctx, client.ObjectKeyFromObject(environment), &updated); err != nil {
+				return err
+			}
+			updated.Status.Lifecycle.Epoch++
+			return kubeClient.Status().Update(ctx, &updated)
+		}},
+		{name: "same-name Pod UID replacement", mutate: func(ctx context.Context, kubeClient client.Client, _ *platformv1alpha1.Environment, pod *corev1.Pod) error {
+			if err := kubeClient.Delete(ctx, pod); err != nil {
+				return err
+			}
+			replacement := pod.DeepCopy()
+			replacement.ResourceVersion = ""
+			replacement.UID = "pod-uid-2"
+			return kubeClient.Create(ctx, replacement)
+		}},
+		{name: "Pod NotFound", mutate: func(ctx context.Context, kubeClient client.Client, _ *platformv1alpha1.Environment, pod *corev1.Pod) error {
+			return kubeClient.Delete(ctx, pod)
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			scheme := runtime.NewScheme()
+			if err := corev1.AddToScheme(scheme); err != nil {
+				t.Fatal(err)
+			}
+			if err := platformv1alpha1.AddToScheme(scheme); err != nil {
+				t.Fatal(err)
+			}
+			environment := &platformv1alpha1.Environment{
+				ObjectMeta: metav1.ObjectMeta{Name: "env-1", Namespace: "project-1", UID: "env-uid", Generation: 1},
+				Status:     platformv1alpha1.EnvironmentStatus{Lifecycle: platformv1alpha1.EnvironmentLifecycleStatus{Epoch: 4}},
+			}
+			applyReadyTerminalStatus(environment, "env-env-1")
+			pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: environment.Status.PodName, Namespace: environment.Namespace, UID: "pod-uid-1"}}
+			baseClient := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(environment).WithObjects(environment, pod).Build()
+			kubeClient := &activityCountingClient{Client: baseClient}
+			dialer := KubernetesTerminalDialer{Client: kubeClient, policyPollInterval: time.Millisecond}
+			lease := &terminalConnectionLease{}
+			closed := make(chan struct{})
+			execution := sandboxclient.TerminalExecution{EnvironmentUID: environment.UID, LifecycleEpoch: 4, PodName: pod.Name, PodUID: pod.UID}
+			if !lease.attach(closeFunc(func() error { close(closed); return nil }), execution) {
+				t.Fatal("failed to bind terminal execution")
+			}
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			go dialer.heartbeatActivity(ctx, client.ObjectKeyFromObject(environment), environment.UID, 0, 40*time.Millisecond, nil, lease.boundExecution, func() { _ = lease.Close() })
+
+			if err := test.mutate(context.Background(), baseClient, environment, pod); err != nil {
+				t.Fatal(err)
+			}
+			select {
+			case <-closed:
+			case <-time.After(time.Second):
+				t.Fatal("bound execution change did not revoke terminal")
+			}
+			writes := kubeClient.count()
+			time.Sleep(80 * time.Millisecond)
+			if got := kubeClient.count(); got != writes {
+				t.Fatalf("stale terminal activity continued after replacement: got %d writes, want %d", got, writes)
+			}
+		})
+	}
+}
+
+func TestTerminalExecutionPolicyPollRetriesTransientPodRead(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	if err := platformv1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	environment := &platformv1alpha1.Environment{
+		ObjectMeta: metav1.ObjectMeta{Name: "env-1", Namespace: "project-1", UID: "env-uid", Generation: 1},
+		Status:     platformv1alpha1.EnvironmentStatus{Lifecycle: platformv1alpha1.EnvironmentLifecycleStatus{Epoch: 2}},
+	}
+	applyReadyTerminalStatus(environment, "env-env-1")
+	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: environment.Status.PodName, Namespace: environment.Namespace, UID: "pod-uid"}}
+	baseClient := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(environment).WithObjects(environment, pod).Build()
+	failed := make(chan struct{}, 1)
+	kubeClient := &transientPodGetClient{Client: baseClient, failures: 1, failed: failed}
+	dialer := KubernetesTerminalDialer{Client: kubeClient, policyPollInterval: time.Millisecond}
+	lease := &terminalConnectionLease{}
+	closed := make(chan struct{})
+	execution := sandboxclient.TerminalExecution{EnvironmentUID: environment.UID, LifecycleEpoch: 2, PodName: pod.Name, PodUID: pod.UID}
+	if !lease.attach(closeFunc(func() error { close(closed); return nil }), execution) {
+		t.Fatal("failed to bind terminal execution")
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go dialer.heartbeatActivity(ctx, client.ObjectKeyFromObject(environment), environment.UID, 0, time.Hour, nil, lease.boundExecution, func() { _ = lease.Close() })
+
+	select {
+	case <-failed:
+	case <-time.After(time.Second):
+		t.Fatal("policy poll did not read bound Pod")
+	}
+	select {
+	case <-closed:
+		t.Fatal("transient Pod read revoked terminal")
+	default:
+	}
+	if err := baseClient.Delete(context.Background(), pod); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-closed:
+	case <-time.After(time.Second):
+		t.Fatal("policy poll did not revoke after Pod disappeared")
 	}
 }
 
@@ -635,7 +762,7 @@ func TestRunTerminalHeartbeatRevokesAfterAssociationLoss(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	revoked := make(chan struct{})
-	go dialer.heartbeatActivity(ctx, client.ObjectKeyFromObject(environment), environment.UID, 0, time.Hour, association, func() { close(revoked) })
+	go dialer.heartbeatActivity(ctx, client.ObjectKeyFromObject(environment), environment.UID, 0, time.Hour, association, nil, func() { close(revoked) })
 
 	var updated platformv1alpha1.Environment
 	if err := kubeClient.Get(context.Background(), client.ObjectKeyFromObject(environment), &updated); err != nil {
@@ -675,6 +802,26 @@ type transientTerminalGetClient struct {
 	getFailures    int
 	updateFailures int
 	failedGets     chan<- struct{}
+}
+
+type transientPodGetClient struct {
+	client.Client
+	mu       sync.Mutex
+	failures int
+	failed   chan<- struct{}
+}
+
+func (c *transientPodGetClient) Get(ctx context.Context, key client.ObjectKey, object client.Object, options ...client.GetOption) error {
+	if _, ok := object.(*corev1.Pod); ok {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		if c.failures > 0 {
+			c.failures--
+			c.failed <- struct{}{}
+			return errors.New("transient Pod API failure")
+		}
+	}
+	return c.Client.Get(ctx, key, object, options...)
 }
 
 func (c *transientTerminalGetClient) Get(ctx context.Context, key client.ObjectKey, object client.Object, options ...client.GetOption) error {
