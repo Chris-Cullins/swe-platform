@@ -39,7 +39,7 @@ to ~$0. Reviewable diff, branch, and PR publication remain planned work.
 |---|---|
 | **Environment** | One ephemeral machine an agent works in (pod + volume + network policy) |
 | **Run** | One agent task executing in an environment |
-| **Project** | One or more git repos + config: setup hooks, size, changes workflow |
+| **Project** | One git repo today (list-shaped for future multi-repo support) + config |
 | **Template** | Environment class: image, size, runtime, warm pool |
 | **Inbox** | Planned addressable message queue per Run |
 | **Portal** | Planned authenticated URL exposing a dev server inside an Environment |

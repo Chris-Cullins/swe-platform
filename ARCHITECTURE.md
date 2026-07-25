@@ -1,9 +1,11 @@
 # swe-platform architecture
 
-This is the canonical, tracked architecture source for `swe-platform`. It records the
-implemented system and the contracts already approved for its next stages. Code and
-generated CRDs remain authoritative for runtime behavior; a CRD field change must update
-the current resource sketch below in the same commit.
+This root document is the canonical, tracked architecture source for `swe-platform`. It
+supersedes the private, gitignored `docs/ARCHITECTURE.md` referenced by earlier decisions; do
+not recreate that path. This document records the implemented system and the contracts already
+approved for its next stages. Code and generated CRDs remain authoritative for runtime
+behavior. Whenever CRD fields or contracts change, update the relevant entries in the current
+resource table and ownership/reference documentation below in the same commit.
 
 ## Implemented today
 
@@ -26,7 +28,7 @@ CLI / TUI / local MCP / browser console
           agent processes + sandboxd
                     ^
                     | authenticated TLS gRPC
-                    +---- control plane and adapters
+                    +---- control plane and operator-hosted adapters
 ```
 
 - **CRDs and controllers.** Kubernetes `swe.dev/v1alpha1` resources hold durable

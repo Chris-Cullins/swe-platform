@@ -63,8 +63,10 @@ Pi deliberately supports no credential profiles or credential injection.
   module** with its own `go.mod`: keep its dependencies minimal so it stays portable and
   the environment base image stays small.
   Generated protobuf code lives in `sandboxd/gen/` and is committed.
-- **APIs:** CRDs are `v1alpha1`; breaking changes are acceptable pre-1.0, but update
-  the current CRD sketch in root [`ARCHITECTURE.md`](ARCHITECTURE.md) when fields change.
+- **APIs:** CRDs are `v1alpha1`; breaking changes are acceptable pre-1.0. Whenever CRD
+  fields or contracts change, update the relevant current resource table and
+  ownership/reference documentation in root [`ARCHITECTURE.md`](ARCHITECTURE.md) in the
+  same commit.
 - **CLI-first:** every user-facing feature needs a CLI path before any UI work.
 - **Minimal changes:** match existing style; don't refactor beyond the task.
 
@@ -74,9 +76,9 @@ Several files must move in lockstep, and CI only enforces some of the pairings.
 When a change touches one side of a row, update the other side **in the same
 commit**:
 
-- **CRD field changes** → `make generate manifests` (deepcopy + CRDs + RBAC; CI
-  diffs `charts/swe-platform/crds`) and update the current CRD sketch in root
-  [`ARCHITECTURE.md`](ARCHITECTURE.md).
+- **CRD field or contract changes** → `make generate manifests` (deepcopy + CRDs + RBAC;
+  CI diffs `charts/swe-platform/crds`) and update the relevant current resource table and
+  ownership/reference documentation in root [`ARCHITECTURE.md`](ARCHITECTURE.md).
 - **Chart values/template changes** → review every `values-*.yaml` preset —
   `kind` uses locally loaded `:dev`, `argocd` tracks `:latest` for the Argo
   mirror, `k3s`/`gke`/`eks` stay immutable on the chart `appVersion` — plus the
