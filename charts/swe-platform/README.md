@@ -522,7 +522,10 @@ when the caller is separately authorized to get that exact Run and its immutable
 matches; otherwise the API returns a conflict without exposing it. Clients select either an
 existing Environment or a Project/Template allocation intent. Only the Run is created—the
 Run controller exclusively allocates or claims Environments. Cancellation monotonically sets
-`spec.cancel` and retries bounded Kubernetes update conflicts.
+`spec.cancel` and retries bounded Kubernetes update conflicts. Every cancellation body must
+include the expected immutable Run UID, for example `{"runUID":"<uid from the Run response>"}`.
+Missing or empty UIDs fail before resource resolution, and a UID that no longer matches a
+same-name Run replacement returns `409 Conflict`.
 
 Run and Environment responses omit raw CRDs, managed fields, conditions, transcript storage
 references, sandboxd/terminal endpoints, pod names, image IDs, and secrets. Environment

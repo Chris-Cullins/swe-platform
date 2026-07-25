@@ -706,10 +706,12 @@ API_CREATE_STATUS=$(curl --silent --output /tmp/swe-platform-api-run.json --writ
 API_RETRY_STATUS=$(curl --silent --output /dev/null --write-out '%{http_code}' \
 	--cookie "$COOKIE_JAR" -H 'Origin: http://127.0.0.1:18080' -H 'Content-Type: application/json' \
 	-d "$API_RUN_BODY" http://127.0.0.1:18080/api/v1/namespaces/default/runs)
+API_RUN_UID=$(python3 -c 'import json; print(json.load(open("/tmp/swe-platform-api-run.json"))["uid"])')
 CSRF_STATUS=$(curl --silent --output /dev/null --write-out '%{http_code}' \
 	--cookie "$COOKIE_JAR" -X POST http://127.0.0.1:18080/api/v1/namespaces/default/runs/e2e-api-run/cancel)
 API_CANCEL_STATUS=$(curl --silent --output /dev/null --write-out '%{http_code}' \
-	--cookie "$COOKIE_JAR" -X POST -H 'Origin: http://127.0.0.1:18080' \
+	--cookie "$COOKIE_JAR" -X POST -H 'Origin: http://127.0.0.1:18080' -H 'Content-Type: application/json' \
+	-d "{\"runUID\":\"${API_RUN_UID}\"}" \
 	http://127.0.0.1:18080/api/v1/namespaces/default/runs/e2e-api-run/cancel)
 if [[ "$API_CREATE_STATUS" != "201" || "$API_RETRY_STATUS" != "200" || "$CSRF_STATUS" != "403" || "$API_CANCEL_STATUS" != "200" ]]; then
 	echo "FAIL: typed mutation API statuses create=${API_CREATE_STATUS} retry=${API_RETRY_STATUS} csrf=${CSRF_STATUS} cancel=${API_CANCEL_STATUS}"

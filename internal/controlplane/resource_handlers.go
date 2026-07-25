@@ -138,6 +138,10 @@ func (s *Server) handleCancelRun(w http.ResponseWriter, r *http.Request, namespa
 	}
 	request, err := decodeCancelRun(w, r)
 	if err != nil {
+		if errors.Is(err, errRunUIDRequired) {
+			writeProblem(w, http.StatusPreconditionRequired, "run-uid-required", "Run UID required", "runUID is required to cancel the exact Run")
+			return
+		}
 		writeProblem(w, http.StatusBadRequest, "invalid-request", "Invalid request", err.Error())
 		return
 	}
@@ -269,7 +273,7 @@ func decodeCancelRun(w http.ResponseWriter, r *http.Request) (CancelRunRequest, 
 	var request CancelRunRequest
 	if err := decoder.Decode(&request); err != nil {
 		if errors.Is(err, io.EOF) {
-			return request, nil
+			return request, errRunUIDRequired
 		}
 		var tooLarge *http.MaxBytesError
 		if errors.As(err, &tooLarge) {
@@ -280,8 +284,11 @@ func decodeCancelRun(w http.ResponseWriter, r *http.Request) (CancelRunRequest, 
 	if err := decoder.Decode(&struct{}{}); err != io.EOF {
 		return request, fmt.Errorf("request body must contain exactly one JSON object")
 	}
-	if len(request.RunUID) > 128 {
-		return request, fmt.Errorf("runUID must not exceed 128 bytes")
+	if request.RunUID == "" {
+		return request, errRunUIDRequired
+	}
+	if len(request.RunUID) > maxRunUIDLength {
+		return request, errRunUIDTooLong
 	}
 	return request, nil
 }

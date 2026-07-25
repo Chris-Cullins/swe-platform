@@ -206,14 +206,32 @@ func TestCreateCollisionAuthorizationAndIntent(t *testing.T) {
 	}
 }
 
-func TestCancelBodyResponseAndDelegation(t *testing.T) {
+func TestCancelRequiresBoundedUIDBeforeResourceResolution(t *testing.T) {
 	f := &fakeResources{cancel: Run{Name: "r", CancelRequested: true}}
 	s := NewServer(nil, ServerOptions{Access: &recordingAccess{}, Resources: f})
-	if w := resourceRequest(s, "POST", "/api/v1/namespaces/ns/runs/r/cancel", "x", ""); w.Code != 400 || len(f.calls) != 0 {
-		t.Fatalf("nonempty=%d calls=%v", w.Code, f.calls)
+	for _, test := range []struct {
+		name, body string
+		status     int
+		typeSuffix string
+	}{
+		{name: "missing", body: "", status: http.StatusPreconditionRequired, typeSuffix: "/run-uid-required"},
+		{name: "empty object", body: `{}`, status: http.StatusPreconditionRequired, typeSuffix: "/run-uid-required"},
+		{name: "empty UID", body: `{"runUID":""}`, status: http.StatusPreconditionRequired, typeSuffix: "/run-uid-required"},
+		{name: "malformed", body: "x", status: http.StatusBadRequest, typeSuffix: "/invalid-request"},
+		{name: "unknown field", body: `{"runUID":"uid","other":true}`, status: http.StatusBadRequest, typeSuffix: "/invalid-request"},
+		{name: "overlong UID", body: `{"runUID":"` + strings.Repeat("u", maxRunUIDLength+1) + `"}`, status: http.StatusBadRequest, typeSuffix: "/invalid-request"},
+		{name: "overlong body", body: `{"runUID":"uid"}` + strings.Repeat(" ", maxCancelRunBody), status: http.StatusBadRequest, typeSuffix: "/invalid-request"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			w := resourceRequest(s, "POST", "/api/v1/namespaces/ns/runs/r/cancel", test.body, "")
+			if w.Code != test.status || !strings.Contains(w.Body.String(), test.typeSuffix) || len(f.calls) != 0 {
+				t.Fatalf("response=%d %s calls=%v", w.Code, w.Body.String(), f.calls)
+			}
+		})
 	}
+
 	for range 2 {
-		w := resourceRequest(s, "POST", "/api/v1/namespaces/ns/runs/r/cancel", "", "")
+		w := resourceRequest(s, "POST", "/api/v1/namespaces/ns/runs/r/cancel", `{"runUID":"uid-1"}`, "")
 		if w.Code != 200 || !strings.Contains(w.Body.String(), `"cancelRequested":true`) {
 			t.Fatalf("response=%d %s", w.Code, w.Body.String())
 		}
@@ -221,9 +239,12 @@ func TestCancelBodyResponseAndDelegation(t *testing.T) {
 	if strings.Join(f.calls, ",") != "cancel,cancel" {
 		t.Fatalf("calls=%v", f.calls)
 	}
+	if f.cancelUID != "uid-1" {
+		t.Fatalf("cancel UID = %q", f.cancelUID)
+	}
 }
 
-func TestCancelTypedUIDConflictAndEmptyBodyCompatibility(t *testing.T) {
+func TestCancelUIDConflict(t *testing.T) {
 	f := &fakeResources{cancel: Run{Name: "r", CancelRequested: true}}
 	s := NewServer(nil, ServerOptions{Access: &recordingAccess{}, Resources: f})
 	w := resourceRequest(s, "POST", "/api/v1/namespaces/ns/runs/r/cancel", `{"runUID":"uid-1"}`, "")
@@ -235,10 +256,24 @@ func TestCancelTypedUIDConflictAndEmptyBodyCompatibility(t *testing.T) {
 	if w.Code != http.StatusConflict || !strings.Contains(w.Body.String(), `/run-uid-conflict"`) {
 		t.Fatalf("conflict = %d %s", w.Code, w.Body.String())
 	}
-	f.cancelErr = nil
-	w = resourceRequest(s, "POST", "/api/v1/namespaces/ns/runs/r/cancel", "", "")
-	if w.Code != http.StatusOK || f.cancelUID != "" {
-		t.Fatalf("empty cancel = %d, UID %q", w.Code, f.cancelUID)
+}
+
+func TestCancelChecksAuthorizationAndOriginBeforeUIDPrecondition(t *testing.T) {
+	f := &fakeResources{}
+	denied := &recordingAccess{err: errForbidden}
+	w := resourceRequest(NewServer(nil, ServerOptions{Access: denied, Resources: f}), "POST", "/api/v1/namespaces/ns/runs/r/cancel", "", "https://api.test")
+	if w.Code != http.StatusForbidden || len(denied.calls) != 1 || len(f.calls) != 0 {
+		t.Fatalf("denied response/access/resources = %d/%v/%v", w.Code, denied.calls, f.calls)
+	}
+
+	request := httptest.NewRequest(http.MethodPost, "https://api.test/api/v1/namespaces/ns/runs/r/cancel", nil)
+	request.AddCookie(&http.Cookie{Name: sessionCookieName, Value: "session"})
+	request.Header.Set("Origin", "https://other.test")
+	response := httptest.NewRecorder()
+	access := &recordingAccess{}
+	NewServer(nil, ServerOptions{Access: access, Resources: f}).Handler().ServeHTTP(response, request)
+	if response.Code != http.StatusForbidden || len(access.calls) != 1 || len(f.calls) != 0 {
+		t.Fatalf("origin response/access/resources = %d/%v/%v", response.Code, access.calls, f.calls)
 	}
 }
 
