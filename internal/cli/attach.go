@@ -23,6 +23,7 @@ import (
 func newAttachCommand() *cobra.Command {
 	var controlPlaneURL string
 	var token string
+	var environmentUID string
 	cmd := &cobra.Command{
 		Use:   "attach <environment>",
 		Short: "Attach a terminal to an environment through the control plane",
@@ -30,28 +31,36 @@ func newAttachCommand() *cobra.Command {
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			namespace, _ := cmd.Flags().GetString("namespace")
-			return attachTerminal(cmd, controlPlaneURL, token, namespace, args[0])
+			return attachTerminal(cmd, controlPlaneURL, token, namespace, args[0], environmentUID)
 		},
 	}
 	cmd.Flags().StringVar(&controlPlaneURL, "control-plane", os.Getenv("SWE_CONTROL_PLANE_URL"), "Control-plane base URL (or SWE_CONTROL_PLANE_URL)")
 	cmd.Flags().StringVar(&token, "token", os.Getenv("SWE_CONTROL_PLANE_TOKEN"), "Control-plane bearer token (or SWE_CONTROL_PLANE_TOKEN)")
+	cmd.Flags().StringVar(&environmentUID, "environment-uid", "", "Exact immutable Environment UID")
+	_ = cmd.MarkFlagRequired("environment-uid")
 	return cmd
 }
 
-func attachTerminal(cmd *cobra.Command, controlPlaneURL, token, namespace, envName string) error {
+func attachTerminal(cmd *cobra.Command, controlPlaneURL, token, namespace, envName, environmentUID string) error {
 	client, err := controlplaneclient.New(controlPlaneURL, token, nil)
 	if err != nil {
 		return err
 	}
-	return attachTerminalWithClient(cmd.Context(), client, namespace, envName, cmd.InOrStdin(), cmd.OutOrStdout())
+	return attachTerminalWithClient(cmd.Context(), client, namespace, envName, environmentUID, cmd.InOrStdin(), cmd.OutOrStdout())
 }
 
-func attachTerminalWithClient(ctx context.Context, client *controlplaneclient.Client, namespace, environment string, input io.Reader, output io.Writer) error {
+func attachTerminalWithClient(ctx context.Context, client *controlplaneclient.Client, namespace, environment, environmentUID string, input io.Reader, output io.Writer) error {
 	if err := validateTerminalInput(input); err != nil {
 		return err
 	}
+	environmentUID = strings.TrimSpace(environmentUID)
+	if environmentUID == "" || len(environmentUID) > 128 {
+		return fmt.Errorf("--environment-uid must be a non-empty UID of at most 128 bytes")
+	}
 	endpoint := client.WebSocketEndpoint("api", "v1", "namespaces", namespace, "environments", environment, "terminal")
-	return dialAndBridgeTerminal(ctx, endpoint, client.AuthorizationHeader(), input, output)
+	header := client.AuthorizationHeader()
+	header.Set(controlplane.EnvironmentUIDHeader, environmentUID)
+	return dialAndBridgeTerminal(ctx, endpoint, header, input, output)
 }
 
 func attachRunTerminalWithClient(ctx context.Context, client *controlplaneclient.Client, namespace, runName, runUID, environmentUID string, input io.Reader, output io.Writer) error {

@@ -41,8 +41,10 @@ export interface Run {
   finishedAt?: string
   environment?: {
     name: string
+    uid?: string
     ownership: 'Owned' | 'Claimed'
   }
+  terminalAvailable?: boolean
   branch?: string
   usage: {
     cpuSeconds: number

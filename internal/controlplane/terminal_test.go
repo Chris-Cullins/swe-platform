@@ -65,7 +65,7 @@ func TestWebTerminalBridgesSandboxd(t *testing.T) {
 	t.Cleanup(server.Close)
 
 	websocketURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/api/v1/namespaces/project-1/environments/env-1/terminal"
-	header := http.Header{"Authorization": []string{"Bearer reader"}}
+	header := http.Header{"Authorization": []string{"Bearer reader"}, EnvironmentUIDHeader: []string{"env-uid"}}
 	websocketConnection, _, err := websocket.DefaultDialer.Dial(websocketURL, header)
 	if err != nil {
 		t.Fatal(err)
@@ -175,7 +175,7 @@ func TestWebTerminalClosesWhileWaitingForOpenWhenContextCanceled(t *testing.T) {
 	t.Cleanup(server.Close)
 
 	websocketURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/api/v1/namespaces/project-1/environments/env-1/terminal"
-	connection, _, err := websocket.DefaultDialer.Dial(websocketURL, http.Header{"Authorization": []string{"Bearer reader"}})
+	connection, _, err := websocket.DefaultDialer.Dial(websocketURL, http.Header{"Authorization": []string{"Bearer reader"}, EnvironmentUIDHeader: []string{"env-uid"}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -208,7 +208,7 @@ func TestWebTerminalOpenTimeoutReleasesStreamAndBackend(t *testing.T) {
 	t.Cleanup(server.Close)
 
 	websocketURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/api/v1/namespaces/project-1/environments/env-1/terminal"
-	connection, _, err := websocket.DefaultDialer.Dial(websocketURL, http.Header{"Authorization": []string{"Bearer reader"}})
+	connection, _, err := websocket.DefaultDialer.Dial(websocketURL, http.Header{"Authorization": []string{"Bearer reader"}, EnvironmentUIDHeader: []string{"env-uid"}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -240,7 +240,7 @@ func TestWebTerminalValidOpenClearsReadDeadline(t *testing.T) {
 	t.Cleanup(server.Close)
 
 	websocketURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/api/v1/namespaces/project-1/environments/env-1/terminal"
-	connection, _, err := websocket.DefaultDialer.Dial(websocketURL, http.Header{"Authorization": []string{"Bearer reader"}})
+	connection, _, err := websocket.DefaultDialer.Dial(websocketURL, http.Header{"Authorization": []string{"Bearer reader"}, EnvironmentUIDHeader: []string{"env-uid"}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -280,7 +280,7 @@ func TestWebTerminalStalledOutputWriteIsBounded(t *testing.T) {
 	t.Cleanup(server.Close)
 
 	websocketURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/api/v1/namespaces/project-1/environments/env-1/terminal"
-	connection, _, err := websocket.DefaultDialer.Dial(websocketURL, http.Header{"Authorization": []string{"Bearer reader"}})
+	connection, _, err := websocket.DefaultDialer.Dial(websocketURL, http.Header{"Authorization": []string{"Bearer reader"}, EnvironmentUIDHeader: []string{"env-uid"}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -354,6 +354,7 @@ func (w *hijackResponseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
 func TestWebTerminalRequiresDialer(t *testing.T) {
 	request := httptest.NewRequest("GET", "/api/v1/namespaces/project-1/environments/env-1/terminal", nil)
 	setWebSocketUpgrade(request)
+	request.Header.Set(EnvironmentUIDHeader, "env-uid")
 	response := httptest.NewRecorder()
 	NewServer(nil, ServerOptions{Access: &fakeAccess{}}).Handler().ServeHTTP(response, request)
 	if response.Code != 503 {
@@ -383,7 +384,7 @@ func TestWebTerminalChecksSandboxdHealthBeforeUpgrade(t *testing.T) {
 	t.Cleanup(server.Close)
 
 	websocketURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/api/v1/namespaces/project-1/environments/env-1/terminal"
-	connection, response, err := websocket.DefaultDialer.Dial(websocketURL, http.Header{"Authorization": []string{"Bearer reader"}})
+	connection, response, err := websocket.DefaultDialer.Dial(websocketURL, http.Header{"Authorization": []string{"Bearer reader"}, EnvironmentUIDHeader: []string{"env-uid"}})
 	if connection != nil {
 		_ = connection.Close()
 	}
@@ -453,6 +454,31 @@ func TestKubernetesTerminalDialerDoesNotMarkReplacementEnvironmentActive(t *test
 	}
 }
 
+func TestKubernetesTerminalDialerRejectsStaleExpectedUIDBeforeLifecycleSideEffects(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := platformv1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	environment := &platformv1alpha1.Environment{
+		ObjectMeta: metav1.ObjectMeta{Name: "env-1", Namespace: "project-1", UID: "new-uid"},
+		Status: platformv1alpha1.EnvironmentStatus{Lifecycle: platformv1alpha1.EnvironmentLifecycleStatus{
+			Suspended: true, SuspensionReason: platformv1alpha1.EnvironmentSuspensionReasonIdle,
+		}},
+	}
+	kubeClient := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(environment).WithObjects(environment).Build()
+	dialer := KubernetesTerminalDialer{Client: kubeClient}
+	if _, _, _, err := dialer.DialTerminal(context.Background(), environment.Namespace, environment.Name, "old-uid"); !errors.Is(err, errTerminalEnvironmentIncarnationChanged) {
+		t.Fatalf("DialTerminal() error = %v, want incarnation conflict", err)
+	}
+	var retained platformv1alpha1.Environment
+	if err := kubeClient.Get(context.Background(), client.ObjectKeyFromObject(environment), &retained); err != nil {
+		t.Fatal(err)
+	}
+	if retained.Spec.Lifecycle.Wake != nil || len(lifecycle.ActivityRequests(&retained)) != 0 {
+		t.Fatalf("stale direct terminal wrote lifecycle traffic: %#v", retained.Spec.Lifecycle)
+	}
+}
+
 func TestKubernetesTerminalDialerRejectsNonIdleSuspension(t *testing.T) {
 	for _, test := range []struct {
 		name   string
@@ -479,7 +505,7 @@ func TestKubernetesTerminalDialerRejectsNonIdleSuspension(t *testing.T) {
 			kubeClient := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(environment).WithObjects(environment).Build()
 			dialer := KubernetesTerminalDialer{Client: kubeClient}
 
-			if _, _, _, err := dialer.DialTerminal(context.Background(), environment.Namespace, environment.Name); err == nil {
+			if _, _, _, err := dialer.DialTerminal(context.Background(), environment.Namespace, environment.Name, string(environment.UID)); err == nil {
 				t.Fatal("DialTerminal() unexpectedly succeeded")
 			}
 			var retained platformv1alpha1.Environment
@@ -1000,7 +1026,7 @@ func TestKubernetesTerminalDialerActivityPreservesReadyGeneration(t *testing.T) 
 	kubeClient := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(environment).WithObjects(environment, template, pod).Build()
 	dialer := KubernetesTerminalDialer{Client: kubeClient}
 
-	_, _, closer, err := dialer.DialTerminal(context.Background(), environment.Namespace, environment.Name)
+	_, _, closer, err := dialer.DialTerminal(context.Background(), environment.Namespace, environment.Name, string(environment.UID))
 	if err != nil {
 		t.Fatalf("DialTerminal() error = %v", err)
 	}
@@ -1056,7 +1082,7 @@ func TestKubernetesTerminalDialerUsesRecreatedPodCredentialsAfterWake(t *testing
 	baseClient := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(environment).WithObjects(environment, template, newPod).Build()
 	dialer := KubernetesTerminalDialer{Client: wakeReadyClient{Client: baseClient, podName: newPod.Name}}
 
-	_, _, closer, err := dialer.DialTerminal(context.Background(), environment.Namespace, environment.Name)
+	_, _, closer, err := dialer.DialTerminal(context.Background(), environment.Namespace, environment.Name, string(environment.UID))
 	if err != nil {
 		t.Fatalf("DialTerminal() error = %v; wake did not use the recreated pod credential bundle", err)
 	}
@@ -1108,7 +1134,7 @@ func TestTerminalHeartbeatProtectsSlowWakeBeforeConnection(t *testing.T) {
 	wakeClient := &heartbeatWakeReadyClient{activityCountingClient: activityClient, podName: pod.Name, minimumActivityWrites: 3}
 	dialer := KubernetesTerminalDialer{Client: wakeClient}
 
-	_, _, closer, err := dialer.DialTerminal(context.Background(), environment.Namespace, environment.Name)
+	_, _, closer, err := dialer.DialTerminal(context.Background(), environment.Namespace, environment.Name, string(environment.UID))
 	if err != nil {
 		t.Fatalf("DialTerminal() error = %v", err)
 	}
@@ -1159,7 +1185,7 @@ func TestTerminalHeartbeatCancelsWhenWakeOrDialFails(t *testing.T) {
 			}
 			dialer := KubernetesTerminalDialer{Client: kubeClient}
 
-			if _, _, _, err := dialer.DialTerminal(context.Background(), environment.Namespace, environment.Name); err == nil {
+			if _, _, _, err := dialer.DialTerminal(context.Background(), environment.Namespace, environment.Name, string(environment.UID)); err == nil {
 				t.Fatalf("DialTerminal() succeeded during %s failure", test.name)
 			}
 			writesAfterFailure := waitForActivityWritesToQuiesce(t, activityClient, 60*time.Millisecond)
@@ -1353,6 +1379,31 @@ func TestWebTerminalAuthorizesBeforeDial(t *testing.T) {
 	}
 }
 
+func TestWebTerminalRequiresBoundedIdentityAfterAuthorization(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		access *fakeAccess
+		uid    string
+		want   int
+	}{
+		{name: "unauthorized missing", access: &fakeAccess{err: errForbidden}, want: http.StatusForbidden},
+		{name: "authorized missing", access: &fakeAccess{}, want: http.StatusBadRequest},
+		{name: "authorized overlong", access: &fakeAccess{}, uid: strings.Repeat("x", maxTerminalUIDLength+1), want: http.StatusBadRequest},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			dialer := &terminalTestDialer{}
+			request := httptest.NewRequest(http.MethodGet, "/api/v1/namespaces/project-a/environments/shared/terminal", nil)
+			request.Header.Set("Authorization", "Bearer reader")
+			request.Header.Set(EnvironmentUIDHeader, test.uid)
+			response := httptest.NewRecorder()
+			NewServer(nil, ServerOptions{Access: test.access, TerminalDialer: dialer}).Handler().ServeHTTP(response, request)
+			if response.Code != test.want || dialer.calls != 0 {
+				t.Fatalf("response/dials = %d/%d, want %d/0", response.Code, dialer.calls, test.want)
+			}
+		})
+	}
+}
+
 func TestWebTerminalSameNamedEnvironmentCannotCrossNamespace(t *testing.T) {
 	dialer := &terminalTestDialer{}
 	access := &fakeAccess{allow: func(resource ResourceAccess) bool { return resource.Namespace == "project-a" }}
@@ -1407,6 +1458,7 @@ func TestWebTerminalRejectsCookieWithoutOriginAndCrossOriginBeforeDial(t *testin
 		handler := NewServer(nil, ServerOptions{Access: &fakeAccess{}, TerminalDialer: dialer}).Handler()
 		request := httptest.NewRequest(http.MethodGet, "/api/v1/namespaces/project-a/environments/env-1/terminal", nil)
 		setWebSocketUpgrade(request)
+		request.Header.Set(EnvironmentUIDHeader, "env-uid")
 		request.Header.Del("Authorization")
 		request.Header.Set("Origin", origin)
 		request.AddCookie(&http.Cookie{Name: sessionCookieName, Value: "reader-session"})
@@ -1455,7 +1507,7 @@ func TestKubernetesTerminalDialerRejectsPodOwnedByAnotherEnvironmentIncarnation(
 	template := &platformv1alpha1.EnvironmentTemplate{ObjectMeta: metav1.ObjectMeta{Name: "default", Namespace: "project-1"}}
 	dialer := KubernetesTerminalDialer{Client: fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(environment).WithObjects(environment, pod, template).Build()}
 
-	_, _, _, err := dialer.DialTerminal(context.Background(), "project-1", "env-1")
+	_, _, _, err := dialer.DialTerminal(context.Background(), "project-1", "env-1", string(environment.UID))
 	if err == nil || !strings.Contains(err.Error(), "not owned by the current environment") {
 		t.Fatalf("DialTerminal() error = %v, want stale pod rejection", err)
 	}
@@ -1468,17 +1520,21 @@ type terminalTestDialer struct {
 	client      sandboxdv1.TerminalServiceClient
 	health      sandboxdv1.HealthServiceClient
 	closer      io.Closer
+	err         error
 	namespace   string
 	environment string
 	calls       int
 }
 
-func (d *terminalTestDialer) DialTerminal(_ context.Context, namespace, environment string) (sandboxdv1.TerminalServiceClient, sandboxdv1.HealthServiceClient, io.Closer, error) {
+func (d *terminalTestDialer) DialTerminal(_ context.Context, namespace, environment, _ string) (sandboxdv1.TerminalServiceClient, sandboxdv1.HealthServiceClient, io.Closer, error) {
 	d.mu.Lock()
 	d.calls++
 	d.namespace = namespace
 	d.environment = environment
 	d.mu.Unlock()
+	if d.err != nil {
+		return nil, nil, nil, d.err
+	}
 	health := d.health
 	if health == nil {
 		health = terminalTestHealthClient{}
@@ -1491,7 +1547,7 @@ func (d *terminalTestDialer) DialTerminal(_ context.Context, namespace, environm
 }
 
 func (d *terminalTestDialer) DialRunTerminal(ctx context.Context, namespace string, association RunTerminalAssociation) (sandboxdv1.TerminalServiceClient, sandboxdv1.HealthServiceClient, io.Closer, error) {
-	return d.DialTerminal(ctx, namespace, association.EnvironmentName)
+	return d.DialTerminal(ctx, namespace, association.EnvironmentName, association.EnvironmentUID)
 }
 
 type terminalTestServer struct {

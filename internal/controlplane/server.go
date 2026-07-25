@@ -10,6 +10,7 @@ import (
 	"io/fs"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -156,6 +157,14 @@ func (s *Server) Handler() http.Handler {
 }
 
 func (s *Server) handleNamespacedAPI(w http.ResponseWriter, r *http.Request) {
+	if namespace, run, runUID, environmentUID, ok := browserRunTerminalPath(r.URL.EscapedPath()); ok {
+		if r.Method == http.MethodGet {
+			s.handleBrowserRunTerminal(w, r, namespace, run, runUID, environmentUID)
+		} else {
+			writeResourceMethodError(w, "GET")
+		}
+		return
+	}
 	namespace, resource, name, subresource, ok := namespacedResource(r.URL.Path)
 	if !ok {
 		http.NotFound(w, r)
@@ -202,6 +211,29 @@ func (s *Server) handleNamespacedAPI(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	http.NotFound(w, r)
+}
+
+// browserRunTerminalPath keeps each immutable UID in one percent-encoded path
+// segment. It returns the UID segments undecoded so Run authorization can happen
+// before malformed identity is distinguished from stale identity.
+func browserRunTerminalPath(path string) (namespace, run, runUID, environmentUID string, ok bool) {
+	remainder := strings.TrimPrefix(path, namespacedPathPrefix)
+	if remainder == path {
+		return "", "", "", "", false
+	}
+	parts := strings.Split(remainder, "/")
+	if len(parts) != 6 || parts[1] != "runs" || parts[3] != "terminal" {
+		return "", "", "", "", false
+	}
+	decodedNamespace, err := url.PathUnescape(parts[0])
+	if err != nil || decodedNamespace == "" {
+		return "", "", "", "", false
+	}
+	decodedRun, err := url.PathUnescape(parts[2])
+	if err != nil || decodedRun == "" {
+		return "", "", "", "", false
+	}
+	return decodedNamespace, decodedRun, parts[4], parts[5], true
 }
 
 func writeResourceMethodError(w http.ResponseWriter, allow string) {

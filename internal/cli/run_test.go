@@ -51,7 +51,8 @@ func TestTerminalGatewayURL(t *testing.T) {
 func TestAttachTerminalUsesAuthenticatedGateway(t *testing.T) {
 	serverErrors := make(chan error, 1)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/api/v1/namespaces/project-a/environments/env-1/terminal" || r.Header.Get("Authorization") != "Bearer terminal-token" {
+		if r.URL.Path != "/api/v1/namespaces/project-a/environments/env-1/terminal" || r.Header.Get("Authorization") != "Bearer terminal-token" ||
+			r.Header.Get(controlplane.EnvironmentUIDHeader) != "env-uid" {
 			serverErrors <- errors.New("gateway request did not carry the environment identity and bearer token")
 			http.Error(w, "bad request", http.StatusBadRequest)
 			return
@@ -84,7 +85,7 @@ func TestAttachTerminalUsesAuthenticatedGateway(t *testing.T) {
 	command.SetIn(strings.NewReader("echo hello\n"))
 	var output bytes.Buffer
 	command.SetOut(&output)
-	if err := attachTerminal(command, server.URL, "terminal-token", "project-a", "env-1"); err != nil {
+	if err := attachTerminal(command, server.URL, "terminal-token", "project-a", "env-1", "env-uid"); err != nil {
 		t.Fatalf("attachTerminal() error = %v", err)
 	}
 	if err := <-serverErrors; err != nil {
@@ -92,6 +93,30 @@ func TestAttachTerminalUsesAuthenticatedGateway(t *testing.T) {
 	}
 	if output.String() != "terminal output" {
 		t.Fatalf("terminal output = %q", output.String())
+	}
+}
+
+func TestAttachCommandRequiresExplicitEnvironmentUID(t *testing.T) {
+	command := NewRootCommand()
+	command.SetArgs([]string{"attach", "env-1", "--control-plane", "https://control.example", "--token", "token"})
+	command.SetOut(io.Discard)
+	command.SetErr(io.Discard)
+	err := command.Execute()
+	if err == nil || !strings.Contains(err.Error(), `required flag(s) "environment-uid" not set`) {
+		t.Fatalf("missing --environment-uid error = %v", err)
+	}
+}
+
+func TestAttachTerminalRejectsInvalidEnvironmentUIDBeforeDial(t *testing.T) {
+	client, err := controlplaneclient.New("https://control.example", "token", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, uid := range []string{"", " ", strings.Repeat("x", 129)} {
+		err := attachTerminalWithClient(context.Background(), client, "default", "env-1", uid, strings.NewReader(""), io.Discard)
+		if err == nil || !strings.Contains(err.Error(), "--environment-uid") {
+			t.Fatalf("UID %q error = %v", uid, err)
+		}
 	}
 }
 
@@ -150,7 +175,7 @@ func TestAttachTerminalReturnsWhenContextIsCancelled(t *testing.T) {
 	command.SetContext(ctx)
 	command.SetIn(strings.NewReader(""))
 	done := make(chan error, 1)
-	go func() { done <- attachTerminal(command, server.URL, "terminal-token", "default", "env-1") }()
+	go func() { done <- attachTerminal(command, server.URL, "terminal-token", "default", "env-1", "env-uid") }()
 	<-opened
 	cancel()
 	select {
@@ -191,7 +216,7 @@ func TestAttachTerminalDetachStopsInputAtControlBracket(t *testing.T) {
 	command.SetContext(context.Background())
 	command.SetIn(strings.NewReader("before\x1dafter"))
 	command.SetOut(io.Discard)
-	if err := attachTerminal(command, server.URL, "terminal-token", "default", "env-1"); err != nil {
+	if err := attachTerminal(command, server.URL, "terminal-token", "default", "env-1", "env-uid"); err != nil {
 		t.Fatal(err)
 	}
 	if err := <-serverResult; err != nil {
@@ -214,7 +239,7 @@ func TestAttachTerminalRejectsUnjoinableInputReader(t *testing.T) {
 	command.SetContext(context.Background())
 	command.SetIn(panicBlockingReader{})
 	command.SetOut(io.Discard)
-	err := attachTerminal(command, server.URL, "terminal-token", "default", "env-1")
+	err := attachTerminal(command, server.URL, "terminal-token", "default", "env-1", "env-uid")
 	if err == nil || !strings.Contains(err.Error(), "standard input or a finite in-memory reader") {
 		t.Fatalf("error = %v", err)
 	}

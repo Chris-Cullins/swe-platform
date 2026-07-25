@@ -95,7 +95,7 @@ export const api = {
     if (response.status === 401) notifyUnauthorized()
     return response
   },
-  terminalPath: (namespace: string, environment: string) => `${base(namespace)}/environments/${encodeURIComponent(environment)}/terminal`,
+  terminalPath: (namespace: string, run: string, runUID: string, environmentUID: string) => `${base(namespace)}/runs/${encodeURIComponent(run)}/terminal/${encodeURIComponent(runUID)}/${encodeURIComponent(environmentUID)}`,
 }
 
 export async function listAllRuns(namespace: string): Promise<RunList> {
