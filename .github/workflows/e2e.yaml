@@ -16,6 +16,7 @@ on:
       - "go.sum"
       - "Makefile"
       - ".dockerignore"
+      - ".github/workflows/**"
   workflow_dispatch:
 
 permissions: {}
