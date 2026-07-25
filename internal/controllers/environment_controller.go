@@ -1693,7 +1693,13 @@ func (r *EnvironmentReconciler) reserveExecutionGeneration(ctx context.Context, 
 	}
 	next := current.Status.ExecutionGeneration + 1
 	before := current.DeepCopy()
-	applyEnvironmentStatus(&current, platformv1alpha1.EnvironmentPhaseCreating, "", "", "ExecutionProvisioning", fmt.Sprintf("backend execution generation %d is being provisioned", next), current.Status.LastActiveAt)
+	phase := platformv1alpha1.EnvironmentPhaseCreating
+	if current.Status.Phase == platformv1alpha1.EnvironmentPhaseResuming {
+		// Keep resume intent durable across a failed create. The next attempt
+		// must still run the Project resume hook for the retained workspace.
+		phase = platformv1alpha1.EnvironmentPhaseResuming
+	}
+	applyEnvironmentStatus(&current, phase, "", "", "ExecutionProvisioning", fmt.Sprintf("backend execution generation %d is being provisioned", next), current.Status.LastActiveAt)
 	current.Status.ExecutionGeneration = next
 	if err := r.Status().Patch(ctx, &current, client.MergeFromWithOptions(before, client.MergeFromWithOptimisticLock{})); err != nil {
 		return 0, err

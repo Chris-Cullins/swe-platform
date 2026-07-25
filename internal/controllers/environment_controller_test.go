@@ -357,7 +357,8 @@ func TestFailedPodCreateLeavesGenerationGap(t *testing.T) {
 	}
 	env := &platformv1alpha1.Environment{
 		ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default", UID: "env-uid"},
-		Spec:       platformv1alpha1.EnvironmentSpec{TemplateRef: "small"},
+		Spec:       platformv1alpha1.EnvironmentSpec{TemplateRef: "small", ProjectRef: "project"},
+		Status:     platformv1alpha1.EnvironmentStatus{Phase: platformv1alpha1.EnvironmentPhaseResuming},
 	}
 	baseClient := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(env).WithObjects(env).Build()
 	failCreate := true
@@ -373,8 +374,9 @@ func TestFailedPodCreateLeavesGenerationGap(t *testing.T) {
 	})
 	reconciler := &EnvironmentReconciler{Client: intercepted, Scheme: scheme}
 	template := &platformv1alpha1.EnvironmentTemplate{Spec: platformv1alpha1.EnvironmentTemplateSpec{Image: "example/environment:latest", Size: "small"}}
+	project := &platformv1alpha1.Project{ObjectMeta: metav1.ObjectMeta{Name: "project", Namespace: env.Namespace}, Spec: platformv1alpha1.ProjectSpec{Repositories: []string{"https://github.com/example/repo"}}}
 
-	if pod, err := reconciler.ensurePod(context.Background(), env, template); pod != nil || !stderrors.Is(err, transientErr) {
+	if pod, err := reconciler.ensurePodForProject(context.Background(), env, template, project, ""); pod != nil || !stderrors.Is(err, transientErr) {
 		t.Fatalf("first create = (%#v, %v), want transient error", pod, err)
 	}
 	var reserved platformv1alpha1.Environment
@@ -384,12 +386,22 @@ func TestFailedPodCreateLeavesGenerationGap(t *testing.T) {
 	if reserved.Status.ExecutionGeneration != 1 {
 		t.Fatalf("failed create reservation = %d, want 1", reserved.Status.ExecutionGeneration)
 	}
-	replacement, err := reconciler.ensurePod(context.Background(), &reserved, template)
+	if reserved.Status.Phase != platformv1alpha1.EnvironmentPhaseResuming {
+		t.Fatalf("failed create lost resume intent: phase %q", reserved.Status.Phase)
+	}
+	replacement, err := reconciler.ensurePodForProject(context.Background(), &reserved, template, project, "")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if replacement.Annotations[executionGenerationAnnotation] != "2" {
 		t.Fatalf("retry reused failed generation: %#v", replacement.Annotations)
+	}
+	resume := false
+	for _, variable := range replacement.Spec.InitContainers[0].Env {
+		resume = resume || variable.Name == "SWE_RESUMING" && variable.Value == "true"
+	}
+	if !resume {
+		t.Fatalf("retry omitted resume hook intent: %#v", replacement.Spec.InitContainers[0].Env)
 	}
 }
 
