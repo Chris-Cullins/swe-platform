@@ -24,11 +24,12 @@ import (
 )
 
 const (
-	wakeTimeout                = 2 * time.Minute
-	wakePollInterval           = 250 * time.Millisecond
-	terminalPolicyPollInterval = 5 * time.Second
-	terminalHealthTimeout      = 5 * time.Second
-	terminalHandshakeTimeout   = 5 * time.Second
+	wakeTimeout                   = 2 * time.Minute
+	wakePollInterval              = 250 * time.Millisecond
+	terminalPolicyPollInterval    = 5 * time.Second
+	terminalHealthTimeout         = 5 * time.Second
+	terminalHandshakeTimeout      = 5 * time.Second
+	terminalStreamingWriteTimeout = 15 * time.Second
 )
 
 var errTerminalEnvironmentIncarnationChanged = errors.New("environment incarnation changed")
@@ -534,7 +535,7 @@ func (s *Server) serveTerminal(w http.ResponseWriter, r *http.Request, namespace
 	stopCloseOnCancel := context.AfterFunc(r.Context(), func() { _ = connection.Close() })
 	defer stopCloseOnCancel()
 	connection.SetReadLimit(1 << 20)
-	if err := bridgeWebTerminal(r.Context(), connection, terminal); err != nil {
+	if err := bridgeWebTerminalWithTimeouts(r.Context(), connection, terminal, s.terminalOpenTimeout, s.terminalWriteTimeout); err != nil {
 		if r.Context().Err() == nil {
 			s.log.Debug("web terminal closed", "namespace", namespace, "environment", environment, "error", err)
 		}
@@ -566,6 +567,10 @@ func (s *Server) checkWebSocketOrigin(r *http.Request) bool {
 }
 
 func bridgeWebTerminal(ctx context.Context, connection *websocket.Conn, client sandboxdv1.TerminalServiceClient) error {
+	return bridgeWebTerminalWithTimeouts(ctx, connection, client, terminalHandshakeTimeout, terminalStreamingWriteTimeout)
+}
+
+func bridgeWebTerminalWithTimeouts(ctx context.Context, connection *websocket.Conn, client sandboxdv1.TerminalServiceClient, openTimeout, writeTimeout time.Duration) error {
 	streamContext, cancel := context.WithCancelCause(ctx)
 	defer cancel(nil)
 	stream, err := client.Terminal(streamContext)
@@ -573,6 +578,9 @@ func bridgeWebTerminal(ctx context.Context, connection *websocket.Conn, client s
 		return fmt.Errorf("open sandboxd terminal: %w", err)
 	}
 
+	if err := connection.SetReadDeadline(time.Now().Add(openTimeout)); err != nil {
+		return fmt.Errorf("set terminal open deadline: %w", err)
+	}
 	messageType, payload, err := connection.ReadMessage()
 	if err != nil {
 		if websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway) {
@@ -583,6 +591,9 @@ func bridgeWebTerminal(ctx context.Context, connection *websocket.Conn, client s
 	control, err := decodeTerminalControl(messageType, payload, "open")
 	if err != nil {
 		return err
+	}
+	if err := connection.SetReadDeadline(time.Time{}); err != nil {
+		return fmt.Errorf("clear terminal open deadline: %w", err)
 	}
 	if err := stream.Send(&sandboxdv1.TerminalMessage{Kind: &sandboxdv1.TerminalMessage_Open{
 		Open: &sandboxdv1.TerminalOpen{Cols: control.Cols, Rows: control.Rows},
@@ -634,8 +645,14 @@ func bridgeWebTerminal(ctx context.Context, connection *websocket.Conn, client s
 			}
 			return fmt.Errorf("sandboxd terminal: %w", err)
 		}
+		if err := connection.SetWriteDeadline(time.Now().Add(writeTimeout)); err != nil {
+			return fmt.Errorf("set terminal output deadline: %w", err)
+		}
 		if err := connection.WriteMessage(websocket.BinaryMessage, message.GetData()); err != nil {
 			return fmt.Errorf("write terminal output: %w", err)
+		}
+		if err := connection.SetWriteDeadline(time.Time{}); err != nil {
+			return fmt.Errorf("clear terminal output deadline: %w", err)
 		}
 	}
 }
