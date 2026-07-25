@@ -10,6 +10,7 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -31,22 +32,74 @@ type Connector struct {
 	Reader client.Reader
 }
 
+// TerminalExecution is the connector-owned identity of the exact backend
+// execution reached by a terminal connection. Consumers retain it opaquely and
+// ask the Connector whether it is still current.
+type TerminalExecution struct {
+	EnvironmentUID types.UID
+	LifecycleEpoch int64
+	PodName        string
+	PodUID         types.UID
+}
+
 // DialTerminal resolves the current ready Environment incarnation and returns
 // terminal and health clients sharing one authenticated, pod-pinned connection.
-func (c Connector) DialTerminal(ctx context.Context, namespace, environment string, environmentUID types.UID) (sandboxdv1.TerminalServiceClient, sandboxdv1.HealthServiceClient, func() error, error) {
+func (c Connector) DialTerminal(ctx context.Context, namespace, environment string, environmentUID types.UID) (sandboxdv1.TerminalServiceClient, sandboxdv1.HealthServiceClient, TerminalExecution, func() error, error) {
 	env, pod, err := c.resolvePod(ctx, namespace, environment, environmentUID, nil)
 	if err != nil {
-		return nil, nil, nil, err
+		return nil, nil, TerminalExecution{}, nil, err
 	}
 	dialOptions, err := DialOptions(pod)
 	if err != nil {
-		return nil, nil, nil, err
+		return nil, nil, TerminalExecution{}, nil, err
 	}
 	conn, err := grpc.NewClient(env.Status.Endpoints.Sandboxd, dialOptions...)
 	if err != nil {
-		return nil, nil, nil, err
+		return nil, nil, TerminalExecution{}, nil, err
 	}
-	return sandboxdv1.NewTerminalServiceClient(conn), sandboxdv1.NewHealthServiceClient(conn), conn.Close, nil
+	execution := TerminalExecution{
+		EnvironmentUID: env.UID,
+		LifecycleEpoch: env.Status.Lifecycle.Epoch,
+		PodName:        pod.Name,
+		PodUID:         pod.UID,
+	}
+	// Re-read after pinning the endpoint and credentials. A lifecycle transition
+	// or same-name Pod replacement racing the dial must not produce an attachment
+	// whose independent activity heartbeat can outlive that execution.
+	currentEnvironment, currentPod, err := c.resolvePod(ctx, namespace, environment, environmentUID, &execution.LifecycleEpoch)
+	if err != nil || currentEnvironment.Status.PodName != execution.PodName || currentPod.UID != execution.PodUID {
+		_ = conn.Close()
+		if err != nil {
+			return nil, nil, TerminalExecution{}, nil, fmt.Errorf("environment execution changed while resolving terminal endpoint: %w", err)
+		}
+		return nil, nil, TerminalExecution{}, nil, fmt.Errorf("environment execution changed while resolving terminal endpoint")
+	}
+	return sandboxdv1.NewTerminalServiceClient(conn), sandboxdv1.NewHealthServiceClient(conn), execution, conn.Close, nil
+}
+
+// TerminalExecutionCurrent reports whether execution is still the active
+// backend for its Environment. Backend-specific identity checks stay behind
+// the connector boundary; API read failures remain retryable by the caller.
+func (c Connector) TerminalExecutionCurrent(ctx context.Context, namespace, environment string, execution TerminalExecution) (bool, error) {
+	var currentEnvironment platformv1alpha1.Environment
+	if err := c.Reader.Get(ctx, types.NamespacedName{Namespace: namespace, Name: environment}, &currentEnvironment); err != nil {
+		if apierrors.IsNotFound(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	if currentEnvironment.UID != execution.EnvironmentUID || currentEnvironment.Spec.Paused || currentEnvironment.Status.Lifecycle.Suspended ||
+		currentEnvironment.Status.Lifecycle.Epoch != execution.LifecycleEpoch || currentEnvironment.Status.PodName != execution.PodName {
+		return false, nil
+	}
+	var currentPod corev1.Pod
+	if err := c.Reader.Get(ctx, types.NamespacedName{Namespace: namespace, Name: execution.PodName}, &currentPod); err != nil {
+		if apierrors.IsNotFound(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	return currentPod.UID == execution.PodUID, nil
 }
 
 // DialProcess resolves the exact Environment UID immediately before dialing
