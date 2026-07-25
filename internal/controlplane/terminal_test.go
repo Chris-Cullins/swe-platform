@@ -194,8 +194,121 @@ func TestWebTerminalClosesWhileWaitingForOpenWhenContextCanceled(t *testing.T) {
 	}
 }
 
+func TestWebTerminalOpenTimeoutReleasesStreamAndBackend(t *testing.T) {
+	backend := &terminalLivenessServer{started: make(chan struct{}), stopped: make(chan struct{})}
+	backendConnection := newTerminalTestConnection(t, backend)
+	backendClosed := make(chan struct{})
+	dialer := &terminalTestDialer{client: sandboxdv1.NewTerminalServiceClient(backendConnection), closer: closeFunc(func() error {
+		close(backendClosed)
+		return nil
+	})}
+	controlPlane := NewServer(nil, ServerOptions{Access: &fakeAccess{}, TerminalDialer: dialer})
+	controlPlane.terminalOpenTimeout = 20 * time.Millisecond
+	server := httptest.NewServer(controlPlane.Handler())
+	t.Cleanup(server.Close)
+
+	websocketURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/api/v1/namespaces/project-1/environments/env-1/terminal"
+	connection, _, err := websocket.DefaultDialer.Dial(websocketURL, http.Header{"Authorization": []string{"Bearer reader"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = connection.Close() })
+	select {
+	case <-backend.started:
+	case <-time.After(time.Second):
+		t.Fatal("sandboxd terminal stream did not open")
+	}
+	select {
+	case <-backendClosed:
+	case <-time.After(time.Second):
+		t.Fatal("terminal backend was not released after open timeout")
+	}
+	select {
+	case <-backend.stopped:
+	case <-time.After(time.Second):
+		t.Fatal("sandboxd terminal stream was not canceled after open timeout")
+	}
+}
+
+func TestWebTerminalValidOpenClearsReadDeadline(t *testing.T) {
+	backend := &terminalIdleServer{opened: make(chan struct{})}
+	backendConnection := newTerminalTestConnection(t, backend)
+	dialer := &terminalTestDialer{client: sandboxdv1.NewTerminalServiceClient(backendConnection)}
+	controlPlane := NewServer(nil, ServerOptions{Access: &fakeAccess{}, TerminalDialer: dialer})
+	controlPlane.terminalOpenTimeout = 100 * time.Millisecond
+	server := httptest.NewServer(controlPlane.Handler())
+	t.Cleanup(server.Close)
+
+	websocketURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/api/v1/namespaces/project-1/environments/env-1/terminal"
+	connection, _, err := websocket.DefaultDialer.Dial(websocketURL, http.Header{"Authorization": []string{"Bearer reader"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = connection.Close() })
+	if err := connection.WriteJSON(terminalControl{Type: "open", Cols: 80, Rows: 24}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-backend.opened:
+	case <-time.After(time.Second):
+		t.Fatal("sandboxd did not receive terminal open")
+	}
+	time.Sleep(2 * controlPlane.terminalOpenTimeout)
+	if err := connection.WriteMessage(websocket.BinaryMessage, []byte("after idle")); err != nil {
+		t.Fatalf("terminal input after post-open idle: %v", err)
+	}
+	messageType, payload, err := connection.ReadMessage()
+	if err != nil {
+		t.Fatalf("terminal output after post-open idle: %v", err)
+	}
+	if messageType != websocket.BinaryMessage || string(payload) != "after idle" {
+		t.Fatalf("terminal output = (%d, %q), want binary echo", messageType, payload)
+	}
+}
+
+func TestWebTerminalStalledOutputWriteIsBounded(t *testing.T) {
+	backend := &terminalLivenessServer{started: make(chan struct{}), stopped: make(chan struct{}), output: make([]byte, 1<<20)}
+	backendConnection := newTerminalTestConnection(t, backend)
+	backendClosed := make(chan struct{})
+	dialer := &terminalTestDialer{client: sandboxdv1.NewTerminalServiceClient(backendConnection), closer: closeFunc(func() error {
+		close(backendClosed)
+		return nil
+	})}
+	controlPlane := NewServer(nil, ServerOptions{Access: &fakeAccess{}, TerminalDialer: dialer})
+	controlPlane.terminalWriteTimeout = 20 * time.Millisecond
+	server := httptest.NewServer(controlPlane.Handler())
+	t.Cleanup(server.Close)
+
+	websocketURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/api/v1/namespaces/project-1/environments/env-1/terminal"
+	connection, _, err := websocket.DefaultDialer.Dial(websocketURL, http.Header{"Authorization": []string{"Bearer reader"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = connection.Close() })
+	tcp, ok := connection.UnderlyingConn().(*net.TCPConn)
+	if !ok {
+		t.Fatalf("websocket connection type = %T, want *net.TCPConn", connection.UnderlyingConn())
+	}
+	if err := tcp.SetReadBuffer(1024); err != nil {
+		t.Fatal(err)
+	}
+	if err := connection.WriteJSON(terminalControl{Type: "open", Cols: 80, Rows: 24}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-backendClosed:
+	case <-time.After(3 * time.Second):
+		t.Fatal("terminal backend remained held by stalled output write")
+	}
+	select {
+	case <-backend.stopped:
+	case <-time.After(time.Second):
+		t.Fatal("sandboxd terminal stream remained held by stalled output write")
+	}
+}
+
 func TestTerminalHandshakeTimeoutBoundsPostHijackWrite(t *testing.T) {
-	if terminalUpgrader.HandshakeTimeout != terminalHandshakeTimeout || terminalHandshakeTimeout >= shutdownTimeoutForTest {
+	if terminalUpgrader.HandshakeTimeout != terminalHandshakeTimeout || terminalHandshakeTimeout != 5*time.Second || terminalHandshakeTimeout >= shutdownTimeoutForTest || terminalStreamingWriteTimeout != 15*time.Second {
 		t.Fatalf("terminal handshake timeout = %v, want positive and below shutdown budget", terminalUpgrader.HandshakeTimeout)
 	}
 	upgrader := terminalUpgrader
@@ -1389,6 +1502,72 @@ type terminalTestServer struct {
 	open          *sandboxdv1.TerminalOpen
 	resize        *sandboxdv1.TerminalResize
 	input         []byte
+}
+
+func newTerminalTestConnection(t *testing.T, backend sandboxdv1.TerminalServiceServer) *grpc.ClientConn {
+	t.Helper()
+	listener := bufconn.Listen(8 << 20)
+	grpcServer := grpc.NewServer()
+	sandboxdv1.RegisterTerminalServiceServer(grpcServer, backend)
+	go func() { _ = grpcServer.Serve(listener) }()
+	t.Cleanup(grpcServer.Stop)
+	connection, err := grpc.NewClient("passthrough:///bufconn", grpc.WithContextDialer(func(context.Context, string) (net.Conn, error) {
+		return listener.Dial()
+	}), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = connection.Close() })
+	return connection
+}
+
+type terminalLivenessServer struct {
+	sandboxdv1.UnimplementedTerminalServiceServer
+	started chan struct{}
+	stopped chan struct{}
+	output  []byte
+}
+
+func (s *terminalLivenessServer) Terminal(stream sandboxdv1.TerminalService_TerminalServer) error {
+	close(s.started)
+	defer close(s.stopped)
+	if len(s.output) == 0 {
+		<-stream.Context().Done()
+		return stream.Context().Err()
+	}
+	message, err := stream.Recv()
+	if err != nil {
+		return err
+	}
+	if message.GetOpen() == nil {
+		return errors.New("missing terminal open")
+	}
+	for {
+		if err := stream.Send(&sandboxdv1.TerminalMessage{Kind: &sandboxdv1.TerminalMessage_Data{Data: s.output}}); err != nil {
+			return err
+		}
+	}
+}
+
+type terminalIdleServer struct {
+	sandboxdv1.UnimplementedTerminalServiceServer
+	opened chan struct{}
+}
+
+func (s *terminalIdleServer) Terminal(stream sandboxdv1.TerminalService_TerminalServer) error {
+	message, err := stream.Recv()
+	if err != nil {
+		return err
+	}
+	if message.GetOpen() == nil {
+		return errors.New("missing terminal open")
+	}
+	close(s.opened)
+	message, err = stream.Recv()
+	if err != nil {
+		return err
+	}
+	return stream.Send(&sandboxdv1.TerminalMessage{Kind: &sandboxdv1.TerminalMessage_Data{Data: message.GetData()}})
 }
 
 func (s *terminalTestServer) Check(context.Context, *sandboxdv1.HealthCheckRequest) (*sandboxdv1.HealthCheckResponse, error) {
