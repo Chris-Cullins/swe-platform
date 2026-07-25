@@ -14,6 +14,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	platformv1alpha1 "github.com/Chris-Cullins/swe-platform/api/v1alpha1"
+	"github.com/Chris-Cullins/swe-platform/internal/lifecycle"
 )
 
 func TestSetEnvironmentHoldUsesMonotonicIdempotentPolicy(t *testing.T) {
@@ -95,6 +96,61 @@ func TestSetEnvironmentHoldRetriesConflictAndPreservesConcurrentLifecycleIntents
 		current.Spec.Lifecycle.Wake == nil || current.Spec.Lifecycle.Wake.ID != "wake-1" ||
 		current.Spec.Lifecycle.Suspend == nil || current.Spec.Lifecycle.Suspend.ID != "suspend-concurrent" {
 		t.Fatalf("concurrent lifecycle intent was lost: %#v", current.Spec.Lifecycle)
+	}
+}
+
+func TestSetEnvironmentHoldRejectsSameNameReplacementIncarnation(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := platformv1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	environment := &platformv1alpha1.Environment{}
+	environment.Name = "shared"
+	environment.Namespace = "ns"
+	environment.UID = "env-uid-old"
+	base := fake.NewClientBuilder().WithScheme(scheme).WithObjects(environment).Build()
+	key := types.NamespacedName{Namespace: environment.Namespace, Name: environment.Name}
+	patches := 0
+	kube := interceptor.NewClient(base, interceptor.Funcs{Patch: func(ctx context.Context, underlying client.WithWatch, object client.Object, patch client.Patch, options ...client.PatchOption) error {
+		patches++
+		if patches == 1 {
+			// Between the first read and the retry, the original incarnation is
+			// deleted and a same-name replacement is created with a new UID.
+			var original platformv1alpha1.Environment
+			if err := underlying.Get(ctx, key, &original); err != nil {
+				return err
+			}
+			if err := underlying.Delete(ctx, &original); err != nil {
+				return err
+			}
+			replacement := &platformv1alpha1.Environment{}
+			replacement.Name = environment.Name
+			replacement.Namespace = environment.Namespace
+			replacement.UID = "env-uid-new"
+			if err := underlying.Create(ctx, replacement); err != nil {
+				return err
+			}
+			return apierrors.NewConflict(schema.GroupResource{Group: platformv1alpha1.GroupVersion.Group, Resource: "environments"}, object.GetName(), errors.New("simulated hold conflict"))
+		}
+		return underlying.Patch(ctx, object, patch, options...)
+	}})
+
+	revision, err := setEnvironmentHold(context.Background(), kube, key, true)
+	if err == nil || revision != 0 {
+		t.Fatalf("replacement incarnation = revision %d, error %v; want failure", revision, err)
+	}
+	if !errors.Is(err, lifecycle.ErrEnvironmentIncarnationChanged) {
+		t.Fatalf("error = %v; want incarnation-changed error", err)
+	}
+	if patches != 1 {
+		t.Fatalf("replacement incarnation patched %d times; want 1 (no retry patch)", patches)
+	}
+	var current platformv1alpha1.Environment
+	if err := base.Get(context.Background(), key, &current); err != nil {
+		t.Fatal(err)
+	}
+	if current.UID != "env-uid-new" || current.Spec.Lifecycle.Hold != nil {
+		t.Fatalf("replacement incarnation was mutated: uid=%q spec=%#v", current.UID, current.Spec.Lifecycle)
 	}
 }
 
