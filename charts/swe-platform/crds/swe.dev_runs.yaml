@@ -133,6 +133,14 @@ spec:
                 format: int64
                 minimum: 0
                 type: integer
+              acceptedEnvironmentExecutionGeneration:
+                description: |-
+                  AcceptedEnvironmentExecutionGeneration is the exact backend execution in
+                  which the adapter most recently accepted this Run. Missing or different
+                  identity always requires fresh acceptance.
+                format: int64
+                minimum: 1
+                type: integer
               branch:
                 description: Branch is the git branch holding the run's changes, once
                   pushed.

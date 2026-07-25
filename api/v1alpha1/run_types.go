@@ -155,6 +155,13 @@ type RunStatus struct {
 	// +optional
 	AcceptedEnvironmentEpoch *int64 `json:"acceptedEnvironmentEpoch,omitempty"`
 
+	// AcceptedEnvironmentExecutionGeneration is the exact backend execution in
+	// which the adapter most recently accepted this Run. Missing or different
+	// identity always requires fresh acceptance.
+	// +kubebuilder:validation:Minimum=1
+	// +optional
+	AcceptedEnvironmentExecutionGeneration *int64 `json:"acceptedEnvironmentExecutionGeneration,omitempty"`
+
 	// Branch is the git branch holding the run's changes, once pushed.
 	// +optional
 	Branch string `json:"branch,omitempty"`

@@ -78,12 +78,24 @@ type EnvironmentWakeRequest struct {
 type EnvironmentActivityRequest struct {
 	Source                      EnvironmentActivitySource `json:"source"`
 	EnvironmentLifecycleRequest `json:",inline"`
+
+	// ExecutionGeneration is the exact backend execution that produced this
+	// activity. Missing or zero values are legacy and are never accepted.
+	// +kubebuilder:validation:Minimum=1
+	// +optional
+	ExecutionGeneration int64 `json:"executionGeneration,omitempty"`
 }
 
 // EnvironmentActivityReceipt records the latest request consumed for a source.
 type EnvironmentActivityReceipt struct {
 	Source    EnvironmentActivitySource `json:"source"`
 	RequestID string                    `json:"requestID"`
+
+	// ExecutionGeneration is absent on receipts written before execution
+	// fencing. Such receipts never acknowledge a generation-fenced request.
+	// +kubebuilder:validation:Minimum=1
+	// +optional
+	ExecutionGeneration int64 `json:"executionGeneration,omitempty"`
 }
 
 // EnvironmentHoldPolicy is explicit user/admin-owned policy. Changing Enabled
@@ -247,10 +259,20 @@ type EnvironmentEndpoints struct {
 }
 
 // EnvironmentStatus defines the observed state of Environment.
+// +kubebuilder:validation:XValidation:rule="!has(oldSelf.executionGeneration) || (has(self.executionGeneration) && self.executionGeneration >= oldSelf.executionGeneration)",message="executionGeneration cannot decrease or be removed"
 type EnvironmentStatus struct {
 	// ObservedGeneration is the Environment generation reflected by this status.
 	// +optional
 	ObservedGeneration int64 `json:"observedGeneration,omitempty"`
+
+	// ExecutionGeneration is the backend-neutral identity of the current or
+	// most recently reserved backend execution. The lifecycle controller
+	// reserves a strictly greater positive value before every backend creation
+	// attempt; gaps are allowed after failed or uncertain attempts. Zero is an
+	// uninitialized migration state and is never reachable by consumers.
+	// +kubebuilder:validation:Minimum=0
+	// +optional
+	ExecutionGeneration int64 `json:"executionGeneration,omitempty"`
 
 	// +optional
 	Phase EnvironmentPhase `json:"phase,omitempty"`
@@ -314,7 +336,7 @@ func IsEnvironmentReady(environment *Environment) bool {
 		return false
 	}
 	condition := apimeta.FindStatusCondition(environment.Status.Conditions, EnvironmentConditionReady)
-	return environment.Status.ObservedGeneration == environment.Generation && condition != nil &&
+	return environment.Status.ExecutionGeneration > 0 && environment.Status.ObservedGeneration == environment.Generation && condition != nil &&
 		condition.ObservedGeneration == environment.Generation && condition.Status == metav1.ConditionTrue
 }
 

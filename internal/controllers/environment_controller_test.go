@@ -7,9 +7,11 @@ import (
 	"encoding/pem"
 	stderrors "errors"
 	"fmt"
+	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -51,16 +53,16 @@ func TestEnsurePodUsesOnlyNonSecretProjectValues(t *testing.T) {
 			Repositories: []string{"https://github.com/example/repo"},
 		},
 	}
-	reconciler := &EnvironmentReconciler{
-		Client: fake.NewClientBuilder().WithScheme(scheme).WithObjects(project).Build(),
-		Scheme: scheme,
-	}
 	env := &platformv1alpha1.Environment{
 		ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default", UID: "environment-uid"},
 		Spec: platformv1alpha1.EnvironmentSpec{
 			ProjectRef:  project.Name,
 			TemplateRef: "small",
 		},
+	}
+	reconciler := &EnvironmentReconciler{
+		Client: fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(env).WithObjects(project, env).Build(),
+		Scheme: scheme,
 	}
 	tmpl := &platformv1alpha1.EnvironmentTemplate{
 		Spec: platformv1alpha1.EnvironmentTemplateSpec{Image: "example/environment:latest", Size: "small"},
@@ -69,6 +71,16 @@ func TestEnsurePodUsesOnlyNonSecretProjectValues(t *testing.T) {
 	pod, err := reconciler.ensurePod(context.Background(), env, tmpl)
 	if err != nil {
 		t.Fatalf("ensurePod() error = %v", err)
+	}
+	if pod.Spec.RestartPolicy != corev1.RestartPolicyNever || pod.Annotations[executionGenerationAnnotation] != "1" {
+		t.Fatalf("initial Pod execution contract = restart %q, generation %q", pod.Spec.RestartPolicy, pod.Annotations[executionGenerationAnnotation])
+	}
+	var reserved platformv1alpha1.Environment
+	if err := reconciler.Get(context.Background(), client.ObjectKeyFromObject(env), &reserved); err != nil {
+		t.Fatal(err)
+	}
+	if reserved.Status.ExecutionGeneration != 1 {
+		t.Fatalf("initial execution generation = %d, want 1", reserved.Status.ExecutionGeneration)
 	}
 	if len(pod.Spec.Containers[0].EnvFrom) != 0 {
 		t.Fatalf("environment EnvFrom = %#v, want no ambient project secrets", pod.Spec.Containers[0].EnvFrom)
@@ -193,12 +205,12 @@ func TestEnsurePodCreatesAndRotatesEphemeralSandboxdCredentials(t *testing.T) {
 	if err := platformv1alpha1.AddToScheme(scheme); err != nil {
 		t.Fatal(err)
 	}
-	reconciler := &EnvironmentReconciler{
-		Client: fake.NewClientBuilder().WithScheme(scheme).Build(),
-		Scheme: scheme,
-	}
 	env := &platformv1alpha1.Environment{
 		ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default", UID: "environment-uid"},
+	}
+	reconciler := &EnvironmentReconciler{
+		Client: fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(env).WithObjects(env).Build(),
+		Scheme: scheme,
 	}
 	tmpl := &platformv1alpha1.EnvironmentTemplate{
 		Spec: platformv1alpha1.EnvironmentTemplateSpec{Image: "example/environment:latest", Size: "small"},
@@ -300,6 +312,167 @@ func TestEnsurePodCreatesAndRotatesEphemeralSandboxdCredentials(t *testing.T) {
 	}
 }
 
+func TestExecutionGenerationReservationSurvivesControllerRestart(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := platformv1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	environment := &platformv1alpha1.Environment{
+		ObjectMeta: metav1.ObjectMeta{Name: "environment", Namespace: "default", UID: "env-uid", Generation: 1},
+		Status:     platformv1alpha1.EnvironmentStatus{ExecutionGeneration: 4},
+	}
+	kubeClient := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(environment).WithObjects(environment).Build()
+	first := &EnvironmentReconciler{Client: kubeClient}
+	if generation, err := first.reserveExecutionGeneration(context.Background(), environment); err != nil || generation != 5 {
+		t.Fatalf("first reservation = (%d, %v), want 5", generation, err)
+	}
+	var persisted platformv1alpha1.Environment
+	if err := kubeClient.Get(context.Background(), client.ObjectKeyFromObject(environment), &persisted); err != nil {
+		t.Fatal(err)
+	}
+	second := &EnvironmentReconciler{Client: kubeClient}
+	if generation, err := second.reserveExecutionGeneration(context.Background(), &persisted); err != nil || generation != 6 {
+		t.Fatalf("post-restart reservation = (%d, %v), want 6", generation, err)
+	}
+	if err := second.Get(context.Background(), client.ObjectKeyFromObject(environment), &persisted); err != nil {
+		t.Fatal(err)
+	}
+	persisted.Status.ExecutionGeneration = math.MaxInt64
+	if err := second.Status().Update(context.Background(), &persisted); err != nil {
+		t.Fatal(err)
+	}
+	var terminal *terminalEnvironmentError
+	if generation, err := second.reserveExecutionGeneration(context.Background(), &persisted); generation != 0 || !stderrors.As(err, &terminal) {
+		t.Fatalf("exhausted reservation = (%d, %v), want terminal error", generation, err)
+	}
+}
+
+func TestFailedPodCreateLeavesGenerationGap(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	if err := platformv1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	env := &platformv1alpha1.Environment{
+		ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default", UID: "env-uid"},
+		Spec:       platformv1alpha1.EnvironmentSpec{TemplateRef: "small", ProjectRef: "project"},
+		Status:     platformv1alpha1.EnvironmentStatus{Phase: platformv1alpha1.EnvironmentPhaseResuming},
+	}
+	baseClient := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(env).WithObjects(env).Build()
+	failCreate := true
+	transientErr := stderrors.New("transient Pod create failure")
+	intercepted := interceptor.NewClient(baseClient, interceptor.Funcs{
+		Create: func(ctx context.Context, underlying client.WithWatch, object client.Object, options ...client.CreateOption) error {
+			if _, ok := object.(*corev1.Pod); ok && failCreate {
+				failCreate = false
+				return transientErr
+			}
+			return underlying.Create(ctx, object, options...)
+		},
+	})
+	reconciler := &EnvironmentReconciler{Client: intercepted, Scheme: scheme}
+	template := &platformv1alpha1.EnvironmentTemplate{Spec: platformv1alpha1.EnvironmentTemplateSpec{Image: "example/environment:latest", Size: "small"}}
+	project := &platformv1alpha1.Project{ObjectMeta: metav1.ObjectMeta{Name: "project", Namespace: env.Namespace}, Spec: platformv1alpha1.ProjectSpec{Repositories: []string{"https://github.com/example/repo"}}}
+
+	if pod, err := reconciler.ensurePodForProject(context.Background(), env, template, project, ""); pod != nil || !stderrors.Is(err, transientErr) {
+		t.Fatalf("first create = (%#v, %v), want transient error", pod, err)
+	}
+	var reserved platformv1alpha1.Environment
+	if err := reconciler.Get(context.Background(), client.ObjectKeyFromObject(env), &reserved); err != nil {
+		t.Fatal(err)
+	}
+	if reserved.Status.ExecutionGeneration != 1 {
+		t.Fatalf("failed create reservation = %d, want 1", reserved.Status.ExecutionGeneration)
+	}
+	if reserved.Status.Phase != platformv1alpha1.EnvironmentPhaseResuming {
+		t.Fatalf("failed create lost resume intent: phase %q", reserved.Status.Phase)
+	}
+	replacement, err := reconciler.ensurePodForProject(context.Background(), &reserved, template, project, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if replacement.Annotations[executionGenerationAnnotation] != "2" {
+		t.Fatalf("retry reused failed generation: %#v", replacement.Annotations)
+	}
+	resume := false
+	for _, variable := range replacement.Spec.InitContainers[0].Env {
+		resume = resume || variable.Name == "SWE_RESUMING" && variable.Value == "true"
+	}
+	if !resume {
+		t.Fatalf("retry omitted resume hook intent: %#v", replacement.Spec.InitContainers[0].Env)
+	}
+}
+
+func TestCurrentSandboxdPodRejectsRestartableLegacyPod(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	if err := platformv1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	env := &platformv1alpha1.Environment{ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default", UID: "env-uid"}, Status: platformv1alpha1.EnvironmentStatus{ExecutionGeneration: 1}}
+	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
+		Name: "env-test", Namespace: env.Namespace, UID: "pod-uid",
+		Annotations: map[string]string{executionGenerationAnnotation: "1"},
+	}}
+	if err := controllerutil.SetControllerReference(env, pod, scheme); err != nil {
+		t.Fatal(err)
+	}
+	for _, policy := range []corev1.RestartPolicy{corev1.RestartPolicyAlways, corev1.RestartPolicyOnFailure, ""} {
+		pod.Spec.RestartPolicy = policy
+		current, err := (&EnvironmentReconciler{}).currentSandboxdPod(context.Background(), env, pod)
+		if err != nil || current {
+			t.Fatalf("restart policy %q current = (%t, %v), want false", policy, current, err)
+		}
+	}
+}
+
+func TestEnsurePodReplacesLegacyOnFailureExecution(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	if err := platformv1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	env := &platformv1alpha1.Environment{
+		ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default", UID: "env-uid"},
+		Spec:       platformv1alpha1.EnvironmentSpec{TemplateRef: "small"},
+		Status:     platformv1alpha1.EnvironmentStatus{ExecutionGeneration: 1},
+	}
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: envPodName(env), Namespace: env.Namespace, UID: "legacy-pod", Annotations: map[string]string{executionGenerationAnnotation: "1"}},
+		Spec:       corev1.PodSpec{RestartPolicy: corev1.RestartPolicyOnFailure},
+	}
+	if err := controllerutil.SetControllerReference(env, pod, scheme); err != nil {
+		t.Fatal(err)
+	}
+	kubeClient := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(env).WithObjects(env, pod).Build()
+	reconciler := &EnvironmentReconciler{Client: kubeClient, Scheme: scheme}
+	template := &platformv1alpha1.EnvironmentTemplate{Spec: platformv1alpha1.EnvironmentTemplateSpec{Image: "example/environment:latest", Size: "small"}}
+
+	if current, err := reconciler.ensurePod(context.Background(), env, template); err != nil || current != nil {
+		t.Fatalf("legacy replacement step = (%#v, %v)", current, err)
+	}
+	if err := reconciler.Get(context.Background(), client.ObjectKeyFromObject(pod), &corev1.Pod{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("legacy OnFailure Pod remains: %v", err)
+	}
+	var replacing platformv1alpha1.Environment
+	if err := reconciler.Get(context.Background(), client.ObjectKeyFromObject(env), &replacing); err != nil {
+		t.Fatal(err)
+	}
+	replacement, err := reconciler.ensurePod(context.Background(), &replacing, template)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if replacement.Spec.RestartPolicy != corev1.RestartPolicyNever || replacement.Annotations[executionGenerationAnnotation] != "2" {
+		t.Fatalf("replacement execution = restart %q, generation %q", replacement.Spec.RestartPolicy, replacement.Annotations[executionGenerationAnnotation])
+	}
+}
+
 func TestSandboxdNetworkPolicyOnlyAllowsControlPlaneIngress(t *testing.T) {
 	scheme := runtime.NewScheme()
 	if err := networkingv1.AddToScheme(scheme); err != nil {
@@ -391,13 +564,15 @@ func TestEnsurePodRetainsCurrentPodWhenSecretReadFails(t *testing.T) {
 	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
 		Name: envPodName(env), Namespace: env.Namespace,
 		Annotations: map[string]string{
+			executionGenerationAnnotation:     "1",
 			sandboxdRevisionAnnotation:        sandboxdSecurityRevision,
 			sandboxdauth.IdentityAnnotation:   "current.sandboxd.swe.dev",
 			sandboxdauth.TrustAnnotation:      "public trust bundle",
 			sandboxdauth.TokenAnnotation:      "terminal token",
 			sandboxdauth.SecretNameAnnotation: envCredentialName(env),
 		},
-	}}
+	}, Spec: corev1.PodSpec{RestartPolicy: corev1.RestartPolicyNever}}
+	env.Status.ExecutionGeneration = 1
 	if err := controllerutil.SetControllerReference(env, pod, scheme); err != nil {
 		t.Fatal(err)
 	}
@@ -431,13 +606,15 @@ func TestEnsurePodRetainsCurrentPodAndForeignSecretOnCollision(t *testing.T) {
 	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
 		Name: envPodName(env), Namespace: env.Namespace,
 		Annotations: map[string]string{
+			executionGenerationAnnotation:     "1",
 			sandboxdRevisionAnnotation:        sandboxdSecurityRevision,
 			sandboxdauth.IdentityAnnotation:   "current.sandboxd.swe.dev",
 			sandboxdauth.TrustAnnotation:      "public trust bundle",
 			sandboxdauth.TokenAnnotation:      "terminal token",
 			sandboxdauth.SecretNameAnnotation: envCredentialName(env),
 		},
-	}}
+	}, Spec: corev1.PodSpec{RestartPolicy: corev1.RestartPolicyNever}}
+	env.Status.ExecutionGeneration = 1
 	if err := controllerutil.SetControllerReference(env, pod, scheme); err != nil {
 		t.Fatal(err)
 	}
@@ -794,7 +971,7 @@ func TestTerminatingFailedPodPersistsRecoveryBeforeReplacement(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default", UID: "env-uid", Generation: 2, Finalizers: []string{environmentFinalizer}},
 		Spec:       platformv1alpha1.EnvironmentSpec{TemplateRef: "small"},
 		Status: platformv1alpha1.EnvironmentStatus{
-			ObservedGeneration: 1, Phase: platformv1alpha1.EnvironmentPhaseReady, PodName: "env-test",
+			ObservedGeneration: 1, ExecutionGeneration: 1, Phase: platformv1alpha1.EnvironmentPhaseReady, PodName: "env-test",
 			Endpoints: platformv1alpha1.EnvironmentEndpoints{Sandboxd: "10.0.0.1:50051"},
 			Conditions: []metav1.Condition{{Type: platformv1alpha1.EnvironmentConditionReady, Status: metav1.ConditionTrue,
 				ObservedGeneration: 1, Reason: "SandboxdReady", Message: "sandboxd is ready"}},
@@ -805,6 +982,7 @@ func TestTerminatingFailedPodPersistsRecoveryBeforeReplacement(t *testing.T) {
 	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
 		Name: envPodName(env), Namespace: env.Namespace, UID: "dead-pod", DeletionTimestamp: &deletedAt, Finalizers: []string{"test/hold"},
 		Annotations: map[string]string{
+			executionGenerationAnnotation:     "1",
 			sandboxdRevisionAnnotation:        sandboxdSecurityRevision,
 			sandboxdauth.IdentityAnnotation:   "sandboxd.test",
 			sandboxdauth.TrustAnnotation:      "trust",
@@ -812,7 +990,7 @@ func TestTerminatingFailedPodPersistsRecoveryBeforeReplacement(t *testing.T) {
 			sandboxdauth.SecretNameAnnotation: envCredentialName(env),
 			sandboxdauth.SecretUIDAnnotation:  "secret-uid",
 		},
-	}, Status: corev1.PodStatus{Phase: corev1.PodFailed}}
+	}, Spec: corev1.PodSpec{RestartPolicy: corev1.RestartPolicyNever}, Status: corev1.PodStatus{Phase: corev1.PodFailed}}
 	secret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{
 		Name: envCredentialName(env), Namespace: env.Namespace, UID: "secret-uid",
 		Annotations: map[string]string{sandboxdauth.IdentityAnnotation: "sandboxd.test", sandboxdauth.PodUIDAnnotation: string(pod.UID)},
@@ -1130,14 +1308,14 @@ func TestHealthReadyResetRejectsSameNameReplacementEnvironment(t *testing.T) {
 	}
 	next := metav1.Now()
 	stored := &platformv1alpha1.Environment{ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default", UID: "environment-u2", Generation: 2}, Status: platformv1alpha1.EnvironmentStatus{
-		ObservedGeneration: 2, Phase: platformv1alpha1.EnvironmentPhaseCreating,
+		ObservedGeneration: 2, ExecutionGeneration: 3, Phase: platformv1alpha1.EnvironmentPhaseCreating,
 		PodRecoveryAttempts: 2, PodRecoveryUID: "u2-terminal-pod", PodRecoveryNextAttemptAt: &next,
 		Conditions: []metav1.Condition{{Type: platformv1alpha1.EnvironmentConditionReady, Status: metav1.ConditionFalse,
 			ObservedGeneration: 2, Reason: "PodRecoveryPending", Message: "U2 recovery is pending"}},
 	}}
 	stale := stored.DeepCopy()
 	stale.UID = "environment-u1"
-	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "env-test", Namespace: "default"}, Status: corev1.PodStatus{
+	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "env-test", Namespace: "default", Annotations: map[string]string{executionGenerationAnnotation: "3"}}, Status: corev1.PodStatus{
 		Phase: corev1.PodRunning, PodIP: "10.0.0.1",
 		Conditions: []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}},
 	}}
@@ -1271,6 +1449,186 @@ func TestReconcileDropsStaleEnvironmentIncarnationStatusWrites(t *testing.T) {
 	}
 }
 
+func TestReconcileUsesUncachedEnvironmentWithLiveExecution(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		mutate func(*platformv1alpha1.Environment)
+	}{
+		{name: "cached status generation is stale", mutate: func(stale *platformv1alpha1.Environment) {
+			stale.Status.ExecutionGeneration--
+		}},
+		{name: "cached spec generation is stale", mutate: func(stale *platformv1alpha1.Environment) {
+			stale.Generation--
+			stale.Spec.TemplateRef = "old-template"
+			stale.Status.ExecutionGeneration--
+		}},
+		{name: "cached UID is stale", mutate: func(stale *platformv1alpha1.Environment) {
+			stale.UID = "old-env-uid"
+			stale.Status.ExecutionGeneration--
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			scheme := runtime.NewScheme()
+			if err := corev1.AddToScheme(scheme); err != nil {
+				t.Fatal(err)
+			}
+			if err := networkingv1.AddToScheme(scheme); err != nil {
+				t.Fatal(err)
+			}
+			if err := platformv1alpha1.AddToScheme(scheme); err != nil {
+				t.Fatal(err)
+			}
+			current := &platformv1alpha1.Environment{
+				ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default", UID: "env-uid", Generation: 2, Finalizers: []string{environmentFinalizer}},
+				Spec:       platformv1alpha1.EnvironmentSpec{TemplateRef: "small"},
+				Status: platformv1alpha1.EnvironmentStatus{
+					ObservedGeneration: 2, ExecutionGeneration: 2, Phase: platformv1alpha1.EnvironmentPhaseCreating,
+				},
+			}
+			stale := current.DeepCopy()
+			test.mutate(stale)
+			template := &platformv1alpha1.EnvironmentTemplate{
+				ObjectMeta: metav1.ObjectMeta{Name: "small", Namespace: current.Namespace},
+				Spec:       platformv1alpha1.EnvironmentTemplateSpec{Image: "example/environment:latest", Size: "small"},
+			}
+			pod := &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: envPodName(current), Namespace: current.Namespace, UID: "pod-uid",
+					Annotations: map[string]string{
+						executionGenerationAnnotation:     "2",
+						sandboxdRevisionAnnotation:        sandboxdSecurityRevision,
+						sandboxdauth.IdentityAnnotation:   "current.sandboxd.swe.dev",
+						sandboxdauth.TrustAnnotation:      "trust",
+						sandboxdauth.TokenAnnotation:      "terminal-token",
+						sandboxdauth.SecretNameAnnotation: envCredentialName(current),
+						sandboxdauth.SecretUIDAnnotation:  "secret-uid",
+					},
+				},
+				Spec: corev1.PodSpec{RestartPolicy: corev1.RestartPolicyNever},
+				Status: corev1.PodStatus{
+					Phase: corev1.PodRunning, PodIP: "10.0.0.2",
+					Conditions:        []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}},
+					ContainerStatuses: []corev1.ContainerStatus{{Name: "environment", ImageID: "example/environment@sha256:current"}},
+				},
+			}
+			secret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{
+				Name: envCredentialName(current), Namespace: current.Namespace, UID: "secret-uid",
+				Annotations: map[string]string{sandboxdauth.IdentityAnnotation: "current.sandboxd.swe.dev", sandboxdauth.PodUIDAnnotation: string(pod.UID)},
+			}, Data: map[string][]byte{
+				sandboxdauth.TLSCertKey: []byte("cert"), sandboxdauth.TLSKeyKey: []byte("key"), sandboxdauth.CapabilitiesKey: []byte("capabilities"),
+				sandboxdauth.HealthTokenKey: []byte("health"), sandboxdauth.ProcessTokenKey: []byte("process"),
+			}}
+			for _, object := range []client.Object{pod, secret} {
+				if err := controllerutil.SetControllerReference(current, object, scheme); err != nil {
+					t.Fatal(err)
+				}
+			}
+			live := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(current).WithObjects(current, template, pod, secret).Build()
+			podDeletes := 0
+			cached := interceptor.NewClient(live, interceptor.Funcs{
+				Get: func(ctx context.Context, underlying client.WithWatch, key client.ObjectKey, object client.Object, options ...client.GetOption) error {
+					if environment, ok := object.(*platformv1alpha1.Environment); ok && key == client.ObjectKeyFromObject(current) {
+						*environment = *stale.DeepCopy()
+						return nil
+					}
+					return underlying.Get(ctx, key, object, options...)
+				},
+				Delete: func(ctx context.Context, underlying client.WithWatch, object client.Object, options ...client.DeleteOption) error {
+					if _, ok := object.(*corev1.Pod); ok {
+						podDeletes++
+					}
+					return underlying.Delete(ctx, object, options...)
+				},
+			})
+			reconciler := &EnvironmentReconciler{Client: cached, APIReader: live, Scheme: scheme}
+
+			if _, err := reconciler.Reconcile(context.Background(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(current)}); err != nil {
+				t.Fatal(err)
+			}
+			if podDeletes != 0 {
+				t.Fatalf("valid live Pod was deleted %d times", podDeletes)
+			}
+			if err := live.Get(context.Background(), client.ObjectKeyFromObject(pod), &corev1.Pod{}); err != nil {
+				t.Fatalf("valid live Pod was not retained: %v", err)
+			}
+			var published platformv1alpha1.Environment
+			if err := live.Get(context.Background(), client.ObjectKeyFromObject(current), &published); err != nil {
+				t.Fatal(err)
+			}
+			ready := apimeta.FindStatusCondition(published.Status.Conditions, platformv1alpha1.EnvironmentConditionReady)
+			if published.UID != current.UID || published.Generation != current.Generation || published.Spec.TemplateRef != current.Spec.TemplateRef ||
+				published.Status.ExecutionGeneration != 2 || published.Status.PodName != pod.Name || ready == nil || ready.Status != metav1.ConditionTrue {
+				t.Fatalf("status publication did not preserve live Environment identity: %#v", published)
+			}
+		})
+	}
+}
+
+func TestExecutionFencesUseUncachedPodReads(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		deleting  bool
+		reconcile func(context.Context, *EnvironmentReconciler, *platformv1alpha1.Environment) (ctrl.Result, error)
+	}{
+		{name: "pause", reconcile: func(ctx context.Context, reconciler *EnvironmentReconciler, env *platformv1alpha1.Environment) (ctrl.Result, error) {
+			return reconciler.reconcilePaused(ctx, env)
+		}},
+		{name: "deletion", deleting: true, reconcile: func(ctx context.Context, reconciler *EnvironmentReconciler, env *platformv1alpha1.Environment) (ctrl.Result, error) {
+			return reconciler.reconcileDeleting(ctx, env)
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			scheme := runtime.NewScheme()
+			if err := corev1.AddToScheme(scheme); err != nil {
+				t.Fatal(err)
+			}
+			if err := platformv1alpha1.AddToScheme(scheme); err != nil {
+				t.Fatal(err)
+			}
+			env := &platformv1alpha1.Environment{
+				ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default", UID: "env-uid", Finalizers: []string{environmentFinalizer}},
+				Status: platformv1alpha1.EnvironmentStatus{
+					ExecutionGeneration: 3, Phase: platformv1alpha1.EnvironmentPhaseIdle,
+					Lifecycle: platformv1alpha1.EnvironmentLifecycleStatus{Suspended: true},
+				},
+			}
+			if test.deleting {
+				deletedAt := metav1.Now()
+				env.DeletionTimestamp = &deletedAt
+			}
+			pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: envPodName(env), Namespace: env.Namespace, UID: "live-pod"}}
+			if err := controllerutil.SetControllerReference(env, pod, scheme); err != nil {
+				t.Fatal(err)
+			}
+			live := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(env).WithObjects(env, pod).Build()
+			cached := interceptor.NewClient(live, interceptor.Funcs{Get: func(ctx context.Context, underlying client.WithWatch, key client.ObjectKey, object client.Object, options ...client.GetOption) error {
+				if _, ok := object.(*corev1.Pod); ok {
+					return apierrors.NewNotFound(schema.GroupResource{Resource: "pods"}, key.Name)
+				}
+				return underlying.Get(ctx, key, object, options...)
+			}})
+			reconciler := &EnvironmentReconciler{Client: cached, APIReader: live, Scheme: scheme}
+
+			result, err := test.reconcile(context.Background(), reconciler, env.DeepCopy())
+			if err != nil || !result.Requeue {
+				t.Fatalf("execution fence = (%#v, %v), want requeue after live Pod deletion", result, err)
+			}
+			if err := live.Get(context.Background(), client.ObjectKeyFromObject(pod), &corev1.Pod{}); !apierrors.IsNotFound(err) {
+				t.Fatalf("live Pod survived cached NotFound: %v", err)
+			}
+			if test.deleting {
+				var retained platformv1alpha1.Environment
+				if err := live.Get(context.Background(), client.ObjectKeyFromObject(env), &retained); err != nil {
+					t.Fatal(err)
+				}
+				if !controllerutil.ContainsFinalizer(&retained, environmentFinalizer) {
+					t.Fatal("deletion finalizer was removed before uncached Pod fence")
+				}
+			}
+		})
+	}
+}
+
 func TestNewEnvironmentRefusesTerminatingPriorIncarnationPVC(t *testing.T) {
 	scheme := runtime.NewScheme()
 	if err := corev1.AddToScheme(scheme); err != nil {
@@ -1385,7 +1743,10 @@ func TestOperationalFailureRetriesAndRecoversReadiness(t *testing.T) {
 	if result, err := reconciler.Reconcile(context.Background(), request); err != nil {
 		t.Fatalf("recovery Reconcile() = (%#v, %v), want provisioning to resume", result, err)
 	}
-	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "pod"}, Status: corev1.PodStatus{
+	if err := baseClient.Get(context.Background(), client.ObjectKeyFromObject(env), &retrying); err != nil {
+		t.Fatal(err)
+	}
+	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "pod", Annotations: map[string]string{executionGenerationAnnotation: strconv.FormatInt(retrying.Status.ExecutionGeneration, 10)}}, Status: corev1.PodStatus{
 		Phase: corev1.PodRunning,
 		PodIP: "10.0.0.1",
 		Conditions: []corev1.PodCondition{{
@@ -2506,13 +2867,14 @@ func TestSyncStatusReportsSetupForProjectInitialization(t *testing.T) {
 
 	env := &platformv1alpha1.Environment{
 		ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default", UID: "environment-uid"},
+		Status:     platformv1alpha1.EnvironmentStatus{ExecutionGeneration: 1},
 	}
 	reconciler := &EnvironmentReconciler{
 		Client: fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(env).WithObjects(env).Build(),
 		Scheme: scheme,
 	}
 	pod := &corev1.Pod{
-		ObjectMeta: metav1.ObjectMeta{Name: "env-test", Namespace: "default"},
+		ObjectMeta: metav1.ObjectMeta{Name: "env-test", Namespace: "default", Annotations: map[string]string{executionGenerationAnnotation: "1"}},
 		Spec:       corev1.PodSpec{InitContainers: []corev1.Container{{Name: "project-setup"}}},
 		Status:     corev1.PodStatus{Phase: corev1.PodPending},
 	}
@@ -2540,6 +2902,7 @@ func TestSyncStatusPublishesSandboxdEndpoint(t *testing.T) {
 
 	nextRecovery := metav1.Now()
 	env := &platformv1alpha1.Environment{ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default", Generation: 4}, Status: platformv1alpha1.EnvironmentStatus{
+		ExecutionGeneration: 1,
 		PodRecoveryAttempts: 2, PodRecoveryExhausted: true, PodRecoveryUID: "old-pod", PodRecoveryNextAttemptAt: &nextRecovery,
 	}}
 	reconciler := &EnvironmentReconciler{
@@ -2547,7 +2910,7 @@ func TestSyncStatusPublishesSandboxdEndpoint(t *testing.T) {
 		Scheme: scheme,
 	}
 	pod := &corev1.Pod{
-		ObjectMeta: metav1.ObjectMeta{Name: "env-test", Namespace: "default"},
+		ObjectMeta: metav1.ObjectMeta{Name: "env-test", Namespace: "default", Annotations: map[string]string{executionGenerationAnnotation: "1"}},
 		Status: corev1.PodStatus{
 			Phase:      corev1.PodRunning,
 			PodIP:      "10.0.0.7",
@@ -2675,7 +3038,8 @@ func TestEnvironmentStatusRetriesConflictAndPreservesConditions(t *testing.T) {
 		t.Fatal(err)
 	}
 	env := &platformv1alpha1.Environment{ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default", Generation: 2}, Status: platformv1alpha1.EnvironmentStatus{
-		Conditions: []metav1.Condition{{Type: "Audit", Status: metav1.ConditionTrue, Reason: "Recorded", Message: "preserve me"}},
+		ExecutionGeneration: 1,
+		Conditions:          []metav1.Condition{{Type: "Audit", Status: metav1.ConditionTrue, Reason: "Recorded", Message: "preserve me"}},
 	}}
 	baseClient := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(env).WithObjects(env).Build()
 	conflicts := 0
@@ -2717,10 +3081,6 @@ func TestEnsurePodMarksProjectInitializationAsResume(t *testing.T) {
 			Repositories: []string{"https://github.com/example/repo"},
 		},
 	}
-	reconciler := &EnvironmentReconciler{
-		Client: fake.NewClientBuilder().WithScheme(scheme).WithObjects(project).Build(),
-		Scheme: scheme,
-	}
 	env := &platformv1alpha1.Environment{
 		ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default", UID: "environment-uid"},
 		Spec: platformv1alpha1.EnvironmentSpec{
@@ -2728,6 +3088,10 @@ func TestEnsurePodMarksProjectInitializationAsResume(t *testing.T) {
 			TemplateRef: "small",
 		},
 		Status: platformv1alpha1.EnvironmentStatus{Phase: platformv1alpha1.EnvironmentPhaseResuming},
+	}
+	reconciler := &EnvironmentReconciler{
+		Client: fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(env).WithObjects(project, env).Build(),
+		Scheme: scheme,
 	}
 	tmpl := &platformv1alpha1.EnvironmentTemplate{
 		Spec: platformv1alpha1.EnvironmentTemplateSpec{Image: "example/environment:latest", Size: "small"},
@@ -2754,14 +3118,14 @@ func TestSyncStatusPreservesResumingWhilePodStarts(t *testing.T) {
 
 	env := &platformv1alpha1.Environment{
 		ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default"},
-		Status:     platformv1alpha1.EnvironmentStatus{Phase: platformv1alpha1.EnvironmentPhaseResuming},
+		Status:     platformv1alpha1.EnvironmentStatus{ExecutionGeneration: 1, Phase: platformv1alpha1.EnvironmentPhaseResuming},
 	}
 	reconciler := &EnvironmentReconciler{
 		Client: fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(env).WithObjects(env).Build(),
 		Scheme: scheme,
 	}
 	pod := &corev1.Pod{
-		ObjectMeta: metav1.ObjectMeta{Name: "env-test", Namespace: "default"},
+		ObjectMeta: metav1.ObjectMeta{Name: "env-test", Namespace: "default", Annotations: map[string]string{executionGenerationAnnotation: "1"}},
 		Spec:       corev1.PodSpec{InitContainers: []corev1.Container{{Name: "project-setup"}}},
 		Status:     corev1.PodStatus{Phase: corev1.PodPending},
 	}
@@ -2888,6 +3252,44 @@ func TestReconcileIdleRequestsPauseAfterTimeout(t *testing.T) {
 	}
 }
 
+func TestLegacyActivityWithoutExecutionGenerationFailsClosed(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := platformv1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	oldActivity := metav1.NewTime(time.Date(2026, time.July, 20, 11, 0, 0, 0, time.UTC))
+	env := &platformv1alpha1.Environment{
+		ObjectMeta: metav1.ObjectMeta{Name: "legacy", Namespace: "default", UID: "env-uid"},
+		Spec: platformv1alpha1.EnvironmentSpec{Lifecycle: platformv1alpha1.EnvironmentLifecycleSpec{Activity: []platformv1alpha1.EnvironmentActivityRequest{{
+			Source: platformv1alpha1.EnvironmentActivitySourceTerminal,
+			EnvironmentLifecycleRequest: platformv1alpha1.EnvironmentLifecycleRequest{
+				ID: "legacy-activity", EnvironmentUID: "env-uid", HoldPolicyRevision: 0,
+			},
+		}}}},
+		Status: platformv1alpha1.EnvironmentStatus{
+			ExecutionGeneration: 4, LastActiveAt: &oldActivity,
+			Lifecycle: platformv1alpha1.EnvironmentLifecycleStatus{ActivityReceipts: []platformv1alpha1.EnvironmentActivityReceipt{{
+				Source: platformv1alpha1.EnvironmentActivitySourceTerminal, RequestID: "legacy-activity",
+			}}},
+		},
+	}
+	kubeClient := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(env).WithObjects(env).Build()
+	reconciler := &EnvironmentReconciler{Client: kubeClient, Now: func() time.Time { return oldActivity.Add(time.Hour) }}
+
+	changed, err := reconciler.reconcileLifecycleIntent(context.Background(), env)
+	if err != nil || changed {
+		t.Fatalf("legacy lifecycle reconcile = (%t, %v), want unchanged", changed, err)
+	}
+	var retained platformv1alpha1.Environment
+	if err := reconciler.Get(context.Background(), client.ObjectKeyFromObject(env), &retained); err != nil {
+		t.Fatal(err)
+	}
+	if retained.Status.LastActiveAt == nil || !retained.Status.LastActiveAt.Equal(&oldActivity) ||
+		len(retained.Status.Lifecycle.ActivityReceipts) != 1 || retained.Status.Lifecycle.ActivityReceipts[0].ExecutionGeneration != 0 {
+		t.Fatalf("legacy activity was accepted or rewritten: %#v", retained.Status)
+	}
+}
+
 func TestLifecycleHoldConsumesButRefusesOrdinaryWake(t *testing.T) {
 	scheme := runtime.NewScheme()
 	if err := platformv1alpha1.AddToScheme(scheme); err != nil {
@@ -2896,12 +3298,13 @@ func TestLifecycleHoldConsumesButRefusesOrdinaryWake(t *testing.T) {
 	now := time.Date(2026, time.July, 20, 12, 0, 0, 0, time.UTC)
 	env := &platformv1alpha1.Environment{
 		ObjectMeta: metav1.ObjectMeta{Name: "held", Namespace: "default", UID: "env-uid"},
+		Status:     platformv1alpha1.EnvironmentStatus{ExecutionGeneration: 1},
 		Spec: platformv1alpha1.EnvironmentSpec{Lifecycle: platformv1alpha1.EnvironmentLifecycleSpec{
 			Hold: &platformv1alpha1.EnvironmentHoldPolicy{Enabled: true, Revision: 4},
 			Wake: &platformv1alpha1.EnvironmentWakeRequest{EnvironmentLifecycleRequest: platformv1alpha1.EnvironmentLifecycleRequest{ID: "wake-1", EnvironmentUID: "env-uid", HoldPolicyRevision: 4}},
 			Activity: []platformv1alpha1.EnvironmentActivityRequest{{Source: platformv1alpha1.EnvironmentActivitySourceTerminal, EnvironmentLifecycleRequest: platformv1alpha1.EnvironmentLifecycleRequest{
 				ID: "activity-1", EnvironmentUID: "env-uid", HoldPolicyRevision: 4,
-			}}},
+			}, ExecutionGeneration: 1}},
 		}},
 	}
 	kubeClient := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(env).WithObjects(env).Build()
@@ -3472,9 +3875,10 @@ func TestWakeAndHoldReleaseWaitForBackendFence(t *testing.T) {
 				ObjectMeta: metav1.ObjectMeta{Name: "shared", Namespace: "default", UID: "env-uid", Finalizers: []string{environmentFinalizer}},
 				Spec:       platformv1alpha1.EnvironmentSpec{ProjectRef: project.Name, TemplateRef: template.Name, Lifecycle: test.spec},
 				Status: platformv1alpha1.EnvironmentStatus{
-					Phase:     platformv1alpha1.EnvironmentPhaseIdle,
-					PodName:   envPodName(&platformv1alpha1.Environment{ObjectMeta: metav1.ObjectMeta{Name: "shared"}}),
-					Endpoints: platformv1alpha1.EnvironmentEndpoints{Sandboxd: "192.0.2.10:50051"},
+					ExecutionGeneration: 7,
+					Phase:               platformv1alpha1.EnvironmentPhaseIdle,
+					PodName:             envPodName(&platformv1alpha1.Environment{ObjectMeta: metav1.ObjectMeta{Name: "shared"}}),
+					Endpoints:           platformv1alpha1.EnvironmentEndpoints{Sandboxd: "192.0.2.10:50051"},
 					Lifecycle: platformv1alpha1.EnvironmentLifecycleStatus{
 						Suspended: true, SuspensionReason: test.reason, Epoch: 1, ObservedHoldPolicyRevision: lifecycle.HoldPolicyRevision(&platformv1alpha1.Environment{Spec: platformv1alpha1.EnvironmentSpec{Lifecycle: test.spec}}),
 					},
@@ -3587,6 +3991,12 @@ func TestWakeAndHoldReleaseWaitForBackendFence(t *testing.T) {
 			}
 			if replacementPod.Annotations[sandboxdauth.IdentityAnnotation] == oldIdentity || replacementCredentials.Annotations[sandboxdauth.IdentityAnnotation] == oldIdentity || replacementPod.Annotations[sandboxdauth.IdentityAnnotation] != replacementCredentials.Annotations[sandboxdauth.IdentityAnnotation] {
 				t.Fatalf("replacement reused old execution identity: pod=%q credentials=%q", replacementPod.Annotations[sandboxdauth.IdentityAnnotation], replacementCredentials.Annotations[sandboxdauth.IdentityAnnotation])
+			}
+			if err := reconciler.Get(context.Background(), key, &fencing); err != nil {
+				t.Fatal(err)
+			}
+			if replacementPod.Annotations[executionGenerationAnnotation] != "8" || fencing.Status.ExecutionGeneration != 8 {
+				t.Fatalf("resume execution generation = status %d, Pod %q, want 8", fencing.Status.ExecutionGeneration, replacementPod.Annotations[executionGenerationAnnotation])
 			}
 			setup := replacementPod.Spec.InitContainers[0]
 			resuming := false
@@ -3931,10 +4341,10 @@ func TestSyncStatusRefreshesActivityWhenSetupBecomesReady(t *testing.T) {
 	oldActivity := metav1.NewTime(time.Now().Add(-time.Hour))
 	env := &platformv1alpha1.Environment{
 		ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default"},
-		Status:     platformv1alpha1.EnvironmentStatus{Phase: platformv1alpha1.EnvironmentPhaseSetup, LastActiveAt: &oldActivity},
+		Status:     platformv1alpha1.EnvironmentStatus{ExecutionGeneration: 1, Phase: platformv1alpha1.EnvironmentPhaseSetup, LastActiveAt: &oldActivity},
 	}
 	pod := &corev1.Pod{
-		ObjectMeta: metav1.ObjectMeta{Name: "env-test", Namespace: "default"},
+		ObjectMeta: metav1.ObjectMeta{Name: "env-test", Namespace: "default", Annotations: map[string]string{executionGenerationAnnotation: "1"}},
 		Status: corev1.PodStatus{
 			Phase: corev1.PodRunning, PodIP: "10.0.0.1",
 			Conditions: []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}},
@@ -3971,12 +4381,13 @@ func TestActivityIntentPreservesReadyGenerationAndProtectsIdle(t *testing.T) {
 			Hold: &platformv1alpha1.EnvironmentHoldPolicy{Revision: 2},
 		}},
 	}
+	environment.Status.ExecutionGeneration = 1
 	applyEnvironmentStatus(environment, platformv1alpha1.EnvironmentPhaseReady, "env-test", "10.0.0.1:50051", "SandboxdReady", "ready", nil)
 	kubeClient := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(environment).WithObjects(environment).Build()
 	reconciler := &EnvironmentReconciler{Client: kubeClient, Scheme: scheme, Now: func() time.Time { return now }}
 	key := client.ObjectKeyFromObject(environment)
 
-	if err := lifecycle.RecordActivity(context.Background(), kubeClient, key, environment.UID, 2, platformv1alpha1.EnvironmentActivitySourceTerminal, "terminal-2"); err != nil {
+	if err := lifecycle.RecordActivity(context.Background(), kubeClient, key, environment.UID, 1, 2, platformv1alpha1.EnvironmentActivitySourceTerminal, "terminal-2"); err != nil {
 		t.Fatal(err)
 	}
 	var activity platformv1alpha1.Environment
@@ -3993,7 +4404,7 @@ func TestActivityIntentPreservesReadyGenerationAndProtectsIdle(t *testing.T) {
 	if err := kubeClient.Get(context.Background(), key, &consumed); err != nil {
 		t.Fatal(err)
 	}
-	if consumed.Status.LastActiveAt == nil || !consumed.Status.LastActiveAt.Equal(&metav1.Time{Time: now}) || activityReceipt(consumed.Status.Lifecycle.ActivityReceipts, platformv1alpha1.EnvironmentActivitySourceTerminal) != "terminal-2" || consumed.Status.Lifecycle.ObservedHoldPolicyRevision != 2 {
+	if consumed.Status.LastActiveAt == nil || !consumed.Status.LastActiveAt.Equal(&metav1.Time{Time: now}) || activityReceipt(consumed.Status.Lifecycle.ActivityReceipts, platformv1alpha1.EnvironmentActivitySourceTerminal, 1) != "terminal-2" || consumed.Status.Lifecycle.ObservedHoldPolicyRevision != 2 {
 		t.Fatalf("consumed activity = %#v", consumed.Status)
 	}
 	if consumed.Status.ObservedGeneration != consumed.Generation || !platformv1alpha1.IsEnvironmentReady(&consumed) {

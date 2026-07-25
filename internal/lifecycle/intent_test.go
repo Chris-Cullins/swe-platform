@@ -9,6 +9,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	platformv1alpha1 "github.com/Chris-Cullins/swe-platform/api/v1alpha1"
 )
@@ -22,16 +23,17 @@ func TestRecordActivityIsSourceBoundedAndFenced(t *testing.T) {
 	environment.Name = "environment"
 	environment.Namespace = "project"
 	environment.UID = "env-uid"
+	environment.Status.ExecutionGeneration = 4
 	environment.Spec.Lifecycle.Hold = &platformv1alpha1.EnvironmentHoldPolicy{Revision: 3}
 	kubeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(environment).Build()
 	key := client.ObjectKeyFromObject(environment)
 
 	for _, requestID := range []string{"terminal-1", "terminal-1", "terminal-2"} {
-		if err := RecordActivity(context.Background(), kubeClient, key, environment.UID, 3, platformv1alpha1.EnvironmentActivitySourceTerminal, requestID); err != nil {
+		if err := RecordActivity(context.Background(), kubeClient, key, environment.UID, 4, 3, platformv1alpha1.EnvironmentActivitySourceTerminal, requestID); err != nil {
 			t.Fatal(err)
 		}
 	}
-	if err := RecordActivity(context.Background(), kubeClient, key, environment.UID, 3, platformv1alpha1.EnvironmentActivitySourcePortal, "portal-1"); err != nil {
+	if err := RecordActivity(context.Background(), kubeClient, key, environment.UID, 4, 3, platformv1alpha1.EnvironmentActivitySourcePortal, "portal-1"); err != nil {
 		t.Fatal(err)
 	}
 	var updated platformv1alpha1.Environment
@@ -45,7 +47,7 @@ func TestRecordActivityIsSourceBoundedAndFenced(t *testing.T) {
 	if updated.Generation != environment.Generation || len(updated.Spec.Lifecycle.Activity) != 0 {
 		t.Fatalf("activity changed execution spec: generation=%d spec=%#v", updated.Generation, updated.Spec.Lifecycle)
 	}
-	if err := RecordActivity(context.Background(), kubeClient, key, types.UID("replacement"), 3, platformv1alpha1.EnvironmentActivitySourceInbox, "stale"); err == nil {
+	if err := RecordActivity(context.Background(), kubeClient, key, types.UID("replacement"), 4, 3, platformv1alpha1.EnvironmentActivitySourceInbox, "stale"); err == nil {
 		t.Fatal("replacement UID activity was accepted")
 	}
 }
@@ -59,24 +61,27 @@ func TestRecordActivityRejectsMalformedRequests(t *testing.T) {
 	environment.Name = "environment"
 	environment.Namespace = "project"
 	environment.UID = "env-uid"
+	environment.Status.ExecutionGeneration = 4
 	kubeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(environment).Build()
 	key := client.ObjectKeyFromObject(environment)
 
 	for _, test := range []struct {
-		name     string
-		uid      types.UID
-		revision int64
-		source   platformv1alpha1.EnvironmentActivitySource
-		id       string
+		name                string
+		uid                 types.UID
+		executionGeneration int64
+		revision            int64
+		source              platformv1alpha1.EnvironmentActivitySource
+		id                  string
 	}{
-		{name: "unknown source", uid: environment.UID, source: "Other", id: "request"},
-		{name: "empty ID", uid: environment.UID, source: platformv1alpha1.EnvironmentActivitySourceTerminal},
-		{name: "oversized ID", uid: environment.UID, source: platformv1alpha1.EnvironmentActivitySourceTerminal, id: string(make([]byte, 129))},
-		{name: "empty UID", source: platformv1alpha1.EnvironmentActivitySourceTerminal, id: "request"},
-		{name: "negative revision", uid: environment.UID, revision: -1, source: platformv1alpha1.EnvironmentActivitySourceTerminal, id: "request"},
+		{name: "unknown source", uid: environment.UID, executionGeneration: 4, source: "Other", id: "request"},
+		{name: "empty ID", uid: environment.UID, executionGeneration: 4, source: platformv1alpha1.EnvironmentActivitySourceTerminal},
+		{name: "oversized ID", uid: environment.UID, executionGeneration: 4, source: platformv1alpha1.EnvironmentActivitySourceTerminal, id: string(make([]byte, 129))},
+		{name: "empty UID", executionGeneration: 4, source: platformv1alpha1.EnvironmentActivitySourceTerminal, id: "request"},
+		{name: "zero execution generation", uid: environment.UID, source: platformv1alpha1.EnvironmentActivitySourceTerminal, id: "request"},
+		{name: "negative revision", uid: environment.UID, executionGeneration: 4, revision: -1, source: platformv1alpha1.EnvironmentActivitySourceTerminal, id: "request"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			if err := RecordActivity(context.Background(), kubeClient, key, test.uid, test.revision, test.source, test.id); err == nil {
+			if err := RecordActivity(context.Background(), kubeClient, key, test.uid, test.executionGeneration, test.revision, test.source, test.id); err == nil {
 				t.Fatal("RecordActivity() accepted malformed request")
 			}
 		})
@@ -93,9 +98,10 @@ func TestRecordActivityRejectsMalformedRequests(t *testing.T) {
 func TestMalformedAnnotationDoesNotShadowLegacyActivity(t *testing.T) {
 	environment := &platformv1alpha1.Environment{}
 	environment.UID = "env-uid"
+	environment.Status.ExecutionGeneration = 1
 	environment.Spec.Lifecycle.Activity = []platformv1alpha1.EnvironmentActivityRequest{{
 		Source:                      platformv1alpha1.EnvironmentActivitySourceTerminal,
-		EnvironmentLifecycleRequest: platformv1alpha1.EnvironmentLifecycleRequest{ID: "legacy", EnvironmentUID: environment.UID},
+		EnvironmentLifecycleRequest: platformv1alpha1.EnvironmentLifecycleRequest{ID: "legacy", EnvironmentUID: environment.UID}, ExecutionGeneration: 1,
 	}}
 	environment.Annotations = map[string]string{activityAnnotation(platformv1alpha1.EnvironmentActivitySourceTerminal): `{"source":"Terminal","id":"","environmentUID":"env-uid","holdPolicyRevision":0}`}
 
@@ -259,5 +265,47 @@ func TestStalePolicyPublisherCannotOverwriteCurrentIntent(t *testing.T) {
 	}
 	if retained.Spec.Lifecycle.Wake == nil || retained.Spec.Lifecycle.Wake.ID != "current" {
 		t.Fatalf("stale publisher replaced current wake: %#v", retained.Spec.Lifecycle.Wake)
+	}
+}
+
+func TestRecordActivityAtomicallyRejectsExecutionTransition(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := platformv1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	environment := &platformv1alpha1.Environment{}
+	environment.Name = "environment"
+	environment.Namespace = "project"
+	environment.UID = "env-uid"
+	environment.Status.ExecutionGeneration = 1
+	baseClient := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(environment).WithObjects(environment).Build()
+	transitioned := false
+	kubeClient := interceptor.NewClient(baseClient, interceptor.Funcs{
+		Patch: func(ctx context.Context, underlying client.WithWatch, object client.Object, patch client.Patch, options ...client.PatchOption) error {
+			if !transitioned {
+				transitioned = true
+				var current platformv1alpha1.Environment
+				if err := underlying.Get(ctx, client.ObjectKeyFromObject(environment), &current); err != nil {
+					return err
+				}
+				current.Status.ExecutionGeneration = 2
+				if err := underlying.Status().Update(ctx, &current); err != nil {
+					return err
+				}
+			}
+			return underlying.Patch(ctx, object, patch, options...)
+		},
+	})
+
+	err := RecordActivity(context.Background(), kubeClient, client.ObjectKeyFromObject(environment), environment.UID, 1, 0, platformv1alpha1.EnvironmentActivitySourceTerminal, "stale-terminal")
+	if !errors.Is(err, ErrExecutionGenerationChanged) {
+		t.Fatalf("RecordActivity() error = %v, want execution-generation fence", err)
+	}
+	var retained platformv1alpha1.Environment
+	if err := baseClient.Get(context.Background(), client.ObjectKeyFromObject(environment), &retained); err != nil {
+		t.Fatal(err)
+	}
+	if retained.Status.ExecutionGeneration != 2 || len(retained.Annotations) != 0 {
+		t.Fatalf("stale activity survived atomic transition: %#v", retained)
 	}
 }

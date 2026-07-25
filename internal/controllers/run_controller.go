@@ -261,11 +261,25 @@ func (r *RunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.R
 			if !environmentReachable(env) || adapter == nil {
 				return r.requestEnvironmentFence(ctx, env)
 			}
+			execution, current, err := r.resolveAllocatedExecution(ctx, &run, env)
+			if err != nil {
+				return ctrl.Result{}, err
+			}
+			if !current {
+				return ctrl.Result{Requeue: true}, nil
+			}
 			if err := adapter.Cancel(ctx, adapterTask(&run), r.adapterSandbox(&run, env)); err != nil {
 				if errors.Is(err, ErrAdapterCancellationPending) {
 					return ctrl.Result{RequeueAfter: adapterPollInterval}, nil
 				}
 				return ctrl.Result{}, err
+			}
+			current, err = r.allocatedExecutionCurrent(ctx, &run, env, execution)
+			if err != nil {
+				return ctrl.Result{}, err
+			}
+			if !current {
+				return ctrl.Result{Requeue: true}, nil
 			}
 		}
 		return ctrl.Result{}, r.setRunState(ctx, &run, platformv1alpha1.RunStateCancelled, "Cancelled", "cancellation completed", environmentReachable(env))
@@ -298,8 +312,8 @@ func (r *RunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.R
 	if !environmentReachable(env) {
 		return ctrl.Result{RequeueAfter: adapterPollInterval}, r.setRunState(ctx, &run, platformv1alpha1.RunStateAllocating, "EnvironmentNotReachable", "sandboxd endpoint is not currently reachable", false)
 	}
-	if runAccepted(&run) && !acceptedEnvironmentEpochCurrent(&run, env) && run.Status.State != platformv1alpha1.RunStateEnvironmentReady {
-		return ctrl.Result{Requeue: true}, r.setRunState(ctx, &run, platformv1alpha1.RunStateEnvironmentReady, "EnvironmentEpochChanged", "fresh environment lifecycle epoch requires adapter acceptance", true)
+	if runAccepted(&run) && !acceptedEnvironmentExecutionCurrent(&run, env) && run.Status.State != platformv1alpha1.RunStateEnvironmentReady {
+		return ctrl.Result{Requeue: true}, r.setRunState(ctx, &run, platformv1alpha1.RunStateEnvironmentReady, "EnvironmentExecutionChanged", "fresh environment execution requires adapter acceptance", true)
 	}
 
 	if run.Status.State == platformv1alpha1.RunStateAllocating || run.Status.State == platformv1alpha1.RunStatePaused || run.Status.State == "" {
@@ -327,20 +341,51 @@ func (r *RunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.R
 		if credential != nil {
 			defer clear(credential.APIKey)
 		}
-		if err := adapter.EnsureAccepted(ctx, adapterTask(&run), r.adapterSandbox(&run, env), credential); err != nil {
-			if errors.Is(err, ErrAdapterTaskRejected) {
-				return ctrl.Result{}, r.setRunState(ctx, &run, platformv1alpha1.RunStateFailed, "AdapterRejected", err.Error(), true)
-			}
+		expectedExecutionGeneration := env.Status.ExecutionGeneration
+		expectedEpoch := env.Status.Lifecycle.Epoch
+		execution, current, err := r.resolveAllocatedExecution(ctx, &run, env)
+		if err != nil {
 			return ctrl.Result{}, err
 		}
-		acceptedEpoch := env.Status.Lifecycle.Epoch
-		run.Status.AcceptedEnvironmentEpoch = &acceptedEpoch
+		if !current {
+			return ctrl.Result{Requeue: true}, nil
+		}
+		acceptErr := adapter.EnsureAccepted(ctx, adapterTask(&run), r.adapterSandbox(&run, env), credential)
+		current, err = r.allocatedExecutionCurrent(ctx, &run, env, execution)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+		if !current {
+			return ctrl.Result{Requeue: true}, nil
+		}
+		if acceptErr != nil {
+			if errors.Is(acceptErr, ErrAdapterTaskRejected) {
+				return ctrl.Result{}, r.setRunState(ctx, &run, platformv1alpha1.RunStateFailed, "AdapterRejected", acceptErr.Error(), true)
+			}
+			return ctrl.Result{}, acceptErr
+		}
+		run.Status.AcceptedEnvironmentEpoch = &expectedEpoch
+		run.Status.AcceptedEnvironmentExecutionGeneration = &expectedExecutionGeneration
 		return ctrl.Result{Requeue: true}, r.setRunState(ctx, &run, platformv1alpha1.RunStateAdapterAccepted, "AdapterAccepted", "adapter accepted the task", true)
 	}
 
+	execution, current, err := r.resolveAllocatedExecution(ctx, &run, env)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if !current {
+		return ctrl.Result{Requeue: true}, nil
+	}
 	observation, message, err := adapter.Observe(ctx, adapterTask(&run), r.adapterSandbox(&run, env))
 	if err != nil {
 		return ctrl.Result{}, err
+	}
+	current, err = r.allocatedExecutionCurrent(ctx, &run, env, execution)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if !current {
+		return ctrl.Result{Requeue: true}, nil
 	}
 	state := platformv1alpha1.RunStateAdapterAccepted
 	switch observation {
@@ -798,7 +843,7 @@ func explicitHoldEnabled(env *platformv1alpha1.Environment) bool {
 }
 
 func environmentReachable(env *platformv1alpha1.Environment) bool {
-	return !environmentSuspended(env) && platformv1alpha1.IsEnvironmentReady(env) && env.Status.PodName != "" && env.Status.Endpoints.Sandboxd != ""
+	return env.Status.ExecutionGeneration > 0 && !environmentSuspended(env) && platformv1alpha1.IsEnvironmentReady(env) && env.Status.PodName != "" && env.Status.Endpoints.Sandboxd != ""
 }
 
 func exactControllerOwner(object metav1.Object, apiVersion, kind, name string, uid types.UID) bool {
@@ -845,6 +890,11 @@ func acceptedEnvironmentEpochCurrent(run *platformv1alpha1.Run, env *platformv1a
 		return env.Status.Lifecycle.Epoch == 0
 	}
 	return *run.Status.AcceptedEnvironmentEpoch == env.Status.Lifecycle.Epoch
+}
+
+func acceptedEnvironmentExecutionCurrent(run *platformv1alpha1.Run, env *platformv1alpha1.Environment) bool {
+	return env.Status.ExecutionGeneration > 0 && run.Status.AcceptedEnvironmentExecutionGeneration != nil &&
+		*run.Status.AcceptedEnvironmentExecutionGeneration == env.Status.ExecutionGeneration && acceptedEnvironmentEpochCurrent(run, env)
 }
 
 func acceptanceAttempted(run *platformv1alpha1.Run) bool {
@@ -910,11 +960,25 @@ func (r *RunReconciler) cleanupTerminal(ctx context.Context, run *platformv1alph
 		if !environmentReachable(env) || adapter == nil {
 			return r.requestEnvironmentFence(ctx, env)
 		}
+		execution, current, err := r.resolveAllocatedExecution(ctx, run, env)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+		if !current {
+			return ctrl.Result{Requeue: true}, nil
+		}
 		if err := adapter.Cancel(ctx, adapterTask(run), r.adapterSandbox(run, env)); err != nil {
 			if errors.Is(err, ErrAdapterCancellationPending) {
 				return ctrl.Result{RequeueAfter: adapterPollInterval}, nil
 			}
 			return ctrl.Result{}, err
+		}
+		current, err = r.allocatedExecutionCurrent(ctx, run, env, execution)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+		if !current {
+			return ctrl.Result{Requeue: true}, nil
 		}
 	}
 	if env.Spec.Lifecycle.Suspend != nil || env.Status.Lifecycle.PendingSuspendRequestID != "" {
@@ -975,11 +1039,25 @@ func (r *RunReconciler) finalize(ctx context.Context, run *platformv1alpha1.Run)
 				if !environmentReachable(env) || adapter == nil {
 					return r.requestEnvironmentFence(ctx, env)
 				}
+				execution, current, resolveErr := r.resolveAllocatedExecution(ctx, run, env)
+				if resolveErr != nil {
+					return ctrl.Result{}, resolveErr
+				}
+				if !current {
+					return ctrl.Result{Requeue: true}, nil
+				}
 				if err := adapter.Cancel(ctx, adapterTask(run), r.adapterSandbox(run, env)); err != nil {
 					if errors.Is(err, ErrAdapterCancellationPending) {
 						return ctrl.Result{RequeueAfter: adapterPollInterval}, nil
 					}
 					return ctrl.Result{}, err
+				}
+				current, resolveErr = r.allocatedExecutionCurrent(ctx, run, env, execution)
+				if resolveErr != nil {
+					return ctrl.Result{}, resolveErr
+				}
+				if !current {
+					return ctrl.Result{Requeue: true}, nil
 				}
 			}
 			if env.Spec.Lifecycle.Suspend != nil || env.Status.Lifecycle.PendingSuspendRequestID != "" {
@@ -1061,6 +1139,7 @@ func adapterTask(run *platformv1alpha1.Run) AdapterTask {
 
 func (r *RunReconciler) adapterSandbox(run *platformv1alpha1.Run, env *platformv1alpha1.Environment) AdapterSandbox {
 	expectedEpoch := env.Status.Lifecycle.Epoch
+	expectedExecutionGeneration := env.Status.ExecutionGeneration
 	sandbox := AdapterSandbox{EnvironmentName: env.Name, EnvironmentUID: env.UID,
 		DialProcess: func(ctx context.Context) (sandboxdv1.ProcessServiceClient, func() error, error) {
 			reader := r.apiReader()
@@ -1068,7 +1147,10 @@ func (r *RunReconciler) adapterSandbox(run *platformv1alpha1.Run, env *platformv
 			if err != nil {
 				return nil, nil, err
 			}
-			return (sandboxclient.Connector{Reader: reader}).DialProcessForEpoch(ctx, current.Namespace, current.Name, current.UID, expectedEpoch)
+			if current.Status.ExecutionGeneration != expectedExecutionGeneration {
+				return nil, nil, fmt.Errorf("environment execution generation changed")
+			}
+			return (sandboxclient.Connector{Reader: reader}).DialProcessForExecution(ctx, current.Namespace, current.Name, current.UID, expectedExecutionGeneration, expectedEpoch)
 		}}
 	if r.EventSink != nil {
 		runUID := string(run.UID)
@@ -1077,6 +1159,40 @@ func (r *RunReconciler) adapterSandbox(run *platformv1alpha1.Run, env *platformv
 		}
 	}
 	return sandbox
+}
+
+func (r *RunReconciler) resolveAllocatedExecution(ctx context.Context, run *platformv1alpha1.Run, expected *platformv1alpha1.Environment) (sandboxclient.Execution, bool, error) {
+	current, err := getAllocatedEnvironment(ctx, r.apiReader(), run)
+	if apierrors.IsNotFound(err) || errors.Is(err, errAllocatedEnvironmentGone) {
+		return sandboxclient.Execution{}, false, nil
+	}
+	if err != nil {
+		return sandboxclient.Execution{}, false, err
+	}
+	if current.UID != expected.UID || current.Status.ExecutionGeneration != expected.Status.ExecutionGeneration ||
+		current.Status.Lifecycle.Epoch != expected.Status.Lifecycle.Epoch || !environmentReachable(current) {
+		return sandboxclient.Execution{}, false, nil
+	}
+	execution, err := (sandboxclient.Connector{Reader: r.apiReader()}).ResolveExecution(ctx, current.Namespace, current.Name, current.UID, current.Status.ExecutionGeneration, current.Status.Lifecycle.Epoch)
+	if err != nil {
+		return sandboxclient.Execution{}, false, err
+	}
+	return execution, true, nil
+}
+
+func (r *RunReconciler) allocatedExecutionCurrent(ctx context.Context, run *platformv1alpha1.Run, expected *platformv1alpha1.Environment, execution sandboxclient.Execution) (bool, error) {
+	current, err := getAllocatedEnvironment(ctx, r.apiReader(), run)
+	if apierrors.IsNotFound(err) || errors.Is(err, errAllocatedEnvironmentGone) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if current.UID != expected.UID || current.Status.ExecutionGeneration != expected.Status.ExecutionGeneration ||
+		current.Status.Lifecycle.Epoch != expected.Status.Lifecycle.Epoch || !environmentReachable(current) {
+		return false, nil
+	}
+	return (sandboxclient.Connector{Reader: r.apiReader()}).ExecutionCurrent(ctx, current.Namespace, current.Name, execution)
 }
 
 // SetupWithManager registers Run watches. Owned Environments enqueue through

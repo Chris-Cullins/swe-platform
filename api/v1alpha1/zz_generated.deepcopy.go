@@ -724,6 +724,11 @@ func (in *RunStatus) DeepCopyInto(out *RunStatus) {
 		*out = new(int64)
 		**out = **in
 	}
+	if in.AcceptedEnvironmentExecutionGeneration != nil {
+		in, out := &in.AcceptedEnvironmentExecutionGeneration, &out.AcceptedEnvironmentExecutionGeneration
+		*out = new(int64)
+		**out = **in
+	}
 	out.Usage = in.Usage
 	if in.Conditions != nil {
 		in, out := &in.Conditions, &out.Conditions

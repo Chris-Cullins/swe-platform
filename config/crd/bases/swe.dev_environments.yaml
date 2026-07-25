@@ -73,6 +73,13 @@ spec:
                           description: EnvironmentUID is the exact Environment incarnation
                             targeted.
                           type: string
+                        executionGeneration:
+                          description: |-
+                            ExecutionGeneration is the exact backend execution that produced this
+                            activity. Missing or zero values are legacy and are never accepted.
+                          format: int64
+                          minimum: 1
+                          type: integer
                         holdPolicyRevision:
                           description: HoldPolicyRevision is the policy revision observed
                             by the requester.
@@ -318,6 +325,16 @@ spec:
                     description: Terminal is the websocket address of the shared terminal.
                     type: string
                 type: object
+              executionGeneration:
+                description: |-
+                  ExecutionGeneration is the backend-neutral identity of the current or
+                  most recently reserved backend execution. The lifecycle controller
+                  reserves a strictly greater positive value before every backend creation
+                  attempt; gaps are allowed after failed or uncertain attempts. Zero is an
+                  uninitialized migration state and is never reachable by consumers.
+                format: int64
+                minimum: 0
+                type: integer
               imageID:
                 description: |-
                   ImageID is the immutable runtime image identity reported for the current
@@ -339,6 +356,13 @@ spec:
                       description: EnvironmentActivityReceipt records the latest request
                         consumed for a source.
                       properties:
+                        executionGeneration:
+                          description: |-
+                            ExecutionGeneration is absent on receipts written before execution
+                            fencing. Such receipts never acknowledge a generation-fenced request.
+                          format: int64
+                          minimum: 1
+                          type: integer
                         requestID:
                           type: string
                         source:
@@ -457,6 +481,10 @@ spec:
                   in-progress recovery attempt.
                 type: string
             type: object
+            x-kubernetes-validations:
+            - message: executionGeneration cannot decrease or be removed
+              rule: '!has(oldSelf.executionGeneration) || (has(self.executionGeneration)
+                && self.executionGeneration >= oldSelf.executionGeneration)'
         type: object
     served: true
     storage: true
