@@ -438,6 +438,18 @@ PEER_HELM_ARGS+=(--set-string "tenancy.namespaces[0]=$PEER_PROJECT_NAMESPACE")
 helm "${PEER_HELM_ARGS[@]}"
 kubectl -n "$PEER_SYSTEM_NAMESPACE" rollout status deployment/"$PEER_INSTALLATION_NAME" --timeout=2m
 kubectl -n "$PEER_PROJECT_NAMESPACE" wait --for=jsonpath='{.status.warmPoolReady}'=1 environmenttemplate/small --timeout=2m
+for _ in $(seq 1 60); do
+	if kubectl -n "$PEER_PROJECT_NAMESPACE" get resourcequota swe-project -o json | \
+		jq -e '.status.hard["count/agentcredentialprofiles.swe.dev"] == .spec.hard["count/agentcredentialprofiles.swe.dev"]' >/dev/null; then
+		break
+	fi
+	sleep 1
+done
+if ! kubectl -n "$PEER_PROJECT_NAMESPACE" get resourcequota swe-project -o json | \
+	jq -e '.status.hard["count/agentcredentialprofiles.swe.dev"] == .spec.hard["count/agentcredentialprofiles.swe.dev"]' >/dev/null; then
+	echo "FAIL: peer ResourceQuota did not observe its credential-profile limit"
+	exit 1
+fi
 PEER_INSTALLATION_UID=$(kubectl -n "$PEER_SYSTEM_NAMESPACE" get installation "$PEER_INSTALLATION_NAME" -o jsonpath='{.metadata.uid}')
 PEER_PROJECT_UID=$(kubectl -n "$PEER_PROJECT_NAMESPACE" get project "$PEER_PROJECT_NAME" -o jsonpath='{.metadata.uid}')
 PEER_CLAIM=$(kubectl get namespace "$PEER_PROJECT_NAMESPACE" -o json)
