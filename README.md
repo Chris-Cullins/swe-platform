@@ -54,13 +54,15 @@ See [`ARCHITECTURE.md`](ARCHITECTURE.md) for the canonical tracked description o
 implemented today, approved next contracts, and remaining open work.
 
 - **`sandboxd`** — a small daemon inside every environment exposing one gRPC contract:
-  exec, filesystem, terminal, port registry, health. The control plane never touches a
-  pod except through it.
+  exec, filesystem, terminal, health, and bounded stateless loopback service observations.
+  No platform connector or declaration observer uses that internal observation primitive yet;
+  the control plane never touches a pod except through sandboxd.
 - **Operator + CRDs** — `Installation`, `Environment`, `EnvironmentTemplate`, `Run`, `Project`, with
   controllers for lifecycle, warm pools (pre-booted environments), and idle reaping.
 - **Control plane** — API, auth, transcripts, resource watches, and a web terminal sharing
   the Environment's tmux session; terminal requests can wake Idle suspension.
-- **Planned gateway** — authenticated portal URLs and reverse proxying are not implemented.
+- **Planned gateway** — service declarations, health publication, authenticated portal URLs,
+  and reverse proxying are not implemented.
 - **Planned Run actors** — inboxes, child spawning, messaging, and wake-on-message are not
   implemented.
 

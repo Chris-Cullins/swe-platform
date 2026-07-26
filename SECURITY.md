@@ -25,12 +25,14 @@ to a different environment, a stale pod, or a process without the current privat
 fails.
 
 Bearer tokens are random per incarnation and map to explicit service capabilities (`health`,
-`terminal`, `exec`, `process`, `filesystem`, and `ports`). sandboxd interceptors authorize both
-unary and streaming RPCs before handlers run. The terminal credential grants `health` and
-`terminal`; a separate operator-held adapter credential grants only `process`. The mounted
-authorization file contains SHA-256 verifiers, not raw tokens, and the raw process token is not
-projected into the environment pod or published in pod annotations. Possession of one
-environment's token grants nothing in another environment.
+`terminal`, `exec`, `process`, `filesystem`, and `service-observation`). sandboxd interceptors
+authorize both unary and streaming RPCs before handlers run. The terminal credential grants
+`health` and `terminal`; a separate operator-held adapter credential grants only `process`.
+`service-observation` authorizes only bounded stateless TCP-connect probes against sandboxd's
+logical loopback; the operator does not yet issue that token and no connector invokes the RPC.
+The mounted authorization file contains SHA-256 verifiers, not raw tokens, and the raw process
+token is not projected into the environment pod or published in pod annotations. Possession of
+one environment's token grants nothing in another environment.
 
 The Environment-owned Secret contains the private key, authorization configuration, and raw
 process token. The public trust certificate and terminal token are published atomically as pod
