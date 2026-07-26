@@ -1,0 +1,15 @@
+apiVersion: swe.dev/v1alpha1
+kind: Installation
+metadata:
+  name: {{ include "swe-platform.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "swe-platform.labels" . | nindent 4 }}
+  annotations:
+    swe.dev/operator-service-account: {{ include "swe-platform.serviceAccountName" . | quote }}
+    swe.dev/operator-cluster-role: {{ include "swe-platform.clusterFullname" . | quote }}
+    {{- if .Values.controlPlane.enabled }}
+    swe.dev/control-plane-service-account: {{ include "swe-platform.controlPlaneFullname" . | quote }}
+    swe.dev/control-plane-cluster-role: {{ include "swe-platform.controlPlaneClusterFullname" . | quote }}
+    {{- end }}
+spec: {}

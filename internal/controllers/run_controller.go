@@ -26,6 +26,7 @@ import (
 	platformv1alpha1 "github.com/Chris-Cullins/swe-platform/api/v1alpha1"
 	"github.com/Chris-Cullins/swe-platform/internal/lifecycle"
 	"github.com/Chris-Cullins/swe-platform/internal/sandboxclient"
+	"github.com/Chris-Cullins/swe-platform/internal/tenancy"
 	sandboxdv1 "github.com/Chris-Cullins/swe-platform/sandboxd/gen/proto/sandboxd/v1"
 )
 
@@ -135,6 +136,7 @@ type RunReconciler struct {
 	client.Client
 	APIReader client.Reader
 	Scheme    *runtime.Scheme
+	Scope     *tenancy.ReconcileScope
 	Adapters  map[string]AdapterLifecycle
 	EventSink AdapterEventSink
 }
@@ -152,6 +154,26 @@ func (r *RunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.R
 	var run platformv1alpha1.Run
 	if err := r.Get(ctx, req.NamespacedName, &run); err != nil {
 		return ctrl.Result{}, client.IgnoreNotFound(err)
+	}
+	ctx, namespaceClaim, err := r.Scope.Begin(ctx, run.Namespace, tenancy.LifecycleActive, tenancy.LifecycleFencing)
+	if err != nil {
+		if errors.Is(err, tenancy.ErrOutOfScope) {
+			return ctrl.Result{}, nil
+		}
+		return ctrl.Result{}, err
+	}
+	if namespaceClaim.Lifecycle == tenancy.LifecycleFencing {
+		if namespaceClaim.Operation != tenancy.OperationOffboarding {
+			return ctrl.Result{}, nil
+		}
+		if run.DeletionTimestamp.IsZero() && !run.Spec.Cancel {
+			before := run.DeepCopy()
+			run.Spec.Cancel = true
+			if err := r.Patch(ctx, &run, client.MergeFromWithOptions(before, client.MergeFromWithOptimisticLock{})); err != nil {
+				return ctrl.Result{}, fmt.Errorf("cancel Run for Project offboarding: %w", err)
+			}
+			return ctrl.Result{Requeue: true}, nil
+		}
 	}
 
 	if !run.DeletionTimestamp.IsZero() {
@@ -719,17 +741,41 @@ func (r *RunReconciler) recoverEnvironmentReference(ctx context.Context, run *pl
 }
 
 func (r *RunReconciler) resolveTemplate(ctx context.Context, run *platformv1alpha1.Run) (string, error) {
+	templateName := run.Spec.TemplateRef
 	if run.Spec.TemplateRef != "" {
-		return run.Spec.TemplateRef, nil
+		templateName = run.Spec.TemplateRef
+	} else if run.Spec.ProjectRef != "" {
+		var project platformv1alpha1.Project
+		if err := r.Get(ctx, types.NamespacedName{Namespace: run.Namespace, Name: run.Spec.ProjectRef}, &project); err != nil {
+			return "", fmt.Errorf("get project %q: %w", run.Spec.ProjectRef, err)
+		}
+		templateName = project.Spec.TemplateRef
 	}
-	if run.Spec.ProjectRef == "" {
+	if templateName == "" {
 		return "", nil
 	}
-	var project platformv1alpha1.Project
-	if err := r.Get(ctx, types.NamespacedName{Namespace: run.Namespace, Name: run.Spec.ProjectRef}, &project); err != nil {
-		return "", fmt.Errorf("get project %q: %w", run.Spec.ProjectRef, err)
+	var template platformv1alpha1.EnvironmentTemplate
+	if err := r.Get(ctx, types.NamespacedName{Namespace: run.Namespace, Name: templateName}, &template); err != nil {
+		// Preserve the existing allocation contract for a missing Template: the
+		// owned Environment records the intent and reports the invalid reference.
+		if !apierrors.IsNotFound(err) {
+			return "", fmt.Errorf("get template %q: %w", templateName, err)
+		}
+		return templateName, nil
 	}
-	return project.Spec.TemplateRef, nil
+	if tenancy.IsCatalogSource(&template) {
+		return "", fmt.Errorf("template %q is an inert installation catalog source", templateName)
+	}
+	if r.Scope != nil && r.Scope.Verifier != nil {
+		claim, err := r.Scope.Verifier.VerifyNamespace(ctx, run.Namespace)
+		if err != nil {
+			return "", err
+		}
+		if err := tenancy.ValidateManagedTemplate(&template, r.Scope.Verifier.Installation, claim); err != nil {
+			return "", err
+		}
+	}
+	return templateName, nil
 }
 
 func (r *RunReconciler) claimWarmEnvironment(ctx context.Context, run *platformv1alpha1.Run, template string) (*platformv1alpha1.RunEnvironmentReference, error) {

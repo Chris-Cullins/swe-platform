@@ -40,6 +40,12 @@ spec:
             - --control-plane-namespace=$(POD_NAMESPACE)
             - --control-plane-name={{ include "swe-platform.name" . }}
             - --control-plane-instance={{ .Release.Name }}
+            - --tenancy-mode={{ include "swe-platform.tenancyMode" . }}
+            - --installation-namespace=$(POD_NAMESPACE)
+            - --installation-name={{ include "swe-platform.fullname" . }}
+            {{- range .Values.tenancy.namespaces }}
+            - --tenancy-namespace={{ . }}
+            {{- end }}
             {{- if .Values.controlPlane.enabled }}
             - --transcript-url=http://{{ include "swe-platform.controlPlaneFullname" . }}
             - --transcript-token-file=/var/run/secrets/swe-platform/transcript-token

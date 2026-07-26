@@ -16,6 +16,11 @@ controlPlane:
 
 leaderElection: false
 
+# Deliberate local-development authority. The primary e2e overrides this to
+# scoped and onboards a distinct Project namespace.
+tenancy:
+  mode: trusted-admin
+
 environmentTemplates:
   - name: small
     spec:

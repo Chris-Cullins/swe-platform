@@ -42,6 +42,7 @@ import (
 
 	platformv1alpha1 "github.com/Chris-Cullins/swe-platform/api/v1alpha1"
 	"github.com/Chris-Cullins/swe-platform/internal/lifecycle"
+	"github.com/Chris-Cullins/swe-platform/internal/tenancy"
 	sandboxdauth "github.com/Chris-Cullins/swe-platform/sandboxd/auth"
 )
 
@@ -135,18 +136,22 @@ fi
 // EnvironmentReconciler reconciles Environment objects into pods + workspace volumes.
 type EnvironmentReconciler struct {
 	client.Client
-	APIReader             client.Reader
-	Scheme                *runtime.Scheme
-	ControlPlaneNamespace string
-	ControlPlaneName      string
-	ControlPlaneInstance  string
-	Now                   func() time.Time
+	APIReader                     client.Reader
+	Scheme                        *runtime.Scheme
+	Scope                         *tenancy.ReconcileScope
+	ControlPlaneNamespace         string
+	ControlPlaneName              string
+	ControlPlaneInstance          string
+	EnvironmentServiceAccountName string
+	Now                           func() time.Time
 }
 
 // +kubebuilder:rbac:groups=swe.dev,resources=environments,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=swe.dev,resources=environments/status,verbs=get;update;patch
-// +kubebuilder:rbac:groups=swe.dev,resources=environmenttemplates,verbs=get;list;watch
+// +kubebuilder:rbac:groups=swe.dev,resources=environmenttemplates,verbs=get;list;watch;update;patch
+// +kubebuilder:rbac:groups=swe.dev,resources=installations,verbs=get;list;watch
 // +kubebuilder:rbac:groups=swe.dev,resources=projects,verbs=get;list;watch
+// +kubebuilder:rbac:groups="",resources=namespaces,verbs=get
 // +kubebuilder:rbac:groups=swe.dev,resources=runs,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=persistentvolumeclaims,verbs=get;list;watch;create;update;patch;delete
@@ -167,6 +172,30 @@ func (r *EnvironmentReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	var env platformv1alpha1.Environment
 	if err := r.apiReader().Get(ctx, req.NamespacedName, &env); err != nil {
 		return ctrl.Result{}, client.IgnoreNotFound(err)
+	}
+	ctx, namespaceClaim, err := r.Scope.Begin(ctx, env.Namespace, tenancy.LifecycleActive, tenancy.LifecycleFencing)
+	if err != nil {
+		if stderrors.Is(err, tenancy.ErrOutOfScope) {
+			return ctrl.Result{}, nil
+		}
+		return ctrl.Result{}, err
+	}
+	if namespaceClaim.Lifecycle == tenancy.LifecycleFencing {
+		if namespaceClaim.Operation != tenancy.OperationOffboarding {
+			return ctrl.Result{}, nil
+		}
+		if env.DeletionTimestamp.IsZero() && (env.Spec.Lifecycle.Hold == nil || !env.Spec.Lifecycle.Hold.Enabled) {
+			before := env.DeepCopy()
+			revision := int64(1)
+			if env.Spec.Lifecycle.Hold != nil {
+				revision = env.Spec.Lifecycle.Hold.Revision + 1
+			}
+			env.Spec.Lifecycle.Hold = &platformv1alpha1.EnvironmentHoldPolicy{Enabled: true, Revision: revision}
+			if err := r.Patch(ctx, &env, client.MergeFromWithOptions(before, client.MergeFromWithOptimisticLock{})); err != nil {
+				return ctrl.Result{}, fmt.Errorf("fence Environment for Project offboarding: %w", err)
+			}
+			return ctrl.Result{Requeue: true}, nil
+		}
 	}
 
 	if !env.DeletionTimestamp.IsZero() {
@@ -249,6 +278,14 @@ func (r *EnvironmentReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 			return r.reconcileInvalidProvisioningConfiguration(ctx, &env, wrapped.Error())
 		}
 		return ctrl.Result{}, r.fail(ctx, &env, wrapped)
+	}
+	if tenancy.IsCatalogSource(&tmpl) {
+		return r.reconcileInvalidProvisioningConfiguration(ctx, &env, fmt.Sprintf("environment template %q is an inert installation catalog source", tmpl.Name))
+	}
+	if r.Scope != nil && r.Scope.Verifier != nil {
+		if err := tenancy.ValidateManagedTemplate(&tmpl, r.Scope.Verifier.Installation, namespaceClaim); err != nil {
+			return r.reconcileInvalidProvisioningConfiguration(ctx, &env, err.Error())
+		}
 	}
 	if result, handled, err := r.reconcilePendingPodRecovery(ctx, &env); handled || err != nil {
 		return result, err
@@ -1096,6 +1133,7 @@ func (r *EnvironmentReconciler) ensurePodForProject(ctx context.Context, env *pl
 		Spec: corev1.PodSpec{
 			RestartPolicy:                corev1.RestartPolicyNever,
 			AutomountServiceAccountToken: ptr(false),
+			ServiceAccountName:           r.EnvironmentServiceAccountName,
 			SecurityContext: &corev1.PodSecurityContext{
 				SeccompProfile: &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault},
 			},

@@ -101,6 +101,9 @@ runs both via `make` targets:
   `$HOME/.local` when they are unavailable.
 
 - **Build all binaries:** `make build` (outputs operator, control plane, CLI, and sandboxd to `bin/`, gitignored)
+- **Local operator:** `make run` requires explicit `RUN_TENANCY_MODE`,
+  `RUN_SYSTEM_NAMESPACE`, and `RUN_INSTALLATION_NAME`; scoped mode also takes a
+  space-separated `RUN_TENANCY_NAMESPACES` list.
 - **Unit tests:** `make test` · **Vet:** `make vet`. PostgreSQL transcript integration tests
   run when `SWE_TEST_POSTGRES_URL` points to a disposable database; CI supplies PostgreSQL 17.
   The required `build-test` CI job runs the root and sandboxd Go suites plus
@@ -143,11 +146,15 @@ runs both via `make` targets:
 - **Production Helm presets:** `charts/swe-platform/values-{k3s,gke,eks}.yaml`; CI lints
   and renders every preset, verifies all rendered production images use the coordinated
   chart `appVersion`, and rejects `latest`/`dev`. Provider assumptions are documented in
-  the chart README. Image publish runs attach a release manifest with the chart version
-  and all three image digests.
+  the chart README. Every ad hoc chart render must also set an explicit tenancy mode; the
+  base values intentionally have no default. Image publish runs attach a release manifest
+  with the chart version and all three image digests.
 - **E2E acceptance:** `./hack/e2e.sh` — full kind + operator + `swe run` pass with the
   env-base image built and loaded locally (no registry credentials needed). It also verifies
   the documented server-side CRD upgrade from the pre-scoped-credentials schema,
+  system-namespace installation plus CLI onboarding of a distinct scoped Project namespace,
+  exact claims, managed catalog copies, explicit baseline quota/RBAC/policy, scoped denial,
+  same-named two-release isolation, and retained offboarding,
   control-plane TokenReview/SAR scoping, opaque browser session exchange/logout and CSRF,
   the embedded console entry point/SPA fallback/static assets, typed Run
   list/get/create/retry/cancel, Environment get, transcript SSE, terminal attach, and

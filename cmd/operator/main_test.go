@@ -1,6 +1,10 @@
 package main
 
-import "testing"
+import (
+	"testing"
+
+	"k8s.io/apimachinery/pkg/types"
+)
 
 func TestDefaultClaudeCodeAdapterIsRegistered(t *testing.T) {
 	if registeredAdapters()["claude-code"] == nil {
@@ -14,5 +18,15 @@ func TestDefaultClaudeCodeAdapterIsRegistered(t *testing.T) {
 	}
 	if registeredAdapters()["pi"] == nil {
 		t.Fatal("pi adapter is not registered")
+	}
+}
+
+func TestInstallationLeaderElectionIDIsReleaseIsolated(t *testing.T) {
+	first := installationLeaderElectionID(types.UID("installation-1"))
+	if first == installationLeaderElectionID(types.UID("installation-2")) {
+		t.Fatal("distinct Installation UIDs share a leader-election lease")
+	}
+	if first != installationLeaderElectionID(types.UID("installation-1")) || len(first) > 63 {
+		t.Fatalf("leader-election ID is unstable or invalid: %q", first)
 	}
 }

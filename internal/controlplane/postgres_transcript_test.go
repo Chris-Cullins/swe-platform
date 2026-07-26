@@ -93,7 +93,7 @@ func TestPostgresTranscriptStoreContract(t *testing.T) {
 	})
 
 	t.Run("durable idempotency cursor and UID fencing", func(t *testing.T) {
-		run := RunIdentity{Namespace: "project-a", UID: "run-uid-1"}
+		run := RunIdentity{Namespace: "project-a", NamespaceUID: testNamespaceUID("project-a"), UID: "run-uid-1"}
 		input := AppendTranscriptInput{Source: "adapter", IdempotencyKey: "event-1", Type: "output", Data: json.RawMessage(`{"text":"same"}`)}
 		first, err := store.Append(ctx, run, input)
 		if err != nil {
@@ -131,7 +131,7 @@ func TestPostgresTranscriptStoreContract(t *testing.T) {
 		if _, err := restarted.Append(ctx, run, conflict); !errors.Is(err, ErrIdempotencyConflict) {
 			t.Fatalf("conflicting durable retry = %v", err)
 		}
-		otherRun := RunIdentity{Namespace: run.Namespace, UID: "run-uid-2"}
+		otherRun := RunIdentity{Namespace: run.Namespace, NamespaceUID: run.NamespaceUID, UID: "run-uid-2"}
 		other, err := restarted.Append(ctx, otherRun, input)
 		if err != nil || other.Event.Sequence != 1 || other.Replayed {
 			t.Fatalf("new Run UID append = %#v, %v", other, err)
@@ -141,8 +141,38 @@ func TestPostgresTranscriptStoreContract(t *testing.T) {
 		}
 	})
 
+	t.Run("Namespace UID fences durable rows and associates exact legacy identity", func(t *testing.T) {
+		run := RunIdentity{Namespace: "reused-name", NamespaceUID: "namespace-uid-1", UID: "run-uid"}
+		appendStoreEvent(t, store, run, "original")
+		replacement := run
+		replacement.NamespaceUID = "namespace-uid-2"
+		if _, err := store.Append(ctx, replacement, AppendTranscriptInput{Source: "adapter", IdempotencyKey: "replacement", Type: "output", Data: json.RawMessage(`{}`)}); !errors.Is(err, ErrTranscriptIdentity) {
+			t.Fatalf("replacement Namespace append error = %v, want identity mismatch", err)
+		}
+		if _, err := store.Subscribe(ctx, replacement, ""); !errors.Is(err, ErrTranscriptIdentity) {
+			t.Fatalf("replacement Namespace subscribe error = %v, want identity mismatch", err)
+		}
+
+		legacy := RunIdentity{Namespace: "legacy-project", NamespaceUID: "legacy-namespace-uid", UID: "legacy-run-uid"}
+		if _, err := store.pool.Exec(ctx, `INSERT INTO transcript_runs(namespace, run_uid) VALUES ($1, $2)`, legacy.Namespace, string(legacy.UID)); err != nil {
+			t.Fatal(err)
+		}
+		subscription, err := store.Subscribe(ctx, legacy, "")
+		if err != nil {
+			t.Fatalf("associate exact legacy identity: %v", err)
+		}
+		subscription.Unsubscribe()
+		var associatedUID string
+		if err := store.pool.QueryRow(ctx, `SELECT namespace_uid FROM transcript_runs WHERE namespace = $1 AND run_uid = $2`, legacy.Namespace, string(legacy.UID)).Scan(&associatedUID); err != nil {
+			t.Fatal(err)
+		}
+		if associatedUID != string(legacy.NamespaceUID) {
+			t.Fatalf("legacy Namespace UID = %q, want %q", associatedUID, legacy.NamespaceUID)
+		}
+	})
+
 	t.Run("opaque bytes and uint64 source sequence round trip", func(t *testing.T) {
-		run := RunIdentity{Namespace: "project-a", UID: "opaque-run"}
+		run := RunIdentity{Namespace: "project-a", NamespaceUID: testNamespaceUID("project-a"), UID: "opaque-run"}
 		maximum := ^uint64(0)
 		input := AppendTranscriptInput{Source: "a\x00b", IdempotencyKey: "c\x00d", SourceSequence: &maximum, Type: "output\x00chunk", Data: json.RawMessage(`{"x":1}`)}
 		result, err := store.Append(ctx, run, input)
@@ -164,7 +194,7 @@ func TestPostgresTranscriptStoreContract(t *testing.T) {
 	})
 
 	t.Run("retained idempotency precedes a lowered capacity limit", func(t *testing.T) {
-		run := RunIdentity{Namespace: "project-a", UID: "changed-limit-run"}
+		run := RunIdentity{Namespace: "project-a", NamespaceUID: testNamespaceUID("project-a"), UID: "changed-limit-run"}
 		input := AppendTranscriptInput{Source: "adapter", IdempotencyKey: "large", Type: "output", Data: json.RawMessage(`{"payload":"retained"}`)}
 		first, err := store.Append(ctx, run, input)
 		if err != nil {
@@ -189,7 +219,7 @@ func TestPostgresTranscriptStoreContract(t *testing.T) {
 	})
 
 	t.Run("concurrent sequence allocation is contiguous", func(t *testing.T) {
-		run := RunIdentity{Namespace: "project-a", UID: "concurrent-run"}
+		run := RunIdentity{Namespace: "project-a", NamespaceUID: testNamespaceUID("project-a"), UID: "concurrent-run"}
 		const count = 32
 		sequences := make(chan uint64, count)
 		errorsCh := make(chan error, count)
@@ -230,7 +260,7 @@ func TestPostgresTranscriptStoreContract(t *testing.T) {
 			t.Fatal(err)
 		}
 		defer peer.Close()
-		run := RunIdentity{Namespace: "project-a", UID: "cross-store-idempotency"}
+		run := RunIdentity{Namespace: "project-a", NamespaceUID: testNamespaceUID("project-a"), UID: "cross-store-idempotency"}
 		input := AppendTranscriptInput{Source: "adapter", IdempotencyKey: "same", Type: "output", Data: json.RawMessage(`{}`)}
 		results := make(chan AppendTranscriptResult, 2)
 		errorsCh := make(chan error, 2)
@@ -272,7 +302,7 @@ func TestPostgresTranscriptStoreContract(t *testing.T) {
 	})
 
 	t.Run("bounded retention reports a recoverable gap", func(t *testing.T) {
-		run := RunIdentity{Namespace: "project-a", UID: "retention-run"}
+		run := RunIdentity{Namespace: "project-a", NamespaceUID: testNamespaceUID("project-a"), UID: "retention-run"}
 		first := appendStoreEvent(t, store, run, "first")
 		appendStoreEvent(t, store, run, "second")
 		appendStoreEvent(t, store, run, "third")
@@ -300,7 +330,7 @@ func TestPostgresTranscriptStoreContract(t *testing.T) {
 			t.Fatal(err)
 		}
 		defer consumer.Close()
-		run := RunIdentity{Namespace: "project-a", UID: "live-run"}
+		run := RunIdentity{Namespace: "project-a", NamespaceUID: testNamespaceUID("project-a"), UID: "live-run"}
 		subscription, err := consumer.Subscribe(ctx, run, "")
 		if err != nil {
 			t.Fatal(err)
@@ -333,7 +363,7 @@ func TestPostgresTranscriptStoreContract(t *testing.T) {
 		defer producer.Close()
 
 		for iteration := range 20 {
-			run := RunIdentity{Namespace: "project-a", UID: types.UID(fmt.Sprintf("cut-run-%d", iteration))}
+			run := RunIdentity{Namespace: "project-a", NamespaceUID: testNamespaceUID("project-a"), UID: types.UID(fmt.Sprintf("cut-run-%d", iteration))}
 			appendStoreEvent(t, producer, run, "before")
 			start := make(chan struct{})
 			subscriptions := make(chan TranscriptSubscription, 1)
@@ -401,7 +431,7 @@ func TestPostgresTranscriptStoreContract(t *testing.T) {
 			t.Fatal(err)
 		}
 		defer consumer.Close()
-		run := RunIdentity{Namespace: "project-a", UID: "poll-batches-run"}
+		run := RunIdentity{Namespace: "project-a", NamespaceUID: testNamespaceUID("project-a"), UID: "poll-batches-run"}
 		subscription, err := consumer.Subscribe(ctx, run, "")
 		if err != nil {
 			t.Fatal(err)
@@ -452,7 +482,7 @@ func TestPostgresTranscriptStoreContract(t *testing.T) {
 			t.Fatal(err)
 		}
 		defer consumer.Close()
-		run := RunIdentity{Namespace: "project-a", UID: "retention-overtake-run"}
+		run := RunIdentity{Namespace: "project-a", NamespaceUID: testNamespaceUID("project-a"), UID: "retention-overtake-run"}
 		subscription, err := consumer.Subscribe(ctx, run, "")
 		if err != nil {
 			t.Fatal(err)
@@ -483,7 +513,7 @@ func TestPostgresTranscriptStoreContract(t *testing.T) {
 			t.Fatal(err)
 		}
 		defer consumer.Close()
-		run := RunIdentity{Namespace: "project-a", UID: "subscriber-overrun-run"}
+		run := RunIdentity{Namespace: "project-a", NamespaceUID: testNamespaceUID("project-a"), UID: "subscriber-overrun-run"}
 		subscription, err := consumer.Subscribe(ctx, run, "")
 		if err != nil {
 			t.Fatal(err)
@@ -507,7 +537,7 @@ func TestPostgresTranscriptStoreContract(t *testing.T) {
 			t.Fatal(err)
 		}
 		defer candidate.Close()
-		run := RunIdentity{Namespace: "project-a", UID: "subscriber-lifecycle-run"}
+		run := RunIdentity{Namespace: "project-a", NamespaceUID: testNamespaceUID("project-a"), UID: "subscriber-lifecycle-run"}
 		first, err := candidate.Subscribe(ctx, run, "")
 		if err != nil {
 			t.Fatal(err)
@@ -531,7 +561,7 @@ func TestPostgresTranscriptStoreContract(t *testing.T) {
 			t.Fatal(err)
 		}
 		failed.Close()
-		result, err := failed.Append(ctx, RunIdentity{Namespace: "project-a", UID: "failed-run"}, AppendTranscriptInput{Source: "adapter", IdempotencyKey: "failed", Type: "output", Data: json.RawMessage(`{}`)})
+		result, err := failed.Append(ctx, RunIdentity{Namespace: "project-a", NamespaceUID: testNamespaceUID("project-a"), UID: "failed-run"}, AppendTranscriptInput{Source: "adapter", IdempotencyKey: "failed", Type: "output", Data: json.RawMessage(`{}`)})
 		if err == nil || result.Event.Sequence != 0 {
 			t.Fatalf("failed append result/error = %#v/%v", result, err)
 		}
@@ -542,7 +572,7 @@ func TestPostgresTranscriptStoreContract(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		subscription, err := failed.Subscribe(ctx, RunIdentity{Namespace: "project-a", UID: "poll-failure-run"}, "")
+		subscription, err := failed.Subscribe(ctx, RunIdentity{Namespace: "project-a", NamespaceUID: testNamespaceUID("project-a"), UID: "poll-failure-run"}, "")
 		if err != nil {
 			failed.Close()
 			t.Fatal(err)
@@ -557,7 +587,7 @@ func TestPostgresTranscriptStoreContract(t *testing.T) {
 	})
 
 	t.Run("signed bigint ceiling remains replayable", func(t *testing.T) {
-		run := RunIdentity{Namespace: "project-a", UID: "sequence-ceiling-run"}
+		run := RunIdentity{Namespace: "project-a", NamespaceUID: testNamespaceUID("project-a"), UID: "sequence-ceiling-run"}
 		createdAt := time.Now().UTC()
 		_, err := store.pool.Exec(ctx, `INSERT INTO transcript_runs(namespace, run_uid, high_water, retained_events, retained_bytes) VALUES ($1,$2,$3,1,256)`, run.Namespace, string(run.UID), int64(maxPostgresTranscriptSequence))
 		if err != nil {

@@ -26,12 +26,14 @@ var (
 	ErrReplayLimit         = errors.New("transcript replay limit exceeded")
 	ErrInvalidCursor       = errors.New("invalid transcript cursor")
 	ErrExpiredCursor       = errors.New("transcript cursor expired")
+	ErrTranscriptIdentity  = errors.New("transcript namespace identity does not match")
 )
 
 // RunIdentity is the immutable tenant-aware identity of a transcript owner.
 type RunIdentity struct {
-	Namespace string
-	UID       types.UID
+	Namespace    string
+	NamespaceUID types.UID
+	UID          types.UID
 }
 
 // AppendTranscriptInput contains platform transport metadata and opaque adapter data.
@@ -199,6 +201,9 @@ func NewMemoryTranscriptStore(options MemoryTranscriptStoreOptions) TranscriptSt
 }
 
 func (s *memoryTranscriptStore) Append(_ context.Context, run RunIdentity, input AppendTranscriptInput) (AppendTranscriptResult, error) {
+	if run.Namespace == "" || run.NamespaceUID == "" || run.UID == "" {
+		return AppendTranscriptResult{}, fmt.Errorf("append transcript: complete namespace and Run identity is required")
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -271,6 +276,9 @@ func (s *memoryTranscriptStore) Append(_ context.Context, run RunIdentity, input
 }
 
 func (s *memoryTranscriptStore) Subscribe(_ context.Context, run RunIdentity, cursor string) (TranscriptSubscription, error) {
+	if run.Namespace == "" || run.NamespaceUID == "" || run.UID == "" {
+		return TranscriptSubscription{}, fmt.Errorf("subscribe transcript: complete namespace and Run identity is required")
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -347,7 +355,7 @@ func (s *memoryTranscriptStore) unsubscribe(run RunIdentity, subscriber *memoryS
 }
 
 func (s *memoryTranscriptStore) cursor(run RunIdentity, sequence uint64) string {
-	runHash := sha256.Sum256([]byte(run.Namespace + "\x00" + string(run.UID)))
+	runHash := sha256.Sum256([]byte(run.Namespace + "\x00" + string(run.NamespaceUID) + "\x00" + string(run.UID)))
 	payload := "v1." + s.generation + "." + base64.RawURLEncoding.EncodeToString(runHash[:16]) + "." + strconv.FormatUint(sequence, 10)
 	signature := hmac.New(sha256.New, s.cursorKey)
 	_, _ = signature.Write([]byte(payload))
@@ -395,6 +403,9 @@ func writeTranscriptStoreError(w http.ResponseWriter, err error) {
 	code := "transcript_store_unavailable"
 	title := "transcript store is unavailable"
 	switch {
+	case errors.Is(err, ErrTranscriptIdentity):
+		status, code = http.StatusConflict, "transcript_identity_mismatch"
+		title = err.Error()
 	case errors.Is(err, ErrIdempotencyConflict):
 		status, code = http.StatusConflict, "idempotency_conflict"
 		title = err.Error()
@@ -445,7 +456,7 @@ func writeTranscriptProblem(w http.ResponseWriter, status int, code, title strin
 }
 
 func isTranscriptContractError(err error) bool {
-	return errors.Is(err, ErrIdempotencyConflict) || errors.Is(err, ErrTranscriptCapacity) ||
+	return errors.Is(err, ErrTranscriptIdentity) || errors.Is(err, ErrIdempotencyConflict) || errors.Is(err, ErrTranscriptCapacity) ||
 		errors.Is(err, ErrSubscriberCapacity) || errors.Is(err, ErrReplayLimit) ||
 		errors.Is(err, ErrInvalidCursor) || errors.Is(err, ErrExpiredCursor)
 }

@@ -115,7 +115,19 @@ Drive it with the swe CLI:
   KIND_ARGO_CLUSTER=$CLUSTER make argocd-ui
   export SWE_CONTROL_PLANE_URL=http://127.0.0.1:18080
   export SWE_CONTROL_PLANE_TOKEN=\$(${KUBECTL[*]} -n $APP_NAMESPACE get secret $BOOTSTRAP_SECRET -o jsonpath='{.data.token}' | base64 -d)
-  bin/swe run "fix the flaky tests" -t small
+  # First onboard a dedicated Project namespace with administrator-selected
+  # ResourceQuota values; chart catalog Templates in $APP_NAMESPACE are inert.
+  bin/swe --namespace my-project project onboard my-project \\
+    --system-namespace $APP_NAMESPACE --installation swe-platform-swe-platform \\
+    --repository https://github.com/example/project.git \\
+    --default-template small --template small \\
+    --quota-hard requests.cpu=REQUIRED --quota-hard requests.memory=REQUIRED \\
+    --quota-hard requests.storage=REQUIRED --quota-hard persistentvolumeclaims=REQUIRED \\
+    --quota-hard pods=REQUIRED --quota-hard secrets=REQUIRED \\
+    --quota-hard count/runs.swe.dev=REQUIRED \\
+    --quota-hard count/environments.swe.dev=REQUIRED \\
+    --quota-hard count/agentcredentialprofiles.swe.dev=REQUIRED
+  bin/swe --namespace my-project run "fix the flaky tests" --project my-project
 
 Teardown: kind delete cluster --name $CLUSTER
 EOF

@@ -2,6 +2,9 @@
 # coordinated release. k3s does not include gVisor, so this preset uses the
 # cluster's default OCI runtime for environment pods.
 
+tenancy:
+  mode: scoped
+
 controlPlane:
   transcripts:
     postgresSecret:

@@ -325,7 +325,13 @@ func (s *Server) handleTranscript(w http.ResponseWriter, r *http.Request, namesp
 	}
 	// Bind storage to the verified caller expectation, not merely the value
 	// returned by name resolution.
-	identity := RunIdentity{Namespace: namespace, UID: expectedUID}
+	namespaceUID := namespaceUIDFromRequest(r)
+	if namespaceUID == "" {
+		s.log.Warn("authorized transcript request without a Namespace UID", "namespace", namespace, "run", run)
+		http.Error(w, "namespace identity is unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	identity := RunIdentity{Namespace: namespace, NamespaceUID: namespaceUID, UID: expectedUID}
 
 	switch r.Method {
 	case http.MethodGet:

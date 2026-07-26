@@ -7,6 +7,12 @@ rules:
 - apiGroups:
   - ""
   resources:
+  - namespaces
+  verbs:
+  - get
+- apiGroups:
+  - ""
+  resources:
   - persistentvolumeclaims
   - pods
   verbs:
@@ -50,7 +56,7 @@ rules:
   - swe.dev
   resources:
   - agentcredentialprofiles
-  - environmenttemplates
+  - installations
   - projects
   verbs:
   - get
@@ -81,6 +87,7 @@ rules:
 - apiGroups:
   - swe.dev
   resources:
+  - environmenttemplates
   - runs
   verbs:
   - get

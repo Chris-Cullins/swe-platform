@@ -60,6 +60,14 @@ leaderElection: true
 metricsBindAddress: ":8080"
 healthProbeBindAddress: ":8081"
 
+# Tenancy mode is intentionally required. Scoped mode watches only the exact
+# claimed Project namespaces listed here. Adding or removing a namespace is a
+# controlled Helm upgrade/operator restart operation. trusted-admin restores
+# deliberate cluster-wide authority and must not be selected accidentally.
+tenancy:
+  mode: ""
+  namespaces: []
+
 podAnnotations: {}
 podSecurityContext:
   runAsNonRoot: true
@@ -83,7 +91,7 @@ environmentImage:
   repository: ghcr.io/chris-cullins/swe-platform/env-base
   tag: ""
 
-# EnvironmentTemplate resources to create. Each entry may set `namespace` and
-# otherwise uses the release namespace. Empty by default because no stable
-# public environment image is published yet.
+# Inert EnvironmentTemplate catalog sources created in the system/release
+# namespace. `swe project onboard` copies selected sources into a claimed
+# Project namespace; these source objects can never provision Environments.
 environmentTemplates: []

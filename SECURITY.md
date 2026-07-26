@@ -91,6 +91,34 @@ intentionally uses the cluster default runtime.
 Certificates are valid for one year to avoid expiring a continuously running pod; normal pod
 recreation rotates them much earlier. Operators should recreate any pod approaching that limit.
 
+## Project namespace authority
+
+Platform services and the immutable-UID `Installation` identity live in a system namespace;
+each Project has a dedicated namespace. In scoped mode, names and labels are discovery data,
+not authority. The boundary is the live Namespace object's immutable UID plus exact annotations
+for the Installation namespace/name/UID, sole Project name/UID, and lifecycle. Onboarding is an
+administrator operation: scoped workload RoleBindings do not grant the operator or control
+plane permission to mutate Namespace claims. Missing, partial, stale, conflicting, deleting, or
+multiple Project identities fail closed.
+
+The scoped operator cache is restart-bound to the explicit `tenancy.namespaces` list. Startup,
+reconcile entry, and every mutation revalidate the Installation and exact Namespace/Project
+claim through uncached reads. The control plane first performs its existing TokenReview and
+SubjectAccessReview checks, then independently requires allowlist membership and an uncached
+active-claim proof. A second release has different Installation and cluster-role identities and
+an Installation-UID-derived leader lease; it cannot satisfy or receive another release's
+namespaced workload authority. `trusted-admin` is a separate explicit cluster-wide mode; absent
+or invalid mode configuration never enables it. Its cache and RBAC are cluster-wide, but exact
+Installation/Namespace/Project claims remain mandatory at mutation boundaries.
+
+Onboarding installs an ingress-only default-deny NetworkPolicy and a tokenless Environment
+ServiceAccount. The existing Environment-specific policy adds only the sandboxd ingress needed
+from the installation's system components. These policies do not restrict egress. Offboarding
+fences before drain and retains the Namespace, workspace PVCs, credential profiles and their
+owned Secrets, and transcript data. Suspending an Environment still revokes its ephemeral
+per-pod sandboxd credential Secret as described above. Destructive Project purge is not
+implemented.
+
 ## Run-scoped agent API keys
 
 An `AgentCredentialProfile` binds an immutable adapter and `APIKey` credential type in one

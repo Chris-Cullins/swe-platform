@@ -34,7 +34,8 @@ CLI / TUI / local MCP / browser console
 - **CRDs and controllers.** Kubernetes `swe.dev/v1alpha1` resources hold durable
   infrastructure and task intent. Controllers allocate or claim Environments for Runs,
   reconcile Environment pods and volumes, maintain warm pools, reap idle Environments, and
-  drive adapter lifecycle.
+  drive adapter lifecycle. Platform services and the Installation identity live in a system
+  namespace; each onboarded Project and its resources live in one dedicated claimed namespace.
 - **Control plane.** A singleton HTTP service exposes typed Run and Environment operations,
   Run watches, transcript ingestion/SSE, browser sessions, the embedded operations console,
   and terminal WebSockets. It acts through Kubernetes APIs and the sandboxd connector; it
@@ -61,8 +62,9 @@ All current CRDs are namespaced:
 
 | Resource | Current contract |
 |---|---|
+| `Installation` | Empty-spec identity object in the system namespace. Its immutable Kubernetes UID is the stable installation identity used by namespace claims, catalog sources, managed Template copies, and baseline resources. |
 | `Project` | One repository URL (represented as a one-item list), a same-namespace default Template reference, changes-workflow metadata, and a reserved egress allowlist. A non-empty allowlist is rejected when an Environment uses the Project. |
-| `EnvironmentTemplate` | Pod image, size/resources, disk, runtime class, idle timeout, warm-pool minimum, and backend. Admission currently permits only the `pod` backend. |
+| `EnvironmentTemplate` | Pod image, size/resources, disk, runtime class, idle timeout, warm-pool minimum, and backend. Admission currently permits only the `pod` backend. Chart-owned system-namespace objects are inert catalog sources; execution accepts only installation-managed same-namespace copies bound to exact Installation, source, and Project identities. |
 | `Environment` | Template/Project selection, explicit hold policy and bounded wake/suspend/activity intents; status owns readiness, lifecycle suspension and epoch, backend-neutral execution generation, exact Run claim, backend observations, activity, and recovery state. |
 | `Run` | Immutable agent task and Environment/Project/Template/credential selection plus monotonic cancellation; status records normalized lifecycle, exact Environment name/UID and ownership, exact credential profile identity, accepted lifecycle epoch, and accepted execution generation. `notify` and `parentRef` are schema placeholders without an implemented inbox. |
 | `AgentCredentialProfile` | Immutable adapter and `APIKey` type metadata. Key bytes live in an owner-linked Secret whose name is derived from the profile UID. |
@@ -70,6 +72,11 @@ All current CRDs are namespaced:
 The current ownership/reference shape is:
 
 ```text
+Installation --UID claim--> Namespace --exact name + UID--> Project
+                              |
+                              +--> managed EnvironmentTemplate copy
+                              +--> quota, service accounts, RBAC, baseline policy
+
 Project -----same namespace----> EnvironmentTemplate
    |                                  |
    +--------> Run --------------------+
@@ -93,19 +100,63 @@ Owned allocations have a Run controller owner reference; claimed allocations car
 and UID in `Environment.status.claimedBy`. Exact UIDs prevent same-name replacements from
 inheriting allocation, cancellation, transcript, terminal, or credential authority.
 
-### Tenancy: current state
+### Tenancy and Project namespace lifecycle
 
-Namespace-per-Project is **not enforced today**. Projects are ordinary namespaced objects;
-clients select a namespace (the CLI defaults to `default`), and Project, Template,
-Environment, Run, and credential references resolve within that selected namespace. The Helm
-chart creates configured Templates in the release namespace unless an entry explicitly names
-another namespace. Its operator and control-plane service accounts currently receive
-cluster-wide RBAC.
+The chart installs one empty-spec `Installation` in its system namespace. The object's
+immutable Kubernetes UID is the installation identity; cluster-scoped RBAC names also include
+a stable hash of the system namespace, and the leader-election lease name is derived from the
+Installation UID, so releases do not share roles, bindings, or leadership. Names and labels are
+discovery data, not authority.
 
-Consequently, installing the production chart in a system namespace does not itself onboard a
-separate Project namespace or copy Templates there. Shared-cluster scoped reconciliation,
-installation namespace claims, Project offboarding, and enforced one-Project-per-namespace
-cardinality remain future work under the approved contract below.
+`swe project onboard` creates or explicitly adopts one namespace and enforces exactly one
+Project in it. Authority is the live Namespace object's own immutable `metadata.uid` plus
+RBAC-protected exact annotations for Installation namespace/name/UID, Project name/UID, and
+`active`, `fencing`, or `fenced` lifecycle. The Namespace must contain exactly the annotated
+live Project UID. Missing, stale, conflicting, deleting, or multiple identities fail closed.
+The Project namespace contains the Project, managed Template copies, Runs, Environments and
+warm pools, credential profiles and their owner-UID Secrets, workspace PVCs, and a versioned
+baseline. Onboarding requires the administrator to supply positive values for every fixed
+ResourceQuota key; the platform does not choose capacity. The baseline adds the environment
+ServiceAccount with token automount disabled, exact operator/control-plane RoleBindings, and
+default-deny ingress. Per-Environment policies still admit sandboxd only from this
+installation's system components. No default-deny egress or egress restriction is claimed.
+
+Chart `environmentTemplates` render only as inert catalog sources in the system namespace.
+The operator binds each source to the live Installation UID. Onboarding copies selected sources
+to the Project namespace with exact Installation, Project, source UID, catalog name, and
+revision annotations. An explicit onboarding rerun updates managed copies in place, including
+source replacement and spec/revision drift, preserving the local Template UID and warm-pool
+status. It refuses unowned or foreign collisions. Removing a source never deletes a local
+copy, and catalog sources themselves cannot provision Environments.
+
+Tenancy mode is required and has no compatibility default:
+
+- **`scoped`.** `tenancy.namespaces` is an explicit restart-bound allowlist. Startup reads the
+  Installation and each listed Namespace/Project directly and accepts only exact claims;
+  transition lifecycles remain startable so interrupted fencing can drain after a restart.
+  The operator's controller-runtime cache watches only the listed Project namespaces; with no
+  entries, workload controllers are disabled while system catalog preparation remains
+  available. Reconcile entry and every client mutation re-read the exact Installation,
+  Namespace UID/claim/lifecycle, and sole Project through an uncached reader. The control plane
+  performs TokenReview/SAR first, then requires both allowlist membership and the same uncached
+  active-claim proof before any namespaced resource work. Namespaced RoleBindings supply
+  workload authority only after onboarding.
+- **`trusted-admin`.** Explicit opt-in cluster-wide cache and workload RBAC, allowing newly
+  claimed namespaces to be discovered without a restart-bound list. Exact Installation,
+  Namespace, and sole-Project claims remain mandatory, so multiple releases do not reconcile
+  each other's namespaces. It does not result from missing or invalid scoped configuration.
+
+The safe scoped ordering is: install system identity/catalog with an empty list; onboard and
+populate a Project namespace; add it to `tenancy.namespaces`; then perform a controlled Helm
+upgrade/restart of operator and control plane. Offboarding reverses the security boundary:
+`swe project offboard` changes the exact claim to `fencing`, publishes Run cancellation and
+Environment hold intents, waits for terminal Runs and suspended podless Environments, then
+marks the namespace `fenced`. It deletes no Namespace, Project, Template, quota, RBAC, policy,
+credential profile or owned Secret, PVC, Run, Environment, or transcript data. Normal
+Environment suspension still revokes the pod incarnation's ephemeral sandboxd credential
+Secret. After fencing, operators may retain/archive the namespace, remove it from
+`tenancy.namespaces`, and restart the scoped components. Purge is not implemented; it remains
+blocked on an exact Namespace-UID-preconditioned durable resumable operation.
 
 ### Environment boundary and backend portability
 
@@ -192,12 +243,15 @@ sandboxd daemon epoch, and bounded output includes absolute offsets and observab
 Adapters map their own completion protocol to normalized Run state. Process exit alone is not
 a universal platform completion rule.
 
-Transcript transport is fenced by namespace, Run name, and immutable Run UID. It supplies
+Transcript transport is fenced by namespace name, immutable Namespace UID, Run name, and
+immutable Run UID. It supplies
 idempotent append, monotonic per-Run cursors, bounded retention, explicit gaps, replay, and SSE.
 Production presets require an external PostgreSQL URL; live PostgreSQL delivery is currently
 database-polled. With no URL, the control plane logs a warning and uses a bounded, non-durable,
-process-local development store. Transcript rows are not currently garbage-collected when a
-Run is deleted.
+process-local development store. Durable legacy rows without a Namespace UID are associated
+only when an authorized request resolves the exact current Run UID; conflicting identity is
+rejected, and otherwise-unprovable rows are retained indefinitely. Transcript rows are not
+currently garbage-collected when a Run or Project is deleted.
 
 ### Authentication and exact identity fences
 
@@ -205,6 +259,9 @@ Normal control-plane bearer credentials are authenticated with Kubernetes TokenR
 configured audience. SubjectAccessReview then authorizes the reviewed username, UID, groups,
 and extras against the exact API group, version, namespace, resource, subresource, verb, and,
 where applicable, object name. Namespace is taken from the route, never a query parameter.
+In scoped mode this authorization completes before the configured-namespace and exact active
+Installation/Namespace/Project claim checks; claim validation supplements and never replaces
+TokenReview/SAR.
 
 The optional bootstrap bearer token bypasses SAR for initial self-hosted setup. It cannot be
 exchanged for a browser session and should be removed after RBAC is configured. Browser login
@@ -228,9 +285,12 @@ Object names are not identities. Current sensitive operations add these fences:
   authorization and immutable-intent comparison. Run watches are separately namespace-level
   `list`/`watch` operations and use opaque Kubernetes resource versions.
 
-The CLI and local MCP server carry the user's explicit control-plane bearer credential. MCP
-fixes all calls to one namespace and currently exposes bounded `create_run` and UID-fenced
-`read_transcript`; interactive terminal attachment is deliberately not an MCP tool.
+The CLI no longer has an implicit `default` namespace: every executable command requires an
+explicit `--namespace`, and Project onboarding/offboarding additionally require the Project
+name plus explicit system Namespace and Installation. The CLI and local MCP server carry the
+user's explicit control-plane bearer credential. MCP fixes all calls to one namespace and
+currently exposes bounded `create_run` and UID-fenced `read_transcript`; interactive terminal
+attachment is deliberately not an MCP tool.
 
 ### Credentials
 
@@ -268,26 +328,33 @@ not implemented.
 
 ### Chart, presets, tests, and deployment topology
 
-The Helm chart installs CRDs, operator, singleton control plane, service accounts/RBAC, and
-optional namespaced EnvironmentTemplates. It does not install PostgreSQL, ingress/TLS,
+The Helm chart installs CRDs, a system-namespaced Installation identity, operator, singleton
+control plane, service accounts/RBAC, and inert system-namespaced EnvironmentTemplate catalog
+sources. Project resources and their namespaced workload RoleBindings are installed by the
+CLI onboarding path, not by Helm. It does not install PostgreSQL, ingress/TLS,
 StorageClasses, RuntimeClasses, an egress proxy, or a portal gateway. The control plane is
 fixed at one replica with `Recreate`; PostgreSQL makes transcripts durable, but browser
 sessions and full control-plane HA are still process-local limitations.
 
-- `values-kind.yaml` uses local `:dev` images and insecure HTTP sessions for development.
-- `values-argocd.yaml` is a separate local mirror of `main` using mutable `:latest` images.
+- `values-kind.yaml` deliberately opts into trusted-admin for isolated local development and
+  uses local `:dev` images and insecure HTTP sessions. Primary acceptance overrides it to
+  scoped mode with distinct system and Project namespaces.
+- `values-argocd.yaml` deliberately opts into trusted-admin in the isolated Argo mirror and
+  uses mutable `:latest` images.
 - `values-k3s.yaml`, `values-gke.yaml`, and `values-eks.yaml` use coordinated immutable chart
-  `appVersion` images and require an out-of-band PostgreSQL Secret. GKE selects `gvisor`; k3s
-  and EKS use the cluster default runtime unless explicitly overridden.
+  `appVersion` images, require an out-of-band PostgreSQL Secret, and default to scoped mode
+  with no Project namespaces. GKE selects `gvisor`; k3s and EKS use the cluster default runtime
+  unless explicitly overridden.
 
 CI builds, vets, and tests both Go modules, runs PostgreSQL transcript integration tests,
 checks UI lint/type/tests/build, exercises focused sandboxd Windows portability, verifies
 generated CRDs/chart copies, and lints/renders every preset. The kind acceptance workflow
-builds and loads local images and covers CRD upgrade, Runs/warm pools/lifecycle, adapters and
-process-scoped credentials, TokenReview/SAR and browser sessions, resource APIs/watches,
-transcript SSE/CLI/MCP, terminal authorization and identity fencing, and UI embedding. It is
-path-filtered for pull requests and can be manually dispatched; a documentation-only change
-does not add dummy source changes merely to trigger it.
+builds and loads local images and covers CRD upgrade, scoped system/Project topology,
+onboarding claims/catalog/baseline, two-release isolation, retained offboarding,
+Runs/warm pools/lifecycle, adapters and process-scoped credentials, TokenReview/SAR and browser
+sessions, resource APIs/watches, transcript SSE/CLI/MCP, terminal authorization and identity
+fencing, and UI embedding. It is path-filtered for pull requests and can be manually
+dispatched; a documentation-only change does not add dummy source changes merely to trigger it.
 
 Local development uses `swe-dev`; `make kind-up` adds gVisor plus snapshot-capable CSI. The
 Argo mirror uses a separate `swe-argo` cluster tracking pushed `main`; the two operators must
@@ -298,22 +365,6 @@ environment base for amd64/arm64.
 
 These decisions constrain future implementation. They do not add current API fields or imply
 that migrations, controllers, proxies, or gateways already exist.
-
-### One claimed namespace per Project
-
-The maintainer approved the [Project namespace decision in #11](https://github.com/Chris-Cullins/swe-platform/issues/11#issuecomment-5078431568):
-
-- platform services and PostgreSQL live in a system namespace;
-- each Project has one dedicated namespace, explicitly created or adopted under a stable
-  installation claim;
-- that namespace contains the Project, installation-managed local Template copies, Runs,
-  Environments/warm pools, credential profiles and owned Secrets, PVCs, quotas, RBAC, and
-  baseline policies;
-- normal references remain same-namespace; scoped mode manages only claimed namespaces, while
-  cluster-wide trusted-admin mode is an explicit opt-in;
-- CLI context is explicit rather than inferred from `default` or the release namespace; and
-- offboarding separates fence/disable, retain/archive, and purge, with explicit PVC and
-  exact-UID transcript handling.
 
 ### Durable services and gateway ownership
 

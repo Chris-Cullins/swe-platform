@@ -12,6 +12,10 @@ LOCALBIN := $(abspath bin)
 CONTROLLER_GEN := $(LOCALBIN)/controller-gen
 
 KIND_CLUSTER ?= swe-dev
+RUN_TENANCY_MODE ?=
+RUN_SYSTEM_NAMESPACE ?=
+RUN_INSTALLATION_NAME ?=
+RUN_TENANCY_NAMESPACES ?=
 
 .PHONY: all
 all: build
@@ -140,7 +144,14 @@ install-crds: manifests ## Install CRDs into the current cluster
 
 .PHONY: run
 run: ## Run the operator locally against the current cluster
-	go run ./cmd/operator
+	@test -n "$(RUN_TENANCY_MODE)" -a -n "$(RUN_SYSTEM_NAMESPACE)" -a -n "$(RUN_INSTALLATION_NAME)" || { \
+		echo "RUN_TENANCY_MODE, RUN_SYSTEM_NAMESPACE, and RUN_INSTALLATION_NAME are required" >&2; exit 1; \
+	}
+	go run ./cmd/operator \
+		--tenancy-mode="$(RUN_TENANCY_MODE)" \
+		--control-plane-namespace="$(RUN_SYSTEM_NAMESPACE)" \
+		--installation-namespace="$(RUN_SYSTEM_NAMESPACE)" \
+		--installation-name="$(RUN_INSTALLATION_NAME)" $(foreach namespace,$(RUN_TENANCY_NAMESPACES),--tenancy-namespace="$(namespace)")
 
 .PHONY: dev
 dev: ## Watch, rebuild, and redeploy operator/control-plane into the kind dev cluster

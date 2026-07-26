@@ -13,6 +13,10 @@
 set -euo pipefail
 
 CLUSTER="${KIND_CLUSTER:-swe-e2e}"
+SYSTEM_NAMESPACE="swe-platform-system"
+PROJECT_NAMESPACE="swe-e2e-project"
+PROJECT_NAME="e2e"
+INSTALLATION_NAME="swe-platform-swe-platform"
 ENV_IMAGE="ghcr.io/chris-cullins/swe-platform/env-base:dev"
 E2E_ENV_IMAGE="ghcr.io/chris-cullins/swe-platform/env-base:e2e-credentials"
 OPERATOR_IMAGE="ghcr.io/chris-cullins/swe-platform/operator:dev"
@@ -78,16 +82,30 @@ contains_e2e_key() {
 		grep -aFq -- "$E2E_AMP_API_KEY" "$1"
 }
 
+wait_for_resource_quota_observation() {
+	local namespace="$1"
+	for _ in $(seq 1 300); do
+		if kubectl -n "$namespace" get resourcequota swe-project -o json | \
+			jq -e '(.status.hard // {}) == .spec.hard' >/dev/null; then
+			return 0
+		fi
+		sleep 1
+	done
+	echo "FAIL: ResourceQuota in $namespace did not observe all configured hard limits" >&2
+	kubectl -n "$namespace" get resourcequota swe-project -o yaml >&2 || true
+	return 1
+}
+
 check_sandboxd_process() {
 	local pod_name="$1"
 	local run_uid="$2"
 	local expected_key="$3"
 	local secret_name identity
-	secret_name=$(kubectl get pod "$pod_name" -o jsonpath='{.metadata.annotations.swe\.dev/sandboxd-secret-name}')
-	identity=$(kubectl get pod "$pod_name" -o jsonpath='{.metadata.annotations.swe\.dev/sandboxd-identity}')
-	kubectl get secret "$secret_name" -o jsonpath='{.data.tls\.crt}' | base64 --decode > /tmp/swe-platform-sandboxd-cert-"$$"
-	kubectl get secret "$secret_name" -o jsonpath='{.data.process-token}' | base64 --decode > /tmp/swe-platform-sandboxd-token-"$$"
-	kubectl port-forward pod/"$pod_name" 15051:50051 >/tmp/swe-platform-sandboxd-port-forward.log 2>&1 &
+	secret_name=$(kubectl -n "$PROJECT_NAMESPACE" get pod "$pod_name" -o jsonpath='{.metadata.annotations.swe\.dev/sandboxd-secret-name}')
+	identity=$(kubectl -n "$PROJECT_NAMESPACE" get pod "$pod_name" -o jsonpath='{.metadata.annotations.swe\.dev/sandboxd-identity}')
+	kubectl -n "$PROJECT_NAMESPACE" get secret "$secret_name" -o jsonpath='{.data.tls\.crt}' | base64 --decode > /tmp/swe-platform-sandboxd-cert-"$$"
+	kubectl -n "$PROJECT_NAMESPACE" get secret "$secret_name" -o jsonpath='{.data.process-token}' | base64 --decode > /tmp/swe-platform-sandboxd-token-"$$"
+	kubectl -n "$PROJECT_NAMESPACE" port-forward pod/"$pod_name" 15051:50051 >/tmp/swe-platform-sandboxd-port-forward.log 2>&1 &
 	SANDBOXD_PORT_FORWARD_PID=$!
 	for _ in $(seq 1 30); do
 		if grep -q 'Forwarding from' /tmp/swe-platform-sandboxd-port-forward.log; then
@@ -276,12 +294,26 @@ kubectl get environment legacy-execution-generation-migration -o json | jq -e \
 	'.spec.lifecycle.activity[0].executionGeneration == null and .status.lifecycle.activityReceipts[0].executionGeneration == null' >/dev/null
 kubectl delete environment legacy-execution-generation-migration --wait=false
 
-echo "==> installing operator and kind template through Helm with upgraded CRDs"
+echo "==> verifying trusted-admin preset and release-scoped cluster RBAC names"
+TRUSTED_RENDER=$(helm template swe-platform charts/swe-platform --namespace preset-check --values charts/swe-platform/values-kind.yaml)
+grep -q -- '--tenancy-mode=trusted-admin' <<<"$TRUSTED_RENDER"
+grep -q 'SWE_TENANCY_MODE' <<<"$TRUSTED_RENDER"
+grep -q '^kind: ClusterRoleBinding$' <<<"$TRUSTED_RENDER"
+RBAC_A=$(helm template swe-platform charts/swe-platform --namespace render-system-a --values charts/swe-platform/values-kind.yaml --set tenancy.mode=scoped | awk '/^kind: ClusterRole(Binding)?$/{k=$2} k && /^  name:/{print k "/" $2; k=""}' | sort -u)
+RBAC_B=$(helm template swe-platform charts/swe-platform --namespace render-system-b --values charts/swe-platform/values-kind.yaml --set tenancy.mode=scoped | awk '/^kind: ClusterRole(Binding)?$/{k=$2} k && /^  name:/{print k "/" $2; k=""}' | sort -u)
+if comm -12 <(printf '%s\n' "$RBAC_A") <(printf '%s\n' "$RBAC_B") | grep -q .; then
+	echo "FAIL: identical release names in distinct system namespaces produced colliding cluster RBAC names"
+	exit 1
+fi
+
+echo "==> installing scoped catalog-only platform through Helm with upgraded CRDs"
 E2E_BOOTSTRAP_TOKEN="$(openssl rand -hex 32)"
-kubectl create secret generic swe-platform-bootstrap --from-literal=token="$E2E_BOOTSTRAP_TOKEN"
+kubectl create namespace "$SYSTEM_NAMESPACE"
+kubectl -n "$SYSTEM_NAMESPACE" create secret generic swe-platform-bootstrap --from-literal=token="$E2E_BOOTSTRAP_TOKEN"
 HELM_ARGS=(
 	upgrade --install swe-platform charts/swe-platform
-	--namespace default --values charts/swe-platform/values-kind.yaml
+	--namespace "$SYSTEM_NAMESPACE" --values charts/swe-platform/values-kind.yaml
+	--set tenancy.mode=scoped --set-json 'tenancy.namespaces=[]'
 	--set controlPlane.auth.bootstrapTokenSecret.name=swe-platform-bootstrap
 	--set-string "environmentTemplates[0].spec.image=$E2E_ENV_IMAGE"
 	--wait --timeout 2m
@@ -291,7 +323,62 @@ if [[ -n "${E2E_RUNTIME_CLASS:-}" ]]; then
 fi
 helm "${HELM_ARGS[@]}"
 
-echo "==> waiting for warm environment"
+CATALOG_TEMPLATE=$(kubectl -n "$SYSTEM_NAMESPACE" get environmenttemplates -o json | jq -r '.items[] | select(.metadata.annotations["swe.dev/catalog-name"] == "small") | .metadata.name' | head -1)
+if [[ -z "$CATALOG_TEMPLATE" ]] || kubectl -n "$SYSTEM_NAMESPACE" get environmenttemplate small >/dev/null 2>&1; then
+	echo "FAIL: chart catalog source is absent or a runnable small Template exists in the system namespace"
+	exit 1
+fi
+
+echo "==> onboarding the Project before enabling workload scope"
+# These generous quota values are explicit E2E test capacity, not platform defaults.
+QUOTA_ARGS=(--quota-hard requests.cpu=16 --quota-hard requests.memory=32Gi --quota-hard requests.storage=100Gi
+	--quota-hard persistentvolumeclaims=20 --quota-hard pods=100 --quota-hard secrets=100
+	--quota-hard count/runs.swe.dev=100 --quota-hard count/environments.swe.dev=20
+	--quota-hard count/agentcredentialprofiles.swe.dev=20)
+ONBOARD_ARGS=(--namespace "$PROJECT_NAMESPACE" project onboard "$PROJECT_NAME"
+	--system-namespace "$SYSTEM_NAMESPACE" --installation "$INSTALLATION_NAME"
+	--repository "git://e2e-git-server.$PROJECT_NAMESPACE.svc.cluster.local/e2e.git"
+	--default-template small --template small
+	"${QUOTA_ARGS[@]}")
+if bin/swe --namespace "" project onboard implicit-refusal --system-namespace "$SYSTEM_NAMESPACE" --installation "$INSTALLATION_NAME" --repository git://unused --default-template small --template small "${QUOTA_ARGS[@]}" >/tmp/swe-e2e-implicit.out 2>&1; then
+	echo "FAIL: project onboarding accepted an implicit/empty CLI namespace"
+	exit 1
+fi
+bin/swe --namespace "$PROJECT_NAMESPACE" "${ONBOARD_ARGS[@]:2}"
+
+INSTALLATION_UID=$(kubectl -n "$SYSTEM_NAMESPACE" get installation "$INSTALLATION_NAME" -o jsonpath='{.metadata.uid}')
+PROJECT_UID=$(kubectl -n "$PROJECT_NAMESPACE" get project "$PROJECT_NAME" -o jsonpath='{.metadata.uid}')
+SOURCE_UID=$(kubectl -n "$SYSTEM_NAMESPACE" get environmenttemplate "$CATALOG_TEMPLATE" -o jsonpath='{.metadata.uid}')
+SOURCE_REVISION=$(kubectl -n "$SYSTEM_NAMESPACE" get environmenttemplate "$CATALOG_TEMPLATE" -o jsonpath='{.metadata.annotations.swe\.dev/catalog-revision}')
+CLAIM=$(kubectl get namespace "$PROJECT_NAMESPACE" -o json)
+jq -e --arg iu "$INSTALLATION_UID" --arg pu "$PROJECT_UID" '.metadata.annotations["swe.dev/installation-uid"]==$iu and .metadata.annotations["swe.dev/project-uid"]==$pu and .metadata.annotations["swe.dev/project-namespace-lifecycle"]=="active"' <<<"$CLAIM" >/dev/null
+LOCAL_TEMPLATE=$(kubectl -n "$PROJECT_NAMESPACE" get environmenttemplate small -o json)
+jq -e --arg iu "$INSTALLATION_UID" --arg pu "$PROJECT_UID" --arg su "$SOURCE_UID" --arg rev "$SOURCE_REVISION" '.metadata.uid != "" and .metadata.annotations["swe.dev/installation-uid"]==$iu and .metadata.annotations["swe.dev/project-uid"]==$pu and .metadata.annotations["swe.dev/catalog-source-uid"]==$su and .metadata.annotations["swe.dev/catalog-revision"]==$rev' <<<"$LOCAL_TEMPLATE" >/dev/null
+kubectl -n "$PROJECT_NAMESPACE" get resourcequota/swe-project serviceaccount/swe-environment rolebinding/swe-platform-operator rolebinding/swe-platform-control-plane networkpolicy/swe-default-deny-ingress >/dev/null
+[[ "$(kubectl -n "$PROJECT_NAMESPACE" get serviceaccount swe-environment -o jsonpath='{.automountServiceAccountToken}')" == "false" ]]
+kubectl -n "$PROJECT_NAMESPACE" get networkpolicy swe-default-deny-ingress -o json | jq -e '.spec.policyTypes == ["Ingress"] and (.spec.ingress | length == 0)' >/dev/null
+wait_for_resource_quota_observation "$PROJECT_NAMESPACE"
+
+echo "==> verifying fail-closed namespace adoption and ownership"
+ADOPT_NAMESPACE=swe-e2e-adopt
+kubectl create namespace "$ADOPT_NAMESPACE"
+if bin/swe --namespace "$ADOPT_NAMESPACE" project onboard "$PROJECT_NAME" --system-namespace "$SYSTEM_NAMESPACE" --installation "$INSTALLATION_NAME" --repository git://unused --default-template small --template small "${QUOTA_ARGS[@]}" >/dev/null 2>&1; then
+	echo "FAIL: existing unclaimed Namespace was onboarded without --adopt"
+	exit 1
+fi
+bin/swe --namespace "$ADOPT_NAMESPACE" project onboard "$PROJECT_NAME" --adopt --system-namespace "$SYSTEM_NAMESPACE" --installation "$INSTALLATION_NAME" --repository git://unused --default-template small --template small "${QUOTA_ARGS[@]}"
+if bin/swe --namespace "$ADOPT_NAMESPACE" project onboard ownership-collision --adopt --system-namespace "$SYSTEM_NAMESPACE" --installation "$INSTALLATION_NAME" --repository git://unused --default-template small --template small "${QUOTA_ARGS[@]}" >/dev/null 2>&1; then
+	echo "FAIL: Namespace accepted a second Project ownership claim"
+	exit 1
+fi
+echo "==> adding the onboarded Project namespace to scoped controllers"
+HELM_ARGS+=(--set-string "tenancy.namespaces[0]=$PROJECT_NAMESPACE")
+helm "${HELM_ARGS[@]}"
+kubectl -n "$SYSTEM_NAMESPACE" rollout status deployment/"$INSTALLATION_NAME" --timeout=2m
+kubectl -n "$SYSTEM_NAMESPACE" rollout status deployment/"$INSTALLATION_NAME-control-plane" --timeout=2m
+kubectl config set-context --current --namespace="$PROJECT_NAMESPACE" >/dev/null
+
+echo "==> waiting for local warm environment"
 kubectl wait --for=jsonpath='{.status.warmPoolReady}'=1 environmenttemplate/small --timeout=2m
 WARM_ENV_NAME=$(kubectl get environments -l swe.dev/warm-pool=small -o jsonpath='{.items[0].metadata.name}')
 if [[ -z "$WARM_ENV_NAME" ]]; then
@@ -299,6 +386,11 @@ if [[ -z "$WARM_ENV_NAME" ]]; then
 	exit 1
 fi
 WARM_POD_UID=$(kubectl get pod "env-${WARM_ENV_NAME}" -o jsonpath='{.metadata.uid}')
+if [[ "$(kubectl get pod "env-${WARM_ENV_NAME}" -o jsonpath='{.spec.serviceAccountName}')" != "swe-environment" || \
+	"$(kubectl get pod "env-${WARM_ENV_NAME}" -o jsonpath='{.spec.automountServiceAccountToken}')" != "false" ]]; then
+	echo "FAIL: Environment pod did not use the tokenless onboarding ServiceAccount"
+	exit 1
+fi
 if [[ -n "${E2E_RUNTIME_CLASS:-}" ]]; then
 	WARM_RUNTIME_CLASS=$(kubectl get pod "env-${WARM_ENV_NAME}" -o jsonpath='{.spec.runtimeClassName}')
 	if [[ "$WARM_RUNTIME_CLASS" != "$E2E_RUNTIME_CLASS" ]]; then
@@ -320,6 +412,93 @@ if [[ "${E2E_USE_EXISTING_CLUSTER:-false}" == "true" ]]; then
 		exit 1
 	fi
 fi
+
+echo "==> synchronizing catalog revision drift in place"
+LOCAL_TEMPLATE_UID=$(kubectl get environmenttemplate small -o jsonpath='{.metadata.uid}')
+WARM_ENV_UID=$(kubectl get environment "$WARM_ENV_NAME" -o jsonpath='{.metadata.uid}')
+kubectl -n "$SYSTEM_NAMESPACE" patch environmenttemplate "$CATALOG_TEMPLATE" --type=merge \
+	-p '{"metadata":{"annotations":{"swe.dev/catalog-revision":"e2e-revision-2"}},"spec":{"idleTimeout":"14m"}}' >/dev/null
+bin/swe --namespace "$PROJECT_NAMESPACE" "${ONBOARD_ARGS[@]:2}"
+if [[ "$(kubectl get environmenttemplate small -o jsonpath='{.metadata.uid}')" != "$LOCAL_TEMPLATE_UID" || \
+	"$(kubectl get environmenttemplate small -o jsonpath='{.metadata.annotations.swe\.dev/catalog-revision}')" != "e2e-revision-2" || \
+	"$(kubectl get environmenttemplate small -o jsonpath='{.spec.idleTimeout}')" != "14m0s" || \
+	"$(kubectl get environment "$WARM_ENV_NAME" -o jsonpath='{.metadata.uid}')" != "$WARM_ENV_UID" ]]; then
+	echo "FAIL: explicit catalog sync did not preserve local Template/warm-pool identity while applying drift"
+	exit 1
+fi
+kubectl -n "$SYSTEM_NAMESPACE" delete environmenttemplate "$CATALOG_TEMPLATE" --wait=true >/dev/null
+if [[ "$(kubectl get environmenttemplate small -o jsonpath='{.metadata.uid}')" != "$LOCAL_TEMPLATE_UID" ]]; then
+	echo "FAIL: deleting a catalog source implicitly removed its managed Project copy"
+	exit 1
+fi
+
+echo "==> verifying exact-UID two-release isolation and retained offboarding"
+PEER_SYSTEM_NAMESPACE=swe-platform-peer-system
+PEER_PROJECT_NAMESPACE=swe-e2e-peer-project
+PEER_PROJECT_NAME=e2e
+PEER_INSTALLATION_NAME=peer-swe-platform
+kubectl create namespace "$PEER_SYSTEM_NAMESPACE"
+PEER_HELM_ARGS=(upgrade --install peer charts/swe-platform --namespace "$PEER_SYSTEM_NAMESPACE"
+	--values charts/swe-platform/values-kind.yaml --set tenancy.mode=scoped --set-json 'tenancy.namespaces=[]'
+	--set controlPlane.enabled=false --set-string "environmentTemplates[0].spec.image=$E2E_ENV_IMAGE"
+	--wait --timeout 2m)
+if [[ -n "${E2E_RUNTIME_CLASS:-}" ]]; then
+	PEER_HELM_ARGS+=(--set-string "environmentTemplates[0].spec.runtimeClass=$E2E_RUNTIME_CLASS")
+fi
+helm "${PEER_HELM_ARGS[@]}"
+bin/swe --namespace "$PEER_PROJECT_NAMESPACE" project onboard "$PEER_PROJECT_NAME" \
+	--system-namespace "$PEER_SYSTEM_NAMESPACE" --installation "$PEER_INSTALLATION_NAME" \
+	--repository git://unused --default-template small --template small "${QUOTA_ARGS[@]}"
+wait_for_resource_quota_observation "$PEER_PROJECT_NAMESPACE"
+PEER_HELM_ARGS+=(--set-string "tenancy.namespaces[0]=$PEER_PROJECT_NAMESPACE")
+helm "${PEER_HELM_ARGS[@]}"
+kubectl -n "$PEER_SYSTEM_NAMESPACE" rollout status deployment/"$PEER_INSTALLATION_NAME" --timeout=2m
+kubectl -n "$PEER_PROJECT_NAMESPACE" wait --for=jsonpath='{.status.warmPoolReady}'=1 environmenttemplate/small --timeout=2m
+PEER_INSTALLATION_UID=$(kubectl -n "$PEER_SYSTEM_NAMESPACE" get installation "$PEER_INSTALLATION_NAME" -o jsonpath='{.metadata.uid}')
+PEER_PROJECT_UID=$(kubectl -n "$PEER_PROJECT_NAMESPACE" get project "$PEER_PROJECT_NAME" -o jsonpath='{.metadata.uid}')
+PEER_CLAIM=$(kubectl get namespace "$PEER_PROJECT_NAMESPACE" -o json)
+if [[ "$PEER_INSTALLATION_UID" == "$INSTALLATION_UID" ]]; then
+	echo "FAIL: independent releases did not receive independent Installation identities"
+	exit 1
+fi
+jq -e --arg iu "$PEER_INSTALLATION_UID" --arg pu "$PEER_PROJECT_UID" '.metadata.annotations["swe.dev/installation-uid"]==$iu and .metadata.annotations["swe.dev/project-uid"]==$pu' <<<"$PEER_CLAIM" >/dev/null
+MAIN_OPERATOR_ROLE=$(kubectl -n "$PROJECT_NAMESPACE" get rolebinding swe-platform-operator -o jsonpath='{.roleRef.name}')
+PEER_OPERATOR_ROLE=$(kubectl -n "$PEER_PROJECT_NAMESPACE" get rolebinding swe-platform-operator -o jsonpath='{.roleRef.name}')
+if [[ "$MAIN_OPERATOR_ROLE" == "$PEER_OPERATOR_ROLE" || \
+	"$(kubectl -n "$PEER_PROJECT_NAMESPACE" get rolebinding swe-platform-operator -o jsonpath='{.subjects[0].namespace}')" != "$PEER_SYSTEM_NAMESPACE" ]]; then
+	echo "FAIL: independent releases share workload authority"
+	exit 1
+fi
+printf 'peer-e2e-retained-key' | bin/swe --namespace "$PEER_PROJECT_NAMESPACE" credentials create retained-peer --agent claude-code --api-key-stdin
+PEER_PROFILE_UID=$(kubectl -n "$PEER_PROJECT_NAMESPACE" get agentcredentialprofile retained-peer -o jsonpath='{.metadata.uid}')
+PEER_SECRET_NAME=$(kubectl -n "$PEER_PROJECT_NAMESPACE" get secrets -o json | jq -r --arg uid "$PEER_PROFILE_UID" '.items[] | select(any(.metadata.ownerReferences[]?; .uid == $uid)) | .metadata.name' | head -1)
+if [[ -z "$PEER_SECRET_NAME" ]]; then
+	echo "FAIL: retained credential profile has no exact UID-owned Secret"
+	exit 1
+fi
+PEER_TEMPLATE_UID=$(kubectl -n "$PEER_PROJECT_NAMESPACE" get environmenttemplate small -o jsonpath='{.metadata.uid}')
+PEER_ENVIRONMENT=$(kubectl -n "$PEER_PROJECT_NAMESPACE" get environments -l swe.dev/warm-pool=small -o jsonpath='{.items[0].metadata.name}')
+PEER_POD=$(kubectl -n "$PEER_PROJECT_NAMESPACE" get environment "$PEER_ENVIRONMENT" -o jsonpath='{.status.podName}')
+PEER_PVC=$(kubectl -n "$PEER_PROJECT_NAMESPACE" get pod "$PEER_POD" -o jsonpath='{.spec.volumes[?(@.name=="workspace")].persistentVolumeClaim.claimName}')
+PEER_PVC_UID=$(kubectl -n "$PEER_PROJECT_NAMESPACE" get pvc "$PEER_PVC" -o jsonpath='{.metadata.uid}')
+bin/swe --namespace "$PEER_PROJECT_NAMESPACE" project offboard "$PEER_PROJECT_NAME" \
+	--system-namespace "$PEER_SYSTEM_NAMESPACE" --installation "$PEER_INSTALLATION_NAME" --timeout 3m
+if [[ "$(kubectl get namespace "$PEER_PROJECT_NAMESPACE" -o jsonpath='{.metadata.annotations.swe\.dev/project-namespace-lifecycle}')" != "fenced" || \
+	"$(kubectl -n "$PEER_PROJECT_NAMESPACE" get environmenttemplate small -o jsonpath='{.metadata.uid}')" != "$PEER_TEMPLATE_UID" || \
+	"$(kubectl -n "$PEER_PROJECT_NAMESPACE" get pvc "$PEER_PVC" -o jsonpath='{.metadata.uid}')" != "$PEER_PVC_UID" || \
+	"$(kubectl -n "$PEER_PROJECT_NAMESPACE" get secret "$PEER_SECRET_NAME" -o jsonpath='{.metadata.ownerReferences[0].uid}')" != "$PEER_PROFILE_UID" ]]; then
+	echo "FAIL: retained offboarding removed or replaced claimed resources"
+	exit 1
+fi
+if [[ -n "$(kubectl -n "$PEER_PROJECT_NAMESPACE" get environment "$PEER_ENVIRONMENT" -o jsonpath='{.status.podName}')" ]] || \
+	kubectl -n "$PEER_PROJECT_NAMESPACE" get pod "$PEER_POD" >/dev/null 2>&1; then
+	echo "FAIL: retained offboarding left a warm Environment pod running"
+	exit 1
+fi
+helm upgrade peer charts/swe-platform --namespace "$PEER_SYSTEM_NAMESPACE" \
+	--values charts/swe-platform/values-kind.yaml --set tenancy.mode=scoped --set-json 'tenancy.namespaces=[]' \
+	--set controlPlane.enabled=false --set-string "environmentTemplates[0].spec.image=$E2E_ENV_IMAGE" --wait --timeout 2m
+kubectl -n "$PEER_SYSTEM_NAMESPACE" rollout status deployment/"$PEER_INSTALLATION_NAME" --timeout=2m
 
 echo "==> creating project configuration"
 PROJECT_REPO="$(mktemp -d /tmp/swe-e2e-project-XXXXXX)"
@@ -356,6 +535,8 @@ spec:
       command: [/bin/sh, -c]
       args:
         - git clone --bare /seed/repo.bundle /repos/e2e.git && git -C /repos/e2e.git symbolic-ref HEAD refs/heads/main
+      resources:
+        requests: {cpu: 10m, memory: 32Mi}
       volumeMounts:
         - {name: seed, mountPath: /seed}
         - {name: repositories, mountPath: /repos}
@@ -365,6 +546,8 @@ spec:
       command: [git, daemon, --reuseaddr, --base-path=/repos, --export-all, --verbose]
       ports:
         - {name: git, containerPort: 9418}
+      resources:
+        requests: {cpu: 10m, memory: 32Mi}
       volumeMounts:
         - {name: repositories, mountPath: /repos}
   volumes:
@@ -381,25 +564,28 @@ spec:
   selector: {app: e2e-git-server}
   ports:
     - {name: git, port: 9418, targetPort: git}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: e2e-git-server-ingress
+spec:
+  podSelector:
+    matchLabels: {app: e2e-git-server}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector: {}
+      ports:
+        - {protocol: TCP, port: 9418}
 EOF
 kubectl wait --for=condition=Ready pod/e2e-git-server --timeout=1m
 rm -rf "$PROJECT_REPO" "$PROJECT_WORKTREE"
 PROJECT_REPO=""
 PROJECT_WORKTREE=""
-kubectl apply -f - <<'EOF'
-apiVersion: swe.dev/v1alpha1
-kind: Project
-metadata:
-  name: e2e
-spec:
-  repositories:
-    - git://e2e-git-server/e2e.git
-  templateRef: small
-EOF
-
 echo "==> creating project environment + run intent via swe"
-printf '%s' "$E2E_AGENT_API_KEY" | bin/swe credentials create e2e-claude --agent claude-code --api-key-stdin
-bin/swe run "end-to-end smoke test" --project e2e --credential-profile e2e-claude --wait=false
+printf '%s' "$E2E_AGENT_API_KEY" | bin/swe --namespace "$PROJECT_NAMESPACE" credentials create e2e-claude --agent claude-code --api-key-stdin
+bin/swe --namespace "$PROJECT_NAMESPACE" run "end-to-end smoke test" --project "$PROJECT_NAME" --credential-profile e2e-claude --wait=false
 RUN_NAME=$(kubectl get runs -o jsonpath='{.items[0].metadata.name}')
 kubectl wait --for=jsonpath='{.status.state}'=Running run/"$RUN_NAME" --timeout=3m
 kubectl wait --for=jsonpath='{.status.state}'=Succeeded run/"$RUN_NAME" --timeout=3m
@@ -511,7 +697,7 @@ roleRef:
 subjects:
   - kind: ServiceAccount
     name: e2e-transcript-producer
-    namespace: default
+    namespace: ${PROJECT_NAMESPACE}
 ---
 apiVersion: v1
 kind: ServiceAccount
@@ -539,7 +725,7 @@ roleRef:
 subjects:
   - kind: ServiceAccount
     name: e2e-transcript-reader
-    namespace: default
+    namespace: ${PROJECT_NAMESPACE}
 ---
 apiVersion: v1
 kind: ServiceAccount
@@ -567,14 +753,14 @@ roleRef:
 subjects:
   - kind: ServiceAccount
     name: e2e-terminal
-    namespace: default
+    namespace: ${PROJECT_NAMESPACE}
 EOF
 PRODUCER_TOKEN=$(kubectl create token e2e-transcript-producer --audience=swe-platform)
 READER_TOKEN=$(kubectl create token e2e-transcript-reader --audience=swe-platform)
 TERMINAL_TOKEN=$(kubectl create token e2e-terminal --audience=swe-platform)
 
 echo "==> configuring a console API user"
-cat <<'EOF' | kubectl apply -f -
+cat <<EOF | kubectl apply -f -
 apiVersion: v1
 kind: ServiceAccount
 metadata:
@@ -606,9 +792,9 @@ roleRef:
 subjects:
   - kind: ServiceAccount
     name: e2e-console
-    namespace: default
+    namespace: ${PROJECT_NAMESPACE}
 EOF
-cat <<'EOF' | kubectl apply -f -
+cat <<EOF | kubectl apply -f -
 apiVersion: v1
 kind: Namespace
 metadata:
@@ -636,7 +822,7 @@ roleRef:
 subjects:
   - kind: ServiceAccount
     name: e2e-console
-    namespace: default
+    namespace: ${PROJECT_NAMESPACE}
 ---
 apiVersion: swe.dev/v1alpha1
 kind: Run
@@ -651,7 +837,7 @@ EOF
 CONSOLE_TOKEN=$(kubectl create token e2e-console --audience=swe-platform)
 
 echo "==> verifying live transcript stream through the control plane"
-kubectl port-forward service/swe-platform-swe-platform-control-plane 18080:80 >/tmp/swe-platform-port-forward.log 2>&1 &
+kubectl -n "$SYSTEM_NAMESPACE" port-forward service/swe-platform-swe-platform-control-plane 18080:80 >/tmp/swe-platform-port-forward.log 2>&1 &
 PORT_FORWARD_PID=$!
 for _ in $(seq 1 30); do
 	if curl --fail --silent http://127.0.0.1:18080/healthz >/dev/null; then
@@ -659,6 +845,16 @@ for _ in $(seq 1 30); do
 	fi
 	sleep 1
 done
+UNLISTED_STATUS=$(curl --silent --output /dev/null --write-out '%{http_code}' \
+	-H "Authorization: Bearer ${E2E_BOOTSTRAP_TOKEN}" \
+	"http://127.0.0.1:18080/api/v1/namespaces/${ADOPT_NAMESPACE}/runs")
+UNLISTED_ENVIRONMENTS=$(kubectl -n "$ADOPT_NAMESPACE" get environments -o json | jq '.items | length')
+if [[ "$UNLISTED_STATUS" != "403" || "$UNLISTED_ENVIRONMENTS" != "0" ]]; then
+	echo "FAIL: active but unlisted claimed Namespace status=${UNLISTED_STATUS} environments=${UNLISTED_ENVIRONMENTS}, expected 403/0"
+	exit 1
+fi
+# Direct test-admin cleanup: retention/purge semantics are deliberately not involved.
+kubectl delete namespace "$ADOPT_NAMESPACE" --wait=false
 
 WEB_TERMINAL_SOURCE="$(mktemp /tmp/swe-browser-terminal-XXXXXX.go)"
 WEB_TERMINAL_CLIENT="${WEB_TERMINAL_SOURCE%.go}"
@@ -739,8 +935,8 @@ WEB_TERMINAL_SOURCE=""
 
 echo "==> verifying terminal console authenticated client path"
 SWE_CONTROL_PLANE_URL=http://127.0.0.1:18080 SWE_CONTROL_PLANE_TOKEN="$CONSOLE_TOKEN" \
-	bin/swe tui --check --namespace default > /tmp/swe-platform-tui-check.out
-if ! grep -Fq 'terminal console API ready for namespace default' /tmp/swe-platform-tui-check.out || \
+	bin/swe tui --check --namespace "$PROJECT_NAMESPACE" > /tmp/swe-platform-tui-check.out
+if ! grep -Fq "terminal console API ready for namespace $PROJECT_NAMESPACE" /tmp/swe-platform-tui-check.out || \
 	grep -Fq "$CONSOLE_TOKEN" /tmp/swe-platform-tui-check.out; then
 	echo "FAIL: swe tui --check did not validate the namespaced Run API safely"
 	cat /tmp/swe-platform-tui-check.out
@@ -753,7 +949,7 @@ ROOT_STATUS=$(curl --silent --dump-header /tmp/swe-platform-console-root.headers
 	http://127.0.0.1:18080/)
 SPA_STATUS=$(curl --silent --dump-header /tmp/swe-platform-console-spa.headers \
 	--output /tmp/swe-platform-console-spa.html --write-out '%{http_code}' \
-	"http://127.0.0.1:18080/namespaces/default/runs/${RUN_NAME}/overview")
+	"http://127.0.0.1:18080/namespaces/${PROJECT_NAMESPACE}/runs/${RUN_NAME}/overview")
 OTHER_NAMESPACE_SPA_STATUS=$(curl --silent --output /tmp/swe-platform-console-other-spa.html \
 	--write-out '%{http_code}' http://127.0.0.1:18080/namespaces/e2e-console-other/runs)
 ASSET_PATH=$(grep -oE 'src="/assets/[^"]+"' /tmp/swe-platform-console-root.html | head -1 | cut -d'"' -f2 || true)
@@ -797,20 +993,18 @@ fi
 SESSION_GET_STATUS=$(curl --silent --output /dev/null --write-out '%{http_code}' \
 	--cookie "$COOKIE_JAR" http://127.0.0.1:18080/api/v1/session)
 RUN_LIST_STATUS=$(curl --silent --output /tmp/swe-platform-runs.json --write-out '%{http_code}' \
-	--cookie "$COOKIE_JAR" 'http://127.0.0.1:18080/api/v1/namespaces/default/runs?limit=200')
+	--cookie "$COOKIE_JAR" "http://127.0.0.1:18080/api/v1/namespaces/${PROJECT_NAMESPACE}/runs?limit=200")
 OTHER_RUN_LIST_STATUS=$(curl --silent --output /tmp/swe-platform-other-runs.json --write-out '%{http_code}' \
 	--cookie "$COOKIE_JAR" 'http://127.0.0.1:18080/api/v1/namespaces/e2e-console-other/runs?limit=200')
 ENV_GET_STATUS=$(curl --silent --output /tmp/swe-platform-environment.json --write-out '%{http_code}' \
-	--cookie "$COOKIE_JAR" "http://127.0.0.1:18080/api/v1/namespaces/default/environments/${ENV_NAME}")
-if [[ "$SESSION_GET_STATUS" != "200" || "$RUN_LIST_STATUS" != "200" || "$OTHER_RUN_LIST_STATUS" != "200" || "$ENV_GET_STATUS" != "200" ]]; then
+	--cookie "$COOKIE_JAR" "http://127.0.0.1:18080/api/v1/namespaces/${PROJECT_NAMESPACE}/environments/${ENV_NAME}")
+if [[ "$SESSION_GET_STATUS" != "200" || "$RUN_LIST_STATUS" != "200" || "$OTHER_RUN_LIST_STATUS" != "403" || "$ENV_GET_STATUS" != "200" ]]; then
 	echo "FAIL: typed read API statuses session=${SESSION_GET_STATUS} runs=${RUN_LIST_STATUS} other-runs=${OTHER_RUN_LIST_STATUS} environment=${ENV_GET_STATUS}"
 	exit 1
 fi
-if ! grep -Fq '"name":"e2e-other-namespace-run"' /tmp/swe-platform-other-runs.json || \
-	grep -Fq '"name":"e2e-other-namespace-run"' /tmp/swe-platform-runs.json || \
-	! grep -Fq "\"name\":\"${RUN_NAME}\"" /tmp/swe-platform-runs.json || \
-	grep -Fq "\"name\":\"${RUN_NAME}\"" /tmp/swe-platform-other-runs.json; then
-	echo "FAIL: browser-session Run feeds were not isolated by namespace"
+if grep -Fq '"name":"e2e-other-namespace-run"' /tmp/swe-platform-runs.json || \
+	! grep -Fq "\"name\":\"${RUN_NAME}\"" /tmp/swe-platform-runs.json; then
+	echo "FAIL: browser-session Run feed crossed the claimed namespace boundary"
 	exit 1
 fi
 if ! grep -Fq '"credentialProfile":"e2e-claude"' /tmp/swe-platform-runs.json || \
@@ -822,7 +1016,7 @@ fi
 
 echo "==> verifying authenticated typed Run watch"
 curl --fail --silent --cookie "$COOKIE_JAR" \
-	'http://127.0.0.1:18080/api/v1/namespaces/default/runs?limit=200&view=summary' \
+	"http://127.0.0.1:18080/api/v1/namespaces/${PROJECT_NAMESPACE}/runs?limit=200&view=summary" \
 	> /tmp/swe-platform-run-watch-snapshot.json
 RUN_WATCH_RV=$(python3 -c 'import json; print(json.load(open("/tmp/swe-platform-run-watch-snapshot.json"))["resourceVersion"])')
 DENIED_WATCH_STATUS=$(curl --silent --output /dev/null --write-out '%{http_code}' \
@@ -833,7 +1027,7 @@ if [[ "$DENIED_WATCH_STATUS" != "403" ]]; then
 	exit 1
 fi
 curl --silent --no-buffer --max-time 30 --cookie "$COOKIE_JAR" -H 'Accept: text/event-stream' \
-	"http://127.0.0.1:18080/api/v1/namespaces/default/runs?watch=true&view=summary&resourceVersion=${RUN_WATCH_RV}" \
+	"http://127.0.0.1:18080/api/v1/namespaces/${PROJECT_NAMESPACE}/runs?watch=true&view=summary&resourceVersion=${RUN_WATCH_RV}" \
 	> /tmp/swe-platform-run-watch.out &
 RUN_WATCH_PID=$!
 cat <<'EOF' | kubectl apply -f -
@@ -886,17 +1080,17 @@ fi
 API_RUN_BODY='{"name":"e2e-api-run","selector":{"template":"small"},"agent":"e2e","prompt":"resource API acceptance"}'
 API_CREATE_STATUS=$(curl --silent --output /tmp/swe-platform-api-run.json --write-out '%{http_code}' \
 	--cookie "$COOKIE_JAR" -H 'Origin: http://127.0.0.1:18080' -H 'Content-Type: application/json' \
-	-d "$API_RUN_BODY" http://127.0.0.1:18080/api/v1/namespaces/default/runs)
+	-d "$API_RUN_BODY" "http://127.0.0.1:18080/api/v1/namespaces/${PROJECT_NAMESPACE}/runs")
 API_RETRY_STATUS=$(curl --silent --output /dev/null --write-out '%{http_code}' \
 	--cookie "$COOKIE_JAR" -H 'Origin: http://127.0.0.1:18080' -H 'Content-Type: application/json' \
-	-d "$API_RUN_BODY" http://127.0.0.1:18080/api/v1/namespaces/default/runs)
+	-d "$API_RUN_BODY" "http://127.0.0.1:18080/api/v1/namespaces/${PROJECT_NAMESPACE}/runs")
 API_RUN_UID=$(python3 -c 'import json; print(json.load(open("/tmp/swe-platform-api-run.json"))["uid"])')
 CSRF_STATUS=$(curl --silent --output /dev/null --write-out '%{http_code}' \
-	--cookie "$COOKIE_JAR" -X POST http://127.0.0.1:18080/api/v1/namespaces/default/runs/e2e-api-run/cancel)
+	--cookie "$COOKIE_JAR" -X POST "http://127.0.0.1:18080/api/v1/namespaces/${PROJECT_NAMESPACE}/runs/e2e-api-run/cancel")
 API_CANCEL_STATUS=$(curl --silent --output /dev/null --write-out '%{http_code}' \
 	--cookie "$COOKIE_JAR" -X POST -H 'Origin: http://127.0.0.1:18080' -H 'Content-Type: application/json' \
 	-d "{\"runUID\":\"${API_RUN_UID}\"}" \
-	http://127.0.0.1:18080/api/v1/namespaces/default/runs/e2e-api-run/cancel)
+	"http://127.0.0.1:18080/api/v1/namespaces/${PROJECT_NAMESPACE}/runs/e2e-api-run/cancel")
 if [[ "$API_CREATE_STATUS" != "201" || "$API_RETRY_STATUS" != "200" || "$CSRF_STATUS" != "403" || "$API_CANCEL_STATUS" != "200" ]]; then
 	echo "FAIL: typed mutation API statuses create=${API_CREATE_STATUS} retry=${API_RETRY_STATUS} csrf=${CSRF_STATUS} cancel=${API_CANCEL_STATUS}"
 	exit 1
@@ -916,7 +1110,7 @@ if [[ "$LOGOUT_REPLAY_STATUS" != "401" ]]; then
 fi
 
 ANONYMOUS_STATUS=$(curl --silent --output /dev/null --write-out '%{http_code}' \
-	"http://127.0.0.1:18080/api/v1/namespaces/default/runs/${RUN_NAME}/transcript")
+	"http://127.0.0.1:18080/api/v1/namespaces/${PROJECT_NAMESPACE}/runs/${RUN_NAME}/transcript")
 if [[ "$ANONYMOUS_STATUS" != "401" ]]; then
 	echo "FAIL: anonymous transcript status was ${ANONYMOUS_STATUS}, expected 401"
 	exit 1
@@ -924,10 +1118,10 @@ fi
 curl --fail --silent --no-buffer --max-time 10 \
 	-H "Authorization: Bearer ${READER_TOKEN}" \
 	-H "SWE-Run-UID: ${RUN_UID}" \
-	"http://127.0.0.1:18080/api/v1/namespaces/default/runs/${RUN_NAME}/transcript" > /tmp/swe-platform-transcript.out &
+	"http://127.0.0.1:18080/api/v1/namespaces/${PROJECT_NAMESPACE}/runs/${RUN_NAME}/transcript" > /tmp/swe-platform-transcript.out &
 STREAM_PID=$!
 SWE_CONTROL_PLANE_URL=http://127.0.0.1:18080 SWE_CONTROL_PLANE_TOKEN="$READER_TOKEN" \
-	timeout 10 bin/swe logs --run "$RUN_NAME" --run-uid "$RUN_UID" > /tmp/swe-platform-cli-transcript.out &
+	timeout 10 bin/swe --namespace "$PROJECT_NAMESPACE" logs --run "$RUN_NAME" --run-uid "$RUN_UID" > /tmp/swe-platform-cli-transcript.out &
 CLI_STREAM_PID=$!
 sleep 1
 APPEND_STATUS=$(curl --silent --output /dev/null --write-out '%{http_code}' \
@@ -935,7 +1129,7 @@ APPEND_STATUS=$(curl --silent --output /dev/null --write-out '%{http_code}' \
 	-H 'Content-Type: application/json' \
 	-H "SWE-Run-UID: ${RUN_UID}" \
 	-d '{"type":"output","data":{"text":"e2e transcript event"}}' \
-	"http://127.0.0.1:18080/api/v1/namespaces/default/runs/${RUN_NAME}/transcript")
+	"http://127.0.0.1:18080/api/v1/namespaces/${PROJECT_NAMESPACE}/runs/${RUN_NAME}/transcript")
 if [[ "$APPEND_STATUS" != "202" ]]; then
 	echo "FAIL: run-scoped producer append status was ${APPEND_STATUS}, expected 202"
 	exit 1
@@ -945,7 +1139,7 @@ DENIED_STATUS=$(curl --silent --output /dev/null --write-out '%{http_code}' \
 	-H 'Content-Type: application/json' \
 	-H "SWE-Run-UID: ${RUN_UID}" \
 	-d '{"type":"output","data":{"text":"forged"}}' \
-	http://127.0.0.1:18080/api/v1/namespaces/default/runs/auth-scope-run-b/transcript)
+	"http://127.0.0.1:18080/api/v1/namespaces/${PROJECT_NAMESPACE}/runs/auth-scope-run-b/transcript")
 if [[ "$DENIED_STATUS" != "403" ]]; then
 	echo "FAIL: cross-run producer append status was ${DENIED_STATUS}, expected 403"
 	exit 1
@@ -955,7 +1149,7 @@ STALE_UID_STATUS=$(curl --silent --output /dev/null --write-out '%{http_code}' \
 	-H 'Content-Type: application/json' \
 	-H 'SWE-Run-UID: stale-uid-not-current' \
 	-d '{"type":"output","data":{"text":"stale"}}' \
-	"http://127.0.0.1:18080/api/v1/namespaces/default/runs/${RUN_NAME}/transcript")
+	"http://127.0.0.1:18080/api/v1/namespaces/${PROJECT_NAMESPACE}/runs/${RUN_NAME}/transcript")
 if [[ "$STALE_UID_STATUS" != "409" ]]; then
 	echo "FAIL: stale UID producer append status was ${STALE_UID_STATUS}, expected 409"
 	exit 1
@@ -964,29 +1158,29 @@ MISSING_UID_STATUS=$(curl --silent --output /dev/null --write-out '%{http_code}'
 	-H "Authorization: Bearer ${PRODUCER_TOKEN}" \
 	-H 'Content-Type: application/json' \
 	-d '{"type":"output","data":{"text":"unfenced"}}' \
-	"http://127.0.0.1:18080/api/v1/namespaces/default/runs/${RUN_NAME}/transcript")
+	"http://127.0.0.1:18080/api/v1/namespaces/${PROJECT_NAMESPACE}/runs/${RUN_NAME}/transcript")
 if [[ "$MISSING_UID_STATUS" != "428" ]]; then
 	echo "FAIL: missing UID producer append status was ${MISSING_UID_STATUS}, expected 428"
 	exit 1
 fi
 MISSING_READ_UID_STATUS=$(curl --silent --output /dev/null --write-out '%{http_code}' \
 	-H "Authorization: Bearer ${E2E_BOOTSTRAP_TOKEN}" \
-	"http://127.0.0.1:18080/api/v1/namespaces/default/runs/${RUN_NAME}/transcript")
+	"http://127.0.0.1:18080/api/v1/namespaces/${PROJECT_NAMESPACE}/runs/${RUN_NAME}/transcript")
 OVERLONG_READ_UID_STATUS=$(curl --silent --output /dev/null --write-out '%{http_code}' \
 	-H "Authorization: Bearer ${E2E_BOOTSTRAP_TOKEN}" \
 	-H "SWE-Run-UID: $(printf 'x%.0s' $(seq 1 129))" \
-	"http://127.0.0.1:18080/api/v1/namespaces/default/runs/${RUN_NAME}/transcript")
+	"http://127.0.0.1:18080/api/v1/namespaces/${PROJECT_NAMESPACE}/runs/${RUN_NAME}/transcript")
 STALE_READ_UID_STATUS=$(curl --silent --output /dev/null --write-out '%{http_code}' \
 	-H "Authorization: Bearer ${E2E_BOOTSTRAP_TOKEN}" \
 	-H 'SWE-Run-UID: stale-uid-not-current' \
-	"http://127.0.0.1:18080/api/v1/namespaces/default/runs/${RUN_NAME}/transcript")
+	"http://127.0.0.1:18080/api/v1/namespaces/${PROJECT_NAMESPACE}/runs/${RUN_NAME}/transcript")
 DENIED_READ_STATUS=$(curl --silent --output /dev/null --write-out '%{http_code}' \
 	-H "Authorization: Bearer ${PRODUCER_TOKEN}" \
 	-H "SWE-Run-UID: $(printf 'x%.0s' $(seq 1 129))" \
-	"http://127.0.0.1:18080/api/v1/namespaces/default/runs/${RUN_NAME}/transcript")
+	"http://127.0.0.1:18080/api/v1/namespaces/${PROJECT_NAMESPACE}/runs/${RUN_NAME}/transcript")
 READER_BASE_RUN_STATUS=$(curl --silent --output /dev/null --write-out '%{http_code}' \
 	-H "Authorization: Bearer ${READER_TOKEN}" \
-	"http://127.0.0.1:18080/api/v1/namespaces/default/runs/${RUN_NAME}")
+	"http://127.0.0.1:18080/api/v1/namespaces/${PROJECT_NAMESPACE}/runs/${RUN_NAME}")
 if [[ "$MISSING_READ_UID_STATUS" != "428" || "$OVERLONG_READ_UID_STATUS" != "400" || \
 	"$STALE_READ_UID_STATUS" != "409" || "$DENIED_READ_STATUS" != "403" || "$READER_BASE_RUN_STATUS" != "403" ]]; then
 	echo "FAIL: transcript read identity statuses missing=${MISSING_READ_UID_STATUS} overlong=${OVERLONG_READ_UID_STATUS} stale=${STALE_READ_UID_STATUS} denied=${DENIED_READ_STATUS} base-run=${READER_BASE_RUN_STATUS}"
@@ -995,7 +1189,7 @@ fi
 UNKNOWN_STATUS=$(curl --silent --output /dev/null --write-out '%{http_code}' \
 	-H "Authorization: Bearer ${E2E_BOOTSTRAP_TOKEN}" \
 	-H 'SWE-Run-UID: unknown-run-uid' \
-	http://127.0.0.1:18080/api/v1/namespaces/default/runs/unknown-run/transcript)
+	"http://127.0.0.1:18080/api/v1/namespaces/${PROJECT_NAMESPACE}/runs/unknown-run/transcript")
 if [[ "$UNKNOWN_STATUS" != "404" ]]; then
 	echo "FAIL: unknown Run transcript status was ${UNKNOWN_STATUS}, expected 404"
 	exit 1
@@ -1035,7 +1229,7 @@ echo "==> verifying local authenticated MCP stdio tools"
 	sleep 2
 } | \
 	SWE_CONTROL_PLANE_URL=http://127.0.0.1:18080 SWE_CONTROL_PLANE_TOKEN="$READER_TOKEN" \
-	timeout 10 bin/swe mcp > /tmp/swe-platform-mcp.out || {
+	timeout 10 bin/swe --namespace "$PROJECT_NAMESPACE" mcp > /tmp/swe-platform-mcp.out || {
 	echo "FAIL: local MCP stdio process did not complete cleanly"
 	cat /tmp/swe-platform-mcp.out
 	exit 1
@@ -1081,7 +1275,7 @@ if contains_e2e_key /tmp/swe-platform-workspace.tar; then
 fi
 
 echo "==> rotating the profile without restarting the existing process"
-printf '%s' "$E2E_ROTATED_AGENT_API_KEY" | bin/swe credentials rotate e2e-claude --api-key-stdin
+printf '%s' "$E2E_ROTATED_AGENT_API_KEY" | bin/swe --namespace "$PROJECT_NAMESPACE" credentials rotate e2e-claude --api-key-stdin
 
 kubectl delete run "$RUN_NAME" --wait=true >/dev/null
 if ! kubectl get environment "$RUN_ENV_NAME" >/dev/null 2>&1; then
@@ -1092,18 +1286,18 @@ fi
 echo "==> verifying shared terminal through swe attach"
 MISSING_TERMINAL_UID_STATUS=$(curl --silent --output /dev/null --write-out '%{http_code}' \
 	-H "Authorization: Bearer ${TERMINAL_TOKEN}" \
-	"http://127.0.0.1:18080/api/v1/namespaces/default/environments/${ENV_NAME}/terminal")
+	"http://127.0.0.1:18080/api/v1/namespaces/${PROJECT_NAMESPACE}/environments/${ENV_NAME}/terminal")
 UNAUTHORIZED_TERMINAL_STATUS=$(curl --silent --output /dev/null --write-out '%{http_code}' \
 	-H "Authorization: Bearer ${READER_TOKEN}" \
 	-H 'SWE-Environment-UID: stale-environment-uid' \
-	"http://127.0.0.1:18080/api/v1/namespaces/default/environments/${ENV_NAME}/terminal")
+	"http://127.0.0.1:18080/api/v1/namespaces/${PROJECT_NAMESPACE}/environments/${ENV_NAME}/terminal")
 if [[ "$MISSING_TERMINAL_UID_STATUS" != "400" || "$UNAUTHORIZED_TERMINAL_STATUS" != "403" ]]; then
 	echo "FAIL: direct terminal auth/identity ordering statuses missing=${MISSING_TERMINAL_UID_STATUS} unauthorized=${UNAUTHORIZED_TERMINAL_STATUS}"
 	exit 1
 fi
 printf 'printf terminal-e2e-ok; if [ -n "${ANTHROPIC_API_KEY+x}" ]; then printf credential-present; else printf credential-absent; fi; exit\n' | \
 	SWE_CONTROL_PLANE_URL=http://127.0.0.1:18080 SWE_CONTROL_PLANE_TOKEN="$TERMINAL_TOKEN" \
-	bin/swe attach "$ENV_NAME" --environment-uid "$ENV_UID" > /tmp/swe-platform-terminal.out
+	bin/swe --namespace "$PROJECT_NAMESPACE" attach "$ENV_NAME" --environment-uid "$ENV_UID" > /tmp/swe-platform-terminal.out
 if ! grep -q 'terminal-e2e-ok' /tmp/swe-platform-terminal.out; then
 	echo "FAIL: terminal output was not received through swe attach"
 	cat /tmp/swe-platform-terminal.out
@@ -1136,7 +1330,7 @@ if ! kubectl exec "$POD_NAME" -- sh -c 'test "$(wc -l < /workspace/setup-result)
 fi
 
 echo "==> verifying pause retains the workspace and resume runs its hook"
-bin/swe environment hold "$ENV_NAME"
+bin/swe --namespace "$PROJECT_NAMESPACE" environment hold "$ENV_NAME"
 for _ in $(seq 1 60); do
 	PHASE=$(kubectl get environment "$ENV_NAME" -o jsonpath='{.status.phase}')
 	if [[ "$PHASE" == "Paused" ]] && ! kubectl get pod "$POD_NAME" >/dev/null 2>&1; then
@@ -1161,7 +1355,7 @@ if [[ "$(kubectl get environment "$ENV_NAME" -o jsonpath='{.spec.lifecycle.hold.
 	echo "FAIL: swe environment hold did not publish enabled revisioned policy"
 	exit 1
 fi
-bin/swe environment release "$ENV_NAME"
+bin/swe --namespace "$PROJECT_NAMESPACE" environment release "$ENV_NAME"
 RELEASE_REVISION=$(kubectl get environment "$ENV_NAME" -o jsonpath='{.spec.lifecycle.hold.revision}')
 if [[ "$(kubectl get environment "$ENV_NAME" -o jsonpath='{.spec.lifecycle.hold.enabled}')" != "false" || "$RELEASE_REVISION" -le "$HOLD_REVISION" ]]; then
 	echo "FAIL: swe environment release did not publish a newer disabled policy"
@@ -1187,18 +1381,18 @@ fi
 
 echo "==> verifying the rotated key is materialized only for a fresh agent launch"
 RESUME_RUN_NAME=e2e-resume-credential-run
-bin/swe run "resume credential smoke test" --name "$RESUME_RUN_NAME" --environment "$ENV_NAME" \
+bin/swe --namespace "$PROJECT_NAMESPACE" run "resume credential smoke test" --name "$RESUME_RUN_NAME" --environment "$ENV_NAME" \
 	--credential-profile e2e-claude --wait=false
 kubectl wait --for=jsonpath='{.status.state}'=Running run/"$RESUME_RUN_NAME" --timeout=3m
 RESUME_RUN_UID=$(kubectl get run "$RESUME_RUN_NAME" -o jsonpath='{.metadata.uid}')
 RESUME_ENV_UID=$(kubectl get run "$RESUME_RUN_NAME" -o jsonpath='{.status.environmentRef.uid}')
-RUN_TERMINAL_PATH="/api/v1/namespaces/default/runs/${RESUME_RUN_NAME}/terminal/${RESUME_RUN_UID}/${RESUME_ENV_UID}"
+RUN_TERMINAL_PATH="/api/v1/namespaces/${PROJECT_NAMESPACE}/runs/${RESUME_RUN_NAME}/terminal/${RESUME_RUN_UID}/${RESUME_ENV_UID}"
 echo "==> verifying exact browser Run terminal through a same-origin session"
 "$WEB_TERMINAL_CLIENT" http://127.0.0.1:18080 "$CONSOLE_TOKEN" "$RUN_TERMINAL_PATH" \
 	$'touch /workspace/browser-terminal-opened; printf browser-run-terminal-e2e-ok; exit\n' browser-run-terminal-e2e-ok
 STALE_RUN_ENVIRONMENT_STATUS=$(curl --silent --output /dev/null --write-out '%{http_code}' \
 	-H "Authorization: Bearer ${CONSOLE_TOKEN}" \
-	"http://127.0.0.1:18080/api/v1/namespaces/default/runs/${RESUME_RUN_NAME}/terminal/${RESUME_RUN_UID}/stale-environment-uid")
+	"http://127.0.0.1:18080/api/v1/namespaces/${PROJECT_NAMESPACE}/runs/${RESUME_RUN_NAME}/terminal/${RESUME_RUN_UID}/stale-environment-uid")
 if [[ "$STALE_RUN_ENVIRONMENT_STATUS" != "409" ]]; then
 	echo "FAIL: browser Run terminal stale Environment status was ${STALE_RUN_ENVIRONMENT_STATUS}, expected 409"
 	exit 1
@@ -1217,7 +1411,7 @@ if [[ "${RELEASED_CLAIM_UID:-}" == "$RESUME_RUN_UID" ]]; then
 fi
 RELEASED_RUN_TERMINAL_STATUS=$(curl --silent --output /dev/null --write-out '%{http_code}' \
 	-H "Authorization: Bearer ${CONSOLE_TOKEN}" \
-	"http://127.0.0.1:18080/api/v1/namespaces/default/runs/${RESUME_RUN_NAME}/terminal/${RESUME_RUN_UID}/${RESUME_ENV_UID}")
+	"http://127.0.0.1:18080/api/v1/namespaces/${PROJECT_NAMESPACE}/runs/${RESUME_RUN_NAME}/terminal/${RESUME_RUN_UID}/${RESUME_ENV_UID}")
 if [[ "$RELEASED_RUN_TERMINAL_STATUS" != "409" ]]; then
 	echo "FAIL: released browser Run terminal status was ${RELEASED_RUN_TERMINAL_STATUS}, expected 409"
 	exit 1
@@ -1232,7 +1426,7 @@ set +e
 curl --silent --no-buffer --max-time 2 \
 	-H "Authorization: Bearer ${E2E_BOOTSTRAP_TOKEN}" \
 	-H "SWE-Run-UID: ${RESUME_RUN_UID}" \
-	"http://127.0.0.1:18080/api/v1/namespaces/default/runs/${RESUME_RUN_NAME}/transcript" \
+	"http://127.0.0.1:18080/api/v1/namespaces/${PROJECT_NAMESPACE}/runs/${RESUME_RUN_NAME}/transcript" \
 	> /tmp/swe-platform-resume-transcript.out
 RESUME_TRANSCRIPT_STATUS=$?
 set -e
@@ -1258,13 +1452,13 @@ fi
 
 echo "==> verifying credentialed fake Amp process scope without network"
 AMP_RUN_NAME=e2e-fake-amp-run
-printf '%s' "$E2E_AMP_API_KEY" | bin/swe credentials create e2e-amp --agent amp --api-key-stdin
-bin/swe run "fake Amp lifecycle smoke test" --name "$AMP_RUN_NAME" --environment "$ENV_NAME" \
+printf '%s' "$E2E_AMP_API_KEY" | bin/swe --namespace "$PROJECT_NAMESPACE" credentials create e2e-amp --agent amp --api-key-stdin
+bin/swe --namespace "$PROJECT_NAMESPACE" run "fake Amp lifecycle smoke test" --name "$AMP_RUN_NAME" --environment "$ENV_NAME" \
 	--agent amp --credential-profile e2e-amp --wait=false
 kubectl wait --for=jsonpath='{.status.state}'=Running run/"$AMP_RUN_NAME" --timeout=3m
 REASSIGNED_RUN_TERMINAL_STATUS=$(curl --silent --output /dev/null --write-out '%{http_code}' \
 	-H "Authorization: Bearer ${CONSOLE_TOKEN}" \
-	"http://127.0.0.1:18080/api/v1/namespaces/default/runs/${RESUME_RUN_NAME}/terminal/${RESUME_RUN_UID}/${RESUME_ENV_UID}")
+	"http://127.0.0.1:18080/api/v1/namespaces/${PROJECT_NAMESPACE}/runs/${RESUME_RUN_NAME}/terminal/${RESUME_RUN_UID}/${RESUME_ENV_UID}")
 if [[ "$REASSIGNED_RUN_TERMINAL_STATUS" != "409" ]]; then
 	echo "FAIL: reassigned browser Run terminal status was ${REASSIGNED_RUN_TERMINAL_STATUS}, expected 409"
 	exit 1
@@ -1283,7 +1477,7 @@ set +e
 curl --silent --no-buffer --max-time 2 \
 	-H "Authorization: Bearer ${E2E_BOOTSTRAP_TOKEN}" \
 	-H "SWE-Run-UID: ${AMP_RUN_UID}" \
-	"http://127.0.0.1:18080/api/v1/namespaces/default/runs/${AMP_RUN_NAME}/transcript" \
+	"http://127.0.0.1:18080/api/v1/namespaces/${PROJECT_NAMESPACE}/runs/${AMP_RUN_NAME}/transcript" \
 	> /tmp/swe-platform-amp-transcript.out
 AMP_TRANSCRIPT_STATUS=$?
 set -e
@@ -1304,8 +1498,8 @@ if ! grep -Fq 'fake-amp-stdout-marker' /tmp/swe-platform-amp-process-output.out 
 	exit 1
 fi
 kubectl get run "$AMP_RUN_NAME" -o yaml > /tmp/swe-platform-amp-run.yaml
-kubectl logs -l app.kubernetes.io/component=control-plane --all-containers --prefix --tail=-1 > /tmp/swe-platform-amp-control-plane.log
-kubectl logs -l app.kubernetes.io/component=operator --all-containers --prefix --tail=-1 > /tmp/swe-platform-amp-operator.log
+kubectl -n "$SYSTEM_NAMESPACE" logs -l app.kubernetes.io/component=control-plane --all-containers --prefix --tail=-1 > /tmp/swe-platform-amp-control-plane.log
+kubectl -n "$SYSTEM_NAMESPACE" logs -l app.kubernetes.io/component=operator --all-containers --prefix --tail=-1 > /tmp/swe-platform-amp-operator.log
 kubectl logs "$AMP_POD_NAME" -c environment --tail=-1 > /tmp/swe-platform-amp-environment.log
 kubectl exec "$AMP_POD_NAME" -- tar -C /workspace -cf - . > /tmp/swe-platform-amp-workspace.tar
 for artifact in /tmp/swe-platform-amp-transcript.out /tmp/swe-platform-amp-process-output.out \
@@ -1321,7 +1515,7 @@ kubectl delete run "$AMP_RUN_NAME" --wait=true >/dev/null
 
 echo "==> verifying credentialless fake Amp retains the plain managed-process path"
 AMP_CREDENTIALLESS_RUN_NAME=e2e-fake-amp-credentialless-run
-bin/swe run "fake Amp credentialless lifecycle smoke test" --name "$AMP_CREDENTIALLESS_RUN_NAME" \
+bin/swe --namespace "$PROJECT_NAMESPACE" run "fake Amp credentialless lifecycle smoke test" --name "$AMP_CREDENTIALLESS_RUN_NAME" \
 	--environment "$ENV_NAME" --agent amp --wait=false
 kubectl wait --for=jsonpath='{.status.state}'=Running run/"$AMP_CREDENTIALLESS_RUN_NAME" --timeout=3m
 kubectl wait --for=jsonpath='{.status.state}'=Succeeded run/"$AMP_CREDENTIALLESS_RUN_NAME" --timeout=3m
@@ -1329,13 +1523,13 @@ kubectl delete run "$AMP_CREDENTIALLESS_RUN_NAME" --wait=true >/dev/null
 
 echo "==> verifying fake Codex real Run lifecycle without credentials or network"
 CODEX_RUN_NAME=e2e-fake-codex-run
-bin/swe run "fake Codex lifecycle smoke test" --name "$CODEX_RUN_NAME" --environment "$ENV_NAME" --agent codex --wait=false
+bin/swe --namespace "$PROJECT_NAMESPACE" run "fake Codex lifecycle smoke test" --name "$CODEX_RUN_NAME" --environment "$ENV_NAME" --agent codex --wait=false
 kubectl wait --for=jsonpath='{.status.state}'=Running run/"$CODEX_RUN_NAME" --timeout=3m
 kubectl wait --for=jsonpath='{.status.state}'=Succeeded run/"$CODEX_RUN_NAME" --timeout=3m
 CODEX_RUN_UID=$(kubectl get run "$CODEX_RUN_NAME" -o jsonpath='{.metadata.uid}')
 set +e
 curl --silent --no-buffer --max-time 2 -H "Authorization: Bearer ${E2E_BOOTSTRAP_TOKEN}" -H "SWE-Run-UID: ${CODEX_RUN_UID}" \
-	"http://127.0.0.1:18080/api/v1/namespaces/default/runs/${CODEX_RUN_NAME}/transcript" > /tmp/swe-platform-codex-transcript.out
+	"http://127.0.0.1:18080/api/v1/namespaces/${PROJECT_NAMESPACE}/runs/${CODEX_RUN_NAME}/transcript" > /tmp/swe-platform-codex-transcript.out
 CODEX_TRANSCRIPT_STATUS=$?
 set -e
 if [[ "$CODEX_TRANSCRIPT_STATUS" != "0" && "$CODEX_TRANSCRIPT_STATUS" != "28" ]]; then echo "FAIL: Codex transcript read failed"; exit 1; fi
@@ -1346,19 +1540,19 @@ kubectl delete run "$CODEX_RUN_NAME" --wait=true >/dev/null
 
 echo "==> verifying fake Codex terminal failure through the real controller"
 CODEX_FAILED_RUN_NAME=e2e-fake-codex-failed-run
-bin/swe run "fake Codex failure smoke test" --name "$CODEX_FAILED_RUN_NAME" --environment "$ENV_NAME" --agent codex --wait=false
+bin/swe --namespace "$PROJECT_NAMESPACE" run "fake Codex failure smoke test" --name "$CODEX_FAILED_RUN_NAME" --environment "$ENV_NAME" --agent codex --wait=false
 kubectl wait --for=jsonpath='{.status.state}'=Failed run/"$CODEX_FAILED_RUN_NAME" --timeout=3m
 kubectl delete run "$CODEX_FAILED_RUN_NAME" --wait=true >/dev/null
 
 echo "==> verifying fake Pi success, opaque output, and terminal error"
 PI_RUN_NAME=e2e-fake-pi-run
-bin/swe run "fake Pi lifecycle smoke test" --name "$PI_RUN_NAME" --environment "$ENV_NAME" --agent pi --wait=false
+bin/swe --namespace "$PROJECT_NAMESPACE" run "fake Pi lifecycle smoke test" --name "$PI_RUN_NAME" --environment "$ENV_NAME" --agent pi --wait=false
 kubectl wait --for=jsonpath='{.status.state}'=Running run/"$PI_RUN_NAME" --timeout=3m
 kubectl wait --for=jsonpath='{.status.state}'=Succeeded run/"$PI_RUN_NAME" --timeout=3m
 PI_RUN_UID=$(kubectl get run "$PI_RUN_NAME" -o jsonpath='{.metadata.uid}')
 set +e
 curl --silent --no-buffer --max-time 2 -H "Authorization: Bearer ${E2E_BOOTSTRAP_TOKEN}" -H "SWE-Run-UID: ${PI_RUN_UID}" \
-	"http://127.0.0.1:18080/api/v1/namespaces/default/runs/${PI_RUN_NAME}/transcript" > /tmp/swe-platform-pi-transcript.out
+	"http://127.0.0.1:18080/api/v1/namespaces/${PROJECT_NAMESPACE}/runs/${PI_RUN_NAME}/transcript" > /tmp/swe-platform-pi-transcript.out
 PI_TRANSCRIPT_STATUS=$?
 set -e
 if [[ "$PI_TRANSCRIPT_STATUS" != "0" && "$PI_TRANSCRIPT_STATUS" != "28" ]]; then echo "FAIL: Pi transcript read failed"; exit 1; fi
@@ -1367,7 +1561,7 @@ grep -F '"source":"pi"' /tmp/swe-platform-pi-transcript.out | grep -F '"type":"p
 for marker in agent_end fake-pi-stderr-marker; do grep -Fq "$marker" /tmp/swe-platform-pi-process-output.out || { echo "FAIL: missing Pi marker $marker"; exit 1; }; done
 kubectl delete run "$PI_RUN_NAME" --wait=true >/dev/null
 PI_FAILED_RUN_NAME=e2e-fake-pi-failed-run
-bin/swe run "fake Pi failure smoke test" --name "$PI_FAILED_RUN_NAME" --environment "$ENV_NAME" --agent pi --wait=false
+bin/swe --namespace "$PROJECT_NAMESPACE" run "fake Pi failure smoke test" --name "$PI_FAILED_RUN_NAME" --environment "$ENV_NAME" --agent pi --wait=false
 kubectl wait --for=jsonpath='{.status.state}'=Failed run/"$PI_FAILED_RUN_NAME" --timeout=3m
 kubectl delete run "$PI_FAILED_RUN_NAME" --wait=true >/dev/null
 
@@ -1387,7 +1581,7 @@ if [[ "${PHASE:-}" != "Paused" ]] || kubectl get pod "$POD_NAME" >/dev/null 2>&1
 fi
 printf 'printf web-terminal-e2e-ok; exit\n' | \
 	SWE_CONTROL_PLANE_URL=http://127.0.0.1:18080 SWE_CONTROL_PLANE_TOKEN="$TERMINAL_TOKEN" \
-	bin/swe attach "$ENV_NAME" --environment-uid "$ENV_UID" > /tmp/swe-platform-web-terminal.out
+	bin/swe --namespace "$PROJECT_NAMESPACE" attach "$ENV_NAME" --environment-uid "$ENV_UID" > /tmp/swe-platform-web-terminal.out
 if ! grep -q 'web-terminal-e2e-ok' /tmp/swe-platform-web-terminal.out; then
 	echo "FAIL: terminal output was not received through the control-plane websocket"
 	cat /tmp/swe-platform-web-terminal.out
@@ -1426,7 +1620,7 @@ STALE_REPLACEMENT_STATUS=$(curl --silent --output /dev/null --write-out '%{http_
 	-H "Authorization: Bearer ${TERMINAL_TOKEN}" \
 	-H "SWE-Environment-UID: ${ENV_UID}" \
 	-H 'Connection: Upgrade' -H 'Upgrade: websocket' \
-	"http://127.0.0.1:18080/api/v1/namespaces/default/environments/${ENV_NAME}/terminal")
+	"http://127.0.0.1:18080/api/v1/namespaces/${PROJECT_NAMESPACE}/environments/${ENV_NAME}/terminal")
 REPLACEMENT_LIFECYCLE_AFTER=$(kubectl get environment "$ENV_NAME" -o jsonpath='{.spec.lifecycle}')
 if [[ "$REPLACEMENT_ENV_UID" == "$ENV_UID" || "$STALE_REPLACEMENT_STATUS" != "409" || "$REPLACEMENT_LIFECYCLE_AFTER" != "$REPLACEMENT_LIFECYCLE_BEFORE" ]]; then
 	echo "FAIL: replacement terminal fence uid=${REPLACEMENT_ENV_UID} status=${STALE_REPLACEMENT_STATUS} lifecycle-before=${REPLACEMENT_LIFECYCLE_BEFORE} lifecycle-after=${REPLACEMENT_LIFECYCLE_AFTER}"
@@ -1437,7 +1631,7 @@ POD_PHASE=$(kubectl get pod "$POD_NAME" -o jsonpath='{.status.phase}')
 if [[ "$POD_PHASE" != "Running" ]]; then
 	echo "FAIL: pod ${POD_NAME} is ${POD_PHASE}, expected Running"
 	echo "--- operator log ---"
-	kubectl logs deployment/swe-platform-swe-platform --tail=50
+	kubectl -n "$SYSTEM_NAMESPACE" logs deployment/swe-platform-swe-platform --tail=50
 	exit 1
 fi
 
