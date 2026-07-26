@@ -1125,8 +1125,9 @@ fi
 set_control_plane_token_audience swe-platform-rejected-e2e
 REJECTION_STATUS=$(curl --silent --output /dev/null --write-out '%{http_code}' \
 	--cookie "$REJECTION_COOKIE_JAR" http://127.0.0.1:18080/api/v1/session)
-if [[ "$REJECTION_STATUS" != "401" || "$(browser_session_count)" != "$REJECTION_SESSION_COUNT_BEFORE" ]]; then
-	echo "FAIL: definitive TokenReview audience rejection did not durably delete its session"
+REJECTION_SESSION_COUNT_REVOKED=$(browser_session_count)
+if [[ "$REJECTION_STATUS" != "401" || "$REJECTION_SESSION_COUNT_REVOKED" != "$REJECTION_SESSION_COUNT_BEFORE" ]]; then
+	echo "FAIL: definitive TokenReview audience rejection status=${REJECTION_STATUS}, session counts before=${REJECTION_SESSION_COUNT_BEFORE} after-exchange=${REJECTION_SESSION_COUNT_AFTER} after-rejection=${REJECTION_SESSION_COUNT_REVOKED}; expected 401 and durable deletion"
 	exit 1
 fi
 set_control_plane_token_audience swe-platform
