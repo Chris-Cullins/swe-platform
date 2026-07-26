@@ -1329,6 +1329,53 @@ if ! kubectl exec "$POD_NAME" -- sh -c 'test "$(wc -l < /workspace/setup-result)
 	exit 1
 fi
 
+echo "==> verifying bounded durable Environment service declarations"
+bin/swe --namespace "$PROJECT_NAMESPACE" environment services declare "$ENV_NAME" web --target-port 3000
+bin/swe --namespace "$PROJECT_NAMESPACE" environment services declare "$ENV_NAME" web-alias --target-port 3000
+SERVICE_LIST=$(bin/swe --namespace "$PROJECT_NAMESPACE" environment services list "$ENV_NAME")
+if ! grep -Fq $'web\t1\tHTTP\t3000\tProject\tTCPConnect' <<<"$SERVICE_LIST" ||
+	! grep -Fq $'web-alias\t1\tHTTP\t3000\tProject\tTCPConnect' <<<"$SERVICE_LIST"; then
+	echo "FAIL: service list did not report durable declarations and duplicate-port aliases"
+	exit 1
+fi
+bin/swe --namespace "$PROJECT_NAMESPACE" environment services declare "$ENV_NAME" web --target-port 3000
+if [[ "$(kubectl get environment "$ENV_NAME" -o jsonpath='{.spec.services[?(@.name=="web")].revision}')" != "1" ]]; then
+	echo "FAIL: exact service declare retry was not idempotent"
+	exit 1
+fi
+if bin/swe --namespace "$PROJECT_NAMESPACE" environment services declare "$ENV_NAME" web --target-port 3001 >/dev/null 2>&1; then
+	echo "FAIL: declare accepted different configuration for an existing service"
+	exit 1
+fi
+bin/swe --namespace "$PROJECT_NAMESPACE" environment services update "$ENV_NAME" web --target-port 3001
+bin/swe --namespace "$PROJECT_NAMESPACE" environment services update "$ENV_NAME" web --target-port 3001
+if [[ "$(kubectl get environment "$ENV_NAME" -o jsonpath='{.spec.services[?(@.name=="web")].revision}')" != "2" ||
+	"$(kubectl get environment "$ENV_NAME" -o jsonpath='{.spec.services[?(@.name=="web")].targetPort}')" != "3001" ]]; then
+	echo "FAIL: service update did not strictly increment revision once"
+	exit 1
+fi
+if bin/swe --namespace "$PROJECT_NAMESPACE" environment services declare "$ENV_NAME" sandboxd --target-port 50051 >/dev/null 2>&1; then
+	echo "FAIL: service declaration accepted sandboxd control port 50051"
+	exit 1
+fi
+if kubectl patch environment "$ENV_NAME" --type=merge -p '{"spec":{"services":[{"name":"web","revision":2,"protocol":"HTTP","targetPort":3002,"visibility":"Project","readiness":"TCPConnect"},{"name":"web-alias","revision":1,"protocol":"HTTP","targetPort":3000,"visibility":"Project","readiness":"TCPConnect"}]}}' >/dev/null 2>&1; then
+	echo "FAIL: admission accepted changed same-name service configuration without a higher revision"
+	exit 1
+fi
+bin/swe --namespace "$PROJECT_NAMESPACE" environment services remove "$ENV_NAME" web-alias
+bin/swe --namespace "$PROJECT_NAMESPACE" environment services remove "$ENV_NAME" web-alias
+if [[ -n "$(kubectl get environment "$ENV_NAME" -o jsonpath='{.spec.services[?(@.name=="web-alias")].name}')" ]]; then
+	echo "FAIL: service removal did not durably remove desired state"
+	exit 1
+fi
+bin/swe --namespace "$PROJECT_NAMESPACE" environment services remove "$ENV_NAME" web
+bin/swe --namespace "$PROJECT_NAMESPACE" environment services declare "$ENV_NAME" web --target-port 3002
+if [[ "$(kubectl get environment "$ENV_NAME" -o jsonpath='{.spec.services[?(@.name=="web")].revision}')" != "1" ]]; then
+	echo "FAIL: same-name service re-add did not create a fresh declaration"
+	exit 1
+fi
+bin/swe --namespace "$PROJECT_NAMESPACE" environment services remove "$ENV_NAME" web
+
 echo "==> verifying pause retains the workspace and resume runs its hook"
 bin/swe --namespace "$PROJECT_NAMESPACE" environment hold "$ENV_NAME"
 for _ in $(seq 1 60); do

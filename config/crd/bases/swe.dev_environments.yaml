@@ -222,6 +222,80 @@ spec:
                 description: ProjectRef is the name of the Project this environment
                   belongs to.
                 type: string
+              services:
+                description: |-
+                  Services contains bounded durable desired service declarations. This
+                  field does not expose routes or URLs and is retained without a Project.
+                items:
+                  description: |-
+                    EnvironmentServiceDeclaration is durable desired service exposure owned by
+                    one Environment. Its logical identity is the Environment UID and Name. The
+                    target is always that Environment's logical loopback; callers cannot supply
+                    an address. Duplicate TargetPorts are allowed as explicit aliases.
+                  properties:
+                    name:
+                      description: Name is the stable service name within this Environment.
+                      maxLength: 63
+                      minLength: 1
+                      pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
+                      type: string
+                    protocol:
+                      description: |-
+                        EnvironmentServiceProtocol is the application protocol a future gateway
+                        may use for a declared service.
+                      enum:
+                      - HTTP
+                      type: string
+                    readiness:
+                      description: |-
+                        EnvironmentServiceReadiness describes the bounded readiness intent for a
+                        declared service. TCPConnect means only that the target accepted a TCP
+                        connection; it does not attest HTTP or dependency health.
+                      enum:
+                      - TCPConnect
+                      type: string
+                    revision:
+                      description: |-
+                        Revision starts at one and strictly increases when this same-name
+                        declaration's configuration changes. An exact no-op is idempotent.
+                      format: int64
+                      minimum: 1
+                      type: integer
+                    targetPort:
+                      description: |-
+                        TargetPort is an explicit port on the Environment's logical loopback.
+                        Port zero and sandboxd's control port are not valid service targets.
+                      format: int32
+                      maximum: 65535
+                      minimum: 1
+                      type: integer
+                      x-kubernetes-validations:
+                      - message: targetPort is reserved for sandboxd control
+                        rule: self != 50051
+                    visibility:
+                      description: |-
+                        EnvironmentServiceVisibility is the authorization scope a future gateway
+                        must enforce. Anonymous and public visibility are not supported.
+                      enum:
+                      - Project
+                      type: string
+                  required:
+                  - name
+                  - protocol
+                  - readiness
+                  - revision
+                  - targetPort
+                  - visibility
+                  type: object
+                  x-kubernetes-validations:
+                  - message: revision must increase when an existing service declaration
+                      changes
+                    rule: self == oldSelf || self.revision > oldSelf.revision
+                maxItems: 32
+                type: array
+                x-kubernetes-list-map-keys:
+                - name
+                x-kubernetes-list-type: map
               templateRef:
                 description: TemplateRef is the name of the EnvironmentTemplate to
                   build from.

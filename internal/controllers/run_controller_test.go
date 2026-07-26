@@ -339,7 +339,17 @@ func TestRunClaimsAndRecoversWarmEnvironment(t *testing.T) {
 				APIVersion: platformv1alpha1.GroupVersion.String(), Kind: "EnvironmentTemplate", Name: "small", UID: "template-uid", Controller: ptr(true),
 			}},
 		},
-		Spec:   platformv1alpha1.EnvironmentSpec{TemplateRef: "small"},
+		Spec: platformv1alpha1.EnvironmentSpec{
+			TemplateRef: "small",
+			Services: []platformv1alpha1.EnvironmentServiceDeclaration{{
+				Name:       "web",
+				Revision:   1,
+				Protocol:   platformv1alpha1.EnvironmentServiceProtocolHTTP,
+				TargetPort: 3000,
+				Visibility: platformv1alpha1.EnvironmentServiceVisibilityProject,
+				Readiness:  platformv1alpha1.EnvironmentServiceReadinessTCPConnect,
+			}},
+		},
 		Status: platformv1alpha1.EnvironmentStatus{Phase: platformv1alpha1.EnvironmentPhaseReady},
 	}
 	r := reconciler(t, &scriptedAdapter{}, run, template, warm)
@@ -357,7 +367,7 @@ func TestRunClaimsAndRecoversWarmEnvironment(t *testing.T) {
 	if claimed.Status.ClaimedBy == nil || claimed.Status.ClaimedBy.UID != run.UID || claimed.Status.LastActiveAt == nil || claimed.Status.Phase != platformv1alpha1.EnvironmentPhaseSetup || claimed.Status.PodName != "" || claimed.Status.Endpoints.Sandboxd != "" {
 		t.Fatalf("claim status = %#v", claimed.Status)
 	}
-	if claimed.Spec.ProjectRef != run.Spec.ProjectRef || claimed.Labels[warmPoolLabel] != "" || metav1.GetControllerOf(&claimed) != nil {
+	if claimed.Spec.ProjectRef != run.Spec.ProjectRef || len(claimed.Spec.Services) != 1 || claimed.Spec.Services[0] != warm.Spec.Services[0] || claimed.Labels[warmPoolLabel] != "" || metav1.GetControllerOf(&claimed) != nil {
 		t.Fatalf("promoted environment = %#v", claimed)
 	}
 	recovered, err := r.recoverEnvironmentReference(context.Background(), run)

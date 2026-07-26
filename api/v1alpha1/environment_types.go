@@ -8,6 +8,11 @@ import (
 
 const EnvironmentConditionReady = "Ready"
 
+const (
+	EnvironmentServiceMaxDeclarations = 32
+	EnvironmentServiceControlPort     = 50051
+)
+
 // EnvironmentSuspensionReason records why the lifecycle controller suspended
 // an Environment. It is observed state, not user-owned policy.
 // +kubebuilder:validation:Enum=Hold;Idle;Requested
@@ -219,6 +224,60 @@ const (
 	EnvironmentBackendExternalRunner EnvironmentBackend = "external-runner"
 )
 
+// EnvironmentServiceProtocol is the application protocol a future gateway
+// may use for a declared service.
+// +kubebuilder:validation:Enum=HTTP
+type EnvironmentServiceProtocol string
+
+const EnvironmentServiceProtocolHTTP EnvironmentServiceProtocol = "HTTP"
+
+// EnvironmentServiceVisibility is the authorization scope a future gateway
+// must enforce. Anonymous and public visibility are not supported.
+// +kubebuilder:validation:Enum=Project
+type EnvironmentServiceVisibility string
+
+const EnvironmentServiceVisibilityProject EnvironmentServiceVisibility = "Project"
+
+// EnvironmentServiceReadiness describes the bounded readiness intent for a
+// declared service. TCPConnect means only that the target accepted a TCP
+// connection; it does not attest HTTP or dependency health.
+// +kubebuilder:validation:Enum=TCPConnect
+type EnvironmentServiceReadiness string
+
+const EnvironmentServiceReadinessTCPConnect EnvironmentServiceReadiness = "TCPConnect"
+
+// EnvironmentServiceDeclaration is durable desired service exposure owned by
+// one Environment. Its logical identity is the Environment UID and Name. The
+// target is always that Environment's logical loopback; callers cannot supply
+// an address. Duplicate TargetPorts are allowed as explicit aliases.
+//
+// +kubebuilder:validation:XValidation:rule="self == oldSelf || self.revision > oldSelf.revision",message="revision must increase when an existing service declaration changes"
+type EnvironmentServiceDeclaration struct {
+	// Name is the stable service name within this Environment.
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=63
+	// +kubebuilder:validation:Pattern=`^[a-z0-9]([-a-z0-9]*[a-z0-9])?$`
+	Name string `json:"name"`
+
+	// Revision starts at one and strictly increases when this same-name
+	// declaration's configuration changes. An exact no-op is idempotent.
+	// +kubebuilder:validation:Minimum=1
+	Revision int64 `json:"revision"`
+
+	Protocol EnvironmentServiceProtocol `json:"protocol"`
+
+	// TargetPort is an explicit port on the Environment's logical loopback.
+	// Port zero and sandboxd's control port are not valid service targets.
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=65535
+	// +kubebuilder:validation:XValidation:rule="self != 50051",message="targetPort is reserved for sandboxd control"
+	TargetPort int32 `json:"targetPort"`
+
+	Visibility EnvironmentServiceVisibility `json:"visibility"`
+
+	Readiness EnvironmentServiceReadiness `json:"readiness"`
+}
+
 // EnvironmentSpec defines the desired state of Environment.
 // +kubebuilder:validation:XValidation:rule="!has(oldSelf.lifecycle) || !has(oldSelf.lifecycle.hold) || (has(self.lifecycle) && has(self.lifecycle.hold))",message="hold policy cannot be removed; disable it at a higher revision"
 type EnvironmentSpec struct {
@@ -239,6 +298,14 @@ type EnvironmentSpec struct {
 	// Lifecycle contains explicit hold policy and bounded lifecycle requests.
 	// +optional
 	Lifecycle EnvironmentLifecycleSpec `json:"lifecycle,omitempty"`
+
+	// Services contains bounded durable desired service declarations. This
+	// field does not expose routes or URLs and is retained without a Project.
+	// +optional
+	// +listType=map
+	// +listMapKey=name
+	// +kubebuilder:validation:MaxItems=32
+	Services []EnvironmentServiceDeclaration `json:"services,omitempty"`
 
 	// Paused is a deprecated compatibility input. The lifecycle controller
 	// migrates true to an explicit hold and clears it. New clients must

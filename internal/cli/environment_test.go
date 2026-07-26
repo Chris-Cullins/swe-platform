@@ -1,8 +1,10 @@
 package cli
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"strings"
 	"testing"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -185,10 +187,184 @@ func TestSetEnvironmentHoldFailsClosedDuringLegacyPauseMigration(t *testing.T) {
 
 func TestRootIncludesEnvironmentHoldCommands(t *testing.T) {
 	root := NewRootCommand()
-	for _, args := range [][]string{{"environment", "hold"}, {"environment", "release"}} {
+	for _, args := range [][]string{
+		{"environment", "hold"},
+		{"environment", "release"},
+		{"environment", "services", "list"},
+		{"environment", "services", "declare"},
+		{"environment", "services", "update"},
+		{"environment", "services", "remove"},
+	} {
 		command, _, err := root.Find(args)
 		if err != nil || command == root {
 			t.Fatalf("root.Find(%v) = command %q, error %v", args, command.Name(), err)
+		}
+	}
+}
+
+func TestEnvironmentServiceDeclarationsAreRevisionedAndIdempotent(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := platformv1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	environment := &platformv1alpha1.Environment{}
+	environment.Name = "shared"
+	environment.Namespace = "ns"
+	environment.UID = "env-uid"
+	kube := fake.NewClientBuilder().WithScheme(scheme).WithObjects(environment).Build()
+	key := client.ObjectKeyFromObject(environment)
+
+	web, err := writeEnvironmentService(context.Background(), kube, key, "web", 3000, false)
+	if err != nil || web != desiredEnvironmentService("web", 3000, 1) {
+		t.Fatalf("declare web = %#v, %v", web, err)
+	}
+	web, err = writeEnvironmentService(context.Background(), kube, key, "web", 3000, false)
+	if err != nil || web.Revision != 1 {
+		t.Fatalf("idempotent declare web = %#v, %v", web, err)
+	}
+	if _, err := writeEnvironmentService(context.Background(), kube, key, "web", 3001, false); err == nil || !strings.Contains(err.Error(), "use update") {
+		t.Fatalf("different declare error = %v", err)
+	}
+	if _, err := writeEnvironmentService(context.Background(), kube, key, "alias", 3000, false); err != nil {
+		t.Fatalf("declare duplicate-port alias: %v", err)
+	}
+	web, err = writeEnvironmentService(context.Background(), kube, key, "web", 3001, true)
+	if err != nil || web != desiredEnvironmentService("web", 3001, 2) {
+		t.Fatalf("update web = %#v, %v", web, err)
+	}
+	web, err = writeEnvironmentService(context.Background(), kube, key, "web", 3001, true)
+	if err != nil || web.Revision != 2 {
+		t.Fatalf("idempotent update web = %#v, %v", web, err)
+	}
+
+	var output bytes.Buffer
+	if err := listEnvironmentServices(context.Background(), kube, key, &output); err != nil {
+		t.Fatal(err)
+	}
+	want := "NAME\tREVISION\tPROTOCOL\tTARGET-PORT\tVISIBILITY\tREADINESS\n" +
+		"alias\t1\tHTTP\t3000\tProject\tTCPConnect\n" +
+		"web\t2\tHTTP\t3001\tProject\tTCPConnect\n"
+	if output.String() != want {
+		t.Fatalf("service list:\n%s\nwant:\n%s", output.String(), want)
+	}
+
+	if err := removeEnvironmentService(context.Background(), kube, key, "web"); err != nil {
+		t.Fatal(err)
+	}
+	if err := removeEnvironmentService(context.Background(), kube, key, "web"); err != nil {
+		t.Fatalf("idempotent remove: %v", err)
+	}
+	web, err = writeEnvironmentService(context.Background(), kube, key, "web", 3002, false)
+	if err != nil || web.Revision != 1 {
+		t.Fatalf("same-name re-declare = %#v, %v", web, err)
+	}
+}
+
+func TestEnvironmentServiceUpdateRetriesConflictAndPreservesConcurrentDeclarations(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := platformv1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	environment := &platformv1alpha1.Environment{}
+	environment.Name = "shared"
+	environment.Namespace = "ns"
+	environment.UID = "env-uid"
+	environment.Spec.Services = []platformv1alpha1.EnvironmentServiceDeclaration{desiredEnvironmentService("web", 3000, 1)}
+	base := fake.NewClientBuilder().WithScheme(scheme).WithObjects(environment).Build()
+	key := client.ObjectKeyFromObject(environment)
+	patches := 0
+	kube := interceptor.NewClient(base, interceptor.Funcs{Patch: func(ctx context.Context, underlying client.WithWatch, object client.Object, patch client.Patch, options ...client.PatchOption) error {
+		patches++
+		if patches == 1 {
+			var concurrent platformv1alpha1.Environment
+			if err := underlying.Get(ctx, key, &concurrent); err != nil {
+				return err
+			}
+			concurrent.Spec.Services = append(concurrent.Spec.Services, desiredEnvironmentService("api", 4000, 1))
+			if err := underlying.Update(ctx, &concurrent); err != nil {
+				return err
+			}
+			return apierrors.NewConflict(schema.GroupResource{Group: platformv1alpha1.GroupVersion.Group, Resource: "environments"}, object.GetName(), errors.New("simulated service conflict"))
+		}
+		return underlying.Patch(ctx, object, patch, options...)
+	}})
+
+	service, err := writeEnvironmentService(context.Background(), kube, key, "web", 3001, true)
+	if err != nil || service.Revision != 2 || patches != 2 {
+		t.Fatalf("conflicting update = %#v, patches %d, error %v", service, patches, err)
+	}
+	var current platformv1alpha1.Environment
+	if err := base.Get(context.Background(), key, &current); err != nil {
+		t.Fatal(err)
+	}
+	if len(current.Spec.Services) != 2 || environmentServiceIndex(current.Spec.Services, "api") < 0 || current.Spec.Services[environmentServiceIndex(current.Spec.Services, "web")].TargetPort != 3001 {
+		t.Fatalf("concurrent declaration was lost: %#v", current.Spec.Services)
+	}
+}
+
+func TestEnvironmentServiceMutationRejectsSameNameReplacement(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := platformv1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	environment := &platformv1alpha1.Environment{}
+	environment.Name = "shared"
+	environment.Namespace = "ns"
+	environment.UID = "env-uid-old"
+	environment.Spec.Services = []platformv1alpha1.EnvironmentServiceDeclaration{desiredEnvironmentService("web", 3000, 1)}
+	base := fake.NewClientBuilder().WithScheme(scheme).WithObjects(environment).Build()
+	key := client.ObjectKeyFromObject(environment)
+	patches := 0
+	kube := interceptor.NewClient(base, interceptor.Funcs{Patch: func(ctx context.Context, underlying client.WithWatch, object client.Object, patch client.Patch, options ...client.PatchOption) error {
+		patches++
+		if patches == 1 {
+			var original platformv1alpha1.Environment
+			if err := underlying.Get(ctx, key, &original); err != nil {
+				return err
+			}
+			if err := underlying.Delete(ctx, &original); err != nil {
+				return err
+			}
+			replacement := &platformv1alpha1.Environment{}
+			replacement.Name, replacement.Namespace, replacement.UID = environment.Name, environment.Namespace, "env-uid-new"
+			if err := underlying.Create(ctx, replacement); err != nil {
+				return err
+			}
+			return apierrors.NewConflict(schema.GroupResource{Group: platformv1alpha1.GroupVersion.Group, Resource: "environments"}, object.GetName(), errors.New("simulated replacement conflict"))
+		}
+		return underlying.Patch(ctx, object, patch, options...)
+	}})
+
+	_, err := writeEnvironmentService(context.Background(), kube, key, "web", 3001, true)
+	if !errors.Is(err, lifecycle.ErrEnvironmentIncarnationChanged) || patches != 1 {
+		t.Fatalf("replacement update = patches %d, error %v", patches, err)
+	}
+	var current platformv1alpha1.Environment
+	if err := base.Get(context.Background(), key, &current); err != nil {
+		t.Fatal(err)
+	}
+	if current.UID != "env-uid-new" || len(current.Spec.Services) != 0 {
+		t.Fatalf("replacement was mutated: uid=%q services=%#v", current.UID, current.Spec.Services)
+	}
+}
+
+func TestValidateEnvironmentServiceInput(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		port uint32
+		ok   bool
+	}{
+		{name: "web", port: 1, ok: true},
+		{name: "web-api", port: 65535, ok: true},
+		{name: "Web", port: 8080},
+		{name: "web.example", port: 8080},
+		{name: "web", port: 0},
+		{name: "web", port: platformv1alpha1.EnvironmentServiceControlPort},
+		{name: "web", port: 65536},
+	} {
+		err := validateEnvironmentServiceInput(test.name, test.port)
+		if (err == nil) != test.ok {
+			t.Errorf("validateEnvironmentServiceInput(%q, %d) = %v, want ok=%t", test.name, test.port, err, test.ok)
 		}
 	}
 }
