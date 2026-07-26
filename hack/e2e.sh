@@ -531,6 +531,8 @@ spec:
       command: [/bin/sh, -c]
       args:
         - git clone --bare /seed/repo.bundle /repos/e2e.git && git -C /repos/e2e.git symbolic-ref HEAD refs/heads/main
+      resources:
+        requests: {cpu: 10m, memory: 32Mi}
       volumeMounts:
         - {name: seed, mountPath: /seed}
         - {name: repositories, mountPath: /repos}
@@ -540,6 +542,8 @@ spec:
       command: [git, daemon, --reuseaddr, --base-path=/repos, --export-all, --verbose]
       ports:
         - {name: git, containerPort: 9418}
+      resources:
+        requests: {cpu: 10m, memory: 32Mi}
       volumeMounts:
         - {name: repositories, mountPath: /repos}
   volumes:
