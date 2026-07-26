@@ -379,7 +379,14 @@ kubectl -n "$SYSTEM_NAMESPACE" rollout status deployment/"$INSTALLATION_NAME-con
 kubectl config set-context --current --namespace="$PROJECT_NAMESPACE" >/dev/null
 
 echo "==> waiting for local warm environment"
-kubectl wait --for=jsonpath='{.status.warmPoolReady}'=1 environmenttemplate/small --timeout=2m
+if ! kubectl wait --for=jsonpath='{.status.warmPoolReady}'=1 environmenttemplate/small --timeout=2m; then
+	echo "FAIL: local warm environment did not become ready" >&2
+	kubectl get environmenttemplate small -o yaml >&2 || true
+	kubectl get environments,pods -o wide >&2 || true
+	kubectl get events --sort-by=.lastTimestamp >&2 || true
+	kubectl -n "$SYSTEM_NAMESPACE" logs deployment/"$INSTALLATION_NAME" --tail=200 >&2 || true
+	exit 1
+fi
 WARM_ENV_NAME=$(kubectl get environments -l swe.dev/warm-pool=small -o jsonpath='{.items[0].metadata.name}')
 if [[ -z "$WARM_ENV_NAME" ]]; then
 	echo "FAIL: warm pool did not create an environment"
