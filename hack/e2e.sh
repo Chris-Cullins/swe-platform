@@ -1104,11 +1104,19 @@ fi
 
 echo "==> verifying definitive expired-token rejection is durably revoked"
 kubectl -n "$PROJECT_NAMESPACE" create serviceaccount e2e-session-rejection >/dev/null
-REJECTION_TOKEN=$(kubectl -n "$PROJECT_NAMESPACE" create token e2e-session-rejection \
-	--audience=swe-platform --duration=10s)
-REJECTION_TOKEN_PAYLOAD=$(cut -d. -f2 <<<"$REJECTION_TOKEN")
-REJECTION_TOKEN_EXPIRY=$(printf '%s===' "$REJECTION_TOKEN_PAYLOAD" | tr '_-' '/+' | base64 -d 2>/dev/null | jq -r '.exp')
-unset REJECTION_TOKEN_PAYLOAD
+REJECTION_TOKEN_BASE=$(kubectl -n "$PROJECT_NAMESPACE" create token e2e-session-rejection --audience=swe-platform)
+REJECTION_TOKEN_HEADER=$(cut -d. -f1 <<<"$REJECTION_TOKEN_BASE")
+REJECTION_TOKEN_PAYLOAD=$(cut -d. -f2 <<<"$REJECTION_TOKEN_BASE")
+REJECTION_TOKEN_EXPIRY=$(($(date +%s) + 30))
+REJECTION_TOKEN_PAYLOAD=$(printf '%s===' "$REJECTION_TOKEN_PAYLOAD" | tr '_-' '/+' | base64 -d 2>/dev/null | \
+	jq -c --argjson now "$(($(date +%s) - 5))" --argjson expiry "$REJECTION_TOKEN_EXPIRY" '.iat=$now | .nbf=$now | .exp=$expiry' | \
+	base64 -w0 | tr '+/' '-_' | tr -d '=')
+REJECTION_TOKEN_INPUT="${REJECTION_TOKEN_HEADER}.${REJECTION_TOKEN_PAYLOAD}"
+REJECTION_TOKEN_SIGNATURE=$(printf '%s' "$REJECTION_TOKEN_INPUT" | openssl dgst -sha256 \
+	-sign <(docker exec "${KIND_CLUSTER}-control-plane" cat /etc/kubernetes/pki/sa.key) | \
+	base64 -w0 | tr '+/' '-_' | tr -d '=')
+REJECTION_TOKEN="${REJECTION_TOKEN_INPUT}.${REJECTION_TOKEN_SIGNATURE}"
+unset REJECTION_TOKEN_BASE REJECTION_TOKEN_HEADER REJECTION_TOKEN_PAYLOAD REJECTION_TOKEN_INPUT REJECTION_TOKEN_SIGNATURE
 REJECTION_COOKIE_JAR=/tmp/swe-platform-rejected-session-cookies
 rm -f "$REJECTION_COOKIE_JAR"
 REJECTION_SESSION_COUNT_BEFORE=$(browser_session_count)
