@@ -1102,11 +1102,13 @@ if [[ "$SESSION_REPLACEMENT_STATUS" != "200" ]]; then
 	exit 1
 fi
 
-echo "==> verifying definitive bound-token rejection is durably revoked"
+echo "==> verifying definitive expired-token rejection is durably revoked"
 kubectl -n "$PROJECT_NAMESPACE" create serviceaccount e2e-session-rejection >/dev/null
-kubectl -n "$PROJECT_NAMESPACE" create secret generic e2e-session-binding --from-literal=marker=e2e >/dev/null
 REJECTION_TOKEN=$(kubectl -n "$PROJECT_NAMESPACE" create token e2e-session-rejection \
-	--audience=swe-platform --bound-object-kind=Secret --bound-object-name=e2e-session-binding)
+	--audience=swe-platform --duration=10s)
+REJECTION_TOKEN_PAYLOAD=$(cut -d. -f2 <<<"$REJECTION_TOKEN")
+REJECTION_TOKEN_EXPIRY=$(printf '%s===' "$REJECTION_TOKEN_PAYLOAD" | tr '_-' '/+' | base64 -d 2>/dev/null | jq -r '.exp')
+unset REJECTION_TOKEN_PAYLOAD
 REJECTION_COOKIE_JAR=/tmp/swe-platform-rejected-session-cookies
 rm -f "$REJECTION_COOKIE_JAR"
 REJECTION_SESSION_COUNT_BEFORE=$(browser_session_count)
@@ -1119,7 +1121,9 @@ if [[ "$REJECTION_EXCHANGE_STATUS" != "200" || "$REJECTION_SESSION_COUNT_AFTER" 
 	echo "FAIL: rejected-token exchange did not add exactly one durable session"
 	exit 1
 fi
-kubectl -n "$PROJECT_NAMESPACE" delete secret e2e-session-binding --wait=true >/dev/null
+while (( $(date +%s) <= REJECTION_TOKEN_EXPIRY + 2 )); do
+	sleep 1
+done
 REJECTION_STATUS=""
 for _ in $(seq 1 120); do
 	REJECTION_STATUS=$(curl --silent --output /dev/null --write-out '%{http_code}' \
@@ -1131,7 +1135,7 @@ for _ in $(seq 1 120); do
 done
 REJECTION_SESSION_COUNT_REVOKED=$(browser_session_count)
 if [[ "$REJECTION_STATUS" != "401" || "$REJECTION_SESSION_COUNT_REVOKED" != "$REJECTION_SESSION_COUNT_BEFORE" ]]; then
-	echo "FAIL: definitive bound-token rejection status=${REJECTION_STATUS}, session counts before=${REJECTION_SESSION_COUNT_BEFORE} after-exchange=${REJECTION_SESSION_COUNT_AFTER} after-rejection=${REJECTION_SESSION_COUNT_REVOKED}; expected 401 and durable deletion"
+	echo "FAIL: definitive expired-token rejection status=${REJECTION_STATUS}, session counts before=${REJECTION_SESSION_COUNT_BEFORE} after-exchange=${REJECTION_SESSION_COUNT_AFTER} after-rejection=${REJECTION_SESSION_COUNT_REVOKED}; expected 401 and durable deletion"
 	exit 1
 fi
 replace_control_plane_pod
