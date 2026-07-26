@@ -1107,8 +1107,14 @@ kubectl -n "$PROJECT_NAMESPACE" create serviceaccount e2e-session-rejection >/de
 REJECTION_TOKEN_BASE=$(kubectl -n "$PROJECT_NAMESPACE" create token e2e-session-rejection --audience=swe-platform)
 REJECTION_TOKEN_HEADER=$(cut -d. -f1 <<<"$REJECTION_TOKEN_BASE")
 REJECTION_TOKEN_PAYLOAD=$(cut -d. -f2 <<<"$REJECTION_TOKEN_BASE")
+case $((${#REJECTION_TOKEN_PAYLOAD} % 4)) in
+	0) ;;
+	2) REJECTION_TOKEN_PAYLOAD+="==" ;;
+	3) REJECTION_TOKEN_PAYLOAD+="=" ;;
+	*) echo "FAIL: generated ServiceAccount token has invalid base64url payload"; exit 1 ;;
+esac
 REJECTION_TOKEN_EXPIRY=$(($(date +%s) + 30))
-REJECTION_TOKEN_PAYLOAD=$(printf '%s===' "$REJECTION_TOKEN_PAYLOAD" | tr '_-' '/+' | base64 -d 2>/dev/null | \
+REJECTION_TOKEN_PAYLOAD=$(printf '%s' "$REJECTION_TOKEN_PAYLOAD" | tr '_-' '/+' | base64 -d | \
 	jq -c --argjson now "$(($(date +%s) - 5))" --argjson expiry "$REJECTION_TOKEN_EXPIRY" '.iat=$now | .nbf=$now | .exp=$expiry' | \
 	base64 -w0 | tr '+/' '-_' | tr -d '=')
 REJECTION_TOKEN_INPUT="${REJECTION_TOKEN_HEADER}.${REJECTION_TOKEN_PAYLOAD}"
