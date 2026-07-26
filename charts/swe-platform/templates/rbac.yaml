@@ -1,7 +1,8 @@
+{{- $mode := include "swe-platform.tenancyMode" . -}}
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
-  name: {{ include "swe-platform.fullname" . }}
+  name: {{ include "swe-platform.clusterFullname" . }}
   labels:
     {{- include "swe-platform.labels" . | nindent 4 }}
 rules:
@@ -14,12 +15,6 @@ rules:
   - apiGroups: ["networking.k8s.io"]
     resources: ["networkpolicies"]
     verbs: ["create", "delete", "get", "list", "patch", "update", "watch"]
-  - apiGroups: ["node.k8s.io"]
-    resources: ["runtimeclasses"]
-    verbs: ["get", "list", "watch"]
-  - apiGroups: ["coordination.k8s.io"]
-    resources: ["leases"]
-    verbs: ["create", "get", "list", "patch", "update", "watch"]
   - apiGroups: ["swe.dev"]
     resources: ["environments"]
     verbs: ["create", "delete", "get", "list", "patch", "update", "watch"]
@@ -42,19 +37,84 @@ rules:
     verbs: ["get", "list", "watch"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "swe-platform.clusterFullname" . }}-scope
+  labels:
+    {{- include "swe-platform.labels" . | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: ["namespaces"]
+    verbs: ["get"]
+  - apiGroups: ["node.k8s.io"]
+    resources: ["runtimeclasses"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
 metadata:
-  name: {{ include "swe-platform.fullname" . }}
+  name: {{ include "swe-platform.clusterFullname" . }}-scope
   labels:
     {{- include "swe-platform.labels" . | nindent 4 }}
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: ClusterRole
-  name: {{ include "swe-platform.fullname" . }}
+  name: {{ include "swe-platform.clusterFullname" . }}-scope
 subjects:
   - kind: ServiceAccount
     name: {{ include "swe-platform.serviceAccountName" . }}
     namespace: {{ .Release.Namespace }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "swe-platform.fullname" . }}-system
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "swe-platform.labels" . | nindent 4 }}
+rules:
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["create", "get", "list", "patch", "update", "watch"]
+  - apiGroups: ["swe.dev"]
+    resources: ["installations"]
+    verbs: ["get"]
+  - apiGroups: ["swe.dev"]
+    resources: ["environmenttemplates"]
+    verbs: ["get", "list", "patch", "update"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "swe-platform.fullname" . }}-system
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "swe-platform.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "swe-platform.fullname" . }}-system
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "swe-platform.serviceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
+{{- if eq $mode "trusted-admin" }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "swe-platform.clusterFullname" . }}
+  labels:
+    {{- include "swe-platform.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ include "swe-platform.clusterFullname" . }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "swe-platform.serviceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
+{{- end }}
 {{- if .Values.controlPlane.enabled }}
 ---
 apiVersion: v1
@@ -69,20 +129,17 @@ metadata:
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
-  name: {{ include "swe-platform.controlPlaneFullname" . }}
+  name: {{ include "swe-platform.controlPlaneClusterFullname" . }}
   labels:
     {{- include "swe-platform.labels" . | nindent 4 }}
     app.kubernetes.io/component: control-plane
 rules:
-  - apiGroups: ["authentication.k8s.io"]
-    resources: ["tokenreviews"]
-    verbs: ["create"]
-  - apiGroups: ["authorization.k8s.io"]
-    resources: ["subjectaccessreviews"]
-    verbs: ["create"]
   - apiGroups: [""]
     resources: ["pods"]
     verbs: ["get"]
+  - apiGroups: ["swe.dev"]
+    resources: ["projects"]
+    verbs: ["get", "list"]
   - apiGroups: ["swe.dev"]
     resources: ["environments"]
     verbs: ["get", "patch"]
@@ -97,18 +154,84 @@ rules:
     verbs: ["create", "get", "list", "update", "watch"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "swe-platform.controlPlaneClusterFullname" . }}-scope
+  labels:
+    {{- include "swe-platform.labels" . | nindent 4 }}
+    app.kubernetes.io/component: control-plane
+rules:
+  - apiGroups: ["authentication.k8s.io"]
+    resources: ["tokenreviews"]
+    verbs: ["create"]
+  - apiGroups: ["authorization.k8s.io"]
+    resources: ["subjectaccessreviews"]
+    verbs: ["create"]
+  - apiGroups: [""]
+    resources: ["namespaces"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
 metadata:
-  name: {{ include "swe-platform.controlPlaneFullname" . }}
+  name: {{ include "swe-platform.controlPlaneClusterFullname" . }}-scope
   labels:
     {{- include "swe-platform.labels" . | nindent 4 }}
     app.kubernetes.io/component: control-plane
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: ClusterRole
-  name: {{ include "swe-platform.controlPlaneFullname" . }}
+  name: {{ include "swe-platform.controlPlaneClusterFullname" . }}-scope
 subjects:
   - kind: ServiceAccount
     name: {{ include "swe-platform.controlPlaneFullname" . }}
     namespace: {{ .Release.Namespace }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "swe-platform.controlPlaneFullname" . }}-system
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "swe-platform.labels" . | nindent 4 }}
+    app.kubernetes.io/component: control-plane
+rules:
+  - apiGroups: ["swe.dev"]
+    resources: ["installations"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "swe-platform.controlPlaneFullname" . }}-system
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "swe-platform.labels" . | nindent 4 }}
+    app.kubernetes.io/component: control-plane
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "swe-platform.controlPlaneFullname" . }}-system
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "swe-platform.controlPlaneFullname" . }}
+    namespace: {{ .Release.Namespace }}
+{{- if eq $mode "trusted-admin" }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "swe-platform.controlPlaneClusterFullname" . }}
+  labels:
+    {{- include "swe-platform.labels" . | nindent 4 }}
+    app.kubernetes.io/component: control-plane
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ include "swe-platform.controlPlaneClusterFullname" . }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "swe-platform.controlPlaneFullname" . }}
+    namespace: {{ .Release.Namespace }}
+{{- end }}
 {{- end }}

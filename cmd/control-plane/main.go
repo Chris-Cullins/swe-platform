@@ -18,12 +18,14 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/config"
 
 	platformv1alpha1 "github.com/Chris-Cullins/swe-platform/api/v1alpha1"
 	"github.com/Chris-Cullins/swe-platform/internal/controlplane"
+	"github.com/Chris-Cullins/swe-platform/internal/tenancy"
 	consoleui "github.com/Chris-Cullins/swe-platform/ui"
 )
 
@@ -66,6 +68,39 @@ func main() {
 		Audience:       os.Getenv("SWE_TOKEN_AUDIENCE"),
 		Sessions:       sessions,
 	}
+	mode, err := tenancy.ParseMode(os.Getenv("SWE_TENANCY_MODE"))
+	if err != nil {
+		log.Error("invalid tenancy configuration", "error", err)
+		os.Exit(1)
+	}
+	installationKey := types.NamespacedName{
+		Namespace: strings.TrimSpace(os.Getenv("SWE_INSTALLATION_NAMESPACE")),
+		Name:      strings.TrimSpace(os.Getenv("SWE_INSTALLATION_NAME")),
+	}
+	identity, _, err := tenancy.LoadInstallation(context.Background(), kubeClient, installationKey)
+	if err != nil {
+		log.Error("load installation identity", "error", err)
+		os.Exit(1)
+	}
+	verifier := &tenancy.Verifier{Reader: kubeClient, Installation: identity, Mode: mode}
+	configuredNamespaces, err := parseTenancyNamespaces(os.Getenv("SWE_TENANCY_NAMESPACES"))
+	if err != nil {
+		log.Error("parse configured Project namespaces", "error", err)
+		os.Exit(1)
+	}
+	if mode == tenancy.ModeTrustedAdmin && len(configuredNamespaces) != 0 {
+		log.Error("SWE_TENANCY_NAMESPACES must be empty in trusted-admin mode")
+		os.Exit(1)
+	}
+	namespaceList := make([]string, 0, len(configuredNamespaces))
+	for namespace := range configuredNamespaces {
+		namespaceList = append(namespaceList, namespace)
+	}
+	if err := verifier.ValidateConfiguredNamespaces(context.Background(), namespaceList); err != nil {
+		log.Error("validate configured Project namespaces", "error", err)
+		os.Exit(1)
+	}
+	resourceAccess := controlplane.TenancyAccessController{Access: access, Verifier: verifier, Namespaces: configuredNamespaces}
 	resources := &controlplane.KubernetesResourceService{Client: kubeClient}
 	transcripts, closeTranscripts, err := transcriptStoreFromEnvironment(context.Background(), log)
 	if err != nil {
@@ -78,7 +113,7 @@ func main() {
 	server := &http.Server{
 		Addr: *address,
 		Handler: controlplane.NewServer(log, controlplane.ServerOptions{
-			Access:                access,
+			Access:                resourceAccess,
 			Sessions:              access,
 			Resources:             resources,
 			Runs:                  controlplane.KubernetesRunResolver{Client: kubeClient},
@@ -104,6 +139,24 @@ func main() {
 		log.Error("control-plane API stopped", "error", err)
 		os.Exit(1)
 	}
+}
+
+func parseTenancyNamespaces(value string) (map[string]struct{}, error) {
+	namespaces := make(map[string]struct{})
+	if strings.TrimSpace(value) == "" {
+		return namespaces, nil
+	}
+	for _, raw := range strings.Split(value, ",") {
+		namespace := strings.TrimSpace(raw)
+		if namespace == "" {
+			return nil, errors.New("SWE_TENANCY_NAMESPACES contains a blank namespace")
+		}
+		if _, duplicate := namespaces[namespace]; duplicate {
+			return nil, fmt.Errorf("SWE_TENANCY_NAMESPACES contains duplicate namespace %q", namespace)
+		}
+		namespaces[namespace] = struct{}{}
+	}
+	return namespaces, nil
 }
 
 func transcriptStoreFromEnvironment(ctx context.Context, log *slog.Logger) (controlplane.TranscriptStore, func(), error) {

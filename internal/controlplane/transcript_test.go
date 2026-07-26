@@ -17,7 +17,7 @@ import (
 
 func TestMemoryTranscriptStoreIdempotencyAndConcurrentOrder(t *testing.T) {
 	store := NewMemoryTranscriptStore(MemoryTranscriptStoreOptions{}).(*memoryTranscriptStore)
-	run := RunIdentity{Namespace: "project-a", UID: "run-uid"}
+	run := RunIdentity{Namespace: "project-a", NamespaceUID: testNamespaceUID("project-a"), UID: "run-uid"}
 	input := AppendTranscriptInput{Source: "adapter", IdempotencyKey: "retry", Type: "output", Data: json.RawMessage(`{"text":"same"}`)}
 
 	const retries = 32
@@ -103,6 +103,11 @@ func TestTranscriptStoreInternalErrorsAreGenericAndRetriable(t *testing.T) {
 	if body := response.Body.String(); strings.Contains(body, "postgres.internal") || strings.Contains(body, "private-user") || !strings.Contains(body, "transcript store is unavailable") {
 		t.Fatalf("unsafe internal store problem response: %s", body)
 	}
+	response = httptest.NewRecorder()
+	writeTranscriptStoreError(response, ErrTranscriptIdentity)
+	if response.Code != http.StatusConflict || !strings.Contains(response.Body.String(), "transcript_identity_mismatch") || !isTranscriptContractError(ErrTranscriptIdentity) {
+		t.Fatalf("identity mismatch response: %d %s", response.Code, response.Body.String())
+	}
 }
 
 func TestMemoryTranscriptStoreTenantIdentityAndRetentionGap(t *testing.T) {
@@ -110,8 +115,8 @@ func TestMemoryTranscriptStoreTenantIdentityAndRetentionGap(t *testing.T) {
 	options.MaxEventsPerRun = 2
 	options.MaxReplayEvents = 2
 	store := NewMemoryTranscriptStore(options).(*memoryTranscriptStore)
-	runA := RunIdentity{Namespace: "project-a", UID: "shared-uid"}
-	runB := RunIdentity{Namespace: "project-b", UID: "shared-uid"}
+	runA := RunIdentity{Namespace: "project-a", NamespaceUID: testNamespaceUID("project-a"), UID: "shared-uid"}
+	runB := RunIdentity{Namespace: "project-b", NamespaceUID: testNamespaceUID("project-b"), UID: "shared-uid"}
 
 	first := appendStoreEvent(t, store, runA, "first")
 	appendStoreEvent(t, store, runA, "second")
@@ -156,7 +161,7 @@ func TestMemoryTranscriptStoreTenantIdentityAndRetentionGap(t *testing.T) {
 func TestMemoryTranscriptStoreAtomicReplayLiveCut(t *testing.T) {
 	for iteration := range 100 {
 		store := NewMemoryTranscriptStore(MemoryTranscriptStoreOptions{}).(*memoryTranscriptStore)
-		run := RunIdentity{Namespace: "project-a", UID: types.UID(fmt.Sprintf("run-%d", iteration))}
+		run := RunIdentity{Namespace: "project-a", NamespaceUID: testNamespaceUID("project-a"), UID: types.UID(fmt.Sprintf("run-%d", iteration))}
 		start := make(chan struct{})
 		result := make(chan TranscriptSubscription, 1)
 		errorsCh := make(chan error, 2)
@@ -203,7 +208,7 @@ func TestMemoryTranscriptStoreAtomicReplayLiveCut(t *testing.T) {
 
 func TestMemoryTranscriptStoreConcurrentLiveOrder(t *testing.T) {
 	store := NewMemoryTranscriptStore(MemoryTranscriptStoreOptions{}).(*memoryTranscriptStore)
-	run := RunIdentity{Namespace: "project-a", UID: "run-uid"}
+	run := RunIdentity{Namespace: "project-a", NamespaceUID: testNamespaceUID("project-a"), UID: "run-uid"}
 	subscription, err := store.Subscribe(context.Background(), run, "")
 	if err != nil {
 		t.Fatal(err)
@@ -234,7 +239,7 @@ func TestMemoryTranscriptStoreConcurrentLiveOrder(t *testing.T) {
 }
 
 func TestMemoryTranscriptStoreRejectsInvalidAndRestartedCursors(t *testing.T) {
-	run := RunIdentity{Namespace: "project-a", UID: "run-uid"}
+	run := RunIdentity{Namespace: "project-a", NamespaceUID: testNamespaceUID("project-a"), UID: "run-uid"}
 	firstStore := NewMemoryTranscriptStore(MemoryTranscriptStoreOptions{}).(*memoryTranscriptStore)
 	event := appendStoreEvent(t, firstStore, run, "first")
 	secondStore := NewMemoryTranscriptStore(MemoryTranscriptStoreOptions{}).(*memoryTranscriptStore)
@@ -242,7 +247,7 @@ func TestMemoryTranscriptStoreRejectsInvalidAndRestartedCursors(t *testing.T) {
 	if _, err := secondStore.Subscribe(context.Background(), run, event.Event.ID); !errors.Is(err, ErrInvalidCursor) {
 		t.Fatalf("restart cursor error = %v, want %v", err, ErrInvalidCursor)
 	}
-	wrongRun := RunIdentity{Namespace: run.Namespace, UID: "other-uid"}
+	wrongRun := RunIdentity{Namespace: run.Namespace, NamespaceUID: run.NamespaceUID, UID: "other-uid"}
 	if _, err := firstStore.Subscribe(context.Background(), wrongRun, event.Event.ID); !errors.Is(err, ErrInvalidCursor) {
 		t.Fatalf("wrong-run cursor error = %v, want %v", err, ErrInvalidCursor)
 	}
@@ -261,7 +266,7 @@ func TestMemoryTranscriptStoreEnforcesReplaySubscriberAndAggregateBounds(t *test
 	options.MaxSubscribersPerRun = 1
 	options.SubscriberBuffer = 1
 	store := NewMemoryTranscriptStore(options).(*memoryTranscriptStore)
-	run := RunIdentity{Namespace: "project-a", UID: "run-uid"}
+	run := RunIdentity{Namespace: "project-a", NamespaceUID: testNamespaceUID("project-a"), UID: "run-uid"}
 	appendStoreEvent(t, store, run, "first")
 	appendStoreEvent(t, store, run, "second")
 	if _, err := store.Subscribe(context.Background(), run, ""); !errors.Is(err, ErrReplayLimit) {
@@ -287,7 +292,7 @@ func TestMemoryTranscriptStoreEnforcesReplaySubscriberAndAggregateBounds(t *test
 	if _, err := store.Subscribe(context.Background(), run, store.cursor(run, 3)); !errors.Is(err, ErrSubscriberCapacity) {
 		t.Fatalf("dropped subscriber released capacity before unsubscribe: %v", err)
 	}
-	other := RunIdentity{Namespace: "project-b", UID: "other-uid"}
+	other := RunIdentity{Namespace: "project-b", NamespaceUID: testNamespaceUID("project-b"), UID: "other-uid"}
 	if _, err := store.Append(context.Background(), other, AppendTranscriptInput{Source: "adapter", IdempotencyKey: "first", Type: "output", Data: json.RawMessage(`{}`)}); !errors.Is(err, ErrTranscriptCapacity) {
 		t.Fatalf("run capacity error = %v, want %v", err, ErrTranscriptCapacity)
 	}
@@ -298,7 +303,7 @@ func TestMemoryTranscriptStoreIdempotencyTupleAndByteBounds(t *testing.T) {
 	options.MaxBytesPerRun = 300
 	options.MaxTotalBytes = 600
 	store := NewMemoryTranscriptStore(options).(*memoryTranscriptStore)
-	run := RunIdentity{Namespace: "project-a", UID: "run-uid"}
+	run := RunIdentity{Namespace: "project-a", NamespaceUID: testNamespaceUID("project-a"), UID: "run-uid"}
 	first, err := store.Append(context.Background(), run, AppendTranscriptInput{
 		Source: "a\x00b", IdempotencyKey: "c", Type: "output", Data: json.RawMessage(`{}`),
 	})
@@ -324,6 +329,30 @@ func TestMemoryTranscriptStoreIdempotencyTupleAndByteBounds(t *testing.T) {
 		Source: "adapter", IdempotencyKey: "oversized", Type: "output", Data: json.RawMessage(`"` + fmt.Sprintf("%050d", 0) + `"`),
 	}); !errors.Is(err, ErrTranscriptCapacity) {
 		t.Fatalf("byte capacity error = %v, want %v", err, ErrTranscriptCapacity)
+	}
+}
+
+func TestMemoryTranscriptStoreRequiresImmutableNamespaceIdentity(t *testing.T) {
+	store := NewMemoryTranscriptStore(MemoryTranscriptStoreOptions{})
+	incomplete := RunIdentity{Namespace: "project-a", UID: "run-uid"}
+	input := AppendTranscriptInput{Source: "adapter", IdempotencyKey: "event", Type: "output", Data: json.RawMessage(`{}`)}
+	if _, err := store.Append(context.Background(), incomplete, input); err == nil {
+		t.Fatal("append accepted a missing Namespace UID")
+	}
+	if _, err := store.Subscribe(context.Background(), incomplete, ""); err == nil {
+		t.Fatal("subscribe accepted a missing Namespace UID")
+	}
+
+	first := RunIdentity{Namespace: "project-a", NamespaceUID: "namespace-uid-old", UID: "run-uid"}
+	second := RunIdentity{Namespace: "project-a", NamespaceUID: "namespace-uid-new", UID: "run-uid"}
+	appendStoreEvent(t, store, first, "first")
+	subscription, err := store.Subscribe(context.Background(), second, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer subscription.Unsubscribe()
+	if len(subscription.History) != 0 {
+		t.Fatalf("replacement Namespace observed old transcript: %#v", subscription.History)
 	}
 }
 

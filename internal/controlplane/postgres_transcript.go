@@ -169,19 +169,25 @@ func (s *PostgresTranscriptStore) initialize(ctx context.Context) error {
 func (s *PostgresTranscriptStore) Close() { s.pool.Close() }
 
 func (s *PostgresTranscriptStore) Append(ctx context.Context, run RunIdentity, input AppendTranscriptInput) (AppendTranscriptResult, error) {
+	if run.Namespace == "" || run.NamespaceUID == "" || run.UID == "" {
+		return AppendTranscriptResult{}, fmt.Errorf("append transcript: complete namespace and Run identity is required")
+	}
 	size := transcriptEventSize(input)
 	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
 	if err != nil {
 		return AppendTranscriptResult{}, fmt.Errorf("begin transcript append: %w", err)
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
-	if _, err := tx.Exec(ctx, `INSERT INTO transcript_runs(namespace, run_uid) VALUES ($1, $2) ON CONFLICT DO NOTHING`, run.Namespace, string(run.UID)); err != nil {
+	if _, err := tx.Exec(ctx, `INSERT INTO transcript_runs(namespace, run_uid, namespace_uid) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING`, run.Namespace, string(run.UID), string(run.NamespaceUID)); err != nil {
 		return AppendTranscriptResult{}, fmt.Errorf("initialize transcript run: %w", err)
+	}
+	if _, err := associateTranscriptRun(ctx, tx, run); err != nil {
+		return AppendTranscriptResult{}, err
 	}
 	var databaseHighWater int64
 	var retainedEvents int
 	var retainedBytes int64
-	if err := tx.QueryRow(ctx, `SELECT high_water, retained_events, retained_bytes FROM transcript_runs WHERE namespace = $1 AND run_uid = $2 FOR UPDATE`, run.Namespace, string(run.UID)).Scan(&databaseHighWater, &retainedEvents, &retainedBytes); err != nil {
+	if err := tx.QueryRow(ctx, `SELECT high_water, retained_events, retained_bytes FROM transcript_runs WHERE namespace = $1 AND namespace_uid = $2 AND run_uid = $3 FOR UPDATE`, run.Namespace, string(run.NamespaceUID), string(run.UID)).Scan(&databaseHighWater, &retainedEvents, &retainedBytes); err != nil {
 		return AppendTranscriptResult{}, fmt.Errorf("lock transcript run: %w", err)
 	}
 	highWater := uint64(databaseHighWater)
@@ -241,7 +247,7 @@ func (s *PostgresTranscriptStore) Append(ctx context.Context, run RunIdentity, i
 	if _, err := tx.Exec(ctx, `INSERT INTO transcript_events(namespace, run_uid, sequence, source, source_sequence, idempotency_key, event_type, data, created_at, event_size) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`, run.Namespace, string(run.UID), int64(sequence), []byte(input.Source), sourceSequence, []byte(input.IdempotencyKey), []byte(input.Type), []byte(input.Data), createdAt, size); err != nil {
 		return AppendTranscriptResult{}, fmt.Errorf("insert transcript event: %w", err)
 	}
-	if _, err := tx.Exec(ctx, `UPDATE transcript_runs SET high_water = $3, retained_events = retained_events - $4 + 1, retained_bytes = retained_bytes - $5 + $6 WHERE namespace = $1 AND run_uid = $2`, run.Namespace, string(run.UID), int64(sequence), freedEvents, freedBytes, size); err != nil {
+	if _, err := tx.Exec(ctx, `UPDATE transcript_runs SET high_water = $4, retained_events = retained_events - $5 + 1, retained_bytes = retained_bytes - $6 + $7 WHERE namespace = $1 AND namespace_uid = $2 AND run_uid = $3`, run.Namespace, string(run.NamespaceUID), string(run.UID), int64(sequence), freedEvents, freedBytes, size); err != nil {
 		return AppendTranscriptResult{}, fmt.Errorf("advance transcript sequence: %w", err)
 	}
 	if err := tx.Commit(ctx); err != nil {
@@ -249,6 +255,27 @@ func (s *PostgresTranscriptStore) Append(ctx context.Context, run RunIdentity, i
 	}
 	event := TranscriptEvent{ID: s.cursor(run, sequence), Sequence: sequence, Source: input.Source, SourceSequence: cloneUint64(input.SourceSequence), Type: input.Type, Data: append(json.RawMessage(nil), input.Data...), CreatedAt: createdAt}
 	return AppendTranscriptResult{Event: event}, nil
+}
+
+func associateTranscriptRun(ctx context.Context, tx pgx.Tx, run RunIdentity) (bool, error) {
+	// The HTTP boundary resolves run.UID from the exact current Kubernetes Run
+	// before reaching the store. Kubernetes UIDs are never reused, so that proof
+	// is sufficient to associate a legacy row; a name-only match is not.
+	if _, err := tx.Exec(ctx, `UPDATE transcript_runs SET namespace_uid = $3 WHERE namespace = $1 AND run_uid = $2 AND namespace_uid IS NULL`, run.Namespace, string(run.UID), string(run.NamespaceUID)); err != nil {
+		return false, fmt.Errorf("associate legacy transcript with exact Namespace UID: %w", err)
+	}
+	var namespaceUID string
+	err := tx.QueryRow(ctx, `SELECT namespace_uid FROM transcript_runs WHERE namespace = $1 AND run_uid = $2`, run.Namespace, string(run.UID)).Scan(&namespaceUID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("read transcript Namespace identity: %w", err)
+	}
+	if namespaceUID != string(run.NamespaceUID) {
+		return false, ErrTranscriptIdentity
+	}
+	return true, nil
 }
 
 type postgresQuery interface {
@@ -284,6 +311,9 @@ func queryIdempotentEvent(ctx context.Context, query postgresQuery, run RunIdent
 }
 
 func (s *PostgresTranscriptStore) Subscribe(ctx context.Context, run RunIdentity, cursor string) (TranscriptSubscription, error) {
+	if run.Namespace == "" || run.NamespaceUID == "" || run.UID == "" {
+		return TranscriptSubscription{}, fmt.Errorf("subscribe transcript: complete namespace and Run identity is required")
+	}
 	sequence := uint64(0)
 	if cursor != "" {
 		parsed, err := s.parseCursor(run, cursor)
@@ -315,13 +345,23 @@ func (s *PostgresTranscriptStore) Subscribe(ctx context.Context, run RunIdentity
 }
 
 func (s *PostgresTranscriptStore) replay(ctx context.Context, run RunIdentity, sequence uint64, hasCursor bool) ([]TranscriptEvent, *TranscriptGap, uint64, error) {
-	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly})
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead})
 	if err != nil {
 		return nil, nil, 0, fmt.Errorf("begin transcript replay: %w", err)
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
+	found, err := associateTranscriptRun(ctx, tx, run)
+	if err != nil {
+		return nil, nil, 0, err
+	}
+	if !found {
+		if err := tx.Commit(ctx); err != nil {
+			return nil, nil, 0, fmt.Errorf("commit empty transcript replay snapshot: %w", err)
+		}
+		return nil, nil, 0, nil
+	}
 	var databaseHighWater int64
-	err = tx.QueryRow(ctx, `SELECT high_water FROM transcript_runs WHERE namespace = $1 AND run_uid = $2`, run.Namespace, string(run.UID)).Scan(&databaseHighWater)
+	err = tx.QueryRow(ctx, `SELECT high_water FROM transcript_runs WHERE namespace = $1 AND namespace_uid = $2 AND run_uid = $3`, run.Namespace, string(run.NamespaceUID), string(run.UID)).Scan(&databaseHighWater)
 	if errors.Is(err, pgx.ErrNoRows) {
 		databaseHighWater = 0
 	} else if err != nil {
@@ -446,7 +486,7 @@ func (s *PostgresTranscriptStore) pollBatch(ctx context.Context, run RunIdentity
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 	var databaseHighWater int64
-	err = tx.QueryRow(ctx, `SELECT high_water FROM transcript_runs WHERE namespace = $1 AND run_uid = $2`, run.Namespace, string(run.UID)).Scan(&databaseHighWater)
+	err = tx.QueryRow(ctx, `SELECT high_water FROM transcript_runs WHERE namespace = $1 AND namespace_uid = $2 AND run_uid = $3`, run.Namespace, string(run.NamespaceUID), string(run.UID)).Scan(&databaseHighWater)
 	if errors.Is(err, pgx.ErrNoRows) {
 		databaseHighWater = 0
 	} else if err != nil {
@@ -488,7 +528,7 @@ func (s *PostgresTranscriptStore) releaseSubscriber() {
 }
 
 func (s *PostgresTranscriptStore) cursor(run RunIdentity, sequence uint64) string {
-	runHash := sha256.Sum256([]byte(run.Namespace + "\x00" + string(run.UID)))
+	runHash := sha256.Sum256([]byte(run.Namespace + "\x00" + string(run.NamespaceUID) + "\x00" + string(run.UID)))
 	payload := "v1." + s.generation + "." + base64.RawURLEncoding.EncodeToString(runHash[:16]) + "." + strconv.FormatUint(sequence, 10)
 	signature := hmac.New(sha256.New, s.cursorKey)
 	_, _ = signature.Write([]byte(payload))

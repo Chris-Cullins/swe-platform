@@ -20,6 +20,10 @@ controlPlane:
 
 leaderElection: false
 
+# Deliberate trusted-admin mode for the isolated local Argo mirror cluster.
+tenancy:
+  mode: trusted-admin
+
 environmentImage:
   tag: latest
 

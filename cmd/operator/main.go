@@ -1,16 +1,22 @@
 package main
 
 import (
+	"context"
+	"crypto/sha256"
 	"flag"
+	"fmt"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
@@ -22,6 +28,7 @@ import (
 	"github.com/Chris-Cullins/swe-platform/internal/adapters/codex"
 	"github.com/Chris-Cullins/swe-platform/internal/adapters/pi"
 	"github.com/Chris-Cullins/swe-platform/internal/controllers"
+	"github.com/Chris-Cullins/swe-platform/internal/tenancy"
 	"github.com/Chris-Cullins/swe-platform/internal/transcriptclient"
 )
 
@@ -44,22 +51,81 @@ func main() {
 	var controlPlaneInstance string
 	var transcriptURL string
 	var transcriptTokenFile string
+	var tenancyModeValue string
+	var installationNamespace string
+	var installationName string
+	var tenancyNamespaces stringListFlag
 	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8080", "The address the metrics endpoint binds to.")
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "The address the probe endpoint binds to.")
 	flag.BoolVar(&leaderElect, "leader-elect", false, "Enable leader election for the operator.")
-	flag.StringVar(&controlPlaneNamespace, "control-plane-namespace", "default", "Namespace containing the control-plane pods allowed to reach sandboxd.")
+	flag.StringVar(&controlPlaneNamespace, "control-plane-namespace", "", "Required system namespace containing the operator/control-plane pods allowed to reach sandboxd.")
 	flag.StringVar(&controlPlaneName, "control-plane-name", "swe-platform", "app.kubernetes.io/name label of the control plane.")
 	flag.StringVar(&controlPlaneInstance, "control-plane-instance", "swe-platform", "app.kubernetes.io/instance label of the control plane.")
 	flag.StringVar(&transcriptURL, "transcript-url", "", "Control-plane base URL for adapter transcript events (disabled when empty).")
 	flag.StringVar(&transcriptTokenFile, "transcript-token-file", "", "Projected service-account token used to append adapter transcript events.")
+	flag.StringVar(&tenancyModeValue, "tenancy-mode", "", "Required tenancy mode: scoped or trusted-admin.")
+	flag.StringVar(&installationNamespace, "installation-namespace", "", "System namespace containing this installation's Installation object.")
+	flag.StringVar(&installationName, "installation-name", "", "Name of this installation's Installation object.")
+	flag.Var(&tenancyNamespaces, "tenancy-namespace", "Claimed Project namespace watched in scoped mode; repeat for each namespace.")
 	opts := zap.Options{Development: true}
 	opts.BindFlags(flag.CommandLine)
 	flag.Parse()
 
 	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts)))
 
-	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
+	mode, err := tenancy.ParseMode(tenancyModeValue)
+	if err != nil {
+		setupLog.Error(err, "invalid tenancy configuration")
+		os.Exit(1)
+	}
+	if installationNamespace == "" || installationName == "" {
+		setupLog.Error(nil, "installation-namespace and installation-name are required")
+		os.Exit(1)
+	}
+	if controlPlaneNamespace == "" {
+		setupLog.Error(nil, "control-plane-namespace is required")
+		os.Exit(1)
+	}
+	if mode == tenancy.ModeTrustedAdmin && len(tenancyNamespaces) != 0 {
+		setupLog.Error(nil, "tenancy-namespace cannot be set in trusted-admin mode")
+		os.Exit(1)
+	}
+	restConfig := ctrl.GetConfigOrDie()
+	directClient, err := client.New(restConfig, client.Options{Scheme: scheme})
+	if err != nil {
+		setupLog.Error(err, "create direct Kubernetes client")
+		os.Exit(1)
+	}
+	identity, installation, err := tenancy.LoadInstallation(context.Background(), directClient, types.NamespacedName{Namespace: installationNamespace, Name: installationName})
+	if err != nil {
+		setupLog.Error(err, "load installation identity")
+		os.Exit(1)
+	}
+	if err := tenancy.PrepareCatalogSources(context.Background(), directClient, installation); err != nil {
+		setupLog.Error(err, "prepare installation catalog")
+		os.Exit(1)
+	}
+	verifier := &tenancy.Verifier{Reader: directClient, Installation: identity, Mode: mode}
+	if err := verifier.ValidateConfiguredNamespaces(context.Background(), tenancyNamespaces); err != nil {
+		setupLog.Error(err, "validate configured Project namespaces")
+		os.Exit(1)
+	}
+	cacheOptions := cache.Options{}
+	if mode == tenancy.ModeScoped {
+		cacheOptions.DefaultNamespaces = make(map[string]cache.Config, len(tenancyNamespaces))
+		for _, namespace := range tenancyNamespaces {
+			cacheOptions.DefaultNamespaces[namespace] = cache.Config{}
+		}
+		// An initial scoped install has no Project namespaces until onboarding.
+		// Keep its otherwise-unused cache restricted to the system namespace;
+		// no workload controllers are registered below until a claim is listed.
+		if len(cacheOptions.DefaultNamespaces) == 0 {
+			cacheOptions.DefaultNamespaces[installationNamespace] = cache.Config{}
+		}
+	}
+	mgr, err := ctrl.NewManager(restConfig, ctrl.Options{
 		Scheme: scheme,
+		Cache:  cacheOptions,
 		// Secret reads are exact-name lookups and deliberately bypass the shared
 		// cache so the operator does not require cluster-wide list/watch access.
 		Client: client.Options{Cache: &client.CacheOptions{
@@ -68,19 +134,25 @@ func main() {
 		Metrics:                metricsserver.Options{BindAddress: metricsAddr},
 		HealthProbeBindAddress: probeAddr,
 		LeaderElection:         leaderElect,
-		LeaderElectionID:       "swe-platform-operator.swe.dev",
+		LeaderElectionID:       installationLeaderElectionID(identity.UID),
 	})
 	if err != nil {
 		setupLog.Error(err, "unable to start manager")
 		os.Exit(1)
 	}
-
-	if err := (&controllers.EnvironmentReconciler{
-		Client:                mgr.GetClient(),
-		Scheme:                mgr.GetScheme(),
-		ControlPlaneNamespace: controlPlaneNamespace,
-		ControlPlaneName:      controlPlaneName,
-		ControlPlaneInstance:  controlPlaneInstance,
+	verifier.Reader = mgr.GetAPIReader()
+	scope := &tenancy.ReconcileScope{Verifier: verifier}
+	guardedClient := tenancy.GuardedClient{Client: mgr.GetClient(), Verifier: verifier}
+	if mode == tenancy.ModeScoped && len(tenancyNamespaces) == 0 {
+		setupLog.Info("scoped installation has no configured Project namespaces; catalog is ready for onboarding and workload controllers are disabled")
+	} else if err := (&controllers.EnvironmentReconciler{
+		Client:                        guardedClient,
+		Scheme:                        mgr.GetScheme(),
+		Scope:                         scope,
+		ControlPlaneNamespace:         controlPlaneNamespace,
+		ControlPlaneName:              controlPlaneName,
+		ControlPlaneInstance:          controlPlaneInstance,
+		EnvironmentServiceAccountName: tenancy.EnvironmentServiceAccount,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "Environment")
 		os.Exit(1)
@@ -96,22 +168,26 @@ func main() {
 			HTTP: &http.Client{Timeout: 15 * time.Second},
 		}
 	}
-	if err := (&controllers.RunReconciler{
-		Client:    mgr.GetClient(),
-		APIReader: mgr.GetAPIReader(),
-		Scheme:    mgr.GetScheme(),
-		Adapters:  registeredAdapters(),
-		EventSink: eventSink,
-	}).SetupWithManager(mgr); err != nil {
-		setupLog.Error(err, "unable to create controller", "controller", "Run")
-		os.Exit(1)
-	}
-	if err := (&controllers.WarmPoolReconciler{
-		Client: mgr.GetClient(),
-		Scheme: mgr.GetScheme(),
-	}).SetupWithManager(mgr); err != nil {
-		setupLog.Error(err, "unable to create controller", "controller", "WarmPool")
-		os.Exit(1)
+	if !(mode == tenancy.ModeScoped && len(tenancyNamespaces) == 0) {
+		if err := (&controllers.RunReconciler{
+			Client:    guardedClient,
+			APIReader: mgr.GetAPIReader(),
+			Scheme:    mgr.GetScheme(),
+			Scope:     scope,
+			Adapters:  registeredAdapters(),
+			EventSink: eventSink,
+		}).SetupWithManager(mgr); err != nil {
+			setupLog.Error(err, "unable to create controller", "controller", "Run")
+			os.Exit(1)
+		}
+		if err := (&controllers.WarmPoolReconciler{
+			Client: guardedClient,
+			Scheme: mgr.GetScheme(),
+			Scope:  scope,
+		}).SetupWithManager(mgr); err != nil {
+			setupLog.Error(err, "unable to create controller", "controller", "WarmPool")
+			os.Exit(1)
+		}
 	}
 
 	if err := mgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {
@@ -128,6 +204,24 @@ func main() {
 		setupLog.Error(err, "problem running manager")
 		os.Exit(1)
 	}
+}
+
+type stringListFlag []string
+
+func (f *stringListFlag) String() string { return strings.Join(*f, ",") }
+
+func (f *stringListFlag) Set(value string) error {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return fmt.Errorf("namespace must not be blank")
+	}
+	*f = append(*f, value)
+	return nil
+}
+
+func installationLeaderElectionID(uid types.UID) string {
+	sum := sha256.Sum256([]byte(uid))
+	return fmt.Sprintf("swe-platform-operator-%x", sum[:16])
 }
 
 func registeredAdapters() map[string]controllers.AdapterLifecycle {

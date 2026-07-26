@@ -26,7 +26,9 @@ The stock image contains no Pi authentication. Ambient auth or configuration int
 custom image, attached user, hooks/repository code, or the process environment is outside the
 supported process-scoped credential contract and should not be added to chart values.
 
-This chart installs the swe-platform CRDs, operator, and the first control-plane API.
+This chart installs the swe-platform CRDs, operator, first control-plane API, and one
+system-namespaced `Installation` identity. Configured `environmentTemplates` are inert catalog
+sources in that system namespace; Helm never creates a Project tenancy there.
 The control plane accepts adapter-owned transcript events and streams them over SSE.
 Production installs must configure the PostgreSQL transcript store described below. The chart
 still requires one control-plane replica and uses a non-overlapping `Recreate` deployment:
@@ -56,6 +58,95 @@ missing Secret keeps the control-plane pod from starting rather than silently se
 development memory store. Override `controlPlane.transcripts.postgresSecret.name` when your
 installation uses a different coordinated Secret name.
 
+Tenancy mode is required. The production presets explicitly use `scoped` with an initially
+empty, restart-bound `tenancy.namespaces` list. The isolated kind and Argo development presets
+deliberately opt into `trusted-admin`; missing or invalid configuration never falls back to
+cluster-wide authority. Trusted-admin discovers exact claimed namespaces dynamically, but does
+not bypass Installation/Namespace/Project claims. Cluster-scoped RBAC names include the system
+namespace, so same-named releases in different namespaces do not manage each other's roles or
+claims.
+
+### Onboard a Project namespace
+
+In scoped mode, install the system identity/catalog first, then use the CLI to create or
+explicitly adopt one dedicated namespace. Every quota value is required and must be chosen by
+the administrator; the platform has no capacity defaults:
+
+```sh
+SYSTEM_NAMESPACE=swe-platform-system
+PROJECT_NAMESPACE=my-project
+INSTALLATION=swe-platform-swe-platform
+
+swe --namespace "$PROJECT_NAMESPACE" project onboard my-project \
+  --system-namespace "$SYSTEM_NAMESPACE" --installation "$INSTALLATION" \
+  --repository https://github.com/example/project.git \
+  --default-template medium --template medium \
+  --quota-hard requests.cpu="$PROJECT_CPU_QUOTA" \
+  --quota-hard requests.memory="$PROJECT_MEMORY_QUOTA" \
+  --quota-hard requests.storage="$PROJECT_STORAGE_QUOTA" \
+  --quota-hard persistentvolumeclaims="$PROJECT_PVC_QUOTA" \
+  --quota-hard pods="$PROJECT_POD_QUOTA" \
+  --quota-hard secrets="$PROJECT_SECRET_QUOTA" \
+  --quota-hard count/runs.swe.dev="$PROJECT_RUN_QUOTA" \
+  --quota-hard count/environments.swe.dev="$PROJECT_ENVIRONMENT_QUOTA" \
+  --quota-hard count/agentcredentialprofiles.swe.dev="$PROJECT_CREDENTIAL_QUOTA"
+```
+
+The command creates/adopts the Namespace under exact Installation and Project UID annotations,
+enforces one Project, copies selected catalog sources into same-namespace managed Templates,
+and installs the versioned ResourceQuota, environment ServiceAccount, workload RoleBindings,
+and ingress-only default-deny policy. Existing unclaimed namespaces require `--adopt`.
+Foreign/stale claims, a second Project, unowned Template/baseline collisions, and incomplete
+quota inputs fail closed. The baseline does not restrict egress; that remains future work.
+
+Add the active namespace to the complete persisted list and perform a controlled Helm
+upgrade/restart. Do not merely change a mutable label or start using the namespace before this
+step:
+
+```sh
+# Illustrative one-Project list; keep every active Project namespace in the
+# production values file rather than relying on ad-hoc --set state.
+helm upgrade swe-platform ./charts/swe-platform \
+  --namespace "$SYSTEM_NAMESPACE" \
+  --values ./charts/swe-platform/values-k3s.yaml \
+  --set-string "tenancy.namespaces[0]=$PROJECT_NAMESPACE"
+
+swe --namespace "$PROJECT_NAMESPACE" run --project my-project "Fix the flaky test"
+```
+
+Both operator and control plane validate every configured exact claim before startup, including
+transition lifecycles so interrupted fencing can safely resume. The operator cache then watches
+only those namespaces, and every reconcile/mutation revalidates the live
+Installation UID, Namespace UID, claim, lifecycle, and sole Project through uncached reads.
+The control plane still performs TokenReview/SAR first, then requires allowlist membership and
+the same exact active claim before resource work. Namespaced RoleBindings, not broad scoped-mode
+cluster bindings, provide workload authority.
+
+Rerun `project onboard` explicitly to sync managed Template source UID/revision/spec changes in
+place; the local Template UID and warm-pool status are preserved. A deleted catalog source never
+implicitly deletes the retained local copy. Catalog sources themselves are not runnable.
+
+### Fence and retain a Project namespace
+
+Offboarding is non-destructive in this phase:
+
+```sh
+swe --namespace "$PROJECT_NAMESPACE" project offboard my-project \
+  --system-namespace "$SYSTEM_NAMESPACE" --installation "$INSTALLATION" \
+  --timeout 15m
+```
+
+The command first changes the exact claim to `fencing`, publishes Run cancellation and
+Environment hold intents, waits for terminal Runs and suspended podless Environments, and only
+then marks the Namespace `fenced`. It deletes no Namespace, Project, Template, quota, RBAC,
+policy, credential profile or owned Secret, PVC, Run, Environment, or transcript row. Normal
+Environment suspension still revokes that pod incarnation's ephemeral sandboxd credential
+Secret. Retain/archive is the safe result. Remove the fenced namespace from
+`tenancy.namespaces`, perform the controlled Helm upgrade/restart, and preserve the resources
+according to local retention policy. Purge is not implemented; it requires a future exact
+Namespace-UID-preconditioned durable resumable operation. Do not treat direct namespace, PVC,
+credential, or transcript deletion as platform purge.
+
 ## Upgrade
 
 Helm installs definitions from a chart's `crds/` directory only on the first install; it does
@@ -75,8 +166,9 @@ checked-in CRD definition authoritative when ownership moves from Helm's initial
 server-side apply. The Argo CD preset does not need this manual step because Argo synchronizes
 the chart's `crds/` files as manifests.
 
-The production presets create a `medium` `EnvironmentTemplate` using the published
-`env-base` image. Operator, control-plane, and env-base tags default to the chart
+The production presets create a `medium` catalog source using the published `env-base` image;
+onboarding creates each runnable Project-local Template copy. Operator, control-plane, and
+env-base tags default to the chart
 `appVersion`, keeping a released chart on one tested version set and making Helm rollback
 restore that set. Override all three tags with immutable release or SHA tags when testing
 a different coordinated set; `latest` and `dev` are development-only choices.
@@ -159,11 +251,11 @@ unmeasured.
 
 | Preset | Assumptions |
 |---|---|
-| `values-kind.yaml` | Local kind development with `:dev` images; explicitly permits insecure HTTP browser sessions. `make kind-up` installs gVisor and snapshot-capable CSI; pass the printed `environmentTemplates[0].spec.runtimeClass=gvisor` override when installing the chart. |
-| `values-argocd.yaml` | Local Argo CD mirror with mutable `:latest` images and an out-of-band bootstrap Secret; explicitly permits insecure HTTP browser sessions. `hack/argocd-up.sh` requires one kind node with at least 5 CPUs and 6 GiB allocatable. |
-| `values-k3s.yaml` | A default CSI-backed StorageClass and the out-of-band `swe-platform-postgres` Secret are available. Uses one operator replica and the default OCI runtime because k3s does not ship gVisor. |
-| `values-gke.yaml` | GKE Sandbox is enabled on every node that can host environments, and the out-of-band `swe-platform-postgres` Secret is available. Sets `runtimeClass: gvisor` and runs two operator replicas with leader election. |
-| `values-eks.yaml` | A default EBS CSI StorageClass and the out-of-band `swe-platform-postgres` Secret are available. Runs two operator replicas with leader election. EKS does not provide a standard gVisor RuntimeClass, so environments use the cluster default unless you override `environmentTemplates[].spec.runtimeClass`. |
+| `values-kind.yaml` | Isolated local kind development with deliberate `trusted-admin`, `:dev` images, and insecure HTTP browser sessions. `make kind-up` installs gVisor and snapshot-capable CSI; pass the printed `environmentTemplates[0].spec.runtimeClass=gvisor` catalog override. Primary acceptance instead overrides this preset to scoped mode and distinct system/Project namespaces. |
+| `values-argocd.yaml` | Isolated local Argo CD mirror with deliberate `trusted-admin`, mutable `:latest` images, an out-of-band bootstrap Secret, and insecure HTTP browser sessions. `hack/argocd-up.sh` requires one kind node with at least 5 CPUs and 6 GiB allocatable. |
+| `values-k3s.yaml` | Production `scoped` mode with an initially empty Project namespace list. A default CSI-backed StorageClass and the out-of-band `swe-platform-postgres` Secret are available. Uses one operator replica and the default OCI runtime because k3s does not ship gVisor. |
+| `values-gke.yaml` | Production `scoped` mode with an initially empty Project namespace list. GKE Sandbox is enabled on every node that can host environments, and the out-of-band `swe-platform-postgres` Secret is available. Sets `runtimeClass: gvisor` and runs two operator replicas with leader election. |
+| `values-eks.yaml` | Production `scoped` mode with an initially empty Project namespace list. A default EBS CSI StorageClass and the out-of-band `swe-platform-postgres` Secret are available. Runs two operator replicas with leader election. EKS does not provide a standard gVisor RuntimeClass, so managed Templates use the cluster default unless you override `environmentTemplates[].spec.runtimeClass` on their catalog source. |
 
 The RuntimeClass applies to environment pods, not the operator. Before creating or retaining
 execution, the operator verifies that a RuntimeClass explicitly named by a template exists. A
@@ -228,8 +320,9 @@ schema, fix the connection's `search_path` to it, and revoke `CREATE` on that sc
 untrusted roles. Applied migration files are immutable; upgrades add a new ordered file.
 
 `maxEventsPerRun` (10,000) and `maxBytesPerRun` (64 MiB) bound retained data independently for
-each immutable `(namespace, Run UID)`. Eviction removes the event and its idempotency key in the
-same append transaction, preserving the existing retained-window idempotency contract. Replay is
+each immutable `(namespace name, Namespace UID, Run UID)`. Eviction removes the event and its
+idempotency key in the same append transaction, preserving the existing retained-window
+idempotency contract. Replay is
 bounded by `maxReplayEvents` (1,000). `subscriberBuffer`, `maxSubscribers`, and `pollInterval`
 bound process-local SSE polling resources. Database replay/polling is correctness truth; no
 notification facility is required. A subscriber overtaken by retention is disconnected and its
@@ -249,10 +342,12 @@ PostgreSQL makes replay and idempotency durable across restart, but this release
 keeps `controlPlane.replicaCount=1`; it does not claim multi-replica control-plane HA.
 
 Per-Run event and byte limits do not bound total database size across Run churn. Deleting a Run
-does not yet reclaim its UID-fenced transcript rows automatically, because completion, deletion,
-and Project-offboarding retention policy depends on the lifecycle decisions tracked in
-[#101](https://github.com/Chris-Cullins/swe-platform/issues/101) and #11. Until that work ships,
-operators must monitor and provision the dedicated transcript database for accumulated history.
+or fencing a Project does not reclaim its UID-fenced transcript rows. New and safely associated
+rows include the immutable Namespace UID. Legacy rows with no Namespace UID are associated only
+through an authorized exact current Run UID; otherwise they are retained indefinitely. The
+retain-only Project offboarding phase deliberately has no deletion API. Until a future exact
+Namespace-UID-preconditioned durable purge operation ships, operators must monitor and provision
+the dedicated transcript database for accumulated history.
 Total retained storage across all Runs can be checked directly against the per-Run accounting
 columns the append path maintains:
 
@@ -266,17 +361,17 @@ FROM transcript_runs;
 or grouped by namespace:
 
 ```sql
-SELECT namespace, count(*) AS runs,
+SELECT namespace, namespace_uid, count(*) AS runs,
        coalesce(sum(retained_events), 0) AS retained_events,
        coalesce(sum(retained_bytes), 0) AS retained_bytes
 FROM transcript_runs
-GROUP BY namespace
+GROUP BY namespace, namespace_uid
 ORDER BY coalesce(sum(retained_bytes), 0) DESC;
 ```
 
 These queries are read-only and report retained history only; they do not advise when or whether
-to delete. Manual deletion should be exceptional: take a backup and target the exact namespace and
-immutable Run UID so a same-name replacement Run's transcript cannot be removed.
+to delete. There is no supported manual purge recipe: name-only SQL can cross a reused Namespace,
+and direct row deletion is neither Namespace-UID-preconditioned nor resumable. Retain the rows.
 
 ### Backup and restore
 
@@ -286,7 +381,7 @@ is not exhaustive:
 | State | Location | Helm reconstructs it? |
 |---|---|---|
 | Transcript events | PostgreSQL database | No |
-| Infrastructure state (Project, Run, Environment, AgentCredentialProfile, user-created EnvironmentTemplate instances) | Kubernetes API / etcd | No — Helm reapplies CRD definitions and chart-owned EnvironmentTemplate resources only, not user-created custom-resource instances |
+| Infrastructure state (Installation, Namespace claims, Project, Run, Environment, AgentCredentialProfile, managed Project-local EnvironmentTemplate copies) | Kubernetes API / etcd | No — Helm reapplies the system Installation and catalog sources, not Project namespace resources |
 | Workspace contents (cloned repos, agent work, uncommitted changes) | Environment PVCs | No |
 | Installation and credential material (out-of-band PostgreSQL Secret, bootstrap token Secret, chart values overrides) | Kubernetes Secrets and local configuration | No |
 
@@ -298,10 +393,10 @@ startup, so a restored database at an older migration version is brought forward
 This database-only recovery path restores transcript events; it does not reconstruct
 infrastructure state, workspace contents, or installation material.
 
-Separately, export or back up the custom-resource instances (Project, Run, Environment,
-AgentCredentialProfile, and any user-created EnvironmentTemplate objects) and snapshot or back
+Separately, export or back up the Namespace claims and custom-resource instances (Project, Run,
+Environment, AgentCredentialProfile, and managed Project-local EnvironmentTemplate copies) and snapshot or back
 up workspace PVCs that your recovery objectives require. Helm alone cannot reconstruct either:
-it reapplies CRD schemas and chart-owned templates, not the user-created resources that
+it reapplies CRD schemas, the Installation object, and catalog sources, not the Project resources that
 represent desired and observed infrastructure state, and workspace PVCs are per-environment
 volumes whose contents survive pause/resume but are not replicated or backed up by the
 platform. AgentCredentialProfile backing Secrets are controller-created and bound to the
@@ -392,7 +487,11 @@ exact namespace, resource name, and subresource on every request:
 
 This permits producer credentials to be restricted to one Run using an RBAC Role with
 `resourceNames`. The namespace is part of the URL only as a resource selector; it becomes
-authoritative only after RBAC authorizes that exact namespaced identity. Unknown Runs are
+authoritative only after RBAC authorizes that exact namespaced identity. In scoped mode,
+authorization happens first and is then supplemented by the restart-bound
+`tenancy.namespaces` allowlist and an uncached proof of the exact active Installation UID,
+Namespace UID, Namespace annotations, sole Project name/UID, and lifecycle. TokenReview/SAR is
+never replaced by labels or claims. Unknown Runs are
 rejected before transcript state is allocated; every transcript read and append additionally
 requires the exact `SWE-Run-UID` header so a recreated Run never receives stale events or
 readers. An already-open stream is not continuously reauthorized or closed when its Run is
@@ -510,7 +609,8 @@ There is no separate UI workload or Service. For local access, forward the exist
 open `http://127.0.0.1:8080/`:
 
 ```sh
-kubectl port-forward service/swe-platform-swe-platform-control-plane 8080:80
+kubectl -n swe-platform-system port-forward \
+  service/swe-platform-swe-platform-control-plane 8080:80
 ```
 
 For the Argo kind mirror, use `make argocd-ui` instead and open
@@ -560,7 +660,8 @@ After forwarding the control-plane Service, adapters can append JSON transcript 
 and clients can consume replay plus live events as an SSE stream:
 
 ```sh
-kubectl port-forward service/swe-platform-swe-platform-control-plane 8080:80
+kubectl -n swe-platform-system port-forward \
+  service/swe-platform-swe-platform-control-plane 8080:80
 TOKEN="$(kubectl create token my-reader -n project-a --audience=swe-platform)"
 RUN_UID="$(kubectl get run run-123 -n project-a -o jsonpath='{.metadata.uid}')"
 curl -N -H "Authorization: Bearer ${TOKEN}" -H "SWE-Run-UID: ${RUN_UID}" \
@@ -573,8 +674,9 @@ curl -H "Authorization: Bearer ${TOKEN}" -H 'Content-Type: application/json' \
 
 The platform envelope owns transport metadata only:
 
-- A transcript belongs to the immutable `(namespace, Run UID)` identity, so names reused
-  across namespaces or after Run recreation never collide. Every GET stream and POST append
+- A transcript belongs to the immutable `(namespace name, Namespace UID, Run UID)` identity,
+  so a deleted/recreated Namespace, names reused across namespaces, and Run recreation do not
+  inherit prior events. Every GET stream and POST append
   must carry the exact current Run UID in the `SWE-Run-UID` header; a missing header returns
   `428 Precondition Required`, a mismatch with the currently resolved Run UID returns
   `409 Conflict`, and an overlong UID returns `400 Bad Request`. Authentication and exact

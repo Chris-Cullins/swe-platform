@@ -117,7 +117,7 @@ func TestTranscriptStreamLifecycleUnsubscribes(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer response.Body.Close()
-	run := RunIdentity{Namespace: "project-1", UID: "run-1-uid"}
+	run := RunIdentity{Namespace: "project-1", NamespaceUID: testNamespaceUID("project-1"), UID: "run-1-uid"}
 	store.mu.Lock()
 	subscribers := len(store.subscribers[run])
 	store.mu.Unlock()
@@ -228,7 +228,7 @@ func TestTranscriptLegacyAppendRemainsNonIdempotent(t *testing.T) {
 		}
 	}
 	store := api.store.(*memoryTranscriptStore)
-	run := RunIdentity{Namespace: "project-1", UID: "run-1-uid"}
+	run := RunIdentity{Namespace: "project-1", NamespaceUID: testNamespaceUID("project-1"), UID: "run-1-uid"}
 	if len(store.runs[run].events) != 2 {
 		t.Fatalf("legacy retained events = %d, want 2", len(store.runs[run].events))
 	}
@@ -263,7 +263,7 @@ func TestTranscriptRejectsOversizedRequest(t *testing.T) {
 
 func TestTranscriptReconnectUsesLastEventID(t *testing.T) {
 	api := newTestServer(&fakeAccess{})
-	run := RunIdentity{Namespace: "project-1", UID: "run-1-uid"}
+	run := RunIdentity{Namespace: "project-1", NamespaceUID: testNamespaceUID("project-1"), UID: "run-1-uid"}
 	first, err := api.store.Append(context.Background(), run, AppendTranscriptInput{Source: "adapter", IdempotencyKey: "first", Type: "output", Data: json.RawMessage(`{"text":"first"}`)})
 	if err != nil {
 		t.Fatal(err)
@@ -365,7 +365,7 @@ func TestTranscriptAuthorizationScopesNamespaceAndRun(t *testing.T) {
 		}
 	}
 	store := api.store.(*memoryTranscriptStore)
-	identity := RunIdentity{Namespace: "project-a", UID: "run-1-uid"}
+	identity := RunIdentity{Namespace: "project-a", NamespaceUID: testNamespaceUID("project-a"), UID: "run-1-uid"}
 	if len(store.runs) != 1 || len(store.runs[identity].events) != 1 {
 		t.Fatalf("forbidden append changed transcript store: %+v", store.runs)
 	}
@@ -404,8 +404,8 @@ func TestRecreatedRunUsesNewTranscriptIdentity(t *testing.T) {
 	resolver.uid = "run-uid-2"
 	appendEvent("run-uid-2")
 	store := api.store.(*memoryTranscriptStore)
-	first := RunIdentity{Namespace: "project-1", UID: "run-uid-1"}
-	second := RunIdentity{Namespace: "project-1", UID: "run-uid-2"}
+	first := RunIdentity{Namespace: "project-1", NamespaceUID: testNamespaceUID("project-1"), UID: "run-uid-1"}
+	second := RunIdentity{Namespace: "project-1", NamespaceUID: testNamespaceUID("project-1"), UID: "run-uid-2"}
 	if len(store.runs[first].events) != 1 || len(store.runs[second].events) != 1 {
 		t.Fatalf("recreated Run transcripts were not isolated by UID: %+v", store.runs)
 	}
@@ -469,8 +469,8 @@ func TestTranscriptAppendRejectsStaleRunUIDAfterReplacement(t *testing.T) {
 	}
 
 	memStore := store.(*memoryTranscriptStore)
-	oldIdentity := RunIdentity{Namespace: "project-1", UID: "run-uid-1"}
-	newIdentity := RunIdentity{Namespace: "project-1", UID: "run-uid-2"}
+	oldIdentity := RunIdentity{Namespace: "project-1", NamespaceUID: testNamespaceUID("project-1"), UID: "run-uid-1"}
+	newIdentity := RunIdentity{Namespace: "project-1", NamespaceUID: testNamespaceUID("project-1"), UID: "run-uid-2"}
 	if len(memStore.runs[oldIdentity].events) != 1 {
 		t.Fatalf("original Run transcript events = %d, want 1", len(memStore.runs[oldIdentity].events))
 	}
@@ -499,7 +499,7 @@ func TestTranscriptReadRejectsStaleRunUIDAfterReplacementBeforeStoreAccess(t *te
 
 func TestTranscriptStoreRemovesEmptySubscriberMap(t *testing.T) {
 	store := NewMemoryTranscriptStore(MemoryTranscriptStoreOptions{}).(*memoryTranscriptStore)
-	run := RunIdentity{Namespace: "project-1", UID: "run-1"}
+	run := RunIdentity{Namespace: "project-1", NamespaceUID: testNamespaceUID("project-1"), UID: "run-1"}
 	subscription, err := store.Subscribe(context.Background(), run, "")
 	if err != nil {
 		t.Fatal(err)
@@ -541,7 +541,7 @@ type fakeAccess struct {
 	calls []ResourceAccess
 }
 
-func (a *fakeAccess) Authorize(_ *http.Request, access ResourceAccess, _ bool) error {
+func (a *fakeAccess) Authorize(request *http.Request, access ResourceAccess, _ bool) error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.calls = append(a.calls, access)
@@ -551,8 +551,13 @@ func (a *fakeAccess) Authorize(_ *http.Request, access ResourceAccess, _ bool) e
 	if a.allow != nil && !a.allow(access) {
 		return errForbidden
 	}
+	if access.Namespace != "" {
+		*request = *request.WithContext(context.WithValue(request.Context(), namespaceUIDContextKey{}, testNamespaceUID(access.Namespace)))
+	}
 	return nil
 }
+
+func testNamespaceUID(namespace string) types.UID { return types.UID("namespace-uid-" + namespace) }
 
 type fakeRunResolver struct {
 	calls int

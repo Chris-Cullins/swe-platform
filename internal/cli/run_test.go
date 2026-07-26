@@ -98,7 +98,7 @@ func TestAttachTerminalUsesAuthenticatedGateway(t *testing.T) {
 
 func TestAttachCommandRequiresExplicitEnvironmentUID(t *testing.T) {
 	command := NewRootCommand()
-	command.SetArgs([]string{"attach", "env-1", "--control-plane", "https://control.example", "--token", "token"})
+	command.SetArgs([]string{"attach", "env-1", "--namespace", "team-a", "--control-plane", "https://control.example", "--token", "token"})
 	command.SetOut(io.Discard)
 	command.SetErr(io.Discard)
 	err := command.Execute()

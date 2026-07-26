@@ -123,6 +123,7 @@ jobs:
           done
           rendered=$(helm template swe-platform charts/swe-platform \
             --namespace swe-platform-system \
+            --set tenancy.mode=scoped \
             --set controlPlane.transcripts.postgresSecret.name=test-postgres)
           printf '%s\n' "$rendered" | grep -A5 'name: SWE_POSTGRES_URL' | grep -q 'name: "test-postgres"'
 

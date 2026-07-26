@@ -1,16 +1,26 @@
 {{- range .Values.environmentTemplates }}
+{{- $catalogName := required "environmentTemplates[].name is required" .name }}
 {{- $spec := deepCopy .spec }}
 {{- if not $spec.image }}
 {{- $_ := set $spec "image" (include "swe-platform.environmentImage" $) }}
+{{- end }}
+{{- if .namespace }}
+{{- fail "environmentTemplates[].namespace is unsupported; catalog sources always live in the system namespace" }}
 {{- end }}
 ---
 apiVersion: swe.dev/v1alpha1
 kind: EnvironmentTemplate
 metadata:
-  name: {{ required "environmentTemplates[].name is required" .name }}
-  namespace: {{ default $.Release.Namespace .namespace }}
+  name: {{ printf "%s-catalog-%s-%s" (include "swe-platform.fullname" $ | trunc 30 | trimSuffix "-") ($catalogName | trunc 15 | trimSuffix "-") (sha256sum $catalogName | trunc 8) | trunc 63 | trimSuffix "-" }}
+  namespace: {{ $.Release.Namespace }}
   labels:
     {{- include "swe-platform.labels" $ | nindent 4 }}
+  annotations:
+    swe.dev/catalog-source: "true"
+    swe.dev/catalog-name: {{ $catalogName | quote }}
+    swe.dev/catalog-revision: {{ toJson $spec | sha256sum | quote }}
+    swe.dev/installation-namespace: {{ $.Release.Namespace | quote }}
+    swe.dev/installation-name: {{ include "swe-platform.fullname" $ | quote }}
 spec:
   {{- toYaml $spec | nindent 2 }}
 {{- end }}

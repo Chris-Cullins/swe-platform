@@ -14,6 +14,14 @@
 {{- printf "%s-control-plane" (include "swe-platform.fullname" . | trunc 49 | trimSuffix "-") -}}
 {{- end }}
 
+{{- define "swe-platform.clusterFullname" -}}
+{{- printf "%s-%s" (include "swe-platform.fullname" . | trunc 53 | trimSuffix "-") (sha256sum .Release.Namespace | trunc 8) | trunc 63 | trimSuffix "-" -}}
+{{- end }}
+
+{{- define "swe-platform.controlPlaneClusterFullname" -}}
+{{- printf "%s-control-plane" (include "swe-platform.clusterFullname" . | trunc 49 | trimSuffix "-") -}}
+{{- end }}
+
 {{- define "swe-platform.labels" -}}
 helm.sh/chart: {{ printf "%s-%s" .Chart.Name .Chart.Version | replace "+" "_" }}
 app.kubernetes.io/name: {{ include "swe-platform.name" . }}
@@ -32,4 +40,12 @@ app.kubernetes.io/managed-by: {{ .Release.Service }}
 
 {{- define "swe-platform.environmentImage" -}}
 {{- printf "%s:%s" .Values.environmentImage.repository (.Values.environmentImage.tag | default .Chart.AppVersion) -}}
+{{- end }}
+
+{{- define "swe-platform.tenancyMode" -}}
+{{- $mode := required "tenancy.mode is required and must be scoped or trusted-admin" .Values.tenancy.mode -}}
+{{- if not (has $mode (list "scoped" "trusted-admin")) -}}
+{{- fail "tenancy.mode must be scoped or trusted-admin" -}}
+{{- end -}}
+{{- $mode -}}
 {{- end }}

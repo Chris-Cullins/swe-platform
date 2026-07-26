@@ -244,3 +244,18 @@ func (l *closeNotifyListener) Close() error {
 	l.once.Do(func() { close(l.closed) })
 	return l.Listener.Close()
 }
+
+func TestParseTenancyNamespaces(t *testing.T) {
+	namespaces, err := parseTenancyNamespaces(" team-a,team-b ")
+	if err != nil || len(namespaces) != 2 {
+		t.Fatalf("namespaces=%v err=%v", namespaces, err)
+	}
+	for _, value := range []string{"team-a,,team-b", "team-a,team-a", ",team-a"} {
+		if _, err := parseTenancyNamespaces(value); err == nil {
+			t.Fatalf("accepted invalid namespace list %q", value)
+		}
+	}
+	if namespaces, err := parseTenancyNamespaces(" "); err != nil || len(namespaces) != 0 {
+		t.Fatalf("empty namespaces=%v err=%v", namespaces, err)
+	}
+}

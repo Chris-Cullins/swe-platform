@@ -2,11 +2,12 @@ package controllers
 
 import (
 	"context"
+	stderrors "errors"
 	"fmt"
 	"sort"
 	"time"
 
-	"k8s.io/apimachinery/pkg/api/errors"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -16,6 +17,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	platformv1alpha1 "github.com/Chris-Cullins/swe-platform/api/v1alpha1"
+	"github.com/Chris-Cullins/swe-platform/internal/tenancy"
 )
 
 const (
@@ -29,6 +31,7 @@ type WarmPoolReconciler struct {
 	client.Client
 	APIReader client.Reader
 	Scheme    *runtime.Scheme
+	Scope     *tenancy.ReconcileScope
 	Now       func() time.Time
 }
 
@@ -40,6 +43,21 @@ func (r *WarmPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 	var tmpl platformv1alpha1.EnvironmentTemplate
 	if err := r.Get(ctx, req.NamespacedName, &tmpl); err != nil {
 		return ctrl.Result{}, client.IgnoreNotFound(err)
+	}
+	if tenancy.IsCatalogSource(&tmpl) {
+		return ctrl.Result{}, nil
+	}
+	ctx, claim, err := r.Scope.Begin(ctx, tmpl.Namespace, tenancy.LifecycleActive)
+	if err != nil {
+		if stderrors.Is(err, tenancy.ErrOutOfScope) {
+			return ctrl.Result{}, nil
+		}
+		return ctrl.Result{}, err
+	}
+	if r.Scope != nil && r.Scope.Verifier != nil {
+		if err := tenancy.ValidateManagedTemplate(&tmpl, r.Scope.Verifier.Installation, claim); err != nil {
+			return ctrl.Result{}, err
+		}
 	}
 
 	minimum := int32(0)
@@ -55,7 +73,7 @@ func (r *WarmPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 			}
 			before := tmpl.DeepCopy()
 			tmpl.Status.WarmPoolReady = 0
-			if err := r.Status().Patch(ctx, &tmpl, client.MergeFromWithOptions(before, client.MergeFromWithOptimisticLock{})); errors.IsConflict(err) || errors.IsNotFound(err) {
+			if err := r.Status().Patch(ctx, &tmpl, client.MergeFromWithOptions(before, client.MergeFromWithOptimisticLock{})); apierrors.IsConflict(err) || apierrors.IsNotFound(err) {
 				return ctrl.Result{Requeue: true}, nil
 			} else if err != nil {
 				return ctrl.Result{}, fmt.Errorf("clear unsupported warm pool status: %w", err)
@@ -93,7 +111,7 @@ func (r *WarmPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 		}
 		before := tmpl.DeepCopy()
 		tmpl.Status.WarmPoolReady = ready
-		if err := r.Status().Patch(ctx, &tmpl, client.MergeFromWithOptions(before, client.MergeFromWithOptimisticLock{})); errors.IsConflict(err) || errors.IsNotFound(err) {
+		if err := r.Status().Patch(ctx, &tmpl, client.MergeFromWithOptions(before, client.MergeFromWithOptimisticLock{})); apierrors.IsConflict(err) || apierrors.IsNotFound(err) {
 			return ctrl.Result{Requeue: true}, nil
 		} else if err != nil {
 			return ctrl.Result{}, fmt.Errorf("update warm pool status: %w", err)
@@ -124,7 +142,7 @@ func (r *WarmPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 					env.Annotations = make(map[string]string)
 				}
 				env.Annotations[warmPoolCleanupAnnotation] = now.UTC().Format(time.RFC3339Nano)
-				if err := r.Patch(ctx, env, client.MergeFromWithOptions(before, client.MergeFromWithOptimisticLock{})); errors.IsConflict(err) || errors.IsNotFound(err) {
+				if err := r.Patch(ctx, env, client.MergeFromWithOptions(before, client.MergeFromWithOptimisticLock{})); apierrors.IsConflict(err) || apierrors.IsNotFound(err) {
 					return ctrl.Result{Requeue: true}, nil
 				} else if err != nil {
 					return ctrl.Result{}, fmt.Errorf("mark unusable warm environment %q: %w", env.Name, err)
@@ -145,7 +163,7 @@ func (r *WarmPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 			}
 			resourceVersion := env.ResourceVersion
 			uid := env.UID
-			if err := r.Delete(ctx, env, client.Preconditions{UID: &uid, ResourceVersion: &resourceVersion}); errors.IsConflict(err) || errors.IsNotFound(err) {
+			if err := r.Delete(ctx, env, client.Preconditions{UID: &uid, ResourceVersion: &resourceVersion}); apierrors.IsConflict(err) || apierrors.IsNotFound(err) {
 				return ctrl.Result{Requeue: true}, nil
 			} else if err != nil {
 				return ctrl.Result{}, fmt.Errorf("delete unusable warm environment %q: %w", env.Name, err)
@@ -161,7 +179,7 @@ func (r *WarmPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 			}
 			before := env.DeepCopy()
 			delete(env.Annotations, warmPoolCleanupAnnotation)
-			if err := r.Patch(ctx, env, client.MergeFromWithOptions(before, client.MergeFromWithOptimisticLock{})); errors.IsConflict(err) || errors.IsNotFound(err) {
+			if err := r.Patch(ctx, env, client.MergeFromWithOptions(before, client.MergeFromWithOptimisticLock{})); apierrors.IsConflict(err) || apierrors.IsNotFound(err) {
 				return ctrl.Result{Requeue: true}, nil
 			} else if err != nil {
 				return ctrl.Result{}, fmt.Errorf("clear warm environment cleanup marker %q: %w", env.Name, err)
@@ -210,7 +228,7 @@ func (r *WarmPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 			}
 			resourceVersion := env.ResourceVersion
 			uid := env.UID
-			if err := r.Delete(ctx, env, client.Preconditions{UID: &uid, ResourceVersion: &resourceVersion}); errors.IsConflict(err) || errors.IsNotFound(err) {
+			if err := r.Delete(ctx, env, client.Preconditions{UID: &uid, ResourceVersion: &resourceVersion}); apierrors.IsConflict(err) || apierrors.IsNotFound(err) {
 				return ctrl.Result{Requeue: true}, nil
 			} else if err != nil {
 				return ctrl.Result{}, fmt.Errorf("delete excess warm environment %q: %w", env.Name, err)
@@ -250,7 +268,7 @@ func (r *WarmPoolReconciler) templateCurrent(ctx context.Context, observed *plat
 		reader = r.Client
 	}
 	var current platformv1alpha1.EnvironmentTemplate
-	if err := reader.Get(ctx, client.ObjectKeyFromObject(observed), &current); errors.IsNotFound(err) {
+	if err := reader.Get(ctx, client.ObjectKeyFromObject(observed), &current); apierrors.IsNotFound(err) {
 		return false, nil
 	} else if err != nil {
 		return false, fmt.Errorf("revalidate environment template: %w", err)

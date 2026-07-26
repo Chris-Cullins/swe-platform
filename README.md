@@ -18,7 +18,10 @@ to ~$0. Reviewable diff, branch, and PR publication remain planned work.
 > `amp`, `codex`, and `pi` adapters run through sandboxd's managed-process API. Portal proxying
 > is not built yet.
 > The Helm chart installs the
-> operator, control plane, and CRDs. Values presets
+> operator, control plane, CRDs, a stable Installation identity, and inert Template catalog
+> sources in a system namespace. `swe project onboard` creates a dedicated claimed namespace,
+> managed local Template copies, quota, RBAC, and baseline policy before Runs are enabled there.
+> Values presets
 > cover kind, k3s, GKE with GKE Sandbox, and EKS.
 
 ## Why
@@ -39,6 +42,7 @@ to ~$0. Reviewable diff, branch, and PR publication remain planned work.
 |---|---|
 | **Environment** | One ephemeral machine an agent works in (pod + volume + network policy) |
 | **Run** | One agent task executing in an environment |
+| **Installation** | Stable system-namespace identity whose immutable UID claims Project namespaces |
 | **Project** | One git repo today (list-shaped for future multi-repo support) + config |
 | **Template** | Environment class: image, size, runtime, warm pool |
 | **Inbox** | Planned addressable message queue per Run |
@@ -52,7 +56,7 @@ implemented today, approved next contracts, and remaining open work.
 - **`sandboxd`** — a small daemon inside every environment exposing one gRPC contract:
   exec, filesystem, terminal, port registry, health. The control plane never touches a
   pod except through it.
-- **Operator + CRDs** — `Environment`, `EnvironmentTemplate`, `Run`, `Project`, with
+- **Operator + CRDs** — `Installation`, `Environment`, `EnvironmentTemplate`, `Run`, `Project`, with
   controllers for lifecycle, warm pools (pre-booted environments), and idle reaping.
 - **Control plane** — API, auth, transcripts, resource watches, and a web terminal sharing
   the Environment's tmux session; terminal requests can wake Idle suspension.
@@ -157,8 +161,8 @@ clients must use `spec.lifecycle`; writing `paused: false` is not a wake operati
 Use the CLI to publish monotonic user/admin hold-policy revisions:
 
 ```sh
-swe environment hold my-environment
-swe environment release my-environment
+swe --namespace my-project environment hold my-environment
+swe --namespace my-project environment release my-environment
 ```
 
 Accepted work is cancelled only while that exact execution incarnation is securely
@@ -188,9 +192,10 @@ to create a cluster with the `gvisor` RuntimeClass and the snapshot-capable CSI 
 driver, build and load the platform images, then install
 `charts/swe-platform` with `values-kind.yaml` and the printed
 `environmentTemplates[0].spec.runtimeClass=gvisor` override. The preset creates the
-`small` template in `default`; the explicit override keeps it usable in ordinary CI kind
-clusters that do not install runsc. The operator requires any explicitly named RuntimeClass
-object to exist before execution, but RuntimeClass handler and eligible-node support remain
+`small` inert catalog source in the `swe-platform-system` release namespace; onboard a
+dedicated Project namespace to create its runnable managed copy. The explicit override keeps
+that copy usable in ordinary CI kind clusters that do not install runsc. The operator requires
+any explicitly named RuntimeClass object to exist before execution, but RuntimeClass handler and eligible-node support remain
 cluster prerequisites; `make kind-up` smoke-tests both for its gVisor installation. Production
 installation assumptions and k3s/GKE/EKS presets are documented in the
 [chart README](charts/swe-platform/README.md).
@@ -211,7 +216,7 @@ make dev
 ```
 
 Skaffold builds and loads the operator and control-plane images, installs or upgrades the
-`swe-platform` Helm release with `values-kind.yaml`, and repeats that cycle when relevant
+`swe-platform` Helm release in `swe-platform-system` with `values-kind.yaml`, and repeats that cycle when relevant
 source, chart template, or values files change. `make dev` always targets the
 `kind-swe-dev` context (or `kind-$KIND_CLUSTER` when overridden) and refuses the Argo mirror
 cluster named by `KIND_ARGO_CLUSTER` (default `swe-argo`) or any target cluster containing
@@ -234,8 +239,55 @@ allocatable so the Argo/system workload and two 1-CPU/2-GiB `tiny` Environments 
 warm member is claimed and replaced. Increase the container runtime's capacity before
 running `make argocd-up`; the script checks this before installing Argo.
 
-Create runs with an explicit template, or reference a `Project` to use its default
-template:
+Every executable CLI command requires an explicit namespace. Chart Templates are inert catalog
+sources in the system namespace, not runnable tenancy. Before the first Run, an administrator
+must onboard a dedicated namespace and choose all quota values; there are intentionally no
+capacity defaults. For a scoped production release, the order is onboarding, Helm allowlist
+update, then controlled rollout:
+
+```sh
+SYSTEM_NAMESPACE=swe-platform-system
+PROJECT_NAMESPACE=my-project
+INSTALLATION=swe-platform-swe-platform
+
+swe --namespace "$PROJECT_NAMESPACE" project onboard my-project \
+  --system-namespace "$SYSTEM_NAMESPACE" --installation "$INSTALLATION" \
+  --repository https://github.com/example/project.git \
+  --default-template medium --template medium \
+  --quota-hard requests.cpu="$PROJECT_CPU_QUOTA" \
+  --quota-hard requests.memory="$PROJECT_MEMORY_QUOTA" \
+  --quota-hard requests.storage="$PROJECT_STORAGE_QUOTA" \
+  --quota-hard persistentvolumeclaims="$PROJECT_PVC_QUOTA" \
+  --quota-hard pods="$PROJECT_POD_QUOTA" \
+  --quota-hard secrets="$PROJECT_SECRET_QUOTA" \
+  --quota-hard count/runs.swe.dev="$PROJECT_RUN_QUOTA" \
+  --quota-hard count/environments.swe.dev="$PROJECT_ENVIRONMENT_QUOTA" \
+  --quota-hard count/agentcredentialprofiles.swe.dev="$PROJECT_CREDENTIAL_QUOTA"
+
+# Persist the complete list in the release's values file in production. This
+# one-entry command only illustrates the required restart-bound scope update.
+helm upgrade swe-platform ./charts/swe-platform \
+  --namespace "$SYSTEM_NAMESPACE" --values ./charts/swe-platform/values-k3s.yaml \
+  --set-string "tenancy.namespaces[0]=$PROJECT_NAMESPACE"
+
+swe --namespace "$PROJECT_NAMESPACE" run --project my-project "Fix the flaky test"
+```
+
+Rerunning `project onboard` explicitly synchronizes managed Template specs/revisions in place
+without replacing the local Template UID or its warm pool. Existing unclaimed namespaces
+require `--adopt`; foreign claims, stale UIDs, multiple Projects, and unowned Template or
+baseline collisions are refused. There is no automatic adoption of the old release-namespace
+topology.
+
+Offboarding is retain-only in this phase. It fences first, requests Run cancellation and
+Environment suspension, waits for drain, and marks the Namespace fenced without deleting any
+Namespace, PVC, credential profile or owned Secret, transcript, or other retained Project
+resource. Normal Environment suspension still revokes that pod incarnation's ephemeral
+sandboxd credential Secret. Remove the fenced namespace from `tenancy.namespaces` and roll the
+scoped components afterward. Purge is not implemented.
+
+After onboarding, create Runs with an explicit local template, or reference the Project to use
+its default template:
 
 > **Breaking v1alpha1 credential migration:** `Project.spec.secretRef` has been removed
 > and is now rejected by CRD admission. For an existing plain-Helm installation, first
@@ -247,11 +299,11 @@ template:
 > remain future work.
 
 ```sh
-swe run --template small "Fix the flaky test"
-swe run --project org-repo "Fix the flaky test"
-swe run --name fix-flaky-42 --project org-repo "Fix the flaky test"
-swe run --environment warm-env-1 "Fix the flaky test"
-swe cancel fix-flaky-42
+swe --namespace my-project run --template small "Fix the flaky test"
+swe --namespace my-project run --project org-repo "Fix the flaky test"
+swe --namespace my-project run --name fix-flaky-42 --project org-repo "Fix the flaky test"
+swe --namespace my-project run --environment warm-env-1 "Fix the flaky test"
+swe --namespace my-project cancel fix-flaky-42
 ```
 
 ### Claude Code adapter
@@ -277,10 +329,13 @@ only supported profile credential type. The CLI creates an owner-linked, same-na
 backing Secret and never prints the key or Secret representation:
 
 ```sh
-secret-tool lookup service anthropic | swe credentials create anthropic --agent claude-code --api-key-stdin
-swe run --project org-repo --credential-profile anthropic "Fix the flaky test"
-secret-tool lookup service anthropic | swe credentials rotate anthropic --api-key-stdin
-swe credentials list
+secret-tool lookup service anthropic | \
+  swe --namespace my-project credentials create anthropic --agent claude-code --api-key-stdin
+swe --namespace my-project run --project org-repo \
+  --credential-profile anthropic "Fix the flaky test"
+secret-tool lookup service anthropic | \
+  swe --namespace my-project credentials rotate anthropic --api-key-stdin
+swe --namespace my-project credentials list
 ```
 
 Immediately before adapter acceptance, the operator revalidates the bound profile UID and its
@@ -456,7 +511,8 @@ GET, so a credential restricted to `environments/terminal` remains sufficient:
 ```sh
 ENV_UID="$(kubectl get environment my-environment -o jsonpath='{.metadata.uid}')"
 SWE_CONTROL_PLANE_URL=https://swe.example.com \
-SWE_CONTROL_PLANE_TOKEN="$TOKEN" swe attach my-environment --environment-uid "$ENV_UID"
+SWE_CONTROL_PLANE_TOKEN="$TOKEN" swe --namespace my-project attach my-environment \
+  --environment-uid "$ENV_UID"
 ```
 
 Name-only direct clients now fail with a terminal-identity error rather than selecting a
@@ -553,7 +609,8 @@ Run transcripts use the same explicit control-plane URL and bearer credential:
 
 ```sh
 SWE_CONTROL_PLANE_URL=https://swe.example.com \
-SWE_CONTROL_PLANE_TOKEN="$TOKEN" swe logs --run fix-flaky-42 --run-uid "$RUN_UID"
+SWE_CONTROL_PLANE_TOKEN="$TOKEN" swe --namespace my-project logs \
+  --run fix-flaky-42 --run-uid "$RUN_UID"
 ```
 
 `swe logs --run RUN --run-uid UID` selects that exact immutable Run in `--namespace` and emits one NDJSON
