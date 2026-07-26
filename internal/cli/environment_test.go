@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -299,6 +300,33 @@ func TestEnvironmentServiceUpdateRetriesConflictAndPreservesConcurrentDeclaratio
 	}
 	if len(current.Spec.Services) != 2 || environmentServiceIndex(current.Spec.Services, "api") < 0 || current.Spec.Services[environmentServiceIndex(current.Spec.Services, "web")].TargetPort != 3001 {
 		t.Fatalf("concurrent declaration was lost: %#v", current.Spec.Services)
+	}
+}
+
+func TestEnvironmentServiceDeclareEnforcesBound(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := platformv1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	environment := &platformv1alpha1.Environment{}
+	environment.Name = "shared"
+	environment.Namespace = "ns"
+	environment.UID = "env-uid"
+	for i := 0; i < platformv1alpha1.EnvironmentServiceMaxDeclarations; i++ {
+		environment.Spec.Services = append(environment.Spec.Services, desiredEnvironmentService(fmt.Sprintf("service-%02d", i), int32(3000+i), 1))
+	}
+	kube := fake.NewClientBuilder().WithScheme(scheme).WithObjects(environment).Build()
+
+	_, err := writeEnvironmentService(context.Background(), kube, client.ObjectKeyFromObject(environment), "one-too-many", 4000, false)
+	if err == nil || !strings.Contains(err.Error(), "maximum of 32") {
+		t.Fatalf("bounded declare error = %v", err)
+	}
+	var current platformv1alpha1.Environment
+	if err := kube.Get(context.Background(), client.ObjectKeyFromObject(environment), &current); err != nil {
+		t.Fatal(err)
+	}
+	if len(current.Spec.Services) != platformv1alpha1.EnvironmentServiceMaxDeclarations {
+		t.Fatalf("service count = %d, want %d", len(current.Spec.Services), platformv1alpha1.EnvironmentServiceMaxDeclarations)
 	}
 }
 
