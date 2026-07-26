@@ -1114,7 +1114,7 @@ if [[ "$SESSION_REPLACEMENT_STATUS" != "200" ]]; then
 	exit 1
 fi
 
-echo "==> verifying definitive unauthenticated TokenReview is durably revoked"
+echo "==> verifying definitive browser-session rejection is durably revoked"
 kubectl -n "$SYSTEM_NAMESPACE" port-forward service/postgres 15432:5432 >/tmp/swe-platform-postgres-port-forward.log 2>&1 &
 POSTGRES_PORT_FORWARD_PID=$!
 for _ in $(seq 1 30); do
@@ -1144,10 +1144,7 @@ func main() {
 	if err != nil { panic(err) }
 	store, err := controlplane.NewPostgresSessionStore(ctx, db, keyring, controlplane.PostgresSessionStoreOptions{})
 	if err != nil { panic(err) }
-	// An unrecognized JWT issuer yields a definitive unauthenticated
-	// TokenReview rather than a status.error.
-	token := "eyJhbGciOiJSUzI1NiJ9." + "eyJpc3MiOiJlMmUtdW5rbm93biJ9." + "c2lnbmF0dXJl"
-	cookie, err := store.Create(ctx, token)
+	cookie, err := store.Create(ctx, os.Getenv("E2E_REJECTED_TOKEN"))
 	if err != nil { panic(err) }
 	fmt.Print(cookie)
 }
@@ -1157,7 +1154,8 @@ E2E_SESSION_POSTGRES_URL=$(kubectl -n "$SYSTEM_NAMESPACE" get secret swe-platfor
 	-o jsonpath='{.data.url}' | base64 -d)
 E2E_SESSION_POSTGRES_URL=${E2E_SESSION_POSTGRES_URL/@postgres:5432/@127.0.0.1:15432}
 REJECTION_COOKIE=$(E2E_POSTGRES_URL="$E2E_SESSION_POSTGRES_URL" \
-	E2E_SESSION_KEYRING_FILE="$SESSION_KEYRING_FILE" go run "$E2E_SESSION_FIXTURE/main.go")
+	E2E_SESSION_KEYRING_FILE="$SESSION_KEYRING_FILE" E2E_REJECTED_TOKEN="$E2E_BOOTSTRAP_TOKEN" \
+	go run "$E2E_SESSION_FIXTURE/main.go")
 unset E2E_SESSION_POSTGRES_URL
 REJECTION_SESSION_COUNT_AFTER=$(browser_session_count)
 rm -rf "$E2E_SESSION_FIXTURE"
@@ -1175,7 +1173,7 @@ REJECTION_STATUS=$(curl --silent --output /dev/null --write-out '%{http_code}' \
 	-H "Cookie: swe-platform-session=${REJECTION_COOKIE}" http://127.0.0.1:18080/api/v1/session)
 REJECTION_SESSION_COUNT_REVOKED=$(browser_session_count)
 if [[ "$REJECTION_STATUS" != "401" || "$REJECTION_SESSION_COUNT_REVOKED" != "$REJECTION_SESSION_COUNT_BEFORE" ]]; then
-	echo "FAIL: definitive unauthenticated TokenReview status=${REJECTION_STATUS}, session counts before=${REJECTION_SESSION_COUNT_BEFORE} after-fixture=${REJECTION_SESSION_COUNT_AFTER} after-rejection=${REJECTION_SESSION_COUNT_REVOKED}; expected 401 and durable deletion"
+	echo "FAIL: definitive browser-session rejection status=${REJECTION_STATUS}, session counts before=${REJECTION_SESSION_COUNT_BEFORE} after-fixture=${REJECTION_SESSION_COUNT_AFTER} after-rejection=${REJECTION_SESSION_COUNT_REVOKED}; expected 401 and durable deletion"
 	exit 1
 fi
 replace_control_plane_pod
