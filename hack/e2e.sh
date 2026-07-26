@@ -150,6 +150,14 @@ browser_session_count() {
 		psql -U swe -d swe -tAc 'SELECT count(*) FROM browser_sessions' | tr -d '[:space:]'
 }
 
+set_control_plane_token_audience() {
+	kubectl -n "$SYSTEM_NAMESPACE" set env deployment/"$INSTALLATION_NAME-control-plane" \
+		SWE_TOKEN_AUDIENCE="$1" >/dev/null
+	kubectl -n "$SYSTEM_NAMESPACE" rollout status deployment/"$INSTALLATION_NAME-control-plane" \
+		--timeout=2m >/dev/null
+	start_control_plane_port_forward
+}
+
 check_sandboxd_process() {
 	local pod_name="$1"
 	local run_uid="$2"
@@ -1102,35 +1110,26 @@ if [[ "$SESSION_REPLACEMENT_STATUS" != "200" ]]; then
 	exit 1
 fi
 
-echo "==> verifying definitive TokenReview rejection is durably revoked"
-kubectl -n "$PROJECT_NAMESPACE" create serviceaccount e2e-session-rejection >/dev/null
-REJECTION_TOKEN=$(kubectl -n "$PROJECT_NAMESPACE" create token e2e-session-rejection --audience=swe-platform)
+echo "==> verifying definitive TokenReview audience rejection is durably revoked"
 REJECTION_COOKIE_JAR=/tmp/swe-platform-rejected-session-cookies
 rm -f "$REJECTION_COOKIE_JAR"
 REJECTION_SESSION_COUNT_BEFORE=$(browser_session_count)
 REJECTION_EXCHANGE_STATUS=$(curl --silent --output /dev/null --write-out '%{http_code}' \
-	--cookie-jar "$REJECTION_COOKIE_JAR" -X POST -H "Authorization: Bearer ${REJECTION_TOKEN}" \
+	--cookie-jar "$REJECTION_COOKIE_JAR" -X POST -H "Authorization: Bearer ${CONSOLE_TOKEN}" \
 	http://127.0.0.1:18080/api/v1/session)
 REJECTION_SESSION_COUNT_AFTER=$(browser_session_count)
-unset REJECTION_TOKEN
-kubectl -n "$PROJECT_NAMESPACE" delete serviceaccount e2e-session-rejection --wait=true >/dev/null
 if [[ "$REJECTION_EXCHANGE_STATUS" != "200" || "$REJECTION_SESSION_COUNT_AFTER" != "$((REJECTION_SESSION_COUNT_BEFORE + 1))" ]]; then
 	echo "FAIL: rejected-token exchange did not add exactly one durable session"
 	exit 1
 fi
-REJECTION_STATUS=""
-for _ in $(seq 1 90); do
-	REJECTION_STATUS=$(curl --silent --output /dev/null --write-out '%{http_code}' \
-		--cookie "$REJECTION_COOKIE_JAR" http://127.0.0.1:18080/api/v1/session)
-	if [[ "$REJECTION_STATUS" == "401" ]]; then
-		break
-	fi
-	sleep 1
-done
+set_control_plane_token_audience swe-platform-rejected-e2e
+REJECTION_STATUS=$(curl --silent --output /dev/null --write-out '%{http_code}' \
+	--cookie "$REJECTION_COOKIE_JAR" http://127.0.0.1:18080/api/v1/session)
 if [[ "$REJECTION_STATUS" != "401" || "$(browser_session_count)" != "$REJECTION_SESSION_COUNT_BEFORE" ]]; then
-	echo "FAIL: definitive TokenReview rejection did not durably delete its session"
+	echo "FAIL: definitive TokenReview audience rejection did not durably delete its session"
 	exit 1
 fi
+set_control_plane_token_audience swe-platform
 replace_control_plane_pod
 REJECTION_REPLAY_STATUS=$(curl --silent --output /dev/null --write-out '%{http_code}' \
 	--cookie "$REJECTION_COOKIE_JAR" http://127.0.0.1:18080/api/v1/session)
