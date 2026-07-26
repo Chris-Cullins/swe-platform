@@ -65,7 +65,10 @@ func (s *Server) deleteSession(w http.ResponseWriter, r *http.Request) {
 		writeProblem(w, http.StatusForbidden, "invalid-origin", "Invalid origin", "cookie-authenticated mutations require an exact same-origin Origin header")
 		return
 	}
-	s.sessions.DeleteSession(r)
+	if err := s.sessions.DeleteSession(r); err != nil {
+		writeProblem(w, http.StatusServiceUnavailable, "session-unavailable", "Session service unavailable", "browser session revocation could not be committed")
+		return
+	}
 	http.SetCookie(w, &http.Cookie{
 		Name:     sessionCookieName,
 		Value:    "",
