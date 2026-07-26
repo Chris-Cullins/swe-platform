@@ -1119,7 +1119,7 @@ REJECTION_TOKEN_PAYLOAD=$(printf '%s' "$REJECTION_TOKEN_PAYLOAD" | tr '_-' '/+' 
 	base64 -w0 | tr '+/' '-_' | tr -d '=')
 REJECTION_TOKEN_INPUT="${REJECTION_TOKEN_HEADER}.${REJECTION_TOKEN_PAYLOAD}"
 REJECTION_TOKEN_SIGNATURE=$(printf '%s' "$REJECTION_TOKEN_INPUT" | openssl dgst -sha256 \
-	-sign <(docker exec "${KIND_CLUSTER}-control-plane" cat /etc/kubernetes/pki/sa.key) | \
+	-sign <(docker exec "${CLUSTER}-control-plane" cat /etc/kubernetes/pki/sa.key) | \
 	base64 -w0 | tr '+/' '-_' | tr -d '=')
 REJECTION_TOKEN="${REJECTION_TOKEN_INPUT}.${REJECTION_TOKEN_SIGNATURE}"
 unset REJECTION_TOKEN_BASE REJECTION_TOKEN_HEADER REJECTION_TOKEN_PAYLOAD REJECTION_TOKEN_INPUT REJECTION_TOKEN_SIGNATURE
