@@ -52,6 +52,26 @@ func TestServiceObservationReportsConnectedAndNotConnectedInRequestOrder(t *test
 	}
 }
 
+func TestServiceObservationReportsIPv6LoopbackListener(t *testing.T) {
+	listener, err := net.Listen("tcp6", "[::1]:0")
+	if err != nil {
+		t.Skipf("IPv6 loopback is unavailable: %v", err)
+	}
+	t.Cleanup(func() { _ = listener.Close() })
+	port := uint32(listener.Addr().(*net.TCPAddr).Port)
+
+	conn := newConn(t, t.TempDir())
+	response, err := sandboxdv1.NewServiceObservationServiceClient(conn).Observe(context.Background(), &sandboxdv1.ObserveServicesRequest{
+		Probes: []*sandboxdv1.ServiceProbe{tcpServiceProbe("ipv6", port)},
+	})
+	if err != nil {
+		t.Fatalf("observe: %v", err)
+	}
+	if len(response.Observations) != 1 || response.Observations[0].Outcome != sandboxdv1.ServiceProbeOutcome_SERVICE_PROBE_OUTCOME_CONNECTED {
+		t.Fatalf("IPv6 observation = %#v", response.Observations)
+	}
+}
+
 func TestServiceObservationRejectsInvalidRequestsBeforeDialing(t *testing.T) {
 	valid := tcpServiceProbe("valid", 8080)
 	tests := map[string][]*sandboxdv1.ServiceProbe{
@@ -74,7 +94,7 @@ func TestServiceObservationRejectsInvalidRequestsBeforeDialing(t *testing.T) {
 	for name, probes := range tests {
 		t.Run(name, func(t *testing.T) {
 			var dials atomic.Int32
-			observer := NewServiceObservationServer()
+			observer := NewServiceObservationServer(50051)
 			observer.dialContext = func(context.Context, string, string) (net.Conn, error) {
 				dials.Add(1)
 				return nil, errors.New("unexpected dial")
@@ -90,8 +110,20 @@ func TestServiceObservationRejectsInvalidRequestsBeforeDialing(t *testing.T) {
 	}
 }
 
+func TestServiceObservationRejectsConfiguredControlPort(t *testing.T) {
+	observer := NewServiceObservationServer(50052)
+	for _, port := range []uint32{50051, 50052} {
+		_, err := observer.Observe(context.Background(), &sandboxdv1.ObserveServicesRequest{
+			Probes: []*sandboxdv1.ServiceProbe{tcpServiceProbe("control", port)},
+		})
+		if status.Code(err) != codes.InvalidArgument {
+			t.Fatalf("port %d status = %v, want InvalidArgument", port, err)
+		}
+	}
+}
+
 func TestServiceObservationBoundsErrorsAndPreservesCorrelation(t *testing.T) {
-	observer := NewServiceObservationServer()
+	observer := NewServiceObservationServer(50051)
 	observer.dialContext = func(_ context.Context, _, address string) (net.Conn, error) {
 		if strings.HasSuffix(address, ":8001") {
 			time.Sleep(20 * time.Millisecond)
@@ -119,7 +151,7 @@ func TestServiceObservationBoundsErrorsAndPreservesCorrelation(t *testing.T) {
 }
 
 func TestServiceObservationEnforcesWholeCallAndGlobalConcurrencyBounds(t *testing.T) {
-	observer := NewServiceObservationServer()
+	observer := NewServiceObservationServer(50051)
 	observer.callTimeout = 40 * time.Millisecond
 	observer.probeTimeout = time.Second
 	observer.probeSlots = make(chan struct{}, 2)
@@ -173,7 +205,7 @@ func TestServiceObservationEnforcesWholeCallAndGlobalConcurrencyBounds(t *testin
 }
 
 func TestServiceObservationCancellationReleasesGlobalSlot(t *testing.T) {
-	observer := NewServiceObservationServer()
+	observer := NewServiceObservationServer(50051)
 	observer.callTimeout = time.Second
 	observer.probeTimeout = time.Second
 	observer.probeSlots = make(chan struct{}, 1)

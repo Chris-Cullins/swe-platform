@@ -82,7 +82,11 @@ func main() {
 	sandboxdv1.RegisterProcessServiceServer(grpcServer, processServer)
 	sandboxdv1.RegisterFilesystemServiceServer(grpcServer, filesystemServer)
 	sandboxdv1.RegisterTerminalServiceServer(grpcServer, server.NewTerminalServer(*workspace))
-	sandboxdv1.RegisterServiceObservationServiceServer(grpcServer, server.NewServiceObservationServer())
+	controlAddress, ok := lis.Addr().(*net.TCPAddr)
+	if !ok {
+		log.Fatalf("sandboxd listener has unexpected address type %T", lis.Addr())
+	}
+	sandboxdv1.RegisterServiceObservationServiceServer(grpcServer, server.NewServiceObservationServer(uint32(controlAddress.Port)))
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()

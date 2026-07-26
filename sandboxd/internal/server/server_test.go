@@ -47,7 +47,7 @@ func newConn(t *testing.T, workspace string) *grpc.ClientConn {
 	sandboxdv1.RegisterTerminalServiceServer(grpcServer, &TerminalServer{
 		backend: newTmuxTerminalBackend(workspace, socketName, []string{"sh"}),
 	})
-	sandboxdv1.RegisterServiceObservationServiceServer(grpcServer, NewServiceObservationServer())
+	sandboxdv1.RegisterServiceObservationServiceServer(grpcServer, NewServiceObservationServer(50051))
 	go func() { _ = grpcServer.Serve(lis) }()
 	t.Cleanup(func() { grpcServer.Stop(); processServer.Close() })
 
