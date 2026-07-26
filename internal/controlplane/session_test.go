@@ -178,7 +178,7 @@ func TestSessionDeleteStoreFailureRetainsCookie(t *testing.T) {
 	r.Header.Set("Origin", "https://example.test")
 	r.AddCookie(&http.Cookie{Name: sessionCookieName, Value: "retryable"})
 	w := httptest.NewRecorder()
-	sessions := &fakeSessions{delete: func(*http.Request) error { return errSessionUnavailable }}
+	sessions := &fakeSessions{delete: func(*http.Request) error { return ErrSessionUnavailable }}
 	NewServer(nil, ServerOptions{Sessions: sessions}).Handler().ServeHTTP(w, r)
 	if w.Code != http.StatusServiceUnavailable {
 		t.Fatalf("status=%d body=%s", w.Code, w.Body.String())

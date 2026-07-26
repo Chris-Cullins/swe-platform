@@ -177,7 +177,7 @@ func (a KubernetesAccessController) CurrentSession(r *http.Request) (Session, er
 
 func (a KubernetesAccessController) DeleteSession(r *http.Request) error {
 	if a.Sessions == nil {
-		return errSessionUnavailable
+		return ErrSessionUnavailable
 	}
 	if cookie, err := r.Cookie(sessionCookieName); err == nil {
 		return sessionStoreAccessError(a.Sessions.Delete(r.Context(), cookie.Value))
@@ -208,7 +208,7 @@ func sessionStoreAccessError(err error) error {
 	if err == nil {
 		return nil
 	}
-	if errors.Is(err, errSessionUnauthenticated) || errors.Is(err, errSessionNotFound) || errors.Is(err, errSessionExpired) {
+	if errors.Is(err, ErrSessionUnauthenticated) || errors.Is(err, ErrSessionNotFound) || errors.Is(err, ErrSessionExpired) {
 		return errUnauthenticated
 	}
 	return err

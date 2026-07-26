@@ -50,11 +50,16 @@ func (e *sessionStoreError) Is(target error) bool {
 }
 
 var (
-	errSessionUnauthenticated = &sessionStoreError{kind: sessionStoreUnauthenticated}
-	errSessionNotFound        = &sessionStoreError{kind: sessionStoreNotFound}
-	errSessionExpired         = &sessionStoreError{kind: sessionStoreExpired}
-	errSessionCapacity        = &sessionStoreError{kind: sessionStoreCapacity}
-	errSessionUnavailable     = &sessionStoreError{kind: sessionStoreUnavailable}
+	// ErrSessionUnauthenticated reports invalid session input.
+	ErrSessionUnauthenticated = &sessionStoreError{kind: sessionStoreUnauthenticated}
+	// ErrSessionNotFound reports an absent session identifier.
+	ErrSessionNotFound = &sessionStoreError{kind: sessionStoreNotFound}
+	// ErrSessionExpired reports a session removed at its absolute expiry.
+	ErrSessionExpired = &sessionStoreError{kind: sessionStoreExpired}
+	// ErrSessionCapacity reports rejection at the live-session bound.
+	ErrSessionCapacity = &sessionStoreError{kind: sessionStoreCapacity}
+	// ErrSessionUnavailable reports an indeterminate backend operation.
+	ErrSessionUnavailable = &sessionStoreError{kind: sessionStoreUnavailable}
 )
 
 // SessionStore retains Kubernetes bearer credentials behind opaque browser
@@ -128,7 +133,7 @@ func NewMemorySessionStore(options MemorySessionStoreOptions) *MemorySessionStor
 
 func (s *MemorySessionStore) ValidateToken(token string) error {
 	if len(token) == 0 || len(token) > s.maxTokenBytes {
-		return errSessionUnauthenticated
+		return ErrSessionUnauthenticated
 	}
 	return nil
 }
@@ -147,7 +152,7 @@ func (s *MemorySessionStore) Create(_ context.Context, token string) (string, er
 		}
 	}
 	if len(s.sessions) >= s.maxActiveSessions {
-		return "", errSessionCapacity
+		return "", ErrSessionCapacity
 	}
 	for attempt := 0; attempt < 4; attempt++ {
 		var raw [32]byte
@@ -167,7 +172,7 @@ func (s *MemorySessionStore) Create(_ context.Context, token string) (string, er
 
 func (s *MemorySessionStore) Resolve(_ context.Context, id string) (string, error) {
 	if id == "" {
-		return "", errSessionUnauthenticated
+		return "", ErrSessionUnauthenticated
 	}
 	key := sha256.Sum256([]byte(id))
 	now := s.now()
@@ -175,11 +180,11 @@ func (s *MemorySessionStore) Resolve(_ context.Context, id string) (string, erro
 	defer s.mu.Unlock()
 	session, ok := s.sessions[key]
 	if !ok {
-		return "", errSessionNotFound
+		return "", ErrSessionNotFound
 	}
 	if !now.Before(session.expiresAt) {
 		delete(s.sessions, key)
-		return "", errSessionExpired
+		return "", ErrSessionExpired
 	}
 	return session.token, nil
 }

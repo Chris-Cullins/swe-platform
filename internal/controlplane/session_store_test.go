@@ -34,14 +34,14 @@ func (s *fakeSessionStore) ValidateToken(token string) error {
 
 func (s *fakeSessionStore) Create(ctx context.Context, token string) (string, error) {
 	if s.create == nil {
-		return "", errSessionUnavailable
+		return "", ErrSessionUnavailable
 	}
 	return s.create(ctx, token)
 }
 
 func (s *fakeSessionStore) Resolve(ctx context.Context, id string) (string, error) {
 	if s.resolve == nil {
-		return "", errSessionUnavailable
+		return "", ErrSessionUnavailable
 	}
 	return s.resolve(ctx, id)
 }
@@ -71,10 +71,10 @@ func TestMemorySessionStoreBoundsAndAbsoluteExpiry(t *testing.T) {
 	if err != nil || first == second {
 		t.Fatalf("second session = %q, err %v", second, err)
 	}
-	if _, err := store.Create(ctx, "three"); !errors.Is(err, errSessionCapacity) {
+	if _, err := store.Create(ctx, "three"); !errors.Is(err, ErrSessionCapacity) {
 		t.Fatalf("capacity error = %v", err)
 	}
-	if _, err := store.Create(ctx, "123456"); !errors.Is(err, errSessionUnauthenticated) {
+	if _, err := store.Create(ctx, "123456"); !errors.Is(err, ErrSessionUnauthenticated) {
 		t.Fatalf("oversized token error = %v", err)
 	}
 	key := sha256SessionKey(first)
@@ -82,10 +82,10 @@ func TestMemorySessionStoreBoundsAndAbsoluteExpiry(t *testing.T) {
 		t.Fatalf("stored times = %s/%s", entry.createdAt, entry.expiresAt)
 	}
 	now = now.Add(time.Minute)
-	if _, err := store.Resolve(ctx, first); !errors.Is(err, errSessionExpired) {
+	if _, err := store.Resolve(ctx, first); !errors.Is(err, ErrSessionExpired) {
 		t.Fatalf("expired resolve error = %v", err)
 	}
-	if _, err := store.Resolve(ctx, first); !errors.Is(err, errSessionNotFound) {
+	if _, err := store.Resolve(ctx, first); !errors.Is(err, ErrSessionNotFound) {
 		t.Fatalf("purged resolve error = %v", err)
 	}
 	if err := store.Delete(ctx, first); err != nil {
@@ -292,12 +292,12 @@ func TestSessionResolveFailureSkipsTokenReview(t *testing.T) {
 		return true, nil, errors.New("unexpected TokenReview")
 	})
 	store := &fakeSessionStore{resolve: func(context.Context, string) (string, error) {
-		return "", errSessionUnavailable
+		return "", ErrSessionUnavailable
 	}}
 	controller := KubernetesAccessController{Client: client, Sessions: store}
 	request := httptest.NewRequest(http.MethodGet, "https://console.test/api/v1/namespaces/ns/runs", nil)
 	request.AddCookie(&http.Cookie{Name: sessionCookieName, Value: "session"})
-	if err := controller.Authorize(request, ResourceAccess{}, true); !errors.Is(err, errSessionUnavailable) {
+	if err := controller.Authorize(request, ResourceAccess{}, true); !errors.Is(err, ErrSessionUnavailable) {
 		t.Fatalf("resolve error = %v", err)
 	}
 	if reviews != 0 {
@@ -407,12 +407,12 @@ func TestDefinitiveRejectionDeleteFailureIsUnavailable(t *testing.T) {
 	})
 	store := &fakeSessionStore{
 		resolve: func(context.Context, string) (string, error) { return "resource-token", nil },
-		delete:  func(context.Context, string) error { return errSessionUnavailable },
+		delete:  func(context.Context, string) error { return ErrSessionUnavailable },
 	}
 	controller := KubernetesAccessController{Client: client, Sessions: store}
 	request := httptest.NewRequest(http.MethodGet, "https://console.test/api/v1/namespaces/ns/runs", nil)
 	request.AddCookie(&http.Cookie{Name: sessionCookieName, Value: "session"})
-	if err := controller.Authorize(request, ResourceAccess{}, true); !errors.Is(err, errSessionUnavailable) {
+	if err := controller.Authorize(request, ResourceAccess{}, true); !errors.Is(err, ErrSessionUnavailable) {
 		t.Fatalf("delete failure error = %v", err)
 	}
 }
