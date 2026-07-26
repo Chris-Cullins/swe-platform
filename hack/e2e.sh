@@ -86,12 +86,12 @@ wait_for_resource_quota_observation() {
 	local namespace="$1"
 	for _ in $(seq 1 300); do
 		if kubectl -n "$namespace" get resourcequota swe-project -o json | \
-			jq -e '(.status.hard // {}) == .spec.hard' >/dev/null; then
+			jq -e '(.status.hard // {}) == .spec.hard and ((.status.used // {}) | has("count/environments.swe.dev"))' >/dev/null; then
 			return 0
 		fi
 		sleep 1
 	done
-	echo "FAIL: ResourceQuota in $namespace did not observe all configured hard limits" >&2
+	echo "FAIL: ResourceQuota in $namespace did not observe configured hard limits and Environment usage" >&2
 	kubectl -n "$namespace" get resourcequota swe-project -o yaml >&2 || true
 	return 1
 }
@@ -379,7 +379,14 @@ kubectl -n "$SYSTEM_NAMESPACE" rollout status deployment/"$INSTALLATION_NAME-con
 kubectl config set-context --current --namespace="$PROJECT_NAMESPACE" >/dev/null
 
 echo "==> waiting for local warm environment"
-kubectl wait --for=jsonpath='{.status.warmPoolReady}'=1 environmenttemplate/small --timeout=2m
+if ! kubectl wait --for=jsonpath='{.status.warmPoolReady}'=1 environmenttemplate/small --timeout=2m; then
+	echo "FAIL: local warm environment did not become ready" >&2
+	kubectl get environmenttemplate small -o yaml >&2 || true
+	kubectl get environments,pods -o wide >&2 || true
+	kubectl get events --sort-by=.lastTimestamp >&2 || true
+	kubectl -n "$SYSTEM_NAMESPACE" logs deployment/"$INSTALLATION_NAME" --tail=200 >&2 || true
+	exit 1
+fi
 WARM_ENV_NAME=$(kubectl get environments -l swe.dev/warm-pool=small -o jsonpath='{.items[0].metadata.name}')
 if [[ -z "$WARM_ENV_NAME" ]]; then
 	echo "FAIL: warm pool did not create an environment"
@@ -1328,6 +1335,53 @@ if ! kubectl exec "$POD_NAME" -- sh -c 'test "$(wc -l < /workspace/setup-result)
 	echo "FAIL: .agents/setup ran again for an initialized workspace"
 	exit 1
 fi
+
+echo "==> verifying bounded durable Environment service declarations"
+bin/swe --namespace "$PROJECT_NAMESPACE" environment services declare "$ENV_NAME" web --target-port 3000
+bin/swe --namespace "$PROJECT_NAMESPACE" environment services declare "$ENV_NAME" web-alias --target-port 3000
+SERVICE_LIST=$(bin/swe --namespace "$PROJECT_NAMESPACE" environment services list "$ENV_NAME")
+if ! grep -Fq $'web\t1\tHTTP\t3000\tProject\tTCPConnect' <<<"$SERVICE_LIST" ||
+	! grep -Fq $'web-alias\t1\tHTTP\t3000\tProject\tTCPConnect' <<<"$SERVICE_LIST"; then
+	echo "FAIL: service list did not report durable declarations and duplicate-port aliases"
+	exit 1
+fi
+bin/swe --namespace "$PROJECT_NAMESPACE" environment services declare "$ENV_NAME" web --target-port 3000
+if [[ "$(kubectl get environment "$ENV_NAME" -o jsonpath='{.spec.services[?(@.name=="web")].revision}')" != "1" ]]; then
+	echo "FAIL: exact service declare retry was not idempotent"
+	exit 1
+fi
+if bin/swe --namespace "$PROJECT_NAMESPACE" environment services declare "$ENV_NAME" web --target-port 3001 >/dev/null 2>&1; then
+	echo "FAIL: declare accepted different configuration for an existing service"
+	exit 1
+fi
+bin/swe --namespace "$PROJECT_NAMESPACE" environment services update "$ENV_NAME" web --target-port 3001
+bin/swe --namespace "$PROJECT_NAMESPACE" environment services update "$ENV_NAME" web --target-port 3001
+if [[ "$(kubectl get environment "$ENV_NAME" -o jsonpath='{.spec.services[?(@.name=="web")].revision}')" != "2" ||
+	"$(kubectl get environment "$ENV_NAME" -o jsonpath='{.spec.services[?(@.name=="web")].targetPort}')" != "3001" ]]; then
+	echo "FAIL: service update did not strictly increment revision once"
+	exit 1
+fi
+if bin/swe --namespace "$PROJECT_NAMESPACE" environment services declare "$ENV_NAME" sandboxd --target-port 50051 >/dev/null 2>&1; then
+	echo "FAIL: service declaration accepted sandboxd control port 50051"
+	exit 1
+fi
+if kubectl patch environment "$ENV_NAME" --type=merge -p '{"spec":{"services":[{"name":"web","revision":2,"protocol":"HTTP","targetPort":3002,"visibility":"Project","readiness":"TCPConnect"},{"name":"web-alias","revision":1,"protocol":"HTTP","targetPort":3000,"visibility":"Project","readiness":"TCPConnect"}]}}' >/dev/null 2>&1; then
+	echo "FAIL: admission accepted changed same-name service configuration without a higher revision"
+	exit 1
+fi
+bin/swe --namespace "$PROJECT_NAMESPACE" environment services remove "$ENV_NAME" web-alias
+bin/swe --namespace "$PROJECT_NAMESPACE" environment services remove "$ENV_NAME" web-alias
+if [[ -n "$(kubectl get environment "$ENV_NAME" -o jsonpath='{.spec.services[?(@.name=="web-alias")].name}')" ]]; then
+	echo "FAIL: service removal did not durably remove desired state"
+	exit 1
+fi
+bin/swe --namespace "$PROJECT_NAMESPACE" environment services remove "$ENV_NAME" web
+bin/swe --namespace "$PROJECT_NAMESPACE" environment services declare "$ENV_NAME" web --target-port 3002
+if [[ "$(kubectl get environment "$ENV_NAME" -o jsonpath='{.spec.services[?(@.name=="web")].revision}')" != "1" ]]; then
+	echo "FAIL: same-name service re-add did not create a fresh declaration"
+	exit 1
+fi
+bin/swe --namespace "$PROJECT_NAMESPACE" environment services remove "$ENV_NAME" web
 
 echo "==> verifying pause retains the workspace and resume runs its hook"
 bin/swe --namespace "$PROJECT_NAMESPACE" environment hold "$ENV_NAME"

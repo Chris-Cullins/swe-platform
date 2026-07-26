@@ -65,7 +65,7 @@ All current CRDs are namespaced:
 | `Installation` | Empty-spec identity object in the system namespace. Its immutable Kubernetes UID is the stable installation identity used by namespace claims, catalog sources, managed Template copies, and baseline resources. |
 | `Project` | One repository URL (represented as a one-item list), a same-namespace default Template reference, changes-workflow metadata, and a reserved egress allowlist. A non-empty allowlist is rejected when an Environment uses the Project. |
 | `EnvironmentTemplate` | Pod image, size/resources, disk, runtime class, idle timeout, warm-pool minimum, and backend. Admission currently permits only the `pod` backend. Chart-owned system-namespace objects are inert catalog sources; execution accepts only installation-managed same-namespace copies bound to exact Installation, source, and Project identities. |
-| `Environment` | Template/Project selection, explicit hold policy and bounded wake/suspend/activity intents; status owns readiness, lifecycle suspension and epoch, backend-neutral execution generation, exact Run claim, backend observations, activity, and recovery state. |
+| `Environment` | Template/Project selection, explicit hold policy, bounded wake/suspend/activity intents, and up to 32 durable desired service declarations; status owns readiness, lifecycle suspension and epoch, backend-neutral execution generation, exact Run claim, backend observations, activity, and recovery state. |
 | `Run` | Immutable agent task and Environment/Project/Template/credential selection plus monotonic cancellation; status records normalized lifecycle, exact Environment name/UID and ownership, exact credential profile identity, accepted lifecycle epoch, and accepted execution generation. `notify` and `parentRef` are schema placeholders without an implemented inbox. |
 | `AgentCredentialProfile` | Immutable adapter and `APIKey` type metadata. Key bytes live in an owner-linked Secret whose name is derived from the profile UID. |
 
@@ -230,6 +230,31 @@ replacement/backoff while retaining the PVC. Warm pools maintain ready unclaimed
 claiming a generic warm member for a Project recreates its pod so Project initialization runs
 before the Run becomes ready.
 
+### Durable desired service declarations
+
+`Environment.spec.services` is a map-list of at most 32 durable desired declarations keyed by
+DNS-1123 service name. Logical identity is `(Environment UID, service name)`, never a target
+port. Each declaration has a positive revision, the sole v1 protocol `HTTP`, an explicit
+loopback target port from 1 through 65535 other than sandboxd control port 50051, Project-only
+visibility intent, and `TCPConnect` readiness intent. There is intentionally no host, IP, DNS,
+address, allocated port, route, or URL input. Duplicate target ports are valid aliases.
+These defaults follow the [maintainer's implementation decision in #16](https://github.com/Chris-Cullins/swe-platform/issues/16#issuecomment-5084221807).
+
+Admission permits an exact same-name no-op and requires a strictly greater revision for every
+same-name configuration change. The CLI supplies `list`, `declare`, `update`, and `remove`;
+mutations pin the Environment UID on their first read, use optimistic conflict retries, and
+refuse to mutate a same-name replacement. `declare` starts at revision 1 and recovers an exact
+same-intent retry, `update` increments revision only for a real change, and `remove` is an
+idempotent durable desired-state removal. A name change is remove plus declare.
+
+Declarations survive process restart, pause/resume, and Project-less warm-pool states because
+they are Environment spec, but nothing observes them or exposes a route today. A Project-less
+Environment may retain declarations but cannot receive a future route until an exact current
+Project and Installation claim authorizes it. Removal permanently revokes any future old route
+generation; re-adding the same name must receive a new route generation and can never resurrect
+an old route or URL. Route generations are gateway state and deliberately are not represented
+in this declaration-only API.
+
 ### Adapters, processes, and transcripts
 
 The agent layer is adapters. Platform code supplies an immutable Run UID/task, an ephemeral
@@ -363,15 +388,16 @@ environment base for amd64/arm64.
 
 ## Approved next contracts (not implemented)
 
-These decisions constrain future implementation. They do not add current API fields or imply
-that migrations, controllers, proxies, or gateways already exist.
+These decisions constrain the future portions of the contracts. They do not imply that the
+listed controllers, proxies, or gateways already exist.
 
-### Durable services and gateway ownership
+### Service observation and gateway ownership
 
 The maintainer approved the [three-owner service model in #16](https://github.com/Chris-Cullins/swe-platform/issues/16#issuecomment-5078805652):
 
-- the Environment owns durable desired Service records with immutable service identity;
-- `.swe/services.yaml` and the CLI declare exposure; listening alone never grants visibility;
+- the Environment owns the durable desired Service records described above;
+- future `.swe/services.yaml` ingestion joins the implemented CLI declaration path; listening
+  alone never grants visibility;
 - sandboxd reports backend-portable listener/health observations fenced to the exact current
   execution; and
 - the control-plane/gateway owns Project-only URLs, authentication, authorization, routing,
@@ -411,12 +437,12 @@ path forcing ship together after Project namespace claims.
 
 ## Remaining decisions and open work
 
-The approved contracts above still require reviewable API sketches, migration/rollout plans,
-controller ownership, and acceptance tests before implementation. sandboxd now has a stateless
-internal loopback observation primitive, but Environment declarations, an observation connector
-and controller-owned health status do not exist. The execution-generation contract is
-implemented above; future declaration observations, portal routes, and egress identity must
-consume the same backend-neutral fence without exposing backend-specific identity.
+The remaining approved service contract still requires observation connector/controller work
+and gateway implementation. sandboxd has a stateless internal loopback observation primitive
+and Environments have durable declarations, but no connector invokes the primitive and no
+controller-owned health status exists. The execution-generation contract is implemented above;
+future declaration observations, portal routes, and egress identity must consume the same
+backend-neutral fence without exposing backend-specific identity.
 
 Other unimplemented areas include portal transport, inbox and child-run semantics, changes
 publication, transcript garbage collection, additional credential forms, ConPTY, non-Pod

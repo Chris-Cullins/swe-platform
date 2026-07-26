@@ -15,8 +15,9 @@ to ~$0. Reviewable diff, branch, and PR publication remain planned work.
 > pause/resume preserves workspace disks and runs repository resume hooks, and idle
 > environments pause automatically before terminal requests wake them. Template warm
 > pools keep unclaimed environments ready for `swe run` to claim. The `claude-code` (default),
-> `amp`, `codex`, and `pi` adapters run through sandboxd's managed-process API. Portal proxying
-> is not built yet.
+> `amp`, `codex`, and `pi` adapters run through sandboxd's managed-process API. Environments
+> accept bounded durable desired service declarations, but observation and portal proxying are
+> not built yet.
 > The Helm chart installs the
 > operator, control plane, CRDs, a stable Installation identity, and inert Template catalog
 > sources in a system namespace. `swe project onboard` creates a dedicated claimed namespace,
@@ -61,8 +62,9 @@ implemented today, approved next contracts, and remaining open work.
   controllers for lifecycle, warm pools (pre-booted environments), and idle reaping.
 - **Control plane** — API, auth, transcripts, resource watches, and a web terminal sharing
   the Environment's tmux session; terminal requests can wake Idle suspension.
-- **Planned gateway** — service declarations, health publication, authenticated portal URLs,
-  and reverse proxying are not implemented.
+- **Desired services** — `Environment.spec.services` and the CLI hold bounded durable HTTP
+  loopback target declarations. Health publication, authenticated portal URLs, and reverse
+  proxying remain planned gateway work.
 - **Planned Run actors** — inboxes, child spawning, messaging, and wake-on-message are not
   implemented.
 
@@ -166,6 +168,29 @@ Use the CLI to publish monotonic user/admin hold-policy revisions:
 swe --namespace my-project environment hold my-environment
 swe --namespace my-project environment release my-environment
 ```
+
+An Environment can also retain up to 32 explicit desired service declarations. Declarations
+alone do not observe a listener, create a route or URL, wake an Environment, or grant network
+access. v1 fixes protocol to `HTTP`, visibility to authenticated `Project` access, readiness
+intent to a TCP connect from the Environment's logical loopback, and requires an explicit port
+from 1 through 65535 other than sandboxd control port 50051. There is no address input or port
+allocation, and multiple names may deliberately alias one target port:
+
+```sh
+swe --namespace my-project environment services declare my-environment web --target-port 3000
+swe --namespace my-project environment services list my-environment
+swe --namespace my-project environment services update my-environment web --target-port 8080
+swe --namespace my-project environment services remove my-environment web
+```
+
+Service names are DNS-1123 labels. `declare` is idempotent only for the exact existing intent;
+use `update` for a real configuration change, which strictly increases its revision. `remove`
+is idempotent durable desired-state removal, and renaming is remove plus declare. Logical
+identity is the Environment UID and service name, so conflict retries never mutate a same-name
+Environment replacement. A Project-less Environment retains declarations but receives no
+route. Future gateways must permanently revoke an old route generation on removal and assign a
+new generation on same-name re-add; this declaration API intentionally contains no route or URL
+fields.
 
 Accepted work is cancelled only while that exact execution incarnation is securely
 reachable, or cleanup proceeds without an RPC after pause has removed its pod and
