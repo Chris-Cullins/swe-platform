@@ -45,6 +45,12 @@ spec:
               value: {{ .Values.controlPlane.auth.trustProxyHeaders | quote }}
             - name: SWE_ALLOW_INSECURE_SESSIONS
               value: {{ .Values.controlPlane.auth.allowInsecureSessions | quote }}
+            - name: SWE_SESSION_BACKEND
+              value: {{ .Values.controlPlane.sessions.backend | quote }}
+            {{- if eq .Values.controlPlane.sessions.backend "postgres" }}
+            - name: SWE_SESSION_KEYRING_FILE
+              value: /var/run/secrets/swe-platform/session-keyring/keyring.json
+            {{- end }}
             - name: SWE_TENANCY_MODE
               value: {{ include "swe-platform.tenancyMode" . | quote }}
             - name: SWE_INSTALLATION_NAMESPACE
@@ -92,4 +98,19 @@ spec:
             {{- toYaml .Values.securityContext | nindent 12 }}
           resources:
             {{- toYaml .Values.controlPlane.resources | nindent 12 }}
+          {{- if eq .Values.controlPlane.sessions.backend "postgres" }}
+          volumeMounts:
+            - name: session-keyring
+              mountPath: /var/run/secrets/swe-platform/session-keyring
+              readOnly: true
+          {{- end }}
+      {{- if eq .Values.controlPlane.sessions.backend "postgres" }}
+      volumes:
+        - name: session-keyring
+          secret:
+            secretName: {{ .Values.controlPlane.sessions.keyringSecret.name | quote }}
+            items:
+              - key: {{ .Values.controlPlane.sessions.keyringSecret.key | quote }}
+                path: keyring.json
+      {{- end }}
 {{- end }}

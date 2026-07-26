@@ -61,7 +61,12 @@ func main() {
 		log.Error("SWE_BOOTSTRAP_TOKEN must contain at least 32 characters")
 		os.Exit(1)
 	}
-	sessions := controlplane.NewMemorySessionStore(controlplane.MemorySessionStoreOptions{})
+	transcripts, sessions, closeStores, err := controlPlaneStoresFromEnvironment(context.Background(), log)
+	if err != nil {
+		log.Error("initialize control-plane stores", "error", err)
+		os.Exit(1)
+	}
+	defer closeStores()
 	access := controlplane.KubernetesAccessController{
 		Client:         clientset,
 		BootstrapToken: bootstrapToken,
@@ -102,12 +107,6 @@ func main() {
 	}
 	resourceAccess := controlplane.TenancyAccessController{Access: access, Verifier: verifier, Namespaces: configuredNamespaces}
 	resources := &controlplane.KubernetesResourceService{Client: kubeClient}
-	transcripts, closeTranscripts, err := transcriptStoreFromEnvironment(context.Background(), log)
-	if err != nil {
-		log.Error("initialize transcript store", "error", err)
-		os.Exit(1)
-	}
-	defer closeTranscripts()
 	streamLifecycle, cancelStreams := context.WithCancel(context.Background())
 	defer cancelStreams()
 	server := &http.Server{
@@ -159,12 +158,75 @@ func parseTenancyNamespaces(value string) (map[string]struct{}, error) {
 	return namespaces, nil
 }
 
-func transcriptStoreFromEnvironment(ctx context.Context, log *slog.Logger) (controlplane.TranscriptStore, func(), error) {
-	databaseURL := strings.TrimSpace(os.Getenv("SWE_POSTGRES_URL"))
-	if databaseURL == "" {
-		log.Warn("using development-only process-local transcript store; set SWE_POSTGRES_URL for durable transcripts")
-		return controlplane.NewMemoryTranscriptStore(controlplane.DefaultMemoryTranscriptStoreOptions()), func() {}, nil
+func controlPlaneStoresFromEnvironment(ctx context.Context, log *slog.Logger) (controlplane.TranscriptStore, controlplane.SessionStore, func(), error) {
+	backend := strings.TrimSpace(os.Getenv("SWE_SESSION_BACKEND"))
+	if backend != "memory" && backend != "postgres" {
+		return nil, nil, nil, errors.New("SWE_SESSION_BACKEND must be memory or postgres")
 	}
+	databaseURL := strings.TrimSpace(os.Getenv("SWE_POSTGRES_URL"))
+	keyringFile := strings.TrimSpace(os.Getenv("SWE_SESSION_KEYRING_FILE"))
+	if backend == "postgres" && databaseURL == "" {
+		return nil, nil, nil, errors.New("SWE_POSTGRES_URL is required when SWE_SESSION_BACKEND=postgres")
+	}
+	if backend == "postgres" && keyringFile == "" {
+		return nil, nil, nil, errors.New("SWE_SESSION_KEYRING_FILE is required when SWE_SESSION_BACKEND=postgres")
+	}
+	if backend == "memory" && keyringFile != "" {
+		return nil, nil, nil, errors.New("SWE_SESSION_KEYRING_FILE must be empty when SWE_SESSION_BACKEND=memory")
+	}
+	transcriptOptions, err := postgresTranscriptOptionsFromEnvironment()
+	if err != nil {
+		return nil, nil, nil, err
+	}
+
+	var database *controlplane.PostgresDatabase
+	if databaseURL != "" {
+		database, err = controlplane.NewPostgresDatabase(ctx, databaseURL)
+		if err != nil {
+			return nil, nil, nil, err
+		}
+	}
+	closeStores := func() {
+		if database != nil {
+			database.Close()
+		}
+	}
+	fail := func(err error) (controlplane.TranscriptStore, controlplane.SessionStore, func(), error) {
+		closeStores()
+		return nil, nil, nil, err
+	}
+
+	var transcripts controlplane.TranscriptStore
+	if database == nil {
+		log.Warn("using development-only process-local transcript store; set SWE_POSTGRES_URL for durable transcripts")
+		transcripts = controlplane.NewMemoryTranscriptStore(controlplane.DefaultMemoryTranscriptStoreOptions())
+	} else {
+		transcripts, err = controlplane.NewPostgresTranscriptStoreWithDatabase(ctx, database, transcriptOptions)
+		if err != nil {
+			return fail(err)
+		}
+		log.Info("using durable PostgreSQL transcript store")
+	}
+
+	var sessions controlplane.SessionStore
+	if backend == "memory" {
+		sessions = controlplane.NewMemorySessionStore(controlplane.MemorySessionStoreOptions{})
+		log.Warn("using development-only process-local browser session store")
+	} else {
+		keyring, err := controlplane.LoadSessionKeyring(keyringFile)
+		if err != nil {
+			return fail(err)
+		}
+		sessions, err = controlplane.NewPostgresSessionStore(ctx, database, keyring, controlplane.PostgresSessionStoreOptions{})
+		if err != nil {
+			return fail(err)
+		}
+		log.Info("using durable PostgreSQL browser session store")
+	}
+	return transcripts, sessions, closeStores, nil
+}
+
+func postgresTranscriptOptionsFromEnvironment() (controlplane.PostgresTranscriptStoreOptions, error) {
 	options := controlplane.DefaultPostgresTranscriptStoreOptions()
 	values := []struct {
 		name   string
@@ -183,23 +245,18 @@ func transcriptStoreFromEnvironment(ctx context.Context, log *slog.Logger) (cont
 		}
 		parsed, err := strconv.Atoi(raw)
 		if err != nil || parsed <= 0 {
-			return nil, nil, fmt.Errorf("%s must be a positive integer", value.name)
+			return options, fmt.Errorf("%s must be a positive integer", value.name)
 		}
 		*value.target = parsed
 	}
 	if raw := strings.TrimSpace(os.Getenv("SWE_TRANSCRIPT_POLL_INTERVAL")); raw != "" {
 		parsed, err := time.ParseDuration(raw)
 		if err != nil || parsed <= 0 {
-			return nil, nil, errors.New("SWE_TRANSCRIPT_POLL_INTERVAL must be a positive duration")
+			return options, errors.New("SWE_TRANSCRIPT_POLL_INTERVAL must be a positive duration")
 		}
 		options.PollInterval = parsed
 	}
-	store, err := controlplane.NewPostgresTranscriptStore(ctx, databaseURL, options)
-	if err != nil {
-		return nil, nil, err
-	}
-	log.Info("using durable PostgreSQL transcript store")
-	return store, store.Close, nil
+	return options, nil
 }
 
 func runHTTPServer(ctx context.Context, log *slog.Logger, server *http.Server, listener net.Listener, drainTimeout time.Duration, cancelStreams context.CancelFunc) error {

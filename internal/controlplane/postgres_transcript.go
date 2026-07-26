@@ -5,12 +5,10 @@ import (
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
-	"embed"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io/fs"
 	"math"
 	"strconv"
 	"strings"
@@ -20,9 +18,6 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
-
-//go:embed migrations/*.sql
-var transcriptMigrations embed.FS
 
 const maxPostgresTranscriptSequence = uint64(math.MaxInt64)
 
@@ -53,6 +48,7 @@ func DefaultPostgresTranscriptStoreOptions() PostgresTranscriptStoreOptions {
 // database replay is the correctness path; a future notification path may only wake polls.
 type PostgresTranscriptStore struct {
 	pool       *pgxpool.Pool
+	ownedDB    *PostgresDatabase
 	options    PostgresTranscriptStoreOptions
 	generation string
 	cursorKey  []byte
@@ -71,13 +67,31 @@ func NewPostgresTranscriptStore(ctx context.Context, databaseURL string, options
 	if options.MaxReplayEvents == math.MaxInt {
 		return nil, errors.New("PostgreSQL transcript replay limit is too large")
 	}
-	pool, err := pgxpool.New(ctx, databaseURL)
+	db, err := NewPostgresDatabase(ctx, databaseURL)
 	if err != nil {
-		return nil, fmt.Errorf("configure PostgreSQL transcript store: %w", err)
+		return nil, err
 	}
-	store := &PostgresTranscriptStore{pool: pool, options: options}
+	store, err := NewPostgresTranscriptStoreWithDatabase(ctx, db, options)
+	if err != nil {
+		db.Close()
+		return nil, err
+	}
+	store.ownedDB = db
+	return store, nil
+}
+
+// NewPostgresTranscriptStoreWithDatabase constructs a store over a shared database.
+// Closing the store does not close the process-owned database.
+func NewPostgresTranscriptStoreWithDatabase(ctx context.Context, db *PostgresDatabase, options PostgresTranscriptStoreOptions) (*PostgresTranscriptStore, error) {
+	if db == nil || db.pool == nil {
+		return nil, errors.New("PostgreSQL database is required")
+	}
+	options = normalizePostgresTranscriptOptions(options)
+	if options.MaxReplayEvents == math.MaxInt {
+		return nil, errors.New("PostgreSQL transcript replay limit is too large")
+	}
+	store := &PostgresTranscriptStore{pool: db.pool, options: options}
 	if err := store.initialize(ctx); err != nil {
-		pool.Close()
 		return nil, err
 	}
 	return store, nil
@@ -112,38 +126,6 @@ func (s *PostgresTranscriptStore) initialize(ctx context.Context) error {
 		return fmt.Errorf("begin transcript migration: %w", err)
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
-	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(739675093427891376)`); err != nil {
-		return fmt.Errorf("lock transcript migrations: %w", err)
-	}
-	if _, err := tx.Exec(ctx, `CREATE TABLE IF NOT EXISTS transcript_schema_migrations (version text PRIMARY KEY, applied_at timestamptz NOT NULL DEFAULT now())`); err != nil {
-		return fmt.Errorf("create transcript migration ledger: %w", err)
-	}
-	entries, err := fs.ReadDir(transcriptMigrations, "migrations")
-	if err != nil {
-		return fmt.Errorf("read transcript migrations: %w", err)
-	}
-	for _, entry := range entries {
-		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".sql") {
-			continue
-		}
-		var applied bool
-		if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM transcript_schema_migrations WHERE version = $1)`, entry.Name()).Scan(&applied); err != nil {
-			return fmt.Errorf("check transcript migration %s: %w", entry.Name(), err)
-		}
-		if applied {
-			continue
-		}
-		migration, err := transcriptMigrations.ReadFile("migrations/" + entry.Name())
-		if err != nil {
-			return fmt.Errorf("read transcript migration %s: %w", entry.Name(), err)
-		}
-		if _, err := tx.Exec(ctx, string(migration)); err != nil {
-			return fmt.Errorf("apply transcript migration %s: %w", entry.Name(), err)
-		}
-		if _, err := tx.Exec(ctx, `INSERT INTO transcript_schema_migrations(version) VALUES ($1)`, entry.Name()); err != nil {
-			return fmt.Errorf("record transcript migration %s: %w", entry.Name(), err)
-		}
-	}
 	generationBytes := make([]byte, 16)
 	cursorKey := make([]byte, 32)
 	if _, err := rand.Read(generationBytes); err != nil {
@@ -166,7 +148,11 @@ func (s *PostgresTranscriptStore) initialize(ctx context.Context) error {
 }
 
 // Close releases database connections. Existing subscriptions should be unsubscribed first.
-func (s *PostgresTranscriptStore) Close() { s.pool.Close() }
+func (s *PostgresTranscriptStore) Close() {
+	if s.ownedDB != nil {
+		s.ownedDB.Close()
+	}
+}
 
 func (s *PostgresTranscriptStore) Append(ctx context.Context, run RunIdentity, input AppendTranscriptInput) (AppendTranscriptResult, error) {
 	if run.Namespace == "" || run.NamespaceUID == "" || run.UID == "" {

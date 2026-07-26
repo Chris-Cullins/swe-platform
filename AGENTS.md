@@ -19,8 +19,10 @@ P0 scaffold is in place: CRD types, environment controller, `sandboxd` (exec/fs/
 health and a shared tmux terminal), CLI (`run`/`logs`/`attach`), kind acceptance, CI,
 and a Helm chart for the operator, control plane, and CRDs. The control plane currently
 provides PostgreSQL-backed durable transcript ingestion and database-polled SSE streaming with
-a development-only bounded memory fallback, opaque process-local browser sessions backed by
-repeated Kubernetes TokenReview/SAR authorization, and typed
+a development-only bounded memory fallback, plus explicit memory or encrypted PostgreSQL
+browser sessions backed by repeated Kubernetes TokenReview/exact SAR authorization. PostgreSQL
+uses one process-owned pgxpool and ordered migrations; production fails closed without its
+database and administrator-owned session keyring. The control plane also provides typed
 Run/Environment resource APIs for the console.
 The CLI also provides a local stdio `swe mcp` server with bounded `create_run` and
 UID-fenced `read_transcript` tools that act through the caller's existing explicit
@@ -104,7 +106,7 @@ runs both via `make` targets:
 - **Local operator:** `make run` requires explicit `RUN_TENANCY_MODE`,
   `RUN_SYSTEM_NAMESPACE`, and `RUN_INSTALLATION_NAME`; scoped mode also takes a
   space-separated `RUN_TENANCY_NAMESPACES` list.
-- **Unit tests:** `make test` · **Vet:** `make vet`. PostgreSQL transcript integration tests
+- **Unit tests:** `make test` · **Vet:** `make vet`. PostgreSQL transcript/session integration tests
   run when `SWE_TEST_POSTGRES_URL` points to a disposable database; CI supplies PostgreSQL 17.
   The required `build-test` CI job runs the root and sandboxd Go suites plus
   `./hack/argocd-port-forward_test.sh`, mirroring `make test`.
@@ -155,7 +157,8 @@ runs both via `make` targets:
   system-namespace installation plus CLI onboarding of a distinct scoped Project namespace,
   exact claims, managed catalog copies, explicit baseline quota/RBAC/policy, scoped denial,
   same-named two-release isolation, and retained offboarding,
-  control-plane TokenReview/SAR scoping, opaque browser session exchange/logout and CSRF,
+  control-plane TokenReview/SAR scoping, memory and durable encrypted PostgreSQL browser session
+  exchange/logout/revocation, capacity and CSRF,
   the embedded console entry point/SPA fallback/static assets, typed Run
   list/get/create/retry/cancel, Environment get, transcript SSE, terminal attach, and
   the local stdio MCP tool list plus UID-fenced bounded transcript read,

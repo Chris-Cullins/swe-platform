@@ -1,0 +1,20 @@
+{{- $backend := .Values.controlPlane.sessions.backend -}}
+{{- if not (has $backend (list "memory" "postgres")) -}}
+{{- fail "controlPlane.sessions.backend must be memory or postgres" -}}
+{{- end -}}
+{{- if eq $backend "postgres" -}}
+  {{- if not .Values.controlPlane.transcripts.postgresSecret.name -}}
+    {{- fail "controlPlane.sessions.backend=postgres requires controlPlane.transcripts.postgresSecret.name" -}}
+  {{- end -}}
+  {{- if not .Values.controlPlane.transcripts.postgresSecret.key -}}
+    {{- fail "controlPlane.sessions.backend=postgres requires controlPlane.transcripts.postgresSecret.key" -}}
+  {{- end -}}
+  {{- if not .Values.controlPlane.sessions.keyringSecret.name -}}
+    {{- fail "controlPlane.sessions.backend=postgres requires controlPlane.sessions.keyringSecret.name" -}}
+  {{- end -}}
+  {{- if not .Values.controlPlane.sessions.keyringSecret.key -}}
+    {{- fail "controlPlane.sessions.backend=postgres requires controlPlane.sessions.keyringSecret.key" -}}
+  {{- end -}}
+{{- else if .Values.controlPlane.sessions.keyringSecret.name -}}
+  {{- fail "controlPlane.sessions.backend=memory must not set controlPlane.sessions.keyringSecret.name" -}}
+{{- end -}}

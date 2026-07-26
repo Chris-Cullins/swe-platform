@@ -9,6 +9,14 @@ image:
 controlPlane:
   enabled: true
   replicaCount: 1
+  sessions:
+    # memory is development-only. Production presets explicitly select postgres.
+    backend: memory
+    # Administrator-owned Secret mounted only when backend is postgres. The chart
+    # references but never creates or manages this Secret.
+    keyringSecret:
+      name: ""
+      key: keyring.json
   image:
     repository: ghcr.io/chris-cullins/swe-platform/control-plane
     # Defaults to Chart.appVersion.
