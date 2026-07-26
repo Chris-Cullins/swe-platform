@@ -82,7 +82,7 @@ func (a KubernetesAccessController) AuthorizePrincipal(r *http.Request, access R
 	if err != nil {
 		if sessionID != "" && errors.Is(err, errUnauthenticated) {
 			if deleteErr := a.Sessions.Delete(r.Context(), sessionID); deleteErr != nil {
-				return "", sessionStoreAccessError(deleteErr)
+				return "", errors.Join(err, sessionStoreAccessError(deleteErr))
 			}
 		}
 		return "", err
@@ -167,7 +167,7 @@ func (a KubernetesAccessController) CurrentSession(r *http.Request) (Session, er
 	if err != nil {
 		if errors.Is(err, errUnauthenticated) {
 			if deleteErr := a.Sessions.Delete(r.Context(), cookie.Value); deleteErr != nil {
-				return Session{}, sessionStoreAccessError(deleteErr)
+				return Session{}, errors.Join(err, sessionStoreAccessError(deleteErr))
 			}
 		}
 		return Session{}, err

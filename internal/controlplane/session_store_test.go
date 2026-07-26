@@ -400,20 +400,58 @@ func TestAudienceMismatchRevokesSession(t *testing.T) {
 	}
 }
 
-func TestDefinitiveRejectionDeleteFailureIsUnavailable(t *testing.T) {
-	client := fake.NewClientset()
-	client.PrependReactor("create", "tokenreviews", func(ktesting.Action) (bool, runtime.Object, error) {
-		return true, &authenticationv1.TokenReview{Status: authenticationv1.TokenReviewStatus{Authenticated: false}}, nil
-	})
-	store := &fakeSessionStore{
-		resolve: func(context.Context, string) (string, error) { return "resource-token", nil },
-		delete:  func(context.Context, string) error { return ErrSessionUnavailable },
-	}
-	controller := KubernetesAccessController{Client: client, Sessions: store}
-	request := httptest.NewRequest(http.MethodGet, "https://console.test/api/v1/namespaces/ns/runs", nil)
-	request.AddCookie(&http.Cookie{Name: sessionCookieName, Value: "session"})
-	if err := controller.Authorize(request, ResourceAccess{}, true); !errors.Is(err, ErrSessionUnavailable) {
-		t.Fatalf("delete failure error = %v", err)
+func TestDefinitiveRejectionDeleteFailureRemainsUnauthenticatedAndRetries(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		operation func(KubernetesAccessController, *http.Request) error
+		write     func(http.ResponseWriter, error)
+	}{
+		{name: "resource authorization", operation: func(controller KubernetesAccessController, request *http.Request) error {
+			return controller.Authorize(request, ResourceAccess{}, true)
+		}, write: writeAccessError},
+		{name: "current session", operation: func(controller KubernetesAccessController, request *http.Request) error {
+			_, err := controller.CurrentSession(request)
+			return err
+		}, write: writeRESTAccessError},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			client := fake.NewClientset()
+			tokenReviews := 0
+			client.PrependReactor("create", "tokenreviews", func(ktesting.Action) (bool, runtime.Object, error) {
+				tokenReviews++
+				return true, &authenticationv1.TokenReview{Status: authenticationv1.TokenReviewStatus{Authenticated: false}}, nil
+			})
+			sars := 0
+			client.PrependReactor("create", "subjectaccessreviews", func(ktesting.Action) (bool, runtime.Object, error) {
+				sars++
+				return true, &authorizationv1.SubjectAccessReview{Status: authorizationv1.SubjectAccessReviewStatus{Allowed: true}}, nil
+			})
+			deletes := 0
+			store := &fakeSessionStore{
+				resolve: func(context.Context, string) (string, error) { return "resource-token", nil },
+				delete: func(context.Context, string) error {
+					deletes++
+					return ErrSessionUnavailable
+				},
+			}
+			controller := KubernetesAccessController{Client: client, Sessions: store}
+			request := httptest.NewRequest(http.MethodGet, "https://console.test/api/v1/namespaces/ns/runs", nil)
+			request.AddCookie(&http.Cookie{Name: sessionCookieName, Value: "session"})
+			for attempt := 1; attempt <= 2; attempt++ {
+				err := tc.operation(controller, request)
+				if !errors.Is(err, errUnauthenticated) || !errors.Is(err, ErrSessionUnavailable) {
+					t.Fatalf("attempt %d error = %v", attempt, err)
+				}
+				response := httptest.NewRecorder()
+				tc.write(response, err)
+				if response.Code != http.StatusUnauthorized {
+					t.Fatalf("attempt %d status = %d, want 401", attempt, response.Code)
+				}
+			}
+			if tokenReviews != 2 || deletes != 2 || sars != 0 {
+				t.Fatalf("TokenReviews/deletes/SARs = %d/%d/%d, want 2/2/0", tokenReviews, deletes, sars)
+			}
+		})
 	}
 }
 
