@@ -1,6 +1,7 @@
 package controlplane
 
 import (
+	"context"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -137,7 +138,7 @@ func TestBrowserSessionAuthenticatesReadsButNotProducerWrites(t *testing.T) {
 		return true, &authorizationv1.SubjectAccessReview{Status: authorizationv1.SubjectAccessReviewStatus{Allowed: true}}, nil
 	})
 	store := NewMemorySessionStore(MemorySessionStoreOptions{})
-	sessionID, err := store.Create("browser-session-token")
+	sessionID, err := store.Create(context.Background(), "browser-session-token")
 	if err != nil {
 		t.Fatal(err)
 	}
