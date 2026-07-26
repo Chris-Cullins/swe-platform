@@ -2,6 +2,7 @@ package controlplane
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"errors"
 	"net/http"
@@ -17,6 +18,41 @@ import (
 	ktesting "k8s.io/client-go/testing"
 )
 
+type fakeSessionStore struct {
+	validate func(string) error
+	create   func(context.Context, string) (string, error)
+	resolve  func(context.Context, string) (string, error)
+	delete   func(context.Context, string) error
+}
+
+func (s *fakeSessionStore) ValidateToken(token string) error {
+	if s.validate == nil {
+		return nil
+	}
+	return s.validate(token)
+}
+
+func (s *fakeSessionStore) Create(ctx context.Context, token string) (string, error) {
+	if s.create == nil {
+		return "", errSessionUnavailable
+	}
+	return s.create(ctx, token)
+}
+
+func (s *fakeSessionStore) Resolve(ctx context.Context, id string) (string, error) {
+	if s.resolve == nil {
+		return "", errSessionUnavailable
+	}
+	return s.resolve(ctx, id)
+}
+
+func (s *fakeSessionStore) Delete(ctx context.Context, id string) error {
+	if s.delete == nil {
+		return nil
+	}
+	return s.delete(ctx, id)
+}
+
 func TestMemorySessionStoreBoundsAndAbsoluteExpiry(t *testing.T) {
 	now := time.Date(2026, 7, 19, 19, 0, 0, 0, time.UTC)
 	store := NewMemorySessionStore(MemorySessionStoreOptions{
@@ -26,18 +62,19 @@ func TestMemorySessionStoreBoundsAndAbsoluteExpiry(t *testing.T) {
 		Now:               func() time.Time { return now },
 		Random:            bytes.NewReader(append(bytes.Repeat([]byte{1}, 32), append(bytes.Repeat([]byte{2}, 32), bytes.Repeat([]byte{3}, 32)...)...)),
 	})
-	first, err := store.Create("one")
+	ctx := context.Background()
+	first, err := store.Create(ctx, "one")
 	if err != nil {
 		t.Fatal(err)
 	}
-	second, err := store.Create("two")
+	second, err := store.Create(ctx, "two")
 	if err != nil || first == second {
 		t.Fatalf("second session = %q, err %v", second, err)
 	}
-	if _, err := store.Create("three"); !errors.Is(err, errSessionCapacity) {
+	if _, err := store.Create(ctx, "three"); !errors.Is(err, errSessionCapacity) {
 		t.Fatalf("capacity error = %v", err)
 	}
-	if _, err := store.Create("123456"); !errors.Is(err, errUnauthenticated) {
+	if _, err := store.Create(ctx, "123456"); !errors.Is(err, errSessionUnauthenticated) {
 		t.Fatalf("oversized token error = %v", err)
 	}
 	key := sha256SessionKey(first)
@@ -45,12 +82,64 @@ func TestMemorySessionStoreBoundsAndAbsoluteExpiry(t *testing.T) {
 		t.Fatalf("stored times = %s/%s", entry.createdAt, entry.expiresAt)
 	}
 	now = now.Add(time.Minute)
-	if _, err := store.Resolve(first); !errors.Is(err, errUnauthenticated) {
+	if _, err := store.Resolve(ctx, first); !errors.Is(err, errSessionExpired) {
 		t.Fatalf("expired resolve error = %v", err)
 	}
-	if _, err := store.Create("new"); err != nil {
+	if _, err := store.Resolve(ctx, first); !errors.Is(err, errSessionNotFound) {
+		t.Fatalf("purged resolve error = %v", err)
+	}
+	if err := store.Delete(ctx, first); err != nil {
+		t.Fatalf("idempotent delete error = %v", err)
+	}
+	if _, err := store.Create(ctx, "new"); err != nil {
 		t.Fatalf("expired sessions did not release capacity: %v", err)
 	}
+}
+
+func TestSessionCreateUsesConfiguredStoreTokenBoundBeforeReview(t *testing.T) {
+	t.Run("below default", func(t *testing.T) {
+		reviews := 0
+		client := fake.NewClientset()
+		client.PrependReactor("create", "tokenreviews", func(ktesting.Action) (bool, runtime.Object, error) {
+			reviews++
+			return true, nil, errors.New("unexpected TokenReview")
+		})
+		controller := KubernetesAccessController{
+			Client:   client,
+			Sessions: NewMemorySessionStore(MemorySessionStoreOptions{MaxTokenBytes: 5}),
+		}
+		request := httptest.NewRequest(http.MethodPost, "https://console.test/api/v1/session", nil)
+		request.Header.Set("Authorization", "Bearer 123456")
+		if _, _, err := controller.CreateSession(request); !errors.Is(err, errUnauthenticated) {
+			t.Fatalf("create error = %v", err)
+		}
+		if reviews != 0 {
+			t.Fatalf("invalid token caused %d TokenReviews", reviews)
+		}
+	})
+
+	t.Run("above default", func(t *testing.T) {
+		token := strings.Repeat("x", defaultMaxSessionTokenBytes+1)
+		client := fake.NewClientset()
+		client.PrependReactor("create", "tokenreviews", func(ktesting.Action) (bool, runtime.Object, error) {
+			return true, &authenticationv1.TokenReview{Status: authenticationv1.TokenReviewStatus{
+				Authenticated: true,
+				Audiences:     []string{defaultTokenAudience},
+				User:          authenticationv1.UserInfo{Username: "console-user"},
+			}}, nil
+		})
+		controller := KubernetesAccessController{
+			Client: client,
+			Sessions: NewMemorySessionStore(MemorySessionStoreOptions{
+				MaxTokenBytes: len(token),
+			}),
+		}
+		request := httptest.NewRequest(http.MethodPost, "https://console.test/api/v1/session", nil)
+		request.Header.Set("Authorization", "Bearer "+token)
+		if _, _, err := controller.CreateSession(request); err != nil {
+			t.Fatalf("create error = %v", err)
+		}
+	})
 }
 
 func TestOpaqueSessionLogoutRevocationAndBearerPreference(t *testing.T) {
@@ -166,7 +255,7 @@ func TestCookieResourceAuthorizationReviewsEveryRequestAndRevokes(t *testing.T) 
 		return true, &authorizationv1.SubjectAccessReview{Status: authorizationv1.SubjectAccessReviewStatus{Allowed: true}}, nil
 	})
 	store := NewMemorySessionStore(MemorySessionStoreOptions{})
-	sessionID, err := store.Create("resource-token")
+	sessionID, err := store.Create(context.Background(), "resource-token")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -192,6 +281,189 @@ func TestCookieResourceAuthorizationReviewsEveryRequestAndRevokes(t *testing.T) 
 	}
 	if len(events) != eventCount {
 		t.Fatalf("deleted session replay reached Kubernetes: %v", events[eventCount:])
+	}
+}
+
+func TestSessionResolveFailureSkipsTokenReview(t *testing.T) {
+	reviews := 0
+	client := fake.NewClientset()
+	client.PrependReactor("create", "tokenreviews", func(ktesting.Action) (bool, runtime.Object, error) {
+		reviews++
+		return true, nil, errors.New("unexpected TokenReview")
+	})
+	store := &fakeSessionStore{resolve: func(context.Context, string) (string, error) {
+		return "", errSessionUnavailable
+	}}
+	controller := KubernetesAccessController{Client: client, Sessions: store}
+	request := httptest.NewRequest(http.MethodGet, "https://console.test/api/v1/namespaces/ns/runs", nil)
+	request.AddCookie(&http.Cookie{Name: sessionCookieName, Value: "session"})
+	if err := controller.Authorize(request, ResourceAccess{}, true); !errors.Is(err, errSessionUnavailable) {
+		t.Fatalf("resolve error = %v", err)
+	}
+	if reviews != 0 {
+		t.Fatalf("resolve failure caused %d TokenReviews", reviews)
+	}
+}
+
+func TestTransientTokenReviewFailureRetainsSessionForRetry(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		firstResult *authenticationv1.TokenReview
+		firstError  error
+	}{
+		{name: "transport", firstError: errors.New("apiserver unavailable")},
+		{name: "status error", firstResult: &authenticationv1.TokenReview{Status: authenticationv1.TokenReviewStatus{Error: "webhook unavailable"}}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			reviews := 0
+			client := fake.NewClientset()
+			client.PrependReactor("create", "tokenreviews", func(ktesting.Action) (bool, runtime.Object, error) {
+				reviews++
+				if reviews == 1 {
+					return true, tc.firstResult, tc.firstError
+				}
+				return true, &authenticationv1.TokenReview{Status: authenticationv1.TokenReviewStatus{
+					Authenticated: true,
+					Audiences:     []string{defaultTokenAudience},
+					User:          authenticationv1.UserInfo{Username: "console-user"},
+				}}, nil
+			})
+			client.PrependReactor("create", "subjectaccessreviews", func(ktesting.Action) (bool, runtime.Object, error) {
+				return true, &authorizationv1.SubjectAccessReview{Status: authorizationv1.SubjectAccessReviewStatus{Allowed: true}}, nil
+			})
+			store := NewMemorySessionStore(MemorySessionStoreOptions{})
+			sessionID, err := store.Create(context.Background(), "resource-token")
+			if err != nil {
+				t.Fatal(err)
+			}
+			controller := KubernetesAccessController{Client: client, Sessions: store}
+			request := httptest.NewRequest(http.MethodGet, "https://console.test/api/v1/namespaces/ns/runs", nil)
+			request.AddCookie(&http.Cookie{Name: sessionCookieName, Value: sessionID})
+			if err := controller.Authorize(request, ResourceAccess{}, true); err == nil || errors.Is(err, errUnauthenticated) {
+				t.Fatalf("transient TokenReview error = %v", err)
+			}
+			if err := controller.Authorize(request, ResourceAccess{}, true); err != nil {
+				t.Fatalf("retry failed: %v", err)
+			}
+			if reviews != 2 {
+				t.Fatalf("TokenReviews = %d, want 2", reviews)
+			}
+		})
+	}
+}
+
+func TestAudienceMismatchRevokesSession(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		operation func(KubernetesAccessController, *http.Request) error
+	}{
+		{name: "resource authorization", operation: func(controller KubernetesAccessController, request *http.Request) error {
+			return controller.Authorize(request, ResourceAccess{}, true)
+		}},
+		{name: "current session", operation: func(controller KubernetesAccessController, request *http.Request) error {
+			_, err := controller.CurrentSession(request)
+			return err
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			client := fake.NewClientset()
+			client.PrependReactor("create", "tokenreviews", func(ktesting.Action) (bool, runtime.Object, error) {
+				return true, &authenticationv1.TokenReview{Status: authenticationv1.TokenReviewStatus{
+					Authenticated: true,
+					Audiences:     []string{"other-service"},
+					User:          authenticationv1.UserInfo{Username: "console-user"},
+				}}, nil
+			})
+			deletes := 0
+			contextKey := struct{}{}
+			store := &fakeSessionStore{
+				resolve: func(context.Context, string) (string, error) { return "resource-token", nil },
+				delete: func(ctx context.Context, id string) error {
+					deletes++
+					if id != "session" || ctx.Value(contextKey) != "request" {
+						t.Fatalf("delete id/context = %q/%v", id, ctx.Value(contextKey))
+					}
+					return nil
+				},
+			}
+			controller := KubernetesAccessController{Client: client, Sessions: store}
+			ctx := context.WithValue(context.Background(), contextKey, "request")
+			request := httptest.NewRequest(http.MethodGet, "https://console.test/api/v1/namespaces/ns/runs", nil).WithContext(ctx)
+			request.AddCookie(&http.Cookie{Name: sessionCookieName, Value: "session"})
+			if err := tc.operation(controller, request); !errors.Is(err, errUnauthenticated) {
+				t.Fatalf("audience mismatch error = %v", err)
+			}
+			if deletes != 1 {
+				t.Fatalf("deletes = %d, want 1", deletes)
+			}
+		})
+	}
+}
+
+func TestDefinitiveRejectionDeleteFailureIsUnavailable(t *testing.T) {
+	client := fake.NewClientset()
+	client.PrependReactor("create", "tokenreviews", func(ktesting.Action) (bool, runtime.Object, error) {
+		return true, &authenticationv1.TokenReview{Status: authenticationv1.TokenReviewStatus{Authenticated: false}}, nil
+	})
+	store := &fakeSessionStore{
+		resolve: func(context.Context, string) (string, error) { return "resource-token", nil },
+		delete:  func(context.Context, string) error { return errSessionUnavailable },
+	}
+	controller := KubernetesAccessController{Client: client, Sessions: store}
+	request := httptest.NewRequest(http.MethodGet, "https://console.test/api/v1/namespaces/ns/runs", nil)
+	request.AddCookie(&http.Cookie{Name: sessionCookieName, Value: "session"})
+	if err := controller.Authorize(request, ResourceAccess{}, true); !errors.Is(err, errSessionUnavailable) {
+		t.Fatalf("delete failure error = %v", err)
+	}
+}
+
+func TestSubjectAccessReviewFailureRetainsSession(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		first      authorizationv1.SubjectAccessReviewStatus
+		firstError error
+	}{
+		{name: "denied", first: authorizationv1.SubjectAccessReviewStatus{Allowed: false}},
+		{name: "transport", firstError: errors.New("apiserver unavailable")},
+		{name: "evaluation error", first: authorizationv1.SubjectAccessReviewStatus{EvaluationError: "webhook unavailable"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			client := fake.NewClientset()
+			reviews := 0
+			client.PrependReactor("create", "tokenreviews", func(ktesting.Action) (bool, runtime.Object, error) {
+				reviews++
+				return true, &authenticationv1.TokenReview{Status: authenticationv1.TokenReviewStatus{
+					Authenticated: true,
+					Audiences:     []string{defaultTokenAudience},
+					User:          authenticationv1.UserInfo{Username: "console-user"},
+				}}, nil
+			})
+			sars := 0
+			client.PrependReactor("create", "subjectaccessreviews", func(ktesting.Action) (bool, runtime.Object, error) {
+				sars++
+				if sars == 1 {
+					return true, &authorizationv1.SubjectAccessReview{Status: tc.first}, tc.firstError
+				}
+				return true, &authorizationv1.SubjectAccessReview{Status: authorizationv1.SubjectAccessReviewStatus{Allowed: true}}, nil
+			})
+			store := NewMemorySessionStore(MemorySessionStoreOptions{})
+			sessionID, err := store.Create(context.Background(), "resource-token")
+			if err != nil {
+				t.Fatal(err)
+			}
+			controller := KubernetesAccessController{Client: client, Sessions: store}
+			request := httptest.NewRequest(http.MethodGet, "https://console.test/api/v1/namespaces/ns/runs", nil)
+			request.AddCookie(&http.Cookie{Name: sessionCookieName, Value: sessionID})
+			if err := controller.Authorize(request, ResourceAccess{}, true); err == nil {
+				t.Fatal("first SAR unexpectedly succeeded")
+			}
+			if err := controller.Authorize(request, ResourceAccess{}, true); err != nil {
+				t.Fatalf("retry failed: %v", err)
+			}
+			if reviews != 2 || sars != 2 {
+				t.Fatalf("reviews = TokenReview %d, SAR %d; want 2 each", reviews, sars)
+			}
+		})
 	}
 }
 

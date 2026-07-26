@@ -11,6 +11,7 @@ import (
 type fakeSessions struct {
 	create  func(*http.Request) (Session, string, error)
 	current func(*http.Request) (Session, error)
+	delete  func(*http.Request) error
 	deleted bool
 }
 
@@ -18,7 +19,13 @@ func (f *fakeSessions) CreateSession(r *http.Request) (Session, string, error) {
 	return f.create(r)
 }
 func (f *fakeSessions) CurrentSession(r *http.Request) (Session, error) { return f.current(r) }
-func (f *fakeSessions) DeleteSession(*http.Request)                     { f.deleted = true }
+func (f *fakeSessions) DeleteSession(r *http.Request) error {
+	f.deleted = true
+	if f.delete != nil {
+		return f.delete(r)
+	}
+	return nil
+}
 
 func TestSessionCreateSecurityAndExplicitBearer(t *testing.T) {
 	for _, tc := range []struct {
@@ -163,5 +170,20 @@ func TestSessionDeleteOriginAndExpiry(t *testing.T) {
 	NewServer(nil, ServerOptions{Sessions: &fakeSessions{}}).Handler().ServeHTTP(w, r)
 	if w.Code != http.StatusForbidden {
 		t.Fatalf("duplicate Origin status=%d", w.Code)
+	}
+}
+
+func TestSessionDeleteStoreFailureRetainsCookie(t *testing.T) {
+	r := httptest.NewRequest(http.MethodDelete, "https://example.test/api/v1/session", nil)
+	r.Header.Set("Origin", "https://example.test")
+	r.AddCookie(&http.Cookie{Name: sessionCookieName, Value: "retryable"})
+	w := httptest.NewRecorder()
+	sessions := &fakeSessions{delete: func(*http.Request) error { return errSessionUnavailable }}
+	NewServer(nil, ServerOptions{Sessions: sessions}).Handler().ServeHTTP(w, r)
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
+	}
+	if cookies := w.Result().Cookies(); len(cookies) != 0 {
+		t.Fatalf("store failure cleared cookie: %+v", cookies)
 	}
 }

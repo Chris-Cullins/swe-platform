@@ -53,7 +53,7 @@ type principalAccessController interface {
 type SessionAuthenticator interface {
 	CreateSession(*http.Request) (Session, string, error)
 	CurrentSession(*http.Request) (Session, error)
-	DeleteSession(*http.Request)
+	DeleteSession(*http.Request) error
 }
 
 // KubernetesAccessController uses TokenReview and SubjectAccessReview. BootstrapToken,
@@ -62,7 +62,7 @@ type KubernetesAccessController struct {
 	Client         kubernetes.Interface
 	BootstrapToken string
 	Audience       string
-	Sessions       *MemorySessionStore
+	Sessions       SessionStore
 }
 
 // Authorize authenticates a bearer token (or, for browser reads, a session cookie) and
@@ -80,8 +80,10 @@ func (a KubernetesAccessController) AuthorizePrincipal(r *http.Request, access R
 	}
 	user, err := a.authenticate(r.Context(), token, bearer)
 	if err != nil {
-		if sessionID != "" {
-			a.Sessions.Delete(sessionID)
+		if sessionID != "" && errors.Is(err, errUnauthenticated) {
+			if deleteErr := a.Sessions.Delete(r.Context(), sessionID); deleteErr != nil {
+				return "", sessionStoreAccessError(deleteErr)
+			}
 		}
 		return "", err
 	}
@@ -134,8 +136,8 @@ func (a KubernetesAccessController) CreateSession(r *http.Request) (Session, str
 	if a.Sessions == nil {
 		return Session{}, "", fmt.Errorf("create session: session store is unavailable")
 	}
-	if !a.Sessions.acceptsToken(token) {
-		return Session{}, "", errUnauthenticated
+	if err := a.Sessions.ValidateToken(token); err != nil {
+		return Session{}, "", sessionStoreAccessError(err)
 	}
 	user, err := a.authenticate(r.Context(), token, bearer)
 	if err != nil {
@@ -144,9 +146,9 @@ func (a KubernetesAccessController) CreateSession(r *http.Request) (Session, str
 	if user.bootstrap {
 		return Session{}, "", errForbidden
 	}
-	sessionID, err := a.Sessions.Create(token)
+	sessionID, err := a.Sessions.Create(r.Context(), token)
 	if err != nil {
-		return Session{}, "", err
+		return Session{}, "", sessionStoreAccessError(err)
 	}
 	return Session{Authenticated: true, Username: user.name}, sessionID, nil
 }
@@ -157,25 +159,30 @@ func (a KubernetesAccessController) CurrentSession(r *http.Request) (Session, er
 	if err != nil || cookie.Value == "" || a.Sessions == nil {
 		return Session{}, errUnauthenticated
 	}
-	token, err := a.Sessions.Resolve(cookie.Value)
+	token, err := a.Sessions.Resolve(r.Context(), cookie.Value)
 	if err != nil {
-		return Session{}, err
+		return Session{}, sessionStoreAccessError(err)
 	}
 	user, err := a.authenticate(r.Context(), token, false)
 	if err != nil {
-		a.Sessions.Delete(cookie.Value)
+		if errors.Is(err, errUnauthenticated) {
+			if deleteErr := a.Sessions.Delete(r.Context(), cookie.Value); deleteErr != nil {
+				return Session{}, sessionStoreAccessError(deleteErr)
+			}
+		}
 		return Session{}, err
 	}
 	return Session{Authenticated: true, Username: user.name}, nil
 }
 
-func (a KubernetesAccessController) DeleteSession(r *http.Request) {
+func (a KubernetesAccessController) DeleteSession(r *http.Request) error {
 	if a.Sessions == nil {
-		return
+		return errSessionUnavailable
 	}
 	if cookie, err := r.Cookie(sessionCookieName); err == nil {
-		a.Sessions.Delete(cookie.Value)
+		return sessionStoreAccessError(a.Sessions.Delete(r.Context(), cookie.Value))
 	}
+	return nil
 }
 
 func (a KubernetesAccessController) requestCredential(r *http.Request, allowSession bool) (token string, bearer bool, sessionID string, err error) {
@@ -190,11 +197,21 @@ func (a KubernetesAccessController) requestCredential(r *http.Request, allowSess
 	if cookieErr != nil || cookie.Value == "" {
 		return "", false, "", errUnauthenticated
 	}
-	token, err = a.Sessions.Resolve(cookie.Value)
+	token, err = a.Sessions.Resolve(r.Context(), cookie.Value)
 	if err != nil {
-		return "", false, "", err
+		return "", false, "", sessionStoreAccessError(err)
 	}
 	return token, false, cookie.Value, nil
+}
+
+func sessionStoreAccessError(err error) error {
+	if err == nil {
+		return nil
+	}
+	if errors.Is(err, errSessionUnauthenticated) || errors.Is(err, errSessionNotFound) || errors.Is(err, errSessionExpired) {
+		return errUnauthenticated
+	}
+	return err
 }
 
 func (a KubernetesAccessController) authenticate(ctx context.Context, token string, bearer bool) (principal, error) {
