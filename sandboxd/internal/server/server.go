@@ -11,10 +11,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net"
 	"os"
 	"os/exec"
-	"sort"
 	"sync"
 	"time"
 
@@ -359,64 +357,4 @@ func (s *ExecServer) Exec(stream sandboxdv1.ExecService_ExecServer) error {
 			Exit: &sandboxdv1.ExecExit{Code: code, Error: errStr, Reason: terminalReason},
 		},
 	})
-}
-
-// PortServer implements PortService.
-type PortServer struct {
-	sandboxdv1.UnimplementedPortServiceServer
-
-	mu    sync.Mutex
-	ports map[uint32]*sandboxdv1.Port
-}
-
-// NewPortServer builds a PortServer with an empty registry.
-func NewPortServer() *PortServer {
-	return &PortServer{ports: map[uint32]*sandboxdv1.Port{}}
-}
-
-func (s *PortServer) Register(_ context.Context, req *sandboxdv1.RegisterPortRequest) (*sandboxdv1.Port, error) {
-	port := req.Port
-	if port == 0 {
-		free, err := freePort()
-		if err != nil {
-			return nil, status.Errorf(codes.Internal, "pick free port: %v", err)
-		}
-		port = free
-	}
-
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if p, ok := s.ports[port]; ok {
-		return p, nil
-	}
-	p := &sandboxdv1.Port{Port: port, Label: req.Label}
-	s.ports[port] = p
-	return p, nil
-}
-
-func (s *PortServer) List(_ context.Context, _ *sandboxdv1.ListPortsRequest) (*sandboxdv1.ListPortsResponse, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	resp := &sandboxdv1.ListPortsResponse{Ports: make([]*sandboxdv1.Port, 0, len(s.ports))}
-	for _, p := range s.ports {
-		resp.Ports = append(resp.Ports, p)
-	}
-	sort.Slice(resp.Ports, func(i, j int) bool { return resp.Ports[i].Port < resp.Ports[j].Port })
-	return resp, nil
-}
-
-// freePort asks the OS for an ephemeral port. There is an inherent race
-// between closing the probe listener and the caller binding the port;
-// acceptable for a registry of convenience.
-func freePort() (uint32, error) {
-	l, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		return 0, err
-	}
-	defer l.Close()
-	addr, ok := l.Addr().(*net.TCPAddr)
-	if !ok {
-		return 0, fmt.Errorf("unexpected address type %T", l.Addr())
-	}
-	return uint32(addr.Port), nil
 }

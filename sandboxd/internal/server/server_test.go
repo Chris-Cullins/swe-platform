@@ -47,7 +47,7 @@ func newConn(t *testing.T, workspace string) *grpc.ClientConn {
 	sandboxdv1.RegisterTerminalServiceServer(grpcServer, &TerminalServer{
 		backend: newTmuxTerminalBackend(workspace, socketName, []string{"sh"}),
 	})
-	sandboxdv1.RegisterPortServiceServer(grpcServer, NewPortServer())
+	sandboxdv1.RegisterServiceObservationServiceServer(grpcServer, NewServiceObservationServer(50051))
 	go func() { _ = grpcServer.Serve(lis) }()
 	t.Cleanup(func() { grpcServer.Stop(); processServer.Close() })
 
@@ -449,28 +449,6 @@ func TestTerminalRequiresOpenFirst(t *testing.T) {
 	}
 	if _, err := stream.Recv(); status.Code(err) != codes.InvalidArgument {
 		t.Fatalf("expected InvalidArgument, got %v", err)
-	}
-}
-
-func TestPortRegistry(t *testing.T) {
-	conn := newConn(t, t.TempDir())
-	ports := sandboxdv1.NewPortServiceClient(conn)
-	ctx := context.Background()
-
-	p, err := ports.Register(ctx, &sandboxdv1.RegisterPortRequest{Port: 0, Label: "web"})
-	if err != nil {
-		t.Fatalf("register: %v", err)
-	}
-	if p.Port == 0 {
-		t.Fatal("expected an assigned port")
-	}
-
-	list, err := ports.List(ctx, &sandboxdv1.ListPortsRequest{})
-	if err != nil {
-		t.Fatalf("list: %v", err)
-	}
-	if len(list.Ports) != 1 || list.Ports[0].Label != "web" {
-		t.Fatalf("unexpected ports: %+v", list.Ports)
 	}
 }
 

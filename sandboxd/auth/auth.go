@@ -23,12 +23,12 @@ import (
 type Capability string
 
 const (
-	CapabilityHealth     Capability = "health"
-	CapabilityExec       Capability = "exec"
-	CapabilityProcess    Capability = "process"
-	CapabilityFilesystem Capability = "filesystem"
-	CapabilityTerminal   Capability = "terminal"
-	CapabilityPorts      Capability = "ports"
+	CapabilityHealth             Capability = "health"
+	CapabilityExec               Capability = "exec"
+	CapabilityProcess            Capability = "process"
+	CapabilityFilesystem         Capability = "filesystem"
+	CapabilityTerminal           Capability = "terminal"
+	CapabilityServiceObservation Capability = "service-observation"
 )
 
 // Credential bundle keys and identity annotation shared by provisioners and clients.
@@ -159,8 +159,8 @@ func methodCapability(method string) (Capability, bool) {
 		return CapabilityFilesystem, true
 	case "sandboxd.v1.TerminalService":
 		return CapabilityTerminal, true
-	case "sandboxd.v1.PortService":
-		return CapabilityPorts, true
+	case "sandboxd.v1.ServiceObservationService":
+		return CapabilityServiceObservation, true
 	default:
 		return "", false
 	}
@@ -168,7 +168,7 @@ func methodCapability(method string) (Capability, bool) {
 
 func validCapability(capability Capability) bool {
 	switch capability {
-	case CapabilityHealth, CapabilityExec, CapabilityProcess, CapabilityFilesystem, CapabilityTerminal, CapabilityPorts:
+	case CapabilityHealth, CapabilityExec, CapabilityProcess, CapabilityFilesystem, CapabilityTerminal, CapabilityServiceObservation:
 		return true
 	default:
 		return false

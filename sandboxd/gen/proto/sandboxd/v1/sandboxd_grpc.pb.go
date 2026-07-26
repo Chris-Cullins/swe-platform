@@ -681,145 +681,110 @@ var TerminalService_ServiceDesc = grpc.ServiceDesc{
 }
 
 const (
-	PortService_Register_FullMethodName = "/sandboxd.v1.PortService/Register"
-	PortService_List_FullMethodName     = "/sandboxd.v1.PortService/List"
+	ServiceObservationService_Observe_FullMethodName = "/sandboxd.v1.ServiceObservationService/Observe"
 )
 
-// PortServiceClient is the client API for PortService service.
+// ServiceObservationServiceClient is the client API for ServiceObservationService service.
 //
 // For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
 //
-// PortService tracks ports in use inside the environment so the gateway
-// can expose them as portals.
-type PortServiceClient interface {
-	Register(ctx context.Context, in *RegisterPortRequest, opts ...grpc.CallOption) (*Port, error)
-	List(ctx context.Context, in *ListPortsRequest, opts ...grpc.CallOption) (*ListPortsResponse, error)
+// ServiceObservationService performs bounded, point-in-time TCP-connect
+// observations from the environment's logical loopback. It retains no state
+// and does not declare, register, allocate, expose, or route services.
+type ServiceObservationServiceClient interface {
+	Observe(ctx context.Context, in *ObserveServicesRequest, opts ...grpc.CallOption) (*ObserveServicesResponse, error)
 }
 
-type portServiceClient struct {
+type serviceObservationServiceClient struct {
 	cc grpc.ClientConnInterface
 }
 
-func NewPortServiceClient(cc grpc.ClientConnInterface) PortServiceClient {
-	return &portServiceClient{cc}
+func NewServiceObservationServiceClient(cc grpc.ClientConnInterface) ServiceObservationServiceClient {
+	return &serviceObservationServiceClient{cc}
 }
 
-func (c *portServiceClient) Register(ctx context.Context, in *RegisterPortRequest, opts ...grpc.CallOption) (*Port, error) {
+func (c *serviceObservationServiceClient) Observe(ctx context.Context, in *ObserveServicesRequest, opts ...grpc.CallOption) (*ObserveServicesResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	out := new(Port)
-	err := c.cc.Invoke(ctx, PortService_Register_FullMethodName, in, out, cOpts...)
+	out := new(ObserveServicesResponse)
+	err := c.cc.Invoke(ctx, ServiceObservationService_Observe_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
 	return out, nil
 }
 
-func (c *portServiceClient) List(ctx context.Context, in *ListPortsRequest, opts ...grpc.CallOption) (*ListPortsResponse, error) {
-	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	out := new(ListPortsResponse)
-	err := c.cc.Invoke(ctx, PortService_List_FullMethodName, in, out, cOpts...)
-	if err != nil {
-		return nil, err
-	}
-	return out, nil
-}
-
-// PortServiceServer is the server API for PortService service.
-// All implementations must embed UnimplementedPortServiceServer
+// ServiceObservationServiceServer is the server API for ServiceObservationService service.
+// All implementations must embed UnimplementedServiceObservationServiceServer
 // for forward compatibility.
 //
-// PortService tracks ports in use inside the environment so the gateway
-// can expose them as portals.
-type PortServiceServer interface {
-	Register(context.Context, *RegisterPortRequest) (*Port, error)
-	List(context.Context, *ListPortsRequest) (*ListPortsResponse, error)
-	mustEmbedUnimplementedPortServiceServer()
+// ServiceObservationService performs bounded, point-in-time TCP-connect
+// observations from the environment's logical loopback. It retains no state
+// and does not declare, register, allocate, expose, or route services.
+type ServiceObservationServiceServer interface {
+	Observe(context.Context, *ObserveServicesRequest) (*ObserveServicesResponse, error)
+	mustEmbedUnimplementedServiceObservationServiceServer()
 }
 
-// UnimplementedPortServiceServer must be embedded to have
+// UnimplementedServiceObservationServiceServer must be embedded to have
 // forward compatible implementations.
 //
 // NOTE: this should be embedded by value instead of pointer to avoid a nil
 // pointer dereference when methods are called.
-type UnimplementedPortServiceServer struct{}
+type UnimplementedServiceObservationServiceServer struct{}
 
-func (UnimplementedPortServiceServer) Register(context.Context, *RegisterPortRequest) (*Port, error) {
-	return nil, status.Error(codes.Unimplemented, "method Register not implemented")
+func (UnimplementedServiceObservationServiceServer) Observe(context.Context, *ObserveServicesRequest) (*ObserveServicesResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method Observe not implemented")
 }
-func (UnimplementedPortServiceServer) List(context.Context, *ListPortsRequest) (*ListPortsResponse, error) {
-	return nil, status.Error(codes.Unimplemented, "method List not implemented")
+func (UnimplementedServiceObservationServiceServer) mustEmbedUnimplementedServiceObservationServiceServer() {
 }
-func (UnimplementedPortServiceServer) mustEmbedUnimplementedPortServiceServer() {}
-func (UnimplementedPortServiceServer) testEmbeddedByValue()                     {}
+func (UnimplementedServiceObservationServiceServer) testEmbeddedByValue() {}
 
-// UnsafePortServiceServer may be embedded to opt out of forward compatibility for this service.
-// Use of this interface is not recommended, as added methods to PortServiceServer will
+// UnsafeServiceObservationServiceServer may be embedded to opt out of forward compatibility for this service.
+// Use of this interface is not recommended, as added methods to ServiceObservationServiceServer will
 // result in compilation errors.
-type UnsafePortServiceServer interface {
-	mustEmbedUnimplementedPortServiceServer()
+type UnsafeServiceObservationServiceServer interface {
+	mustEmbedUnimplementedServiceObservationServiceServer()
 }
 
-func RegisterPortServiceServer(s grpc.ServiceRegistrar, srv PortServiceServer) {
-	// If the following call panics, it indicates UnimplementedPortServiceServer was
+func RegisterServiceObservationServiceServer(s grpc.ServiceRegistrar, srv ServiceObservationServiceServer) {
+	// If the following call panics, it indicates UnimplementedServiceObservationServiceServer was
 	// embedded by pointer and is nil.  This will cause panics if an
 	// unimplemented method is ever invoked, so we test this at initialization
 	// time to prevent it from happening at runtime later due to I/O.
 	if t, ok := srv.(interface{ testEmbeddedByValue() }); ok {
 		t.testEmbeddedByValue()
 	}
-	s.RegisterService(&PortService_ServiceDesc, srv)
+	s.RegisterService(&ServiceObservationService_ServiceDesc, srv)
 }
 
-func _PortService_Register_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
-	in := new(RegisterPortRequest)
+func _ServiceObservationService_Observe_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ObserveServicesRequest)
 	if err := dec(in); err != nil {
 		return nil, err
 	}
 	if interceptor == nil {
-		return srv.(PortServiceServer).Register(ctx, in)
+		return srv.(ServiceObservationServiceServer).Observe(ctx, in)
 	}
 	info := &grpc.UnaryServerInfo{
 		Server:     srv,
-		FullMethod: PortService_Register_FullMethodName,
+		FullMethod: ServiceObservationService_Observe_FullMethodName,
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(PortServiceServer).Register(ctx, req.(*RegisterPortRequest))
+		return srv.(ServiceObservationServiceServer).Observe(ctx, req.(*ObserveServicesRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
 
-func _PortService_List_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
-	in := new(ListPortsRequest)
-	if err := dec(in); err != nil {
-		return nil, err
-	}
-	if interceptor == nil {
-		return srv.(PortServiceServer).List(ctx, in)
-	}
-	info := &grpc.UnaryServerInfo{
-		Server:     srv,
-		FullMethod: PortService_List_FullMethodName,
-	}
-	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(PortServiceServer).List(ctx, req.(*ListPortsRequest))
-	}
-	return interceptor(ctx, in, info, handler)
-}
-
-// PortService_ServiceDesc is the grpc.ServiceDesc for PortService service.
+// ServiceObservationService_ServiceDesc is the grpc.ServiceDesc for ServiceObservationService service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
-var PortService_ServiceDesc = grpc.ServiceDesc{
-	ServiceName: "sandboxd.v1.PortService",
-	HandlerType: (*PortServiceServer)(nil),
+var ServiceObservationService_ServiceDesc = grpc.ServiceDesc{
+	ServiceName: "sandboxd.v1.ServiceObservationService",
+	HandlerType: (*ServiceObservationServiceServer)(nil),
 	Methods: []grpc.MethodDesc{
 		{
-			MethodName: "Register",
-			Handler:    _PortService_Register_Handler,
-		},
-		{
-			MethodName: "List",
-			Handler:    _PortService_List_Handler,
+			MethodName: "Observe",
+			Handler:    _ServiceObservationService_Observe_Handler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},

@@ -44,8 +44,9 @@ CLI / TUI / local MCP / browser console
   uses the same control-plane resource, transcript, and terminal APIs.
 - **`sandboxd`.** A small daemon in each Environment provides authenticated gRPC services for
   connection-bound exec, keyed managed processes, workspace-confined filesystem access, one
-  shared terminal, a process-local port registry, and health. The port registry is not a
-  portal gateway.
+  shared terminal, health, and bounded stateless TCP-connect observations from its logical
+  loopback. The observation primitive retains no declarations or results, and no operator token
+  or connector currently invokes it.
 
 Portal proxying, inbox delivery and child-run spawning, branch/PR publication, and non-Pod
 Environment backends are not implemented.
@@ -360,9 +361,11 @@ path forcing ship together after Project namespace claims.
 ## Remaining decisions and open work
 
 The approved contracts above still require reviewable API sketches, migration/rollout plans,
-controller ownership, and acceptance tests before implementation. The execution-generation
-contract is implemented above; future service observations, portal routes, and egress identity
-must consume the same backend-neutral fence without exposing backend-specific identity.
+controller ownership, and acceptance tests before implementation. sandboxd now has a stateless
+internal loopback observation primitive, but Environment declarations, an observation connector
+and controller-owned health status do not exist. The execution-generation contract is
+implemented above; future declaration observations, portal routes, and egress identity must
+consume the same backend-neutral fence without exposing backend-specific identity.
 
 Other unimplemented areas include portal transport, inbox and child-run semantics, changes
 publication, transcript garbage collection, additional credential forms, ConPTY, non-Pod

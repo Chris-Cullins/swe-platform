@@ -458,6 +458,113 @@ func (EntryType) EnumDescriptor() ([]byte, []int) {
 	return file_proto_sandboxd_v1_sandboxd_proto_rawDescGZIP(), []int{7}
 }
 
+type ServiceProbeOutcome int32
+
+const (
+	ServiceProbeOutcome_SERVICE_PROBE_OUTCOME_UNSPECIFIED   ServiceProbeOutcome = 0
+	ServiceProbeOutcome_SERVICE_PROBE_OUTCOME_CONNECTED     ServiceProbeOutcome = 1
+	ServiceProbeOutcome_SERVICE_PROBE_OUTCOME_NOT_CONNECTED ServiceProbeOutcome = 2
+	ServiceProbeOutcome_SERVICE_PROBE_OUTCOME_TIMED_OUT     ServiceProbeOutcome = 3
+)
+
+// Enum value maps for ServiceProbeOutcome.
+var (
+	ServiceProbeOutcome_name = map[int32]string{
+		0: "SERVICE_PROBE_OUTCOME_UNSPECIFIED",
+		1: "SERVICE_PROBE_OUTCOME_CONNECTED",
+		2: "SERVICE_PROBE_OUTCOME_NOT_CONNECTED",
+		3: "SERVICE_PROBE_OUTCOME_TIMED_OUT",
+	}
+	ServiceProbeOutcome_value = map[string]int32{
+		"SERVICE_PROBE_OUTCOME_UNSPECIFIED":   0,
+		"SERVICE_PROBE_OUTCOME_CONNECTED":     1,
+		"SERVICE_PROBE_OUTCOME_NOT_CONNECTED": 2,
+		"SERVICE_PROBE_OUTCOME_TIMED_OUT":     3,
+	}
+)
+
+func (x ServiceProbeOutcome) Enum() *ServiceProbeOutcome {
+	p := new(ServiceProbeOutcome)
+	*p = x
+	return p
+}
+
+func (x ServiceProbeOutcome) String() string {
+	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
+}
+
+func (ServiceProbeOutcome) Descriptor() protoreflect.EnumDescriptor {
+	return file_proto_sandboxd_v1_sandboxd_proto_enumTypes[8].Descriptor()
+}
+
+func (ServiceProbeOutcome) Type() protoreflect.EnumType {
+	return &file_proto_sandboxd_v1_sandboxd_proto_enumTypes[8]
+}
+
+func (x ServiceProbeOutcome) Number() protoreflect.EnumNumber {
+	return protoreflect.EnumNumber(x)
+}
+
+// Deprecated: Use ServiceProbeOutcome.Descriptor instead.
+func (ServiceProbeOutcome) EnumDescriptor() ([]byte, []int) {
+	return file_proto_sandboxd_v1_sandboxd_proto_rawDescGZIP(), []int{8}
+}
+
+type ServiceProbeReason int32
+
+const (
+	ServiceProbeReason_SERVICE_PROBE_REASON_UNSPECIFIED         ServiceProbeReason = 0
+	ServiceProbeReason_SERVICE_PROBE_REASON_CONNECTION_ACCEPTED ServiceProbeReason = 1
+	ServiceProbeReason_SERVICE_PROBE_REASON_CONNECTION_FAILED   ServiceProbeReason = 2
+	ServiceProbeReason_SERVICE_PROBE_REASON_DEADLINE_EXCEEDED   ServiceProbeReason = 3
+	ServiceProbeReason_SERVICE_PROBE_REASON_CANCELED            ServiceProbeReason = 4
+)
+
+// Enum value maps for ServiceProbeReason.
+var (
+	ServiceProbeReason_name = map[int32]string{
+		0: "SERVICE_PROBE_REASON_UNSPECIFIED",
+		1: "SERVICE_PROBE_REASON_CONNECTION_ACCEPTED",
+		2: "SERVICE_PROBE_REASON_CONNECTION_FAILED",
+		3: "SERVICE_PROBE_REASON_DEADLINE_EXCEEDED",
+		4: "SERVICE_PROBE_REASON_CANCELED",
+	}
+	ServiceProbeReason_value = map[string]int32{
+		"SERVICE_PROBE_REASON_UNSPECIFIED":         0,
+		"SERVICE_PROBE_REASON_CONNECTION_ACCEPTED": 1,
+		"SERVICE_PROBE_REASON_CONNECTION_FAILED":   2,
+		"SERVICE_PROBE_REASON_DEADLINE_EXCEEDED":   3,
+		"SERVICE_PROBE_REASON_CANCELED":            4,
+	}
+)
+
+func (x ServiceProbeReason) Enum() *ServiceProbeReason {
+	p := new(ServiceProbeReason)
+	*p = x
+	return p
+}
+
+func (x ServiceProbeReason) String() string {
+	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
+}
+
+func (ServiceProbeReason) Descriptor() protoreflect.EnumDescriptor {
+	return file_proto_sandboxd_v1_sandboxd_proto_enumTypes[9].Descriptor()
+}
+
+func (ServiceProbeReason) Type() protoreflect.EnumType {
+	return &file_proto_sandboxd_v1_sandboxd_proto_enumTypes[9]
+}
+
+func (x ServiceProbeReason) Number() protoreflect.EnumNumber {
+	return protoreflect.EnumNumber(x)
+}
+
+// Deprecated: Use ServiceProbeReason.Descriptor instead.
+func (ServiceProbeReason) EnumDescriptor() ([]byte, []int) {
+	return file_proto_sandboxd_v1_sandboxd_proto_rawDescGZIP(), []int{9}
+}
+
 type ExecRequest struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// Types that are valid to be assigned to Kind:
@@ -2349,29 +2456,27 @@ func (x *TerminalResize) GetRows() uint32 {
 	return 0
 }
 
-type RegisterPortRequest struct {
-	state protoimpl.MessageState `protogen:"open.v1"`
-	// port of 0 asks sandboxd to pick a free one.
-	Port          uint32 `protobuf:"varint,1,opt,name=port,proto3" json:"port,omitempty"`
-	Label         string `protobuf:"bytes,2,opt,name=label,proto3" json:"label,omitempty"`
+type ObserveServicesRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Probes        []*ServiceProbe        `protobuf:"bytes,1,rep,name=probes,proto3" json:"probes,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
 
-func (x *RegisterPortRequest) Reset() {
-	*x = RegisterPortRequest{}
+func (x *ObserveServicesRequest) Reset() {
+	*x = ObserveServicesRequest{}
 	mi := &file_proto_sandboxd_v1_sandboxd_proto_msgTypes[28]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
 
-func (x *RegisterPortRequest) String() string {
+func (x *ObserveServicesRequest) String() string {
 	return protoimpl.X.MessageStringOf(x)
 }
 
-func (*RegisterPortRequest) ProtoMessage() {}
+func (*ObserveServicesRequest) ProtoMessage() {}
 
-func (x *RegisterPortRequest) ProtoReflect() protoreflect.Message {
+func (x *ObserveServicesRequest) ProtoReflect() protoreflect.Message {
 	mi := &file_proto_sandboxd_v1_sandboxd_proto_msgTypes[28]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
@@ -2383,49 +2488,45 @@ func (x *RegisterPortRequest) ProtoReflect() protoreflect.Message {
 	return mi.MessageOf(x)
 }
 
-// Deprecated: Use RegisterPortRequest.ProtoReflect.Descriptor instead.
-func (*RegisterPortRequest) Descriptor() ([]byte, []int) {
+// Deprecated: Use ObserveServicesRequest.ProtoReflect.Descriptor instead.
+func (*ObserveServicesRequest) Descriptor() ([]byte, []int) {
 	return file_proto_sandboxd_v1_sandboxd_proto_rawDescGZIP(), []int{28}
 }
 
-func (x *RegisterPortRequest) GetPort() uint32 {
+func (x *ObserveServicesRequest) GetProbes() []*ServiceProbe {
 	if x != nil {
-		return x.Port
+		return x.Probes
 	}
-	return 0
+	return nil
 }
 
-func (x *RegisterPortRequest) GetLabel() string {
-	if x != nil {
-		return x.Label
-	}
-	return ""
-}
-
-type Port struct {
+type ServiceProbe struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
-	Port  uint32                 `protobuf:"varint,1,opt,name=port,proto3" json:"port,omitempty"`
-	Label string                 `protobuf:"bytes,2,opt,name=label,proto3" json:"label,omitempty"`
-	// url is filled in once the gateway has exposed the port; empty until then.
-	Url           string `protobuf:"bytes,3,opt,name=url,proto3" json:"url,omitempty"`
+	// id is opaque correlation data scoped only to this request.
+	Id         string `protobuf:"bytes,1,opt,name=id,proto3" json:"id,omitempty"`
+	TargetPort uint32 `protobuf:"varint,2,opt,name=target_port,json=targetPort,proto3" json:"target_port,omitempty"`
+	// Types that are valid to be assigned to Probe:
+	//
+	//	*ServiceProbe_TcpConnect
+	Probe         isServiceProbe_Probe `protobuf_oneof:"probe"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
 
-func (x *Port) Reset() {
-	*x = Port{}
+func (x *ServiceProbe) Reset() {
+	*x = ServiceProbe{}
 	mi := &file_proto_sandboxd_v1_sandboxd_proto_msgTypes[29]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
 
-func (x *Port) String() string {
+func (x *ServiceProbe) String() string {
 	return protoimpl.X.MessageStringOf(x)
 }
 
-func (*Port) ProtoMessage() {}
+func (*ServiceProbe) ProtoMessage() {}
 
-func (x *Port) ProtoReflect() protoreflect.Message {
+func (x *ServiceProbe) ProtoReflect() protoreflect.Message {
 	mi := &file_proto_sandboxd_v1_sandboxd_proto_msgTypes[29]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
@@ -2437,52 +2538,71 @@ func (x *Port) ProtoReflect() protoreflect.Message {
 	return mi.MessageOf(x)
 }
 
-// Deprecated: Use Port.ProtoReflect.Descriptor instead.
-func (*Port) Descriptor() ([]byte, []int) {
+// Deprecated: Use ServiceProbe.ProtoReflect.Descriptor instead.
+func (*ServiceProbe) Descriptor() ([]byte, []int) {
 	return file_proto_sandboxd_v1_sandboxd_proto_rawDescGZIP(), []int{29}
 }
 
-func (x *Port) GetPort() uint32 {
+func (x *ServiceProbe) GetId() string {
 	if x != nil {
-		return x.Port
+		return x.Id
+	}
+	return ""
+}
+
+func (x *ServiceProbe) GetTargetPort() uint32 {
+	if x != nil {
+		return x.TargetPort
 	}
 	return 0
 }
 
-func (x *Port) GetLabel() string {
+func (x *ServiceProbe) GetProbe() isServiceProbe_Probe {
 	if x != nil {
-		return x.Label
+		return x.Probe
 	}
-	return ""
+	return nil
 }
 
-func (x *Port) GetUrl() string {
+func (x *ServiceProbe) GetTcpConnect() *TCPConnectProbe {
 	if x != nil {
-		return x.Url
+		if x, ok := x.Probe.(*ServiceProbe_TcpConnect); ok {
+			return x.TcpConnect
+		}
 	}
-	return ""
+	return nil
 }
 
-type ListPortsRequest struct {
+type isServiceProbe_Probe interface {
+	isServiceProbe_Probe()
+}
+
+type ServiceProbe_TcpConnect struct {
+	TcpConnect *TCPConnectProbe `protobuf:"bytes,3,opt,name=tcp_connect,json=tcpConnect,proto3,oneof"`
+}
+
+func (*ServiceProbe_TcpConnect) isServiceProbe_Probe() {}
+
+type TCPConnectProbe struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
 
-func (x *ListPortsRequest) Reset() {
-	*x = ListPortsRequest{}
+func (x *TCPConnectProbe) Reset() {
+	*x = TCPConnectProbe{}
 	mi := &file_proto_sandboxd_v1_sandboxd_proto_msgTypes[30]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
 
-func (x *ListPortsRequest) String() string {
+func (x *TCPConnectProbe) String() string {
 	return protoimpl.X.MessageStringOf(x)
 }
 
-func (*ListPortsRequest) ProtoMessage() {}
+func (*TCPConnectProbe) ProtoMessage() {}
 
-func (x *ListPortsRequest) ProtoReflect() protoreflect.Message {
+func (x *TCPConnectProbe) ProtoReflect() protoreflect.Message {
 	mi := &file_proto_sandboxd_v1_sandboxd_proto_msgTypes[30]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
@@ -2494,32 +2614,34 @@ func (x *ListPortsRequest) ProtoReflect() protoreflect.Message {
 	return mi.MessageOf(x)
 }
 
-// Deprecated: Use ListPortsRequest.ProtoReflect.Descriptor instead.
-func (*ListPortsRequest) Descriptor() ([]byte, []int) {
+// Deprecated: Use TCPConnectProbe.ProtoReflect.Descriptor instead.
+func (*TCPConnectProbe) Descriptor() ([]byte, []int) {
 	return file_proto_sandboxd_v1_sandboxd_proto_rawDescGZIP(), []int{30}
 }
 
-type ListPortsResponse struct {
+type ServiceProbeObservation struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
-	Ports         []*Port                `protobuf:"bytes,1,rep,name=ports,proto3" json:"ports,omitempty"`
+	Id            string                 `protobuf:"bytes,1,opt,name=id,proto3" json:"id,omitempty"`
+	Outcome       ServiceProbeOutcome    `protobuf:"varint,2,opt,name=outcome,proto3,enum=sandboxd.v1.ServiceProbeOutcome" json:"outcome,omitempty"`
+	Reason        ServiceProbeReason     `protobuf:"varint,3,opt,name=reason,proto3,enum=sandboxd.v1.ServiceProbeReason" json:"reason,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
 
-func (x *ListPortsResponse) Reset() {
-	*x = ListPortsResponse{}
+func (x *ServiceProbeObservation) Reset() {
+	*x = ServiceProbeObservation{}
 	mi := &file_proto_sandboxd_v1_sandboxd_proto_msgTypes[31]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
 
-func (x *ListPortsResponse) String() string {
+func (x *ServiceProbeObservation) String() string {
 	return protoimpl.X.MessageStringOf(x)
 }
 
-func (*ListPortsResponse) ProtoMessage() {}
+func (*ServiceProbeObservation) ProtoMessage() {}
 
-func (x *ListPortsResponse) ProtoReflect() protoreflect.Message {
+func (x *ServiceProbeObservation) ProtoReflect() protoreflect.Message {
 	mi := &file_proto_sandboxd_v1_sandboxd_proto_msgTypes[31]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
@@ -2531,14 +2653,74 @@ func (x *ListPortsResponse) ProtoReflect() protoreflect.Message {
 	return mi.MessageOf(x)
 }
 
-// Deprecated: Use ListPortsResponse.ProtoReflect.Descriptor instead.
-func (*ListPortsResponse) Descriptor() ([]byte, []int) {
+// Deprecated: Use ServiceProbeObservation.ProtoReflect.Descriptor instead.
+func (*ServiceProbeObservation) Descriptor() ([]byte, []int) {
 	return file_proto_sandboxd_v1_sandboxd_proto_rawDescGZIP(), []int{31}
 }
 
-func (x *ListPortsResponse) GetPorts() []*Port {
+func (x *ServiceProbeObservation) GetId() string {
 	if x != nil {
-		return x.Ports
+		return x.Id
+	}
+	return ""
+}
+
+func (x *ServiceProbeObservation) GetOutcome() ServiceProbeOutcome {
+	if x != nil {
+		return x.Outcome
+	}
+	return ServiceProbeOutcome_SERVICE_PROBE_OUTCOME_UNSPECIFIED
+}
+
+func (x *ServiceProbeObservation) GetReason() ServiceProbeReason {
+	if x != nil {
+		return x.Reason
+	}
+	return ServiceProbeReason_SERVICE_PROBE_REASON_UNSPECIFIED
+}
+
+type ObserveServicesResponse struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// observations preserve request order and contain exactly one result per
+	// validated probe.
+	Observations  []*ServiceProbeObservation `protobuf:"bytes,1,rep,name=observations,proto3" json:"observations,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ObserveServicesResponse) Reset() {
+	*x = ObserveServicesResponse{}
+	mi := &file_proto_sandboxd_v1_sandboxd_proto_msgTypes[32]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ObserveServicesResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ObserveServicesResponse) ProtoMessage() {}
+
+func (x *ObserveServicesResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_sandboxd_v1_sandboxd_proto_msgTypes[32]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ObserveServicesResponse.ProtoReflect.Descriptor instead.
+func (*ObserveServicesResponse) Descriptor() ([]byte, []int) {
+	return file_proto_sandboxd_v1_sandboxd_proto_rawDescGZIP(), []int{32}
+}
+
+func (x *ObserveServicesResponse) GetObservations() []*ServiceProbeObservation {
+	if x != nil {
+		return x.Observations
 	}
 	return nil
 }
@@ -2551,7 +2733,7 @@ type HealthCheckRequest struct {
 
 func (x *HealthCheckRequest) Reset() {
 	*x = HealthCheckRequest{}
-	mi := &file_proto_sandboxd_v1_sandboxd_proto_msgTypes[32]
+	mi := &file_proto_sandboxd_v1_sandboxd_proto_msgTypes[33]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2563,7 +2745,7 @@ func (x *HealthCheckRequest) String() string {
 func (*HealthCheckRequest) ProtoMessage() {}
 
 func (x *HealthCheckRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_sandboxd_v1_sandboxd_proto_msgTypes[32]
+	mi := &file_proto_sandboxd_v1_sandboxd_proto_msgTypes[33]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2576,7 +2758,7 @@ func (x *HealthCheckRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use HealthCheckRequest.ProtoReflect.Descriptor instead.
 func (*HealthCheckRequest) Descriptor() ([]byte, []int) {
-	return file_proto_sandboxd_v1_sandboxd_proto_rawDescGZIP(), []int{32}
+	return file_proto_sandboxd_v1_sandboxd_proto_rawDescGZIP(), []int{33}
 }
 
 type HealthCheckResponse struct {
@@ -2589,7 +2771,7 @@ type HealthCheckResponse struct {
 
 func (x *HealthCheckResponse) Reset() {
 	*x = HealthCheckResponse{}
-	mi := &file_proto_sandboxd_v1_sandboxd_proto_msgTypes[33]
+	mi := &file_proto_sandboxd_v1_sandboxd_proto_msgTypes[34]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2601,7 +2783,7 @@ func (x *HealthCheckResponse) String() string {
 func (*HealthCheckResponse) ProtoMessage() {}
 
 func (x *HealthCheckResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_sandboxd_v1_sandboxd_proto_msgTypes[33]
+	mi := &file_proto_sandboxd_v1_sandboxd_proto_msgTypes[34]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2614,7 +2796,7 @@ func (x *HealthCheckResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use HealthCheckResponse.ProtoReflect.Descriptor instead.
 func (*HealthCheckResponse) Descriptor() ([]byte, []int) {
-	return file_proto_sandboxd_v1_sandboxd_proto_rawDescGZIP(), []int{33}
+	return file_proto_sandboxd_v1_sandboxd_proto_rawDescGZIP(), []int{34}
 }
 
 func (x *HealthCheckResponse) GetOk() bool {
@@ -2774,17 +2956,23 @@ const file_proto_sandboxd_v1_sandboxd_proto_rawDesc = "" +
 	"\x04rows\x18\x02 \x01(\rR\x04rows\"8\n" +
 	"\x0eTerminalResize\x12\x12\n" +
 	"\x04cols\x18\x01 \x01(\rR\x04cols\x12\x12\n" +
-	"\x04rows\x18\x02 \x01(\rR\x04rows\"?\n" +
-	"\x13RegisterPortRequest\x12\x12\n" +
-	"\x04port\x18\x01 \x01(\rR\x04port\x12\x14\n" +
-	"\x05label\x18\x02 \x01(\tR\x05label\"B\n" +
-	"\x04Port\x12\x12\n" +
-	"\x04port\x18\x01 \x01(\rR\x04port\x12\x14\n" +
-	"\x05label\x18\x02 \x01(\tR\x05label\x12\x10\n" +
-	"\x03url\x18\x03 \x01(\tR\x03url\"\x12\n" +
-	"\x10ListPortsRequest\"<\n" +
-	"\x11ListPortsResponse\x12'\n" +
-	"\x05ports\x18\x01 \x03(\v2\x11.sandboxd.v1.PortR\x05ports\"\x14\n" +
+	"\x04rows\x18\x02 \x01(\rR\x04rows\"K\n" +
+	"\x16ObserveServicesRequest\x121\n" +
+	"\x06probes\x18\x01 \x03(\v2\x19.sandboxd.v1.ServiceProbeR\x06probes\"\x89\x01\n" +
+	"\fServiceProbe\x12\x0e\n" +
+	"\x02id\x18\x01 \x01(\tR\x02id\x12\x1f\n" +
+	"\vtarget_port\x18\x02 \x01(\rR\n" +
+	"targetPort\x12?\n" +
+	"\vtcp_connect\x18\x03 \x01(\v2\x1c.sandboxd.v1.TCPConnectProbeH\x00R\n" +
+	"tcpConnectB\a\n" +
+	"\x05probe\"\x11\n" +
+	"\x0fTCPConnectProbe\"\x9e\x01\n" +
+	"\x17ServiceProbeObservation\x12\x0e\n" +
+	"\x02id\x18\x01 \x01(\tR\x02id\x12:\n" +
+	"\aoutcome\x18\x02 \x01(\x0e2 .sandboxd.v1.ServiceProbeOutcomeR\aoutcome\x127\n" +
+	"\x06reason\x18\x03 \x01(\x0e2\x1f.sandboxd.v1.ServiceProbeReasonR\x06reason\"c\n" +
+	"\x17ObserveServicesResponse\x12H\n" +
+	"\fobservations\x18\x01 \x03(\v2$.sandboxd.v1.ServiceProbeObservationR\fobservations\"\x14\n" +
 	"\x12HealthCheckRequest\"?\n" +
 	"\x13HealthCheckResponse\x12\x0e\n" +
 	"\x02ok\x18\x01 \x01(\bR\x02ok\x12\x18\n" +
@@ -2835,7 +3023,18 @@ const file_proto_sandboxd_v1_sandboxd_proto_rawDesc = "" +
 	"\x0fENTRY_TYPE_FILE\x10\x01\x12\x18\n" +
 	"\x14ENTRY_TYPE_DIRECTORY\x10\x02\x12\x16\n" +
 	"\x12ENTRY_TYPE_SYMLINK\x10\x03\x12\x14\n" +
-	"\x10ENTRY_TYPE_OTHER\x10\x042N\n" +
+	"\x10ENTRY_TYPE_OTHER\x10\x04*\xaf\x01\n" +
+	"\x13ServiceProbeOutcome\x12%\n" +
+	"!SERVICE_PROBE_OUTCOME_UNSPECIFIED\x10\x00\x12#\n" +
+	"\x1fSERVICE_PROBE_OUTCOME_CONNECTED\x10\x01\x12'\n" +
+	"#SERVICE_PROBE_OUTCOME_NOT_CONNECTED\x10\x02\x12#\n" +
+	"\x1fSERVICE_PROBE_OUTCOME_TIMED_OUT\x10\x03*\xe3\x01\n" +
+	"\x12ServiceProbeReason\x12$\n" +
+	" SERVICE_PROBE_REASON_UNSPECIFIED\x10\x00\x12,\n" +
+	"(SERVICE_PROBE_REASON_CONNECTION_ACCEPTED\x10\x01\x12*\n" +
+	"&SERVICE_PROBE_REASON_CONNECTION_FAILED\x10\x02\x12*\n" +
+	"&SERVICE_PROBE_REASON_DEADLINE_EXCEEDED\x10\x03\x12!\n" +
+	"\x1dSERVICE_PROBE_REASON_CANCELED\x10\x042N\n" +
 	"\vExecService\x12?\n" +
 	"\x04Exec\x12\x18.sandboxd.v1.ExecRequest\x1a\x19.sandboxd.v1.ExecResponse(\x010\x012\x81\x03\n" +
 	"\x0eProcessService\x12?\n" +
@@ -2850,10 +3049,9 @@ const file_proto_sandboxd_v1_sandboxd_proto_rawDesc = "" +
 	"\x05Write\x12\x19.sandboxd.v1.WriteRequest\x1a\x1a.sandboxd.v1.WriteResponse(\x01\x12;\n" +
 	"\x04List\x12\x18.sandboxd.v1.ListRequest\x1a\x19.sandboxd.v1.ListResponse2]\n" +
 	"\x0fTerminalService\x12J\n" +
-	"\bTerminal\x12\x1c.sandboxd.v1.TerminalMessage\x1a\x1c.sandboxd.v1.TerminalMessage(\x010\x012\x95\x01\n" +
-	"\vPortService\x12?\n" +
-	"\bRegister\x12 .sandboxd.v1.RegisterPortRequest\x1a\x11.sandboxd.v1.Port\x12E\n" +
-	"\x04List\x12\x1d.sandboxd.v1.ListPortsRequest\x1a\x1e.sandboxd.v1.ListPortsResponse2[\n" +
+	"\bTerminal\x12\x1c.sandboxd.v1.TerminalMessage\x1a\x1c.sandboxd.v1.TerminalMessage(\x010\x012q\n" +
+	"\x19ServiceObservationService\x12T\n" +
+	"\aObserve\x12#.sandboxd.v1.ObserveServicesRequest\x1a$.sandboxd.v1.ObserveServicesResponse2[\n" +
 	"\rHealthService\x12J\n" +
 	"\x05Check\x12\x1f.sandboxd.v1.HealthCheckRequest\x1a .sandboxd.v1.HealthCheckResponseBQZOgithub.com/Chris-Cullins/swe-platform/sandboxd/gen/proto/sandboxd/v1;sandboxdv1b\x06proto3"
 
@@ -2869,8 +3067,8 @@ func file_proto_sandboxd_v1_sandboxd_proto_rawDescGZIP() []byte {
 	return file_proto_sandboxd_v1_sandboxd_proto_rawDescData
 }
 
-var file_proto_sandboxd_v1_sandboxd_proto_enumTypes = make([]protoimpl.EnumInfo, 8)
-var file_proto_sandboxd_v1_sandboxd_proto_msgTypes = make([]protoimpl.MessageInfo, 37)
+var file_proto_sandboxd_v1_sandboxd_proto_enumTypes = make([]protoimpl.EnumInfo, 10)
+var file_proto_sandboxd_v1_sandboxd_proto_msgTypes = make([]protoimpl.MessageInfo, 38)
 var file_proto_sandboxd_v1_sandboxd_proto_goTypes = []any{
 	(ProcessControl)(0),                           // 0: sandboxd.v1.ProcessControl
 	(EnvironmentMode)(0),                          // 1: sandboxd.v1.EnvironmentMode
@@ -2880,111 +3078,116 @@ var file_proto_sandboxd_v1_sandboxd_proto_goTypes = []any{
 	(ProcessState)(0),                             // 5: sandboxd.v1.ProcessState
 	(WritePrecondition)(0),                        // 6: sandboxd.v1.WritePrecondition
 	(EntryType)(0),                                // 7: sandboxd.v1.EntryType
-	(*ExecRequest)(nil),                           // 8: sandboxd.v1.ExecRequest
-	(*ExecStdinEOF)(nil),                          // 9: sandboxd.v1.ExecStdinEOF
-	(*ExecControl)(nil),                           // 10: sandboxd.v1.ExecControl
-	(*OutputChunk)(nil),                           // 11: sandboxd.v1.OutputChunk
-	(*ExecStart)(nil),                             // 12: sandboxd.v1.ExecStart
-	(*ExecResponse)(nil),                          // 13: sandboxd.v1.ExecResponse
-	(*ExecExit)(nil),                              // 14: sandboxd.v1.ExecExit
-	(*ProcessKey)(nil),                            // 15: sandboxd.v1.ProcessKey
-	(*ProcessSpec)(nil),                           // 16: sandboxd.v1.ProcessSpec
-	(*StartProcessRequest)(nil),                   // 17: sandboxd.v1.StartProcessRequest
-	(*LaunchMaterial)(nil),                        // 18: sandboxd.v1.LaunchMaterial
-	(*StartProcessWithLaunchMaterialRequest)(nil), // 19: sandboxd.v1.StartProcessWithLaunchMaterialRequest
-	(*GetProcessRequest)(nil),                     // 20: sandboxd.v1.GetProcessRequest
-	(*StopProcessRequest)(nil),                    // 21: sandboxd.v1.StopProcessRequest
-	(*Process)(nil),                               // 22: sandboxd.v1.Process
-	(*ReadOutputRequest)(nil),                     // 23: sandboxd.v1.ReadOutputRequest
-	(*ReadOutputResponse)(nil),                    // 24: sandboxd.v1.ReadOutputResponse
-	(*ReadRequest)(nil),                           // 25: sandboxd.v1.ReadRequest
-	(*ReadResponse)(nil),                          // 26: sandboxd.v1.ReadResponse
-	(*WriteRequest)(nil),                          // 27: sandboxd.v1.WriteRequest
-	(*WriteHeader)(nil),                           // 28: sandboxd.v1.WriteHeader
-	(*WriteResponse)(nil),                         // 29: sandboxd.v1.WriteResponse
-	(*ListRequest)(nil),                           // 30: sandboxd.v1.ListRequest
-	(*ListResponse)(nil),                          // 31: sandboxd.v1.ListResponse
-	(*Entry)(nil),                                 // 32: sandboxd.v1.Entry
-	(*TerminalMessage)(nil),                       // 33: sandboxd.v1.TerminalMessage
-	(*TerminalOpen)(nil),                          // 34: sandboxd.v1.TerminalOpen
-	(*TerminalResize)(nil),                        // 35: sandboxd.v1.TerminalResize
-	(*RegisterPortRequest)(nil),                   // 36: sandboxd.v1.RegisterPortRequest
-	(*Port)(nil),                                  // 37: sandboxd.v1.Port
-	(*ListPortsRequest)(nil),                      // 38: sandboxd.v1.ListPortsRequest
-	(*ListPortsResponse)(nil),                     // 39: sandboxd.v1.ListPortsResponse
-	(*HealthCheckRequest)(nil),                    // 40: sandboxd.v1.HealthCheckRequest
-	(*HealthCheckResponse)(nil),                   // 41: sandboxd.v1.HealthCheckResponse
-	nil,                                           // 42: sandboxd.v1.ExecStart.EnvEntry
-	nil,                                           // 43: sandboxd.v1.ProcessSpec.EnvEntry
-	nil,                                           // 44: sandboxd.v1.LaunchMaterial.SecretEnvEntry
+	(ServiceProbeOutcome)(0),                      // 8: sandboxd.v1.ServiceProbeOutcome
+	(ServiceProbeReason)(0),                       // 9: sandboxd.v1.ServiceProbeReason
+	(*ExecRequest)(nil),                           // 10: sandboxd.v1.ExecRequest
+	(*ExecStdinEOF)(nil),                          // 11: sandboxd.v1.ExecStdinEOF
+	(*ExecControl)(nil),                           // 12: sandboxd.v1.ExecControl
+	(*OutputChunk)(nil),                           // 13: sandboxd.v1.OutputChunk
+	(*ExecStart)(nil),                             // 14: sandboxd.v1.ExecStart
+	(*ExecResponse)(nil),                          // 15: sandboxd.v1.ExecResponse
+	(*ExecExit)(nil),                              // 16: sandboxd.v1.ExecExit
+	(*ProcessKey)(nil),                            // 17: sandboxd.v1.ProcessKey
+	(*ProcessSpec)(nil),                           // 18: sandboxd.v1.ProcessSpec
+	(*StartProcessRequest)(nil),                   // 19: sandboxd.v1.StartProcessRequest
+	(*LaunchMaterial)(nil),                        // 20: sandboxd.v1.LaunchMaterial
+	(*StartProcessWithLaunchMaterialRequest)(nil), // 21: sandboxd.v1.StartProcessWithLaunchMaterialRequest
+	(*GetProcessRequest)(nil),                     // 22: sandboxd.v1.GetProcessRequest
+	(*StopProcessRequest)(nil),                    // 23: sandboxd.v1.StopProcessRequest
+	(*Process)(nil),                               // 24: sandboxd.v1.Process
+	(*ReadOutputRequest)(nil),                     // 25: sandboxd.v1.ReadOutputRequest
+	(*ReadOutputResponse)(nil),                    // 26: sandboxd.v1.ReadOutputResponse
+	(*ReadRequest)(nil),                           // 27: sandboxd.v1.ReadRequest
+	(*ReadResponse)(nil),                          // 28: sandboxd.v1.ReadResponse
+	(*WriteRequest)(nil),                          // 29: sandboxd.v1.WriteRequest
+	(*WriteHeader)(nil),                           // 30: sandboxd.v1.WriteHeader
+	(*WriteResponse)(nil),                         // 31: sandboxd.v1.WriteResponse
+	(*ListRequest)(nil),                           // 32: sandboxd.v1.ListRequest
+	(*ListResponse)(nil),                          // 33: sandboxd.v1.ListResponse
+	(*Entry)(nil),                                 // 34: sandboxd.v1.Entry
+	(*TerminalMessage)(nil),                       // 35: sandboxd.v1.TerminalMessage
+	(*TerminalOpen)(nil),                          // 36: sandboxd.v1.TerminalOpen
+	(*TerminalResize)(nil),                        // 37: sandboxd.v1.TerminalResize
+	(*ObserveServicesRequest)(nil),                // 38: sandboxd.v1.ObserveServicesRequest
+	(*ServiceProbe)(nil),                          // 39: sandboxd.v1.ServiceProbe
+	(*TCPConnectProbe)(nil),                       // 40: sandboxd.v1.TCPConnectProbe
+	(*ServiceProbeObservation)(nil),               // 41: sandboxd.v1.ServiceProbeObservation
+	(*ObserveServicesResponse)(nil),               // 42: sandboxd.v1.ObserveServicesResponse
+	(*HealthCheckRequest)(nil),                    // 43: sandboxd.v1.HealthCheckRequest
+	(*HealthCheckResponse)(nil),                   // 44: sandboxd.v1.HealthCheckResponse
+	nil,                                           // 45: sandboxd.v1.ExecStart.EnvEntry
+	nil,                                           // 46: sandboxd.v1.ProcessSpec.EnvEntry
+	nil,                                           // 47: sandboxd.v1.LaunchMaterial.SecretEnvEntry
 }
 var file_proto_sandboxd_v1_sandboxd_proto_depIdxs = []int32{
-	12, // 0: sandboxd.v1.ExecRequest.start:type_name -> sandboxd.v1.ExecStart
-	9,  // 1: sandboxd.v1.ExecRequest.stdin_eof:type_name -> sandboxd.v1.ExecStdinEOF
-	10, // 2: sandboxd.v1.ExecRequest.control:type_name -> sandboxd.v1.ExecControl
+	14, // 0: sandboxd.v1.ExecRequest.start:type_name -> sandboxd.v1.ExecStart
+	11, // 1: sandboxd.v1.ExecRequest.stdin_eof:type_name -> sandboxd.v1.ExecStdinEOF
+	12, // 2: sandboxd.v1.ExecRequest.control:type_name -> sandboxd.v1.ExecControl
 	0,  // 3: sandboxd.v1.ExecControl.control:type_name -> sandboxd.v1.ProcessControl
 	3,  // 4: sandboxd.v1.OutputChunk.stream:type_name -> sandboxd.v1.OutputStream
-	42, // 5: sandboxd.v1.ExecStart.env:type_name -> sandboxd.v1.ExecStart.EnvEntry
+	45, // 5: sandboxd.v1.ExecStart.env:type_name -> sandboxd.v1.ExecStart.EnvEntry
 	1,  // 6: sandboxd.v1.ExecStart.env_mode:type_name -> sandboxd.v1.EnvironmentMode
-	11, // 7: sandboxd.v1.ExecResponse.stdout:type_name -> sandboxd.v1.OutputChunk
-	11, // 8: sandboxd.v1.ExecResponse.stderr:type_name -> sandboxd.v1.OutputChunk
-	14, // 9: sandboxd.v1.ExecResponse.exit:type_name -> sandboxd.v1.ExecExit
+	13, // 7: sandboxd.v1.ExecResponse.stdout:type_name -> sandboxd.v1.OutputChunk
+	13, // 8: sandboxd.v1.ExecResponse.stderr:type_name -> sandboxd.v1.OutputChunk
+	16, // 9: sandboxd.v1.ExecResponse.exit:type_name -> sandboxd.v1.ExecExit
 	2,  // 10: sandboxd.v1.ExecExit.reason:type_name -> sandboxd.v1.TerminationReason
-	43, // 11: sandboxd.v1.ProcessSpec.env:type_name -> sandboxd.v1.ProcessSpec.EnvEntry
+	46, // 11: sandboxd.v1.ProcessSpec.env:type_name -> sandboxd.v1.ProcessSpec.EnvEntry
 	1,  // 12: sandboxd.v1.ProcessSpec.env_mode:type_name -> sandboxd.v1.EnvironmentMode
-	15, // 13: sandboxd.v1.StartProcessRequest.key:type_name -> sandboxd.v1.ProcessKey
-	16, // 14: sandboxd.v1.StartProcessRequest.spec:type_name -> sandboxd.v1.ProcessSpec
-	44, // 15: sandboxd.v1.LaunchMaterial.secret_env:type_name -> sandboxd.v1.LaunchMaterial.SecretEnvEntry
-	15, // 16: sandboxd.v1.StartProcessWithLaunchMaterialRequest.key:type_name -> sandboxd.v1.ProcessKey
-	16, // 17: sandboxd.v1.StartProcessWithLaunchMaterialRequest.spec:type_name -> sandboxd.v1.ProcessSpec
-	18, // 18: sandboxd.v1.StartProcessWithLaunchMaterialRequest.launch_material:type_name -> sandboxd.v1.LaunchMaterial
-	15, // 19: sandboxd.v1.GetProcessRequest.key:type_name -> sandboxd.v1.ProcessKey
-	15, // 20: sandboxd.v1.StopProcessRequest.key:type_name -> sandboxd.v1.ProcessKey
+	17, // 13: sandboxd.v1.StartProcessRequest.key:type_name -> sandboxd.v1.ProcessKey
+	18, // 14: sandboxd.v1.StartProcessRequest.spec:type_name -> sandboxd.v1.ProcessSpec
+	47, // 15: sandboxd.v1.LaunchMaterial.secret_env:type_name -> sandboxd.v1.LaunchMaterial.SecretEnvEntry
+	17, // 16: sandboxd.v1.StartProcessWithLaunchMaterialRequest.key:type_name -> sandboxd.v1.ProcessKey
+	18, // 17: sandboxd.v1.StartProcessWithLaunchMaterialRequest.spec:type_name -> sandboxd.v1.ProcessSpec
+	20, // 18: sandboxd.v1.StartProcessWithLaunchMaterialRequest.launch_material:type_name -> sandboxd.v1.LaunchMaterial
+	17, // 19: sandboxd.v1.GetProcessRequest.key:type_name -> sandboxd.v1.ProcessKey
+	17, // 20: sandboxd.v1.StopProcessRequest.key:type_name -> sandboxd.v1.ProcessKey
 	4,  // 21: sandboxd.v1.StopProcessRequest.mode:type_name -> sandboxd.v1.StopMode
-	15, // 22: sandboxd.v1.Process.key:type_name -> sandboxd.v1.ProcessKey
-	16, // 23: sandboxd.v1.Process.spec:type_name -> sandboxd.v1.ProcessSpec
+	17, // 22: sandboxd.v1.Process.key:type_name -> sandboxd.v1.ProcessKey
+	18, // 23: sandboxd.v1.Process.spec:type_name -> sandboxd.v1.ProcessSpec
 	5,  // 24: sandboxd.v1.Process.state:type_name -> sandboxd.v1.ProcessState
 	2,  // 25: sandboxd.v1.Process.reason:type_name -> sandboxd.v1.TerminationReason
-	15, // 26: sandboxd.v1.ReadOutputRequest.key:type_name -> sandboxd.v1.ProcessKey
+	17, // 26: sandboxd.v1.ReadOutputRequest.key:type_name -> sandboxd.v1.ProcessKey
 	3,  // 27: sandboxd.v1.ReadOutputRequest.stream:type_name -> sandboxd.v1.OutputStream
-	28, // 28: sandboxd.v1.WriteRequest.header:type_name -> sandboxd.v1.WriteHeader
+	30, // 28: sandboxd.v1.WriteRequest.header:type_name -> sandboxd.v1.WriteHeader
 	6,  // 29: sandboxd.v1.WriteHeader.precondition:type_name -> sandboxd.v1.WritePrecondition
-	32, // 30: sandboxd.v1.ListResponse.entries:type_name -> sandboxd.v1.Entry
+	34, // 30: sandboxd.v1.ListResponse.entries:type_name -> sandboxd.v1.Entry
 	7,  // 31: sandboxd.v1.Entry.type:type_name -> sandboxd.v1.EntryType
-	34, // 32: sandboxd.v1.TerminalMessage.open:type_name -> sandboxd.v1.TerminalOpen
-	35, // 33: sandboxd.v1.TerminalMessage.resize:type_name -> sandboxd.v1.TerminalResize
-	37, // 34: sandboxd.v1.ListPortsResponse.ports:type_name -> sandboxd.v1.Port
-	8,  // 35: sandboxd.v1.ExecService.Exec:input_type -> sandboxd.v1.ExecRequest
-	17, // 36: sandboxd.v1.ProcessService.Start:input_type -> sandboxd.v1.StartProcessRequest
-	19, // 37: sandboxd.v1.ProcessService.StartWithLaunchMaterial:input_type -> sandboxd.v1.StartProcessWithLaunchMaterialRequest
-	20, // 38: sandboxd.v1.ProcessService.Get:input_type -> sandboxd.v1.GetProcessRequest
-	21, // 39: sandboxd.v1.ProcessService.Stop:input_type -> sandboxd.v1.StopProcessRequest
-	23, // 40: sandboxd.v1.ProcessService.ReadOutput:input_type -> sandboxd.v1.ReadOutputRequest
-	25, // 41: sandboxd.v1.FilesystemService.Read:input_type -> sandboxd.v1.ReadRequest
-	27, // 42: sandboxd.v1.FilesystemService.Write:input_type -> sandboxd.v1.WriteRequest
-	30, // 43: sandboxd.v1.FilesystemService.List:input_type -> sandboxd.v1.ListRequest
-	33, // 44: sandboxd.v1.TerminalService.Terminal:input_type -> sandboxd.v1.TerminalMessage
-	36, // 45: sandboxd.v1.PortService.Register:input_type -> sandboxd.v1.RegisterPortRequest
-	38, // 46: sandboxd.v1.PortService.List:input_type -> sandboxd.v1.ListPortsRequest
-	40, // 47: sandboxd.v1.HealthService.Check:input_type -> sandboxd.v1.HealthCheckRequest
-	13, // 48: sandboxd.v1.ExecService.Exec:output_type -> sandboxd.v1.ExecResponse
-	22, // 49: sandboxd.v1.ProcessService.Start:output_type -> sandboxd.v1.Process
-	22, // 50: sandboxd.v1.ProcessService.StartWithLaunchMaterial:output_type -> sandboxd.v1.Process
-	22, // 51: sandboxd.v1.ProcessService.Get:output_type -> sandboxd.v1.Process
-	22, // 52: sandboxd.v1.ProcessService.Stop:output_type -> sandboxd.v1.Process
-	24, // 53: sandboxd.v1.ProcessService.ReadOutput:output_type -> sandboxd.v1.ReadOutputResponse
-	26, // 54: sandboxd.v1.FilesystemService.Read:output_type -> sandboxd.v1.ReadResponse
-	29, // 55: sandboxd.v1.FilesystemService.Write:output_type -> sandboxd.v1.WriteResponse
-	31, // 56: sandboxd.v1.FilesystemService.List:output_type -> sandboxd.v1.ListResponse
-	33, // 57: sandboxd.v1.TerminalService.Terminal:output_type -> sandboxd.v1.TerminalMessage
-	37, // 58: sandboxd.v1.PortService.Register:output_type -> sandboxd.v1.Port
-	39, // 59: sandboxd.v1.PortService.List:output_type -> sandboxd.v1.ListPortsResponse
-	41, // 60: sandboxd.v1.HealthService.Check:output_type -> sandboxd.v1.HealthCheckResponse
-	48, // [48:61] is the sub-list for method output_type
-	35, // [35:48] is the sub-list for method input_type
-	35, // [35:35] is the sub-list for extension type_name
-	35, // [35:35] is the sub-list for extension extendee
-	0,  // [0:35] is the sub-list for field type_name
+	36, // 32: sandboxd.v1.TerminalMessage.open:type_name -> sandboxd.v1.TerminalOpen
+	37, // 33: sandboxd.v1.TerminalMessage.resize:type_name -> sandboxd.v1.TerminalResize
+	39, // 34: sandboxd.v1.ObserveServicesRequest.probes:type_name -> sandboxd.v1.ServiceProbe
+	40, // 35: sandboxd.v1.ServiceProbe.tcp_connect:type_name -> sandboxd.v1.TCPConnectProbe
+	8,  // 36: sandboxd.v1.ServiceProbeObservation.outcome:type_name -> sandboxd.v1.ServiceProbeOutcome
+	9,  // 37: sandboxd.v1.ServiceProbeObservation.reason:type_name -> sandboxd.v1.ServiceProbeReason
+	41, // 38: sandboxd.v1.ObserveServicesResponse.observations:type_name -> sandboxd.v1.ServiceProbeObservation
+	10, // 39: sandboxd.v1.ExecService.Exec:input_type -> sandboxd.v1.ExecRequest
+	19, // 40: sandboxd.v1.ProcessService.Start:input_type -> sandboxd.v1.StartProcessRequest
+	21, // 41: sandboxd.v1.ProcessService.StartWithLaunchMaterial:input_type -> sandboxd.v1.StartProcessWithLaunchMaterialRequest
+	22, // 42: sandboxd.v1.ProcessService.Get:input_type -> sandboxd.v1.GetProcessRequest
+	23, // 43: sandboxd.v1.ProcessService.Stop:input_type -> sandboxd.v1.StopProcessRequest
+	25, // 44: sandboxd.v1.ProcessService.ReadOutput:input_type -> sandboxd.v1.ReadOutputRequest
+	27, // 45: sandboxd.v1.FilesystemService.Read:input_type -> sandboxd.v1.ReadRequest
+	29, // 46: sandboxd.v1.FilesystemService.Write:input_type -> sandboxd.v1.WriteRequest
+	32, // 47: sandboxd.v1.FilesystemService.List:input_type -> sandboxd.v1.ListRequest
+	35, // 48: sandboxd.v1.TerminalService.Terminal:input_type -> sandboxd.v1.TerminalMessage
+	38, // 49: sandboxd.v1.ServiceObservationService.Observe:input_type -> sandboxd.v1.ObserveServicesRequest
+	43, // 50: sandboxd.v1.HealthService.Check:input_type -> sandboxd.v1.HealthCheckRequest
+	15, // 51: sandboxd.v1.ExecService.Exec:output_type -> sandboxd.v1.ExecResponse
+	24, // 52: sandboxd.v1.ProcessService.Start:output_type -> sandboxd.v1.Process
+	24, // 53: sandboxd.v1.ProcessService.StartWithLaunchMaterial:output_type -> sandboxd.v1.Process
+	24, // 54: sandboxd.v1.ProcessService.Get:output_type -> sandboxd.v1.Process
+	24, // 55: sandboxd.v1.ProcessService.Stop:output_type -> sandboxd.v1.Process
+	26, // 56: sandboxd.v1.ProcessService.ReadOutput:output_type -> sandboxd.v1.ReadOutputResponse
+	28, // 57: sandboxd.v1.FilesystemService.Read:output_type -> sandboxd.v1.ReadResponse
+	31, // 58: sandboxd.v1.FilesystemService.Write:output_type -> sandboxd.v1.WriteResponse
+	33, // 59: sandboxd.v1.FilesystemService.List:output_type -> sandboxd.v1.ListResponse
+	35, // 60: sandboxd.v1.TerminalService.Terminal:output_type -> sandboxd.v1.TerminalMessage
+	42, // 61: sandboxd.v1.ServiceObservationService.Observe:output_type -> sandboxd.v1.ObserveServicesResponse
+	44, // 62: sandboxd.v1.HealthService.Check:output_type -> sandboxd.v1.HealthCheckResponse
+	51, // [51:63] is the sub-list for method output_type
+	39, // [39:51] is the sub-list for method input_type
+	39, // [39:39] is the sub-list for extension type_name
+	39, // [39:39] is the sub-list for extension extendee
+	0,  // [0:39] is the sub-list for field type_name
 }
 
 func init() { file_proto_sandboxd_v1_sandboxd_proto_init() }
@@ -3013,13 +3216,16 @@ func file_proto_sandboxd_v1_sandboxd_proto_init() {
 		(*TerminalMessage_Data)(nil),
 		(*TerminalMessage_Resize)(nil),
 	}
+	file_proto_sandboxd_v1_sandboxd_proto_msgTypes[29].OneofWrappers = []any{
+		(*ServiceProbe_TcpConnect)(nil),
+	}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_proto_sandboxd_v1_sandboxd_proto_rawDesc), len(file_proto_sandboxd_v1_sandboxd_proto_rawDesc)),
-			NumEnums:      8,
-			NumMessages:   37,
+			NumEnums:      10,
+			NumMessages:   38,
 			NumExtensions: 0,
 			NumServices:   6,
 		},
