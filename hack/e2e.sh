@@ -26,6 +26,7 @@ E2E_ROTATED_AGENT_API_KEY='!!SWE-E2E-ROTATED-AGENT-API-KEY-DO-NOT-USE!!'
 E2E_AMP_API_KEY='!!SWE-E2E-AMP-API-KEY-DO-NOT-USE!!'
 PORT_FORWARD_PID=""
 SANDBOXD_PORT_FORWARD_PID=""
+POSTGRES_PORT_FORWARD_PID=""
 STREAM_PID=""
 CLI_STREAM_PID=""
 WEB_TERMINAL_CLIENT=""
@@ -34,6 +35,8 @@ PROJECT_REPO=""
 PROJECT_WORKTREE=""
 FAKE_ENV_CONTEXT=""
 E2E_KUBECONFIG=""
+SESSION_KEYRING_FILE=""
+E2E_SESSION_FIXTURE=""
 
 cleanup() {
 	if [[ -n "$STREAM_PID" ]]; then
@@ -52,6 +55,10 @@ cleanup() {
 		kill "$SANDBOXD_PORT_FORWARD_PID" >/dev/null 2>&1 || true
 		wait "$SANDBOXD_PORT_FORWARD_PID" >/dev/null 2>&1 || true
 	fi
+	if [[ -n "$POSTGRES_PORT_FORWARD_PID" ]]; then
+		kill "$POSTGRES_PORT_FORWARD_PID" >/dev/null 2>&1 || true
+		wait "$POSTGRES_PORT_FORWARD_PID" >/dev/null 2>&1 || true
+	fi
 	if [[ -n "$WEB_TERMINAL_CLIENT" ]]; then
 		rm -f "$WEB_TERMINAL_CLIENT"
 	fi
@@ -69,6 +76,12 @@ cleanup() {
 	fi
 	if [[ -n "$E2E_KUBECONFIG" ]]; then
 		rm -f "$E2E_KUBECONFIG"
+	fi
+	if [[ -n "$SESSION_KEYRING_FILE" ]]; then
+		rm -f "$SESSION_KEYRING_FILE"
+	fi
+	if [[ -n "$E2E_SESSION_FIXTURE" ]]; then
+		rm -rf "$E2E_SESSION_FIXTURE"
 	fi
 	rm -f /tmp/swe-platform-sandboxd-cert-"$$" /tmp/swe-platform-sandboxd-token-"$$"
 	if [[ "${KEEP_CLUSTER:-false}" != "true" && "${E2E_USE_EXISTING_CLUSTER:-false}" != "true" ]]; then
@@ -374,8 +387,7 @@ jq -n --arg key "$(openssl rand -base64 32 | tr '+/' '-_' | tr -d '=\n')" \
 	'{version:1,activeKeyId:"e2e",keys:[{id:"e2e",masterKey:$key}]}' > "$SESSION_KEYRING_FILE"
 kubectl -n "$SYSTEM_NAMESPACE" create secret generic swe-platform-session-keyring \
 	--from-file=keyring.json="$SESSION_KEYRING_FILE"
-rm -f "$SESSION_KEYRING_FILE"
-unset SESSION_KEYRING_FILE POSTGRES_PASSWORD
+unset POSTGRES_PASSWORD
 cat <<'EOF' | kubectl -n "$SYSTEM_NAMESPACE" apply -f -
 apiVersion: apps/v1
 kind: Deployment
@@ -1102,59 +1114,71 @@ if [[ "$SESSION_REPLACEMENT_STATUS" != "200" ]]; then
 	exit 1
 fi
 
-echo "==> verifying definitive expired-token rejection is durably revoked"
-kubectl -n "$PROJECT_NAMESPACE" create serviceaccount e2e-session-rejection >/dev/null
-REJECTION_TOKEN_BASE=$(kubectl -n "$PROJECT_NAMESPACE" create token e2e-session-rejection --audience=swe-platform)
-REJECTION_TOKEN_HEADER=$(cut -d. -f1 <<<"$REJECTION_TOKEN_BASE")
-REJECTION_TOKEN_PAYLOAD=$(cut -d. -f2 <<<"$REJECTION_TOKEN_BASE")
-case $((${#REJECTION_TOKEN_PAYLOAD} % 4)) in
-	0) ;;
-	2) REJECTION_TOKEN_PAYLOAD+="==" ;;
-	3) REJECTION_TOKEN_PAYLOAD+="=" ;;
-	*) echo "FAIL: generated ServiceAccount token has invalid base64url payload"; exit 1 ;;
-esac
-REJECTION_TOKEN_EXPIRY=$(($(date +%s) + 30))
-REJECTION_TOKEN_PAYLOAD=$(printf '%s' "$REJECTION_TOKEN_PAYLOAD" | tr '_-' '/+' | base64 -d | \
-	jq -c --argjson now "$(($(date +%s) - 5))" --argjson expiry "$REJECTION_TOKEN_EXPIRY" '.iat=$now | .nbf=$now | .exp=$expiry' | \
-	base64 -w0 | tr '+/' '-_' | tr -d '=')
-REJECTION_TOKEN_INPUT="${REJECTION_TOKEN_HEADER}.${REJECTION_TOKEN_PAYLOAD}"
-REJECTION_TOKEN_SIGNATURE=$(printf '%s' "$REJECTION_TOKEN_INPUT" | openssl dgst -sha256 \
-	-sign <(docker exec "${CLUSTER}-control-plane" cat /etc/kubernetes/pki/sa.key) | \
-	base64 -w0 | tr '+/' '-_' | tr -d '=')
-REJECTION_TOKEN="${REJECTION_TOKEN_INPUT}.${REJECTION_TOKEN_SIGNATURE}"
-unset REJECTION_TOKEN_BASE REJECTION_TOKEN_HEADER REJECTION_TOKEN_PAYLOAD REJECTION_TOKEN_INPUT REJECTION_TOKEN_SIGNATURE
-REJECTION_COOKIE_JAR=/tmp/swe-platform-rejected-session-cookies
-rm -f "$REJECTION_COOKIE_JAR"
-REJECTION_SESSION_COUNT_BEFORE=$(browser_session_count)
-REJECTION_EXCHANGE_STATUS=$(curl --silent --output /dev/null --write-out '%{http_code}' \
-	--cookie-jar "$REJECTION_COOKIE_JAR" -X POST -H "Authorization: Bearer ${REJECTION_TOKEN}" \
-	http://127.0.0.1:18080/api/v1/session)
-REJECTION_SESSION_COUNT_AFTER=$(browser_session_count)
-unset REJECTION_TOKEN
-if [[ "$REJECTION_EXCHANGE_STATUS" != "200" || "$REJECTION_SESSION_COUNT_AFTER" != "$((REJECTION_SESSION_COUNT_BEFORE + 1))" ]]; then
-	echo "FAIL: rejected-token exchange did not add exactly one durable session"
-	exit 1
-fi
-while (( $(date +%s) <= REJECTION_TOKEN_EXPIRY + 2 )); do
-	sleep 1
-done
-REJECTION_STATUS=""
-for _ in $(seq 1 120); do
-	REJECTION_STATUS=$(curl --silent --output /dev/null --write-out '%{http_code}' \
-		--cookie "$REJECTION_COOKIE_JAR" http://127.0.0.1:18080/api/v1/session)
-	if [[ "$REJECTION_STATUS" == "401" ]]; then
+echo "==> verifying definitive unauthenticated TokenReview is durably revoked"
+kubectl -n "$SYSTEM_NAMESPACE" port-forward service/postgres 15432:5432 >/tmp/swe-platform-postgres-port-forward.log 2>&1 &
+POSTGRES_PORT_FORWARD_PID=$!
+for _ in $(seq 1 30); do
+	if kill -0 "$POSTGRES_PORT_FORWARD_PID" >/dev/null 2>&1 && (echo >/dev/tcp/127.0.0.1/15432) >/dev/null 2>&1; then
 		break
 	fi
 	sleep 1
 done
+E2E_SESSION_FIXTURE=$(mktemp -d ./e2e-session-fixture-XXXXXX)
+cat >"$E2E_SESSION_FIXTURE/main.go" <<'EOF'
+package main
+
+import (
+	"context"
+	"fmt"
+	"os"
+
+	"github.com/Chris-Cullins/swe-platform/internal/controlplane"
+)
+
+func main() {
+	ctx := context.Background()
+	db, err := controlplane.NewPostgresDatabase(ctx, os.Getenv("E2E_POSTGRES_URL"))
+	if err != nil { panic(err) }
+	defer db.Close()
+	keyring, err := controlplane.LoadSessionKeyring(os.Getenv("E2E_SESSION_KEYRING_FILE"))
+	if err != nil { panic(err) }
+	store, err := controlplane.NewPostgresSessionStore(ctx, db, keyring, controlplane.PostgresSessionStoreOptions{})
+	if err != nil { panic(err) }
+	cookie, err := store.Create(ctx, "e2e-definitively-invalid-kubernetes-token")
+	if err != nil { panic(err) }
+	fmt.Print(cookie)
+}
+EOF
+REJECTION_SESSION_COUNT_BEFORE=$(browser_session_count)
+E2E_SESSION_POSTGRES_URL=$(kubectl -n "$SYSTEM_NAMESPACE" get secret swe-platform-postgres \
+	-o jsonpath='{.data.url}' | base64 -d)
+E2E_SESSION_POSTGRES_URL=${E2E_SESSION_POSTGRES_URL/@postgres:5432/@127.0.0.1:15432}
+REJECTION_COOKIE=$(E2E_POSTGRES_URL="$E2E_SESSION_POSTGRES_URL" \
+	E2E_SESSION_KEYRING_FILE="$SESSION_KEYRING_FILE" go run "$E2E_SESSION_FIXTURE/main.go")
+unset E2E_SESSION_POSTGRES_URL
+REJECTION_SESSION_COUNT_AFTER=$(browser_session_count)
+rm -rf "$E2E_SESSION_FIXTURE"
+E2E_SESSION_FIXTURE=""
+rm -f "$SESSION_KEYRING_FILE"
+SESSION_KEYRING_FILE=""
+kill "$POSTGRES_PORT_FORWARD_PID" >/dev/null 2>&1 || true
+wait "$POSTGRES_PORT_FORWARD_PID" >/dev/null 2>&1 || true
+POSTGRES_PORT_FORWARD_PID=""
+if [[ "$REJECTION_SESSION_COUNT_AFTER" != "$((REJECTION_SESSION_COUNT_BEFORE + 1))" ]]; then
+	echo "FAIL: invalid-token fixture did not add exactly one durable session"
+	exit 1
+fi
+REJECTION_STATUS=$(curl --silent --output /dev/null --write-out '%{http_code}' \
+	-H "Cookie: swe-platform-session=${REJECTION_COOKIE}" http://127.0.0.1:18080/api/v1/session)
 REJECTION_SESSION_COUNT_REVOKED=$(browser_session_count)
 if [[ "$REJECTION_STATUS" != "401" || "$REJECTION_SESSION_COUNT_REVOKED" != "$REJECTION_SESSION_COUNT_BEFORE" ]]; then
-	echo "FAIL: definitive expired-token rejection status=${REJECTION_STATUS}, session counts before=${REJECTION_SESSION_COUNT_BEFORE} after-exchange=${REJECTION_SESSION_COUNT_AFTER} after-rejection=${REJECTION_SESSION_COUNT_REVOKED}; expected 401 and durable deletion"
+	echo "FAIL: definitive unauthenticated TokenReview status=${REJECTION_STATUS}, session counts before=${REJECTION_SESSION_COUNT_BEFORE} after-fixture=${REJECTION_SESSION_COUNT_AFTER} after-rejection=${REJECTION_SESSION_COUNT_REVOKED}; expected 401 and durable deletion"
 	exit 1
 fi
 replace_control_plane_pod
 REJECTION_REPLAY_STATUS=$(curl --silent --output /dev/null --write-out '%{http_code}' \
-	--cookie "$REJECTION_COOKIE_JAR" http://127.0.0.1:18080/api/v1/session)
+	-H "Cookie: swe-platform-session=${REJECTION_COOKIE}" http://127.0.0.1:18080/api/v1/session)
+unset REJECTION_COOKIE
 if [[ "$REJECTION_REPLAY_STATUS" != "401" ]]; then
 	echo "FAIL: rejected-token session replay after replacement was ${REJECTION_REPLAY_STATUS}, expected 401"
 	exit 1
