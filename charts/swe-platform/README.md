@@ -32,8 +32,9 @@ sources in that system namespace; Helm never creates a Project tenancy there.
 The control plane accepts adapter-owned transcript events and streams them over SSE.
 Production installs must configure the PostgreSQL transcript store described below. The chart
 still requires one control-plane replica and uses a non-overlapping `Recreate` deployment:
-durable transcripts remove replay loss, but process-local browser sessions and other control-plane
-HA concerns remain. Portal proxying is not implemented yet.
+durable transcripts and encrypted PostgreSQL browser sessions survive process replacement, but
+open SSE/WebSocket connections do not and this release makes no control-plane HA claim. Portal
+proxying is not implemented yet.
 
 The operator reconciles each `Run` as the single task intent and allocates or claims its
 `Environment`; clients must not create the two resources independently. Its RBAC permits
@@ -48,15 +49,23 @@ Choose the values preset for the target cluster and install into a dedicated nam
 kubectl create namespace swe-platform-system --dry-run=client -o yaml | kubectl apply -f -
 kubectl -n swe-platform-system create secret generic swe-platform-postgres \
   --from-literal=url='postgres://swe:REDACTED@postgres.example:5432/swe?sslmode=require'
+# Generate a fresh key locally; do not copy a key from this documentation.
+KEY_ID="initial-$(date +%Y%m%d)"
+MASTER_KEY="$(openssl rand 32 | base64 | tr '+/' '-_' | tr -d '=\n')"
+jq -n --arg id "$KEY_ID" --arg key "$MASTER_KEY" \
+  '{version:1,activeKeyId:$id,keys:[{id:$id,masterKey:$key}]}' >keyring.json
+kubectl -n swe-platform-system create secret generic swe-platform-session-keyring \
+  --from-file=keyring.json=keyring.json
+rm -f keyring.json
 helm upgrade --install swe-platform ./charts/swe-platform \
   --namespace swe-platform-system --create-namespace \
   --values ./charts/swe-platform/values-k3s.yaml
 ```
 
-The k3s, GKE, and EKS production presets require that out-of-band Secret name by default. A
-missing Secret keeps the control-plane pod from starting rather than silently selecting the
-development memory store. Override `controlPlane.transcripts.postgresSecret.name` when your
-installation uses a different coordinated Secret name.
+The k3s, GKE, and EKS production presets explicitly select PostgreSQL sessions and require both
+out-of-band Secrets by default. Helm rejects a partial configuration; a Secret that is named but
+absent keeps the pod from starting. There is no runtime fallback to memory. Override the two
+Secret names when your installation uses different coordinated names.
 
 Tenancy mode is required. The production presets explicitly use `scoped` with an initially
 empty, restart-bound `tenancy.namespaces` list. The isolated kind and Argo development presets
@@ -251,11 +260,11 @@ unmeasured.
 
 | Preset | Assumptions |
 |---|---|
-| `values-kind.yaml` | Isolated local kind development with deliberate `trusted-admin`, `:dev` images, and insecure HTTP browser sessions. `make kind-up` installs gVisor and snapshot-capable CSI; pass the printed `environmentTemplates[0].spec.runtimeClass=gvisor` catalog override. Primary acceptance instead overrides this preset to scoped mode and distinct system/Project namespaces. |
-| `values-argocd.yaml` | Isolated local Argo CD mirror with deliberate `trusted-admin`, mutable `:latest` images, an out-of-band bootstrap Secret, and insecure HTTP browser sessions. `hack/argocd-up.sh` requires one kind node with at least 5 CPUs and 6 GiB allocatable. |
-| `values-k3s.yaml` | Production `scoped` mode with an initially empty Project namespace list. A default CSI-backed StorageClass and the out-of-band `swe-platform-postgres` Secret are available. Uses one operator replica and the default OCI runtime because k3s does not ship gVisor. |
-| `values-gke.yaml` | Production `scoped` mode with an initially empty Project namespace list. GKE Sandbox is enabled on every node that can host environments, and the out-of-band `swe-platform-postgres` Secret is available. Sets `runtimeClass: gvisor` and runs two operator replicas with leader election. |
-| `values-eks.yaml` | Production `scoped` mode with an initially empty Project namespace list. A default EBS CSI StorageClass and the out-of-band `swe-platform-postgres` Secret are available. Runs two operator replicas with leader election. EKS does not provide a standard gVisor RuntimeClass, so managed Templates use the cluster default unless you override `environmentTemplates[].spec.runtimeClass` on their catalog source. |
+| `values-kind.yaml` | Isolated local kind development with explicit process-local `memory` sessions, deliberate `trusted-admin`, `:dev` images, and insecure HTTP browser sessions. `make kind-up` installs gVisor and snapshot-capable CSI; pass the printed `environmentTemplates[0].spec.runtimeClass=gvisor` catalog override. Primary acceptance instead overrides this preset to scoped mode and distinct system/Project namespaces. |
+| `values-argocd.yaml` | Isolated local Argo CD mirror with explicit process-local `memory` sessions, deliberate `trusted-admin`, mutable `:latest` images, an out-of-band bootstrap Secret, and insecure HTTP browser sessions. `hack/argocd-up.sh` requires one kind node with at least 5 CPUs and 6 GiB allocatable. |
+| `values-k3s.yaml` | Production `scoped` mode with PostgreSQL transcripts and sessions and out-of-band `swe-platform-postgres` and `swe-platform-session-keyring` Secrets. Uses one operator replica and the default OCI runtime because k3s does not ship gVisor. |
+| `values-gke.yaml` | Production `scoped` mode with PostgreSQL transcripts and sessions and both out-of-band Secrets. GKE Sandbox is enabled on environment nodes. Sets `runtimeClass: gvisor` and runs two operator replicas with leader election. |
+| `values-eks.yaml` | Production `scoped` mode with PostgreSQL transcripts and sessions and both out-of-band Secrets. Uses a default EBS CSI StorageClass and two operator replicas. EKS does not provide a standard gVisor RuntimeClass, so managed Templates use the cluster default unless overridden. |
 
 The RuntimeClass applies to environment pods, not the operator. Before creating or retaining
 execution, the operator verifies that a RuntimeClass explicitly named by a template exists. A
@@ -341,6 +350,44 @@ SWE_TEST_POSTGRES_URL='postgres://postgres:postgres@localhost:5432/swe_test?sslm
 PostgreSQL makes replay and idempotency durable across restart, but this release deliberately
 keeps `controlPlane.replicaCount=1`; it does not claim multi-replica control-plane HA.
 
+## Durable browser sessions
+
+`controlPlane.sessions.backend` is required to be `memory` or `postgres`. The default, kind,
+and Argo presets explicitly use bounded, process-local `memory` storage for development. The
+production presets use `postgres`, reuse `controlPlane.transcripts.postgresSecret` for
+`SWE_POSTGRES_URL`, and mount the administrator-owned keyring Secret read-only at
+`/var/run/secrets/swe-platform/session-keyring/keyring.json`. The chart never creates this
+Secret and grants no Secret RBAC. Its configured key is projected to the fixed filename
+`keyring.json`; the JSON schema is exactly:
+
+```json
+{"version":1,"activeKeyId":"<id>","keys":[{"id":"<id>","masterKey":"<canonical unpadded base64url 32 bytes>"}]}
+```
+
+The control plane's ordered PostgreSQL migrations include the `browser_sessions` storage.
+Startup fails on a database, migration, keyring, or configuration error: production never
+falls back to process memory. Session credentials are encrypted before database storage, but
+the database necessarily stores ciphertext and metadata. Encryption protects a database-only
+disclosure; compromise of the control-plane process, mounted keyring, Kubernetes administrator,
+or a database-plus-keyring backup can recover credentials. Protect and separately control
+access to both systems.
+
+To rotate, generate a new 32-byte canonical unpadded base64url key, add it with a unique ID,
+set `activeKeyId` to that ID, retain every prior key for at least the one-hour absolute session
+TTL **plus operational margin**, update the Secret, and roll the control-plane Deployment. Only
+after that interval may the old key be removed and another rollout performed. A rollback must
+receive a keyring containing every key needed by sessions it may read; retain old keys through
+the rollback window. The administrator-owned Secret survives Helm uninstall and rollback.
+
+PostgreSQL sessions survive a control-plane pod replacement, and every cookie request still
+repeats Kubernetes TokenReview and exact SubjectAccessReview, so upstream expiry/revocation and
+RBAC remain authoritative. Sessions have a one-hour absolute TTL and a 10,000-session limit;
+at capacity new session exchange is rejected rather than evicting an existing session. Logout,
+expiry, or failed TokenReview removes the record. The chart intentionally enforces one control-
+plane replica and `Recreate`: replacement interrupts open SSE and WebSocket connections, which
+clients must reconnect, and neither durable sessions nor transcripts constitute a live-connection
+survival or HA claim.
+
 Per-Run event and byte limits do not bound total database size across Run churn. Deleting a Run
 or fencing a Project does not reclaim its UID-fenced transcript rows. New and safely associated
 rows include the immutable Namespace UID. Legacy rows with no Namespace UID are associated only
@@ -383,7 +430,7 @@ is not exhaustive:
 | Transcript events | PostgreSQL database | No |
 | Infrastructure state (Installation, Namespace claims, Project, Run, Environment, AgentCredentialProfile, managed Project-local EnvironmentTemplate copies) | Kubernetes API / etcd | No — Helm reapplies the system Installation and catalog sources, not Project namespace resources |
 | Workspace contents (cloned repos, agent work, uncommitted changes) | Environment PVCs | No |
-| Installation and credential material (out-of-band PostgreSQL Secret, bootstrap token Secret, chart values overrides) | Kubernetes Secrets and local configuration | No |
+| Installation and credential material (out-of-band PostgreSQL URL, session keyring, bootstrap token Secrets, chart values overrides) | Kubernetes Secrets and local configuration | No |
 
 Back up the PostgreSQL transcript database before every upgrade using your provider's backup
 mechanism (`pg_dump`, managed-service snapshots, or equivalent). To restore transcripts only,
@@ -401,7 +448,7 @@ represent desired and observed infrastructure state, and workspace PVCs are per-
 volumes whose contents survive pause/resume but are not replicated or backed up by the
 platform. AgentCredentialProfile backing Secrets are controller-created and bound to the
 profile's exact owner UID; do not copy them into a replacement cluster. Instead, preserve or
-re-provision out-of-band secret sources (the PostgreSQL connection Secret, bootstrap token,
+re-provision out-of-band secret sources (the PostgreSQL connection Secret, session keyring, bootstrap token,
 and any chart values overrides), and recreate agent API-key credentials through the supported
 `swe credentials create` / `--api-key-stdin` flow, then rotate if necessary.
 
@@ -422,9 +469,11 @@ out of scope here and requires separate maintainer product input.
 
 ### Provider prerequisites
 
-Each production preset assumes an out-of-band `swe-platform-postgres` Secret (see
-[Install](#install) and [Durable transcript storage](#durable-transcript-storage)) and a
-default StorageClass for environment workspace PVCs. The operator creates PVCs with
+Each production preset assumes out-of-band `swe-platform-postgres` and
+`swe-platform-session-keyring` Secrets (see [Install](#install),
+[Durable transcript storage](#durable-transcript-storage), and
+[Durable browser sessions](#durable-browser-sessions)) and a default StorageClass for
+environment workspace PVCs. The operator creates PVCs with
 `ReadWriteOnce` access and leaves `spec.storageClassName` unset, so the cluster's default
 StorageClass admission supplies the storage; the chart does not create or manage
 StorageClasses. Provider-specific runtime, replica, and isolation assumptions are
@@ -447,9 +496,9 @@ reproducing them locally confirms that the preset renders against the current ch
 )
 ```
 
-The production presets reference the out-of-band PostgreSQL Secret by name; the chart does
-not create it, so the template renders whether or not the Secret exists. A missing Secret
-keeps the control-plane pod from starting after installation.
+The production presets reference both out-of-band Secrets by name; the chart does not create
+them, so the template renders whether or not they exist. A missing Secret keeps the control-
+plane pod from starting after installation, with no memory fallback.
 
 ### Networking requirements
 
@@ -499,15 +548,16 @@ deleted. Transcript event `data` remains opaque, adapter-owned JSON.
 
 Service clients send `Authorization: Bearer <token>`. A browser exchanges an explicit,
 non-bootstrap bearer credential with `POST /api/v1/session`. After a successful TokenReview,
-the control plane stores that credential in a bounded process-local session and places only a
+the control plane stores that credential in the configured bounded session backend and places only a
 random 256-bit opaque identifier in an `HttpOnly`, `Secure`, `SameSite=Strict`, `Path=/`
 cookie named `swe-platform-session`; it does not issue a platform token or refresh token.
 Every cookie-authenticated request resolves the server-side credential and repeats TokenReview
 before SAR, so upstream expiry and revocation still apply. Sessions have a one-hour absolute
-lifetime, credentials are limited to 16 KiB, and one process accepts at most 10,000 active
-sessions. Logout, absolute expiry, or a failed TokenReview deletes the server-side entry.
-Because sessions are process-local, a control-plane restart logs browsers out; the chart's
-single-replica requirement prevents session routing ambiguity. `GET /api/v1/session` validates
+lifetime, credentials are limited to 16 KiB, and the backend accepts at most 10,000 active
+sessions, rejecting new exchanges at capacity rather than evicting entries. Logout, absolute
+expiry, or a failed TokenReview deletes the server-side entry.
+Memory-backend restart logs browsers out; PostgreSQL sessions survive replacement as described
+above. `GET /api/v1/session` validates
 the current session and `DELETE /api/v1/session` revokes it. Production session exchange requires HTTPS. Only the
 kind and Argo development presets set `controlPlane.auth.allowInsecureSessions=true`, which
 allows HTTP and omits the cookie's `Secure` flag.
@@ -618,7 +668,8 @@ For the Argo kind mirror, use `make argocd-ui` instead and open
 restarts its loopback-only Service forward when a rollout replaces the selected pod. Set
 `KIND_ARGO_CLUSTER` or `ARGO_UI_PORT` to override its cluster or local port. A reconnect
 restores the URL and all control-plane routes, but cannot preserve an open SSE/WebSocket TCP
-connection or a process-local browser session across control-plane replacement.
+connection across control-plane replacement. This development preset's memory-backed browser
+sessions are also lost on replacement; production PostgreSQL sessions remain valid.
 
 The kind preset permits HTTP browser sessions for this local flow. Production browser sessions
 still require HTTPS. To build the embedded binary outside the image build, run `make ui-build`

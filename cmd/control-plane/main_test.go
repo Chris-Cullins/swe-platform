@@ -13,24 +13,51 @@ import (
 	"github.com/gorilla/websocket"
 )
 
-func TestTranscriptStoreFromEnvironmentUsesMemoryFallback(t *testing.T) {
+func TestControlPlaneStoresFromEnvironmentUsesMemoryFallback(t *testing.T) {
+	t.Setenv("SWE_SESSION_BACKEND", "memory")
 	t.Setenv("SWE_POSTGRES_URL", "")
-	store, closeStore, err := transcriptStoreFromEnvironment(context.Background(), slog.New(slog.NewTextHandler(io.Discard, nil)))
+	t.Setenv("SWE_SESSION_KEYRING_FILE", "")
+	transcripts, sessions, closeStores, err := controlPlaneStoresFromEnvironment(context.Background(), slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer closeStore()
-	if store == nil {
-		t.Fatal("memory fallback returned a nil transcript store")
+	defer closeStores()
+	if transcripts == nil || sessions == nil {
+		t.Fatal("memory configuration returned a nil store")
 	}
 }
 
-func TestTranscriptStoreFromEnvironmentRejectsInvalidOptionsBeforeConnecting(t *testing.T) {
+func TestControlPlaneStoresFromEnvironmentRejectsInvalidOptionsBeforeConnecting(t *testing.T) {
+	t.Setenv("SWE_SESSION_BACKEND", "memory")
 	t.Setenv("SWE_POSTGRES_URL", "postgres://unused.invalid/test")
+	t.Setenv("SWE_SESSION_KEYRING_FILE", "")
 	t.Setenv("SWE_TRANSCRIPT_MAX_EVENTS_PER_RUN", "zero")
-	_, _, err := transcriptStoreFromEnvironment(context.Background(), slog.New(slog.NewTextHandler(io.Discard, nil)))
+	_, _, _, err := controlPlaneStoresFromEnvironment(context.Background(), slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err == nil || err.Error() != "SWE_TRANSCRIPT_MAX_EVENTS_PER_RUN must be a positive integer" {
 		t.Fatalf("configuration error = %v", err)
+	}
+}
+
+func TestControlPlaneStoresFromEnvironmentRejectsPartialSessionConfiguration(t *testing.T) {
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	for _, tc := range []struct {
+		name, backend, databaseURL, keyringFile, want string
+	}{
+		{"missing backend", "", "", "", "SWE_SESSION_BACKEND must be memory or postgres"},
+		{"invalid backend", "other", "", "", "SWE_SESSION_BACKEND must be memory or postgres"},
+		{"postgres without database", "postgres", "", "/keyring", "SWE_POSTGRES_URL is required when SWE_SESSION_BACKEND=postgres"},
+		{"postgres without keyring", "postgres", "postgres://unused.invalid/test", "", "SWE_SESSION_KEYRING_FILE is required when SWE_SESSION_BACKEND=postgres"},
+		{"memory with keyring", "memory", "", "/keyring", "SWE_SESSION_KEYRING_FILE must be empty when SWE_SESSION_BACKEND=memory"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("SWE_SESSION_BACKEND", tc.backend)
+			t.Setenv("SWE_POSTGRES_URL", tc.databaseURL)
+			t.Setenv("SWE_SESSION_KEYRING_FILE", tc.keyringFile)
+			_, _, _, err := controlPlaneStoresFromEnvironment(context.Background(), log)
+			if err == nil || err.Error() != tc.want {
+				t.Fatalf("error = %v, want %q", err, tc.want)
+			}
+		})
 	}
 }
 

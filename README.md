@@ -235,7 +235,8 @@ Argo rollout replaces the selected control-plane pod. Override the cluster with
 `KIND_ARGO_CLUSTER` or the local port with `ARGO_UI_PORT`. Stopping the helper also stops
 only its own `kubectl` child. Existing SSE or WebSocket connections still disconnect during
 a rollout and must reconnect. PostgreSQL-backed transcript streams replay from their last event
-ID; a control-plane replacement still invalidates its process-local browser sessions. The
+ID; the Argo development preset's explicit memory-backed browser sessions are invalidated by a
+control-plane replacement. Production presets use PostgreSQL-backed sessions. The
 bootstrap requires one kind node with at least 5 CPUs and 6 GiB
 allocatable so the Argo/system workload and two 1-CPU/2-GiB `tiny` Environments fit while a
 warm member is claimed and replaced. Increase the container runtime's capacity before
@@ -604,8 +605,9 @@ minutes so reconnect repeats browser-session or bearer TokenReview and SubjectAc
 Authorization changes can therefore take up to the remaining connection lifetime to take effect.
 The first release admits at most 20 new establishments per second (burst 40), 32 concurrent
 establishments, 128 active watches globally, 16 per namespace, and four per authenticated
-principal. A control-plane restart closes watches and invalidates process-local browser sessions;
-clients relist after signing in again.
+principal. A control-plane restart closes watches; clients reconnect and relist. Memory sessions
+require sign-in again, while production PostgreSQL sessions survive replacement and are
+revalidated.
 
 Run transcripts use the same explicit control-plane URL and bearer credential:
 

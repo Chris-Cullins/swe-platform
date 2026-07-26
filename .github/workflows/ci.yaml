@@ -118,14 +118,47 @@ jobs:
             rendered=$(helm template swe-platform charts/swe-platform \
               --namespace swe-platform-system --values "$values")
             if [[ "$preset" =~ ^(k3s|gke|eks)$ ]]; then
+              printf '%s\n' "$rendered" | grep -A1 'name: SWE_SESSION_BACKEND' | grep -q 'value: "postgres"'
               printf '%s\n' "$rendered" | grep -A5 'name: SWE_POSTGRES_URL' | grep -q 'name: "swe-platform-postgres"'
+              printf '%s\n' "$rendered" | grep -A1 'name: SWE_SESSION_KEYRING_FILE' | grep -q '/var/run/secrets/swe-platform/session-keyring/keyring.json'
+              printf '%s\n' "$rendered" | grep -A3 'name: session-keyring' | grep -q 'mountPath: /var/run/secrets/swe-platform/session-keyring'
+              printf '%s\n' "$rendered" | grep -A4 'secretName: "swe-platform-session-keyring"' | grep -q 'key: "keyring.json"'
+            else
+              printf '%s\n' "$rendered" | grep -A1 'name: SWE_SESSION_BACKEND' | grep -q 'value: "memory"'
+              ! printf '%s\n' "$rendered" | grep -q 'name: SWE_SESSION_KEYRING_FILE'
             fi
           done
           rendered=$(helm template swe-platform charts/swe-platform \
             --namespace swe-platform-system \
             --set tenancy.mode=scoped \
+            --set controlPlane.sessions.backend=postgres \
+            --set controlPlane.sessions.keyringSecret.name=test-keyring \
             --set controlPlane.transcripts.postgresSecret.name=test-postgres)
           printf '%s\n' "$rendered" | grep -A5 'name: SWE_POSTGRES_URL' | grep -q 'name: "test-postgres"'
+          expect_render_failure() {
+            label=$1
+            shift
+            if helm template swe-platform charts/swe-platform \
+              --namespace swe-platform-system --set tenancy.mode=scoped "$@" >/tmp/render.out 2>/tmp/render.err; then
+              echo "expected Helm render to fail: $label" >&2
+              exit 1
+            fi
+          }
+          expect_render_failure invalid-backend --set controlPlane.sessions.backend=invalid
+          expect_render_failure postgres-without-url --set controlPlane.sessions.backend=postgres \
+            --set controlPlane.sessions.keyringSecret.name=test-keyring
+          expect_render_failure postgres-without-keyring-name --set controlPlane.sessions.backend=postgres \
+            --set controlPlane.transcripts.postgresSecret.name=test-postgres
+          expect_render_failure postgres-without-url-key --set controlPlane.sessions.backend=postgres \
+            --set controlPlane.transcripts.postgresSecret.name=test-postgres \
+            --set controlPlane.transcripts.postgresSecret.key= \
+            --set controlPlane.sessions.keyringSecret.name=test-keyring
+          expect_render_failure postgres-without-keyring-key --set controlPlane.sessions.backend=postgres \
+            --set controlPlane.transcripts.postgresSecret.name=test-postgres \
+            --set controlPlane.sessions.keyringSecret.name=test-keyring \
+            --set controlPlane.sessions.keyringSecret.key=
+          expect_render_failure memory-with-keyring --set controlPlane.sessions.backend=memory \
+            --set controlPlane.sessions.keyringSecret.name=test-keyring
 
       - name: Production images are immutable and coordinated
         run: |

@@ -16,8 +16,9 @@ CLI / TUI / local MCP / browser console
                     |
                     | HTTP, SSE, WebSocket
                     v
-             control plane -------- PostgreSQL transcripts
-                    |                    (or bounded dev memory)
+             control plane -------- shared PostgreSQL database
+                    |                 (transcripts + browser sessions,
+                    |                  or bounded dev memory stores)
                     | Kubernetes API
                     v
        CRDs <---- operator/controllers
@@ -55,8 +56,9 @@ Environment backends are not implemented.
 ### Current CRDs and sources of truth
 
 CRDs are the source of truth for desired and observed infrastructure state. PostgreSQL is
-used for durable transcript events, not as a second infrastructure-state store. Browser
-sessions are bounded process-local state and are lost when the control plane restarts.
+used for durable transcript events and encrypted browser sessions, not as a second
+infrastructure-state store. The control plane owns one shared `pgxpool` and ordered,
+versioned migrations; migration 003 adds browser sessions.
 
 All current CRDs are namespaced:
 
@@ -265,9 +267,27 @@ TokenReview/SAR.
 
 The optional bootstrap bearer token bypasses SAR for initial self-hosted setup. It cannot be
 exchanged for a browser session and should be removed after RBAC is configured. Browser login
-stores the Kubernetes token server-side behind an opaque, bounded, process-local cookie ID;
-each cookie use repeats TokenReview. Production cookies are Secure, HttpOnly, and SameSite
-Strict, and cookie-authenticated mutations require same-origin checks.
+stores the Kubernetes token server-side behind an opaque cookie; each cookie use repeats
+TokenReview and exact SAR authorization retains the reviewed username, UID, groups, and extras.
+Production cookies are Secure, HttpOnly, and SameSite Strict, and cookie-authenticated
+mutations require same-origin checks.
+
+Session storage is explicitly `memory` or `postgres`. Memory is bounded and process-local.
+PostgreSQL stores encrypted bearer ciphertext and metadata, never a cookie value or raw bearer.
+Cookies have the form `s1.<key-id>.<random>`; HKDF derives independent HMAC selector and
+AES-256-GCM encryption keys from each administrator-provided master key, and stable
+microsecond timestamps form part of the authenticated associated data. The strictly validated,
+version-1 JSON keyring is created out of band, mounted read-only, and has one live active key.
+Sessions have a one-hour absolute TTL. Under a transaction advisory lock, creation purges
+expired rows and enforces a global 10,000-live-session cap by rejecting rather than evicting.
+Logout and failed authentication durably and idempotently revoke the row.
+
+Startup fails on database connection, migration, keyring, or missing-live-key errors and never
+falls back to memory. Rotation adds a unique key and makes it active; old keys must remain for
+at least the TTL plus operational and rollback margin before retirement. Database-only theft
+does not reveal bearers, but the running control plane, keyring, cluster administrator, or a
+database-plus-keyring disclosure can. The keyring is not a substitute for database, Kubernetes,
+backup, or process security.
 
 Object names are not identities. Current sensitive operations add these fences:
 
@@ -333,20 +353,22 @@ control plane, service accounts/RBAC, and inert system-namespaced EnvironmentTem
 sources. Project resources and their namespaced workload RoleBindings are installed by the
 CLI onboarding path, not by Helm. It does not install PostgreSQL, ingress/TLS,
 StorageClasses, RuntimeClasses, an egress proxy, or a portal gateway. The control plane is
-fixed at one replica with `Recreate`; PostgreSQL makes transcripts durable, but browser
-sessions and full control-plane HA are still process-local limitations.
+fixed at one replica with `Recreate`; PostgreSQL makes transcripts and browser sessions
+durable across replacement, but open streams disconnect and clients must reconnect. No
+multi-replica or control-plane HA claim is made.
 
 - `values-kind.yaml` deliberately opts into trusted-admin for isolated local development and
-  uses local `:dev` images and insecure HTTP sessions. Primary acceptance overrides it to
-  scoped mode with distinct system and Project namespaces.
+  uses local `:dev` images and explicit memory-backed insecure HTTP sessions. Primary
+  acceptance overrides it to scoped mode with distinct system and Project namespaces.
 - `values-argocd.yaml` deliberately opts into trusted-admin in the isolated Argo mirror and
-  uses mutable `:latest` images.
+  uses mutable `:latest` images and explicit memory-backed sessions. Base/default values also
+  select memory for development.
 - `values-k3s.yaml`, `values-gke.yaml`, and `values-eks.yaml` use coordinated immutable chart
-  `appVersion` images, require an out-of-band PostgreSQL Secret, and default to scoped mode
-  with no Project namespaces. GKE selects `gvisor`; k3s and EKS use the cluster default runtime
-  unless explicitly overridden.
+  `appVersion` images, explicitly select PostgreSQL sessions, require out-of-band PostgreSQL
+  and session-keyring Secrets, and default to scoped mode with no Project namespaces. GKE
+  selects `gvisor`; k3s and EKS use the cluster default runtime unless explicitly overridden.
 
-CI builds, vets, and tests both Go modules, runs PostgreSQL transcript integration tests,
+CI builds, vets, and tests both Go modules, runs PostgreSQL transcript/session integration tests,
 checks UI lint/type/tests/build, exercises focused sandboxd Windows portability, verifies
 generated CRDs/chart copies, and lints/renders every preset. The kind acceptance workflow
 builds and loads local images and covers CRD upgrade, scoped system/Project topology,
@@ -431,6 +453,7 @@ not by themselves make these features implemented.
 - [#68 — fail-closed egress proxy](https://github.com/Chris-Cullins/swe-platform/issues/68)
 - [#122 — stale adapter observation fencing](https://github.com/Chris-Cullins/swe-platform/issues/122)
 - [#125 — terminal execution fencing](https://github.com/Chris-Cullins/swe-platform/issues/125)
+- [#145 — durable PostgreSQL browser sessions](https://github.com/Chris-Cullins/swe-platform/issues/145)
 - [`sandboxd` managed-process contract](sandboxd/proto/sandboxd/v1/PROCESS_LIFECYCLE.md)
 - [`sandboxd` filesystem contract](sandboxd/proto/sandboxd/v1/FILESYSTEM.md)
 - [Helm deployment and preset documentation](charts/swe-platform/README.md)

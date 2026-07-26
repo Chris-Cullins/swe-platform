@@ -119,6 +119,37 @@ owned Secrets, and transcript data. Suspending an Environment still revokes its 
 per-pod sandboxd credential Secret as described above. Destructive Project purge is not
 implemented.
 
+## Browser sessions
+
+Browser session storage is an explicit `memory` or `postgres` choice. Production k3s, GKE, and
+EKS presets use PostgreSQL; default, kind, and Argo development configurations use bounded,
+process-local memory. PostgreSQL uses the control plane's shared `pgxpool` and ordered migrations
+(version 003 creates session storage). Startup fails closed on database connection, migration,
+configuration, keyring, or missing-live-key errors, with no memory fallback.
+
+The administrator owns a strictly validated version-1 JSON keyring out of band and mounts it
+read-only; the chart neither creates it nor grants Secret-read RBAC. Each 32-byte master key is
+expanded with HKDF into independent HMAC selector and AES-256-GCM keys. The cookie is
+`s1.<key-id>.<random>`; the database stores only a keyed selector, encrypted bearer, authenticated
+metadata, and timestamps—never the cookie or raw bearer. Stable microsecond timestamp encoding
+is included in AES-GCM associated data. This limits database-only disclosure, but compromise of
+the process or keyring, a Kubernetes administrator, or combined database and keyring backups can
+recover credentials.
+
+Sessions expire absolutely after one hour. Creation takes a global PostgreSQL advisory
+transaction lock, purges expired rows, and rejects a new exchange once 10,000 live rows remain;
+it never evicts a live session. Logout, expiry, and failed TokenReview revoke durably and
+idempotently. Every use repeats TokenReview, then exact SAR with the reviewed username, UID,
+groups, and extras, so Kubernetes credential expiry/revocation and RBAC remain authoritative.
+Cookie security and same-origin mutation checks remain mandatory.
+
+For rotation, add a uniquely identified key, select it as active, and roll the control plane.
+Retain old keys for at least the one-hour TTL plus operational and rollback margin; retire them
+only after no live or rollback-visible session needs them, then roll again. Backups and rollback
+keyrings must preserve required keys. The deployment remains one replica with `Recreate`:
+PostgreSQL sessions survive replacement, but open SSE/WebSocket connections must reconnect and
+this is not an HA claim.
+
 ## Run-scoped agent API keys
 
 An `AgentCredentialProfile` binds an immutable adapter and `APIKey` credential type in one

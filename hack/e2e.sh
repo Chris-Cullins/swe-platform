@@ -96,6 +96,60 @@ wait_for_resource_quota_observation() {
 	return 1
 }
 
+start_control_plane_port_forward() {
+	if [[ -n "$PORT_FORWARD_PID" ]]; then
+		kill "$PORT_FORWARD_PID" >/dev/null 2>&1 || true
+		wait "$PORT_FORWARD_PID" >/dev/null 2>&1 || true
+	fi
+	: > /tmp/swe-platform-port-forward.log
+	kubectl -n "$SYSTEM_NAMESPACE" port-forward service/swe-platform-swe-platform-control-plane 18080:80 \
+		>/tmp/swe-platform-port-forward.log 2>&1 &
+	PORT_FORWARD_PID=$!
+	for _ in $(seq 1 30); do
+		if kill -0 "$PORT_FORWARD_PID" >/dev/null 2>&1 && \
+			curl --fail --silent http://127.0.0.1:18080/healthz >/dev/null; then
+			return 0
+		fi
+		sleep 1
+	done
+	echo "FAIL: control-plane port-forward did not become ready" >&2
+	cat /tmp/swe-platform-port-forward.log >&2
+	return 1
+}
+
+replace_control_plane_pod() {
+	local deployment="$INSTALLATION_NAME-control-plane"
+	local ready_pods old_name old_uid
+	ready_pods=$(kubectl -n "$SYSTEM_NAMESPACE" get pod \
+		-l 'app.kubernetes.io/component=control-plane' -o json | \
+		jq -r '.items[] | select(.metadata.deletionTimestamp == null and any(.status.conditions[]?; .type == "Ready" and .status == "True")) | [.metadata.name, .metadata.uid] | @tsv')
+	if [[ "$(wc -l <<<"$ready_pods")" != "1" ]]; then
+		echo "FAIL: expected exactly one ready control-plane pod before replacement" >&2
+		kubectl -n "$SYSTEM_NAMESPACE" get pods -l 'app.kubernetes.io/component=control-plane' >&2 || true
+		return 1
+	fi
+	IFS=$'\t' read -r old_name old_uid <<<"$ready_pods"
+	kubectl -n "$SYSTEM_NAMESPACE" delete pod "$old_name" --wait=true >/dev/null
+	for _ in $(seq 1 120); do
+		if kubectl -n "$SYSTEM_NAMESPACE" get pod \
+			-l 'app.kubernetes.io/component=control-plane' -o json | \
+			jq -e --arg old "$old_uid" '.items | any(.metadata.deletionTimestamp == null and .metadata.uid != $old and any(.status.conditions[]?; .type == "Ready" and .status == "True"))' >/dev/null; then
+			kubectl -n "$SYSTEM_NAMESPACE" rollout status deployment/"$deployment" --timeout=30s >/dev/null
+			start_control_plane_port_forward
+			return 0
+		fi
+		sleep 1
+	done
+	echo "FAIL: control-plane pod was not replaced with a ready pod" >&2
+	kubectl -n "$SYSTEM_NAMESPACE" get pods -l 'app.kubernetes.io/component=control-plane' >&2 || true
+	return 1
+}
+
+browser_session_count() {
+	kubectl -n "$SYSTEM_NAMESPACE" exec deployment/postgres -- \
+		psql -U swe -d swe -tAc 'SELECT count(*) FROM browser_sessions' | tr -d '[:space:]'
+}
+
 check_sandboxd_process() {
 	local pod_name="$1"
 	local run_uid="$2"
@@ -310,11 +364,60 @@ echo "==> installing scoped catalog-only platform through Helm with upgraded CRD
 E2E_BOOTSTRAP_TOKEN="$(openssl rand -hex 32)"
 kubectl create namespace "$SYSTEM_NAMESPACE"
 kubectl -n "$SYSTEM_NAMESPACE" create secret generic swe-platform-bootstrap --from-literal=token="$E2E_BOOTSTRAP_TOKEN"
+echo "==> provisioning PostgreSQL 17 and administrator-owned durable-session Secrets"
+POSTGRES_PASSWORD="$(openssl rand -hex 24)"
+kubectl -n "$SYSTEM_NAMESPACE" create secret generic swe-platform-postgres \
+	--from-literal=url="postgres://swe:${POSTGRES_PASSWORD}@postgres:5432/swe?sslmode=disable" \
+	--from-literal=password="$POSTGRES_PASSWORD"
+SESSION_KEYRING_FILE="$(mktemp /tmp/swe-session-keyring-XXXXXX.json)"
+jq -n --arg key "$(openssl rand -base64 32 | tr '+/' '-_' | tr -d '=\n')" \
+	'{version:1,activeKeyId:"e2e",keys:[{id:"e2e",masterKey:$key}]}' > "$SESSION_KEYRING_FILE"
+kubectl -n "$SYSTEM_NAMESPACE" create secret generic swe-platform-session-keyring \
+	--from-file=keyring.json="$SESSION_KEYRING_FILE"
+rm -f "$SESSION_KEYRING_FILE"
+unset SESSION_KEYRING_FILE POSTGRES_PASSWORD
+cat <<'EOF' | kubectl -n "$SYSTEM_NAMESPACE" apply -f -
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: postgres
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: swe-e2e-postgres}
+  template:
+    metadata:
+      labels: {app: swe-e2e-postgres}
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:17
+          env:
+            - {name: POSTGRES_USER, value: swe}
+            - {name: POSTGRES_PASSWORD, valueFrom: {secretKeyRef: {name: swe-platform-postgres, key: password}}}
+            - {name: POSTGRES_DB, value: swe}
+          readinessProbe:
+            exec: {command: [pg_isready, -U, swe]}
+            initialDelaySeconds: 2
+            periodSeconds: 2
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+spec:
+  selector: {app: swe-e2e-postgres}
+  ports: [{port: 5432, targetPort: 5432}]
+EOF
+kubectl -n "$SYSTEM_NAMESPACE" rollout status deployment/postgres --timeout=2m
 HELM_ARGS=(
 	upgrade --install swe-platform charts/swe-platform
 	--namespace "$SYSTEM_NAMESPACE" --values charts/swe-platform/values-kind.yaml
 	--set tenancy.mode=scoped --set-json 'tenancy.namespaces=[]'
 	--set controlPlane.auth.bootstrapTokenSecret.name=swe-platform-bootstrap
+	--set controlPlane.sessions.backend=postgres
+	--set controlPlane.sessions.keyringSecret.name=swe-platform-session-keyring
+	--set controlPlane.transcripts.postgresSecret.name=swe-platform-postgres
 	--set-string "environmentTemplates[0].spec.image=$E2E_ENV_IMAGE"
 	--wait --timeout 2m
 )
@@ -837,14 +940,7 @@ EOF
 CONSOLE_TOKEN=$(kubectl create token e2e-console --audience=swe-platform)
 
 echo "==> verifying live transcript stream through the control plane"
-kubectl -n "$SYSTEM_NAMESPACE" port-forward service/swe-platform-swe-platform-control-plane 18080:80 >/tmp/swe-platform-port-forward.log 2>&1 &
-PORT_FORWARD_PID=$!
-for _ in $(seq 1 30); do
-	if curl --fail --silent http://127.0.0.1:18080/healthz >/dev/null; then
-		break
-	fi
-	sleep 1
-done
+start_control_plane_port_forward
 UNLISTED_STATUS=$(curl --silent --output /dev/null --write-out '%{http_code}' \
 	-H "Authorization: Bearer ${E2E_BOOTSTRAP_TOKEN}" \
 	"http://127.0.0.1:18080/api/v1/namespaces/${ADOPT_NAMESPACE}/runs")
@@ -990,6 +1086,51 @@ if grep -Fq "$CONSOLE_TOKEN" "$COOKIE_JAR"; then
 	echo "FAIL: session cookie contains the Kubernetes bearer token"
 	exit 1
 fi
+echo "==> verifying PostgreSQL browser session survives control-plane pod replacement"
+replace_control_plane_pod
+SESSION_REPLACEMENT_STATUS=$(curl --silent --output /dev/null --write-out '%{http_code}' \
+	--cookie "$COOKIE_JAR" http://127.0.0.1:18080/api/v1/session)
+if [[ "$SESSION_REPLACEMENT_STATUS" != "200" ]]; then
+	echo "FAIL: durable session status after pod replacement was ${SESSION_REPLACEMENT_STATUS}, expected 200"
+	exit 1
+fi
+
+echo "==> verifying definitive TokenReview rejection is durably revoked"
+kubectl -n "$PROJECT_NAMESPACE" create serviceaccount e2e-session-rejection >/dev/null
+REJECTION_TOKEN=$(kubectl -n "$PROJECT_NAMESPACE" create token e2e-session-rejection --audience=swe-platform)
+REJECTION_COOKIE_JAR=/tmp/swe-platform-rejected-session-cookies
+rm -f "$REJECTION_COOKIE_JAR"
+REJECTION_SESSION_COUNT_BEFORE=$(browser_session_count)
+REJECTION_EXCHANGE_STATUS=$(curl --silent --output /dev/null --write-out '%{http_code}' \
+	--cookie-jar "$REJECTION_COOKIE_JAR" -X POST -H "Authorization: Bearer ${REJECTION_TOKEN}" \
+	http://127.0.0.1:18080/api/v1/session)
+REJECTION_SESSION_COUNT_AFTER=$(browser_session_count)
+unset REJECTION_TOKEN
+kubectl -n "$PROJECT_NAMESPACE" delete serviceaccount e2e-session-rejection --wait=true >/dev/null
+if [[ "$REJECTION_EXCHANGE_STATUS" != "200" || "$REJECTION_SESSION_COUNT_AFTER" != "$((REJECTION_SESSION_COUNT_BEFORE + 1))" ]]; then
+	echo "FAIL: rejected-token exchange did not add exactly one durable session"
+	exit 1
+fi
+REJECTION_STATUS=""
+for _ in $(seq 1 90); do
+	REJECTION_STATUS=$(curl --silent --output /dev/null --write-out '%{http_code}' \
+		--cookie "$REJECTION_COOKIE_JAR" http://127.0.0.1:18080/api/v1/session)
+	if [[ "$REJECTION_STATUS" == "401" ]]; then
+		break
+	fi
+	sleep 1
+done
+if [[ "$REJECTION_STATUS" != "401" || "$(browser_session_count)" != "$REJECTION_SESSION_COUNT_BEFORE" ]]; then
+	echo "FAIL: definitive TokenReview rejection did not durably delete its session"
+	exit 1
+fi
+replace_control_plane_pod
+REJECTION_REPLAY_STATUS=$(curl --silent --output /dev/null --write-out '%{http_code}' \
+	--cookie "$REJECTION_COOKIE_JAR" http://127.0.0.1:18080/api/v1/session)
+if [[ "$REJECTION_REPLAY_STATUS" != "401" ]]; then
+	echo "FAIL: rejected-token session replay after replacement was ${REJECTION_REPLAY_STATUS}, expected 401"
+	exit 1
+fi
 SESSION_GET_STATUS=$(curl --silent --output /dev/null --write-out '%{http_code}' \
 	--cookie "$COOKIE_JAR" http://127.0.0.1:18080/api/v1/session)
 RUN_LIST_STATUS=$(curl --silent --output /tmp/swe-platform-runs.json --write-out '%{http_code}' \
@@ -1095,6 +1236,8 @@ if [[ "$API_CREATE_STATUS" != "201" || "$API_RETRY_STATUS" != "200" || "$CSRF_ST
 	echo "FAIL: typed mutation API statuses create=${API_CREATE_STATUS} retry=${API_RETRY_STATUS} csrf=${CSRF_STATUS} cancel=${API_CANCEL_STATUS}"
 	exit 1
 fi
+LOGOUT_REPLAY_COOKIE_JAR=/tmp/swe-platform-logout-replay-cookies
+cp "$COOKIE_JAR" "$LOGOUT_REPLAY_COOKIE_JAR"
 SESSION_DELETE_STATUS=$(curl --silent --output /dev/null --write-out '%{http_code}' \
 	--cookie "$COOKIE_JAR" --cookie-jar "$COOKIE_JAR" -X DELETE -H 'Origin: http://127.0.0.1:18080' \
 	http://127.0.0.1:18080/api/v1/session)
@@ -1103,9 +1246,16 @@ if [[ "$SESSION_DELETE_STATUS" != "204" ]]; then
 	exit 1
 fi
 LOGOUT_REPLAY_STATUS=$(curl --silent --output /dev/null --write-out '%{http_code}' \
-	--cookie "$COOKIE_JAR" http://127.0.0.1:18080/api/v1/session)
+	--cookie "$LOGOUT_REPLAY_COOKIE_JAR" http://127.0.0.1:18080/api/v1/session)
 if [[ "$LOGOUT_REPLAY_STATUS" != "401" ]]; then
 	echo "FAIL: logged-out session replay status was ${LOGOUT_REPLAY_STATUS}, expected 401"
+	exit 1
+fi
+replace_control_plane_pod
+LOGOUT_REPLACEMENT_STATUS=$(curl --silent --output /dev/null --write-out '%{http_code}' \
+	--cookie "$LOGOUT_REPLAY_COOKIE_JAR" http://127.0.0.1:18080/api/v1/session)
+if [[ "$LOGOUT_REPLACEMENT_STATUS" != "401" ]]; then
+	echo "FAIL: logged-out session replay after replacement was ${LOGOUT_REPLACEMENT_STATUS}, expected 401"
 	exit 1
 fi
 

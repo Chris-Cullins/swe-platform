@@ -9,6 +9,9 @@ image:
   pullPolicy: Always
 
 controlPlane:
+  # Development sessions are intentionally process-local.
+  sessions:
+    backend: memory
   image:
     tag: latest
     pullPolicy: Always

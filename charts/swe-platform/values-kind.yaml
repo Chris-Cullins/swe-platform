@@ -4,6 +4,9 @@ image:
   pullPolicy: IfNotPresent
 
 controlPlane:
+  # Development sessions are intentionally process-local.
+  sessions:
+    backend: memory
   image:
     tag: dev
   auth:

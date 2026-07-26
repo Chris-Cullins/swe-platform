@@ -7,6 +7,12 @@ tenancy:
 replicaCount: 2
 
 controlPlane:
+  sessions:
+    backend: postgres
+    keyringSecret:
+      # Create this administrator-owned Secret out of band.
+      name: swe-platform-session-keyring
+      key: keyring.json
   transcripts:
     postgresSecret:
       # Create this Secret out of band before installing the production preset.
