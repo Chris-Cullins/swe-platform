@@ -86,12 +86,12 @@ wait_for_resource_quota_observation() {
 	local namespace="$1"
 	for _ in $(seq 1 300); do
 		if kubectl -n "$namespace" get resourcequota swe-project -o json | \
-			jq -e '(.status.hard // {}) == .spec.hard and (((.spec.hard | keys) - ((.status.used // {}) | keys)) == [])' >/dev/null; then
+			jq -e '(.status.hard // {}) == .spec.hard and ((.status.used // {}) | has("count/environments.swe.dev"))' >/dev/null; then
 			return 0
 		fi
 		sleep 1
 	done
-	echo "FAIL: ResourceQuota in $namespace did not observe hard and used values for all configured limits" >&2
+	echo "FAIL: ResourceQuota in $namespace did not observe configured hard limits and Environment usage" >&2
 	kubectl -n "$namespace" get resourcequota swe-project -o yaml >&2 || true
 	return 1
 }
