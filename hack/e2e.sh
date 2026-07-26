@@ -82,6 +82,20 @@ contains_e2e_key() {
 		grep -aFq -- "$E2E_AMP_API_KEY" "$1"
 }
 
+wait_for_resource_quota_observation() {
+	local namespace="$1"
+	for _ in $(seq 1 300); do
+		if kubectl -n "$namespace" get resourcequota swe-project -o json | \
+			jq -e '(.status.hard // {}) == .spec.hard' >/dev/null; then
+			return 0
+		fi
+		sleep 1
+	done
+	echo "FAIL: ResourceQuota in $namespace did not observe all configured hard limits" >&2
+	kubectl -n "$namespace" get resourcequota swe-project -o yaml >&2 || true
+	return 1
+}
+
 check_sandboxd_process() {
 	local pod_name="$1"
 	local run_uid="$2"
@@ -343,6 +357,7 @@ jq -e --arg iu "$INSTALLATION_UID" --arg pu "$PROJECT_UID" --arg su "$SOURCE_UID
 kubectl -n "$PROJECT_NAMESPACE" get resourcequota/swe-project serviceaccount/swe-environment rolebinding/swe-platform-operator rolebinding/swe-platform-control-plane networkpolicy/swe-default-deny-ingress >/dev/null
 [[ "$(kubectl -n "$PROJECT_NAMESPACE" get serviceaccount swe-environment -o jsonpath='{.automountServiceAccountToken}')" == "false" ]]
 kubectl -n "$PROJECT_NAMESPACE" get networkpolicy swe-default-deny-ingress -o json | jq -e '.spec.policyTypes == ["Ingress"] and (.spec.ingress | length == 0)' >/dev/null
+wait_for_resource_quota_observation "$PROJECT_NAMESPACE"
 
 echo "==> verifying fail-closed namespace adoption and ownership"
 ADOPT_NAMESPACE=swe-e2e-adopt
@@ -434,22 +449,11 @@ helm "${PEER_HELM_ARGS[@]}"
 bin/swe --namespace "$PEER_PROJECT_NAMESPACE" project onboard "$PEER_PROJECT_NAME" \
 	--system-namespace "$PEER_SYSTEM_NAMESPACE" --installation "$PEER_INSTALLATION_NAME" \
 	--repository git://unused --default-template small --template small "${QUOTA_ARGS[@]}"
+wait_for_resource_quota_observation "$PEER_PROJECT_NAMESPACE"
 PEER_HELM_ARGS+=(--set-string "tenancy.namespaces[0]=$PEER_PROJECT_NAMESPACE")
 helm "${PEER_HELM_ARGS[@]}"
 kubectl -n "$PEER_SYSTEM_NAMESPACE" rollout status deployment/"$PEER_INSTALLATION_NAME" --timeout=2m
 kubectl -n "$PEER_PROJECT_NAMESPACE" wait --for=jsonpath='{.status.warmPoolReady}'=1 environmenttemplate/small --timeout=2m
-for _ in $(seq 1 60); do
-	if kubectl -n "$PEER_PROJECT_NAMESPACE" get resourcequota swe-project -o json | \
-		jq -e '.status.hard["count/agentcredentialprofiles.swe.dev"] == .spec.hard["count/agentcredentialprofiles.swe.dev"]' >/dev/null; then
-		break
-	fi
-	sleep 1
-done
-if ! kubectl -n "$PEER_PROJECT_NAMESPACE" get resourcequota swe-project -o json | \
-	jq -e '.status.hard["count/agentcredentialprofiles.swe.dev"] == .spec.hard["count/agentcredentialprofiles.swe.dev"]' >/dev/null; then
-	echo "FAIL: peer ResourceQuota did not observe its credential-profile limit"
-	exit 1
-fi
 PEER_INSTALLATION_UID=$(kubectl -n "$PEER_SYSTEM_NAMESPACE" get installation "$PEER_INSTALLATION_NAME" -o jsonpath='{.metadata.uid}')
 PEER_PROJECT_UID=$(kubectl -n "$PEER_PROJECT_NAMESPACE" get project "$PEER_PROJECT_NAME" -o jsonpath='{.metadata.uid}')
 PEER_CLAIM=$(kubectl get namespace "$PEER_PROJECT_NAMESPACE" -o json)
