@@ -304,30 +304,53 @@ message TerminalResize {
   uint32 rows = 2;
 }
 
-// PortService tracks ports in use inside the environment so the gateway
-// can expose them as portals.
-service PortService {
-  rpc Register(RegisterPortRequest) returns (Port);
-  rpc List(ListPortsRequest) returns (ListPortsResponse);
+// ServiceObservationService performs bounded, point-in-time TCP-connect
+// observations from the environment's logical loopback. It retains no state
+// and does not declare, register, allocate, expose, or route services.
+service ServiceObservationService {
+  rpc Observe(ObserveServicesRequest) returns (ObserveServicesResponse);
 }
 
-message RegisterPortRequest {
-  // port of 0 asks sandboxd to pick a free one.
-  uint32 port = 1;
-  string label = 2;
+message ObserveServicesRequest {
+  repeated ServiceProbe probes = 1;
 }
 
-message Port {
-  uint32 port = 1;
-  string label = 2;
-  // url is filled in once the gateway has exposed the port; empty until then.
-  string url = 3;
+message ServiceProbe {
+  // id is opaque correlation data scoped only to this request.
+  string id = 1;
+  uint32 target_port = 2;
+  oneof probe {
+    TCPConnectProbe tcp_connect = 3;
+  }
 }
 
-message ListPortsRequest {}
+message TCPConnectProbe {}
 
-message ListPortsResponse {
-  repeated Port ports = 1;
+enum ServiceProbeOutcome {
+  SERVICE_PROBE_OUTCOME_UNSPECIFIED = 0;
+  SERVICE_PROBE_OUTCOME_CONNECTED = 1;
+  SERVICE_PROBE_OUTCOME_NOT_CONNECTED = 2;
+  SERVICE_PROBE_OUTCOME_TIMED_OUT = 3;
+}
+
+enum ServiceProbeReason {
+  SERVICE_PROBE_REASON_UNSPECIFIED = 0;
+  SERVICE_PROBE_REASON_CONNECTION_ACCEPTED = 1;
+  SERVICE_PROBE_REASON_CONNECTION_FAILED = 2;
+  SERVICE_PROBE_REASON_DEADLINE_EXCEEDED = 3;
+  SERVICE_PROBE_REASON_CANCELED = 4;
+}
+
+message ServiceProbeObservation {
+  string id = 1;
+  ServiceProbeOutcome outcome = 2;
+  ServiceProbeReason reason = 3;
+}
+
+message ObserveServicesResponse {
+  // observations preserve request order and contain exactly one result per
+  // validated probe.
+  repeated ServiceProbeObservation observations = 1;
 }
 
 // HealthService reports daemon liveness and version.

@@ -91,6 +91,37 @@ func TestProcessCapabilityAuthorizesManagedProcesses(t *testing.T) {
 	}
 }
 
+func TestServiceObservationCapabilityIsExact(t *testing.T) {
+	authorizer := newTestAuthorizer(t, Config{Grants: []Grant{{
+		TokenHash:    TokenVerifier("observer-token"),
+		Capabilities: []Capability{CapabilityServiceObservation},
+	}, {
+		TokenHash:    TokenVerifier("process-token"),
+		Capabilities: []Capability{CapabilityProcess},
+	}}})
+	observerContext := metadata.NewIncomingContext(context.Background(), metadata.Pairs(
+		"authorization", "Bearer observer-token",
+	))
+	if err := authorizer.authorize(observerContext, "/sandboxd.v1.ServiceObservationService/Observe"); err != nil {
+		t.Fatalf("authorize observation: %v", err)
+	}
+	for _, method := range []string{
+		"/sandboxd.v1.HealthService/Check",
+		"/sandboxd.v1.ProcessService/Start",
+		"/sandboxd.v1.TerminalService/Terminal",
+	} {
+		if err := authorizer.authorize(observerContext, method); status.Code(err) != codes.PermissionDenied {
+			t.Fatalf("method %s status = %v, want PermissionDenied", method, err)
+		}
+	}
+	processContext := metadata.NewIncomingContext(context.Background(), metadata.Pairs(
+		"authorization", "Bearer process-token",
+	))
+	if err := authorizer.authorize(processContext, "/sandboxd.v1.ServiceObservationService/Observe"); status.Code(err) != codes.PermissionDenied {
+		t.Fatalf("process token observation status = %v, want PermissionDenied", err)
+	}
+}
+
 func TestTLSAndCapabilityInterceptorsEndToEnd(t *testing.T) {
 	const (
 		serverName   = "incarnation-a.sandboxd.swe.dev"
