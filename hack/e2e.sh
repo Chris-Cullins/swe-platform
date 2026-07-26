@@ -1144,7 +1144,10 @@ func main() {
 	if err != nil { panic(err) }
 	store, err := controlplane.NewPostgresSessionStore(ctx, db, keyring, controlplane.PostgresSessionStoreOptions{})
 	if err != nil { panic(err) }
-	cookie, err := store.Create(ctx, "e2e-definitively-invalid-kubernetes-token")
+	// An unrecognized JWT issuer yields a definitive unauthenticated
+	// TokenReview rather than a status.error.
+	token := "eyJhbGciOiJSUzI1NiJ9." + "eyJpc3MiOiJlMmUtdW5rbm93biJ9." + "c2lnbmF0dXJl"
+	cookie, err := store.Create(ctx, token)
 	if err != nil { panic(err) }
 	fmt.Print(cookie)
 }
