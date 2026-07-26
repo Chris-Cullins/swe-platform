@@ -3,9 +3,13 @@ package cli
 import (
 	"context"
 	"fmt"
+	"io"
+	"math"
+	"sort"
 
 	"github.com/spf13/cobra"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/validation"
 	"k8s.io/client-go/util/retry"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
@@ -14,9 +18,93 @@ import (
 )
 
 func newEnvironmentCommand() *cobra.Command {
-	cmd := &cobra.Command{Use: "environment", Short: "Manage environment lifecycle policy"}
-	cmd.AddCommand(newEnvironmentHoldCommand(true), newEnvironmentHoldCommand(false))
+	cmd := &cobra.Command{Use: "environment", Short: "Manage environments"}
+	cmd.AddCommand(newEnvironmentHoldCommand(true), newEnvironmentHoldCommand(false), newEnvironmentServicesCommand())
 	return cmd
+}
+
+func newEnvironmentServicesCommand() *cobra.Command {
+	cmd := &cobra.Command{Use: "services", Short: "Manage durable desired service declarations"}
+	cmd.AddCommand(
+		newEnvironmentServicesListCommand(),
+		newEnvironmentServiceWriteCommand(false),
+		newEnvironmentServiceWriteCommand(true),
+		newEnvironmentServiceRemoveCommand(),
+	)
+	return cmd
+}
+
+func newEnvironmentServicesListCommand() *cobra.Command {
+	return &cobra.Command{
+		Use:   "list ENVIRONMENT",
+		Short: "List an environment's desired service declarations",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			clients, err := newKubeClients()
+			if err != nil {
+				return err
+			}
+			namespace, _ := cmd.Flags().GetString("namespace")
+			return listEnvironmentServices(cmd.Context(), clients.Client, types.NamespacedName{Namespace: namespace, Name: args[0]}, cmd.OutOrStdout())
+		},
+	}
+}
+
+func newEnvironmentServiceWriteCommand(update bool) *cobra.Command {
+	var targetPort uint32
+	verb := "declare"
+	short := "Declare a desired service on an environment"
+	if update {
+		verb = "update"
+		short = "Update an existing desired service declaration"
+	}
+	cmd := &cobra.Command{
+		Use:   verb + " ENVIRONMENT SERVICE",
+		Short: short,
+		Args:  cobra.ExactArgs(2),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if err := validateEnvironmentServiceInput(args[1], targetPort); err != nil {
+				return err
+			}
+			clients, err := newKubeClients()
+			if err != nil {
+				return err
+			}
+			namespace, _ := cmd.Flags().GetString("namespace")
+			service, err := writeEnvironmentService(cmd.Context(), clients.Client, types.NamespacedName{Namespace: namespace, Name: args[0]}, args[1], int32(targetPort), update)
+			if err != nil {
+				return err
+			}
+			fmt.Fprintf(cmd.OutOrStdout(), "service %s %sd on environment %s at revision %d\n", args[1], verb, args[0], service.Revision)
+			return nil
+		},
+	}
+	cmd.Flags().Uint32Var(&targetPort, "target-port", 0, "Explicit port on the Environment loopback (1-65535, excluding 50051)")
+	_ = cmd.MarkFlagRequired("target-port")
+	return cmd
+}
+
+func newEnvironmentServiceRemoveCommand() *cobra.Command {
+	return &cobra.Command{
+		Use:   "remove ENVIRONMENT SERVICE",
+		Short: "Remove a durable desired service declaration",
+		Args:  cobra.ExactArgs(2),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if err := validateEnvironmentServiceName(args[1]); err != nil {
+				return err
+			}
+			clients, err := newKubeClients()
+			if err != nil {
+				return err
+			}
+			namespace, _ := cmd.Flags().GetString("namespace")
+			if err := removeEnvironmentService(cmd.Context(), clients.Client, types.NamespacedName{Namespace: namespace, Name: args[0]}, args[1]); err != nil {
+				return err
+			}
+			fmt.Fprintf(cmd.OutOrStdout(), "service %s removed from environment %s\n", args[1], args[0])
+			return nil
+		},
+	}
 }
 
 func newEnvironmentHoldCommand(enabled bool) *cobra.Command {
@@ -92,4 +180,135 @@ func setEnvironmentHold(ctx context.Context, kube client.Client, key types.Names
 
 func holdPoliciesEqual(a, b *platformv1alpha1.EnvironmentHoldPolicy) bool {
 	return a == nil && b == nil || a != nil && b != nil && *a == *b
+}
+
+func validateEnvironmentServiceName(name string) error {
+	if len(validation.IsDNS1123Label(name)) != 0 {
+		return fmt.Errorf("service name must be a Kubernetes DNS-1123 label")
+	}
+	return nil
+}
+
+func validateEnvironmentServiceInput(name string, targetPort uint32) error {
+	if err := validateEnvironmentServiceName(name); err != nil {
+		return err
+	}
+	if targetPort == 0 || targetPort > 65535 || targetPort == platformv1alpha1.EnvironmentServiceControlPort {
+		return fmt.Errorf("--target-port must be between 1 and 65535 and must not be sandboxd control port %d", platformv1alpha1.EnvironmentServiceControlPort)
+	}
+	return nil
+}
+
+func desiredEnvironmentService(name string, targetPort int32, revision int64) platformv1alpha1.EnvironmentServiceDeclaration {
+	return platformv1alpha1.EnvironmentServiceDeclaration{
+		Name:       name,
+		Revision:   revision,
+		Protocol:   platformv1alpha1.EnvironmentServiceProtocolHTTP,
+		TargetPort: targetPort,
+		Visibility: platformv1alpha1.EnvironmentServiceVisibilityProject,
+		Readiness:  platformv1alpha1.EnvironmentServiceReadinessTCPConnect,
+	}
+}
+
+func writeEnvironmentService(ctx context.Context, kube client.Client, key types.NamespacedName, name string, targetPort int32, update bool) (platformv1alpha1.EnvironmentServiceDeclaration, error) {
+	var result platformv1alpha1.EnvironmentServiceDeclaration
+	var pinnedUID types.UID
+	pinned := false
+	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		var environment platformv1alpha1.Environment
+		if err := kube.Get(ctx, key, &environment); err != nil {
+			return err
+		}
+		if !pinned {
+			pinnedUID = environment.UID
+			pinned = true
+		} else if environment.UID != pinnedUID {
+			return lifecycle.ErrEnvironmentIncarnationChanged
+		}
+
+		before := environment.DeepCopy()
+		index := environmentServiceIndex(environment.Spec.Services, name)
+		if index < 0 {
+			if update {
+				return fmt.Errorf("service %q is not declared", name)
+			}
+			if len(environment.Spec.Services) >= platformv1alpha1.EnvironmentServiceMaxDeclarations {
+				return fmt.Errorf("environment already has the maximum of %d service declarations", platformv1alpha1.EnvironmentServiceMaxDeclarations)
+			}
+			result = desiredEnvironmentService(name, targetPort, 1)
+			environment.Spec.Services = append(environment.Spec.Services, result)
+		} else {
+			existing := environment.Spec.Services[index]
+			desired := desiredEnvironmentService(name, targetPort, existing.Revision)
+			if existing == desired {
+				result = existing
+				return nil
+			}
+			if !update {
+				return fmt.Errorf("service %q is already declared with different configuration; use update", name)
+			}
+			if existing.Revision == math.MaxInt64 {
+				return fmt.Errorf("service %q revision cannot be increased", name)
+			}
+			desired.Revision++
+			result = desired
+			environment.Spec.Services[index] = desired
+		}
+		return kube.Patch(ctx, &environment, client.MergeFromWithOptions(before, client.MergeFromWithOptimisticLock{}))
+	})
+	if err != nil {
+		return platformv1alpha1.EnvironmentServiceDeclaration{}, fmt.Errorf("%s service %q on environment %q: %w", map[bool]string{false: "declare", true: "update"}[update], name, key.Name, err)
+	}
+	return result, nil
+}
+
+func removeEnvironmentService(ctx context.Context, kube client.Client, key types.NamespacedName, name string) error {
+	var pinnedUID types.UID
+	pinned := false
+	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		var environment platformv1alpha1.Environment
+		if err := kube.Get(ctx, key, &environment); err != nil {
+			return err
+		}
+		if !pinned {
+			pinnedUID = environment.UID
+			pinned = true
+		} else if environment.UID != pinnedUID {
+			return lifecycle.ErrEnvironmentIncarnationChanged
+		}
+		index := environmentServiceIndex(environment.Spec.Services, name)
+		if index < 0 {
+			return nil
+		}
+		before := environment.DeepCopy()
+		environment.Spec.Services = append(environment.Spec.Services[:index], environment.Spec.Services[index+1:]...)
+		return kube.Patch(ctx, &environment, client.MergeFromWithOptions(before, client.MergeFromWithOptimisticLock{}))
+	})
+	if err != nil {
+		return fmt.Errorf("remove service %q from environment %q: %w", name, key.Name, err)
+	}
+	return nil
+}
+
+func environmentServiceIndex(services []platformv1alpha1.EnvironmentServiceDeclaration, name string) int {
+	for i := range services {
+		if services[i].Name == name {
+			return i
+		}
+	}
+	return -1
+}
+
+func listEnvironmentServices(ctx context.Context, kube client.Reader, key types.NamespacedName, out io.Writer) error {
+	var environment platformv1alpha1.Environment
+	if err := kube.Get(ctx, key, &environment); err != nil {
+		return fmt.Errorf("get environment %q: %w", key.Name, err)
+	}
+	services := append([]platformv1alpha1.EnvironmentServiceDeclaration(nil), environment.Spec.Services...)
+	sort.Slice(services, func(i, j int) bool { return services[i].Name < services[j].Name })
+	fmt.Fprintln(out, "NAME\tREVISION\tPROTOCOL\tTARGET-PORT\tVISIBILITY\tREADINESS")
+	for _, service := range services {
+		fmt.Fprintf(out, "%s\t%d\t%s\t%d\t%s\t%s\n", service.Name, service.Revision, service.Protocol, service.TargetPort, service.Visibility, service.Readiness)
+	}
+	return nil
 }
