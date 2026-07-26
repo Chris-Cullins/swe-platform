@@ -12,9 +12,8 @@ import (
 type mutationLeaseKey struct{}
 
 type mutationLease struct {
-	namespace    string
-	namespaceUID string
-	lifecycle    Lifecycle
+	namespace string
+	claim     Claim
 }
 
 // ReconcileScope validates a namespace at reconcile entry and issues the
@@ -34,7 +33,7 @@ func (s *ReconcileScope) Begin(ctx context.Context, namespace string, permitted 
 	if !permitsLifecycle(claim.Lifecycle, permitted) {
 		return ctx, claim, fmt.Errorf("%w: Namespace %q lifecycle is %s", ErrOutOfScope, namespace, claim.Lifecycle)
 	}
-	lease := mutationLease{namespace: namespace, namespaceUID: string(claim.NamespaceUID), lifecycle: claim.Lifecycle}
+	lease := mutationLease{namespace: namespace, claim: claim}
 	return context.WithValue(ctx, mutationLeaseKey{}, lease), claim, nil
 }
 
@@ -55,7 +54,7 @@ func (c GuardedClient) authorize(ctx context.Context, namespace string) error {
 	if err != nil {
 		return err
 	}
-	if string(claim.NamespaceUID) != lease.namespaceUID || claim.Lifecycle != lease.lifecycle {
+	if claim != lease.claim {
 		return fmt.Errorf("%w: Namespace %q claim changed during reconciliation", ErrOutOfScope, namespace)
 	}
 	return nil

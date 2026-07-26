@@ -406,7 +406,7 @@ kubectl -n "$SYSTEM_NAMESPACE" patch environmenttemplate "$CATALOG_TEMPLATE" --t
 bin/swe --namespace "$PROJECT_NAMESPACE" "${ONBOARD_ARGS[@]:2}"
 if [[ "$(kubectl get environmenttemplate small -o jsonpath='{.metadata.uid}')" != "$LOCAL_TEMPLATE_UID" || \
 	"$(kubectl get environmenttemplate small -o jsonpath='{.metadata.annotations.swe\.dev/catalog-revision}')" != "e2e-revision-2" || \
-	"$(kubectl get environmenttemplate small -o jsonpath='{.spec.idleTimeout}')" != "14m" || \
+	"$(kubectl get environmenttemplate small -o jsonpath='{.spec.idleTimeout}')" != "14m0s" || \
 	"$(kubectl get environment "$WARM_ENV_NAME" -o jsonpath='{.metadata.uid}')" != "$WARM_ENV_UID" ]]; then
 	echo "FAIL: explicit catalog sync did not preserve local Template/warm-pool identity while applying drift"
 	exit 1

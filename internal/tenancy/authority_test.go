@@ -199,6 +199,59 @@ func TestGuardedClientLeaseAndClaimChanges(t *testing.T) {
 	}
 }
 
+func TestGuardedClientLeaseBindsCompleteClaim(t *testing.T) {
+	tests := []struct {
+		name      string
+		lifecycle Lifecycle
+		mutate    func(client.Client, *corev1.Namespace, *platformv1alpha1.Project)
+	}{
+		{
+			name:      "project name and UID",
+			lifecycle: LifecycleActive,
+			mutate: func(c client.Client, namespace *corev1.Namespace, project *platformv1alpha1.Project) {
+				if err := c.Delete(context.Background(), project); err != nil {
+					t.Fatal(err)
+				}
+				replacement := &platformv1alpha1.Project{ObjectMeta: metav1.ObjectMeta{Name: "replacement", Namespace: "team", UID: "p-2"}}
+				if err := c.Create(context.Background(), replacement); err != nil {
+					t.Fatal(err)
+				}
+				namespace.Annotations[ProjectNameAnnotation] = replacement.Name
+				namespace.Annotations[ProjectUIDAnnotation] = string(replacement.UID)
+				if err := c.Update(context.Background(), namespace); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name:      "fencing operation",
+			lifecycle: LifecycleFencing,
+			mutate: func(c client.Client, namespace *corev1.Namespace, _ *platformv1alpha1.Project) {
+				namespace.Annotations[LifecycleOperationAnnotation] = OperationOnboarding
+				if err := c.Update(context.Background(), namespace); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			i, namespace, project := fixture(test.lifecycle)
+			v, c := verifier(t, i, namespace, project)
+			leased, _, err := (&ReconcileScope{Verifier: &v}).Begin(context.Background(), namespace.Name, test.lifecycle)
+			if err != nil {
+				t.Fatal(err)
+			}
+			test.mutate(c, namespace, project)
+			guarded := GuardedClient{Client: c, Verifier: &v}
+			err = guarded.Create(leased, &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: "stale-lease", Namespace: namespace.Name}})
+			if !errors.Is(err, ErrOutOfScope) {
+				t.Fatalf("changed claim accepted: %v", err)
+			}
+		})
+	}
+}
+
 func TestValidateManagedTemplateExactOwnership(t *testing.T) {
 	identity := InstallationIdentity{Key: types.NamespacedName{Namespace: "system", Name: "main"}, UID: "i-1"}
 	claim := Claim{NamespaceUID: "n-1", ProjectName: "app", ProjectUID: "p-1", Lifecycle: LifecycleActive}
