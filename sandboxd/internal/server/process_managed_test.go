@@ -159,6 +159,30 @@ func TestManagedServicesRouteRevisionOrdersSameIntentRevision(t *testing.T) {
 	s.Close()
 }
 
+func TestNewerManagedRevisionRestartsTerminalProcessDuringOldBackoff(t *testing.T) {
+	s := NewProcessServer(t.TempDir())
+	s.restartInitial = 10 * time.Second
+	request := &sandboxdv1.ReconcileManagedServicesRequest{OwnerId: "uid", IntentRevision: 1, Services: []*sandboxdv1.ManagedServiceSpec{{Role: "svc", Spec: &sandboxdv1.ProcessSpec{Argv: []string{filepath.Join(t.TempDir(), "missing")}}}}}
+	first, err := s.ReconcileManagedServices(context.Background(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	failed := first.Services[0].Process
+	if failed.State != sandboxdv1.ProcessState_PROCESS_STATE_FAILED {
+		t.Fatalf("first process = %#v, want failed", failed)
+	}
+	request.IntentRevision = 2
+	second, err := s.ReconcileManagedServices(context.Background(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	restarted := second.Services[0].Process
+	if restarted.State != sandboxdv1.ProcessState_PROCESS_STATE_FAILED || restarted.ExecutionId == failed.ExecutionId {
+		t.Fatalf("new revision did not replace failed execution: first=%#v second=%#v", failed, restarted)
+	}
+	s.Close()
+}
+
 func TestManagedServiceIntentRejectsOrdinaryAdmission(t *testing.T) {
 	s := NewProcessServer(t.TempDir())
 	marker := filepath.Join(t.TempDir(), "starts")
