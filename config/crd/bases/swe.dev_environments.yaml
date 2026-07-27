@@ -249,8 +249,8 @@ spec:
                       type: string
                     protocol:
                       description: |-
-                        EnvironmentServiceProtocol is the application protocol a future gateway
-                        may use for a declared service.
+                        EnvironmentServiceProtocol is the application protocol the portal gateway
+                        uses for a declared service.
                       enum:
                       - HTTP
                       type: string
@@ -282,8 +282,8 @@ spec:
                         rule: self != 50051
                     visibility:
                       description: |-
-                        EnvironmentServiceVisibility is the authorization scope a future gateway
-                        must enforce. Anonymous and public visibility are not supported.
+                        EnvironmentServiceVisibility is the authorization scope the portal gateway
+                        enforces. Anonymous and public visibility are not supported.
                       enum:
                       - Project
                       type: string

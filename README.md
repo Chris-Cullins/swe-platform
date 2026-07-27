@@ -206,9 +206,10 @@ use `update` for a real configuration change, which strictly increases its revis
 is idempotent durable desired-state removal, and renaming is remove plus declare. Logical
 identity is the Environment UID and service name, so conflict retries never mutate a same-name
 Environment replacement. A Project-less Environment retains declarations but receives no
-route. Future gateways must permanently revoke an old route generation on removal and assign a
-new generation on same-name re-add; this declaration API intentionally contains no route or URL
-fields.
+route. The control-plane gateway tombstones an old route generation on removal and assigns a
+new generation and locator on same-name re-add; declaration intent and advisory observations
+remain separate from gateway-owned `status.portalRoutes`, and declarations contain no route or
+URL input fields.
 
 Accepted work is cancelled only while that exact execution incarnation is securely
 reachable, or cleanup proceeds without an RPC after pause has removed its pod and
