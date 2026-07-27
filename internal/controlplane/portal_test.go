@@ -17,6 +17,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	platformv1alpha1 "github.com/Chris-Cullins/swe-platform/api/v1alpha1"
@@ -387,6 +388,50 @@ func TestPortalProxyWebSocketEcho(t *testing.T) {
 	kind, payload, err := conn.ReadMessage()
 	if err != nil || kind != websocket.TextMessage || string(payload) != "hello" {
 		t.Fatalf("echo = kind %d payload %q err %v", kind, payload, err)
+	}
+}
+
+func TestPortalAdmissionActivityRefreshesForCurrentExecution(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := platformv1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	environment := &platformv1alpha1.Environment{
+		ObjectMeta: metav1.ObjectMeta{Name: "env", Namespace: "ns", UID: "env-uid"},
+		Status: platformv1alpha1.EnvironmentStatus{
+			ExecutionGeneration: 1,
+			Lifecycle:           platformv1alpha1.EnvironmentLifecycleStatus{Epoch: 1, Suspended: true, SuspensionReason: platformv1alpha1.EnvironmentSuspensionReasonIdle},
+		},
+	}
+	resolver := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(environment).WithObjects(environment).Build()
+	gateway := &portalGateway{resolver: resolver, admissionHeartbeat: time.Millisecond}
+	next := time.Time{}
+	if err := gateway.recordAdmissionActivity(context.Background(), environment, &next); err != nil {
+		t.Fatal(err)
+	}
+	var current platformv1alpha1.Environment
+	if err := resolver.Get(context.Background(), client.ObjectKeyFromObject(environment), &current); err != nil {
+		t.Fatal(err)
+	}
+	first := lifecycle.ActivityRequests(&current)
+	if len(first) != 1 || first[0].Source != platformv1alpha1.EnvironmentActivitySourcePortal || first[0].ExecutionGeneration != 1 {
+		t.Fatalf("initial portal admission activity = %#v", first)
+	}
+	current.Status.ExecutionGeneration = 2
+	current.Status.Lifecycle.Suspended = false
+	if err := resolver.Status().Update(context.Background(), &current); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(2 * time.Millisecond)
+	if err := gateway.recordAdmissionActivity(context.Background(), &current, &next); err != nil {
+		t.Fatal(err)
+	}
+	if err := resolver.Get(context.Background(), client.ObjectKeyFromObject(environment), &current); err != nil {
+		t.Fatal(err)
+	}
+	refreshed := lifecycle.ActivityRequests(&current)
+	if len(refreshed) != 1 || refreshed[0].ExecutionGeneration != 2 || refreshed[0].ID == first[0].ID {
+		t.Fatalf("refreshed portal admission activity = %#v, first %#v", refreshed, first)
 	}
 }
 
