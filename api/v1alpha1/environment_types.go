@@ -651,6 +651,9 @@ func EffectiveEnvironmentBackend(environment *Environment, template *Environment
 // +kubebuilder:printcolumn:name="Phase",type=string,JSONPath=`.status.phase`
 // +kubebuilder:printcolumn:name="Template",type=string,JSONPath=`.spec.templateRef`
 // +kubebuilder:printcolumn:name="Age",type=date,JSONPath=`.metadata.creationTimestamp`
+// The first-publication transition guard is rooted here because oldSelf is not
+// available inside the optional status subtree when that entire subtree first appears.
+// +kubebuilder:validation:XValidation:rule="!has(self.status) || !has(self.status.provisioning) || (has(oldSelf.status) && has(oldSelf.status.provisioning)) || (!self.status.provisioning.templateVerified && !self.status.provisioning.projectVerified)",message="initial provisioning snapshot must be unverified"
 
 // Environment is one ephemeral machine an agent works in.
 type Environment struct {

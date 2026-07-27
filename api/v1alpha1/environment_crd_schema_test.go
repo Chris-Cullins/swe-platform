@@ -142,6 +142,17 @@ func TestGeneratedEnvironmentSelectorTransitions(t *testing.T) {
 		}
 	}
 	t.Run("provisioning initial add", func(t *testing.T) { transition(t, nil, provisioning, true) })
+	t.Run("provisioning rejects initially template-verified snapshot", func(t *testing.T) {
+		next := runtime.DeepCopyJSONValue(provisioning).(map[string]interface{})
+		next["templateVerified"] = true
+		transition(t, nil, next, false)
+	})
+	t.Run("provisioning rejects initially project-verified snapshot", func(t *testing.T) {
+		next := runtime.DeepCopyJSONValue(provisioning).(map[string]interface{})
+		next["project"] = map[string]interface{}{"name": "project", "uid": "project-uid", "generation": int64(1), "repository": "https://example.test/repo"}
+		next["projectVerified"] = true
+		transition(t, nil, next, false)
+	})
 	t.Run("provisioning template verification", func(t *testing.T) {
 		next := runtime.DeepCopyJSONValue(provisioning).(map[string]interface{})
 		next["templateVerified"] = true

@@ -108,6 +108,13 @@ func (c GuardedClient) authorizeFence(ctx context.Context, obj client.Object, st
 	if claim != lease.claim {
 		return fmt.Errorf("%w: Namespace %q claim changed during fence", ErrOutOfScope, lease.namespace)
 	}
+	projectErr := c.Verifier.verifyProjectClaim(ctx, lease.namespace, claim)
+	if projectErr == nil {
+		return fmt.Errorf("%w: Project claim recovered during fence", ErrOutOfScope)
+	}
+	if !errors.Is(projectErr, ErrOutOfScope) {
+		return projectErr
+	}
 	if status {
 		env, ok := obj.(*platformv1alpha1.Environment)
 		if !ok || env.Name != lease.environmentName || env.UID != lease.environmentUID {
