@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
+	"errors"
 	"fmt"
 	"net"
 	"reflect"
@@ -26,6 +27,8 @@ import (
 
 const sandboxdPort = "50051"
 const executionGenerationAnnotation = "swe.dev/execution-generation"
+
+var errProvisioningSourcesChanged = errors.New("environment provisioning sources changed")
 
 // Connector is the single Kubernetes resolution boundary for authenticated
 // sandboxd connections. Consumers identify an Environment and capability; they
@@ -110,7 +113,10 @@ func (c Connector) ExecutionCurrent(ctx context.Context, fence lifecycle.Executi
 		return false, nil
 	}
 	if err := c.validateProvisioningSources(ctx, env); err != nil {
-		return false, nil
+		if errors.Is(err, errProvisioningSourcesChanged) {
+			return false, nil
+		}
+		return false, err
 	}
 	var pod corev1.Pod
 	if err := c.Reader.Get(ctx, types.NamespacedName{Namespace: env.Namespace, Name: execution.podName}, &pod); apierrors.IsNotFound(err) {
@@ -297,23 +303,29 @@ func (c Connector) resolvePodForEnvironment(ctx context.Context, env *platformv1
 
 func (c Connector) validateProvisioningSources(ctx context.Context, env *platformv1alpha1.Environment) error {
 	if err := platformv1alpha1.ValidateEnvironmentProvisioningSnapshot(env, env.Status.Provisioning); err != nil {
-		return err
+		return fmt.Errorf("%w: %v", errProvisioningSourcesChanged, err)
 	}
 	snapshot := env.Status.Provisioning
 	var template platformv1alpha1.EnvironmentTemplate
 	if err := c.Reader.Get(ctx, types.NamespacedName{Namespace: env.Namespace, Name: snapshot.Template.Name}, &template); err != nil {
+		if apierrors.IsNotFound(err) {
+			return fmt.Errorf("%w: snapshotted environment template no longer exists", errProvisioningSourcesChanged)
+		}
 		return fmt.Errorf("get snapshotted environment template: %w", err)
 	}
 	if template.UID != snapshot.Template.UID || !template.DeletionTimestamp.IsZero() {
-		return fmt.Errorf("snapshotted environment template is not the current live incarnation")
+		return fmt.Errorf("%w: snapshotted environment template is not the current live incarnation", errProvisioningSourcesChanged)
 	}
 	if snapshot.Project != nil {
 		var project platformv1alpha1.Project
 		if err := c.Reader.Get(ctx, types.NamespacedName{Namespace: env.Namespace, Name: snapshot.Project.Name}, &project); err != nil {
+			if apierrors.IsNotFound(err) {
+				return fmt.Errorf("%w: snapshotted project no longer exists", errProvisioningSourcesChanged)
+			}
 			return fmt.Errorf("get snapshotted project: %w", err)
 		}
 		if project.UID != snapshot.Project.UID || !project.DeletionTimestamp.IsZero() {
-			return fmt.Errorf("snapshotted project is not the current live incarnation")
+			return fmt.Errorf("%w: snapshotted project is not the current live incarnation", errProvisioningSourcesChanged)
 		}
 	}
 	return nil
