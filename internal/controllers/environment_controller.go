@@ -813,7 +813,8 @@ func (r *EnvironmentReconciler) currentSandboxdPod(ctx context.Context, env *pla
 		pod.UID != "" && secret.Annotations[sandboxdauth.PodUIDAnnotation] == string(pod.UID) &&
 		len(secret.Data[sandboxdauth.TLSCertKey]) > 0 && len(secret.Data[sandboxdauth.TLSKeyKey]) > 0 &&
 		len(secret.Data[sandboxdauth.CapabilitiesKey]) > 0 && len(secret.Data[sandboxdauth.HealthTokenKey]) > 0 &&
-		len(secret.Data[sandboxdauth.ProcessTokenKey]) > 0 && len(secret.Data[sandboxdauth.ServiceObservationTokenKey]) > 0 && len(secret.Data[sandboxdauth.PortalTokenKey]) > 0, nil
+		len(secret.Data[sandboxdauth.ProcessTokenKey]) > 0 && len(secret.Data[sandboxdauth.FilesystemTokenKey]) > 0 &&
+		len(secret.Data[sandboxdauth.ServiceObservationTokenKey]) > 0 && len(secret.Data[sandboxdauth.PortalTokenKey]) > 0, nil
 }
 
 func (r *EnvironmentReconciler) rotateSandboxdCredentials(ctx context.Context, env *platformv1alpha1.Environment) (string, []byte, string, error) {
@@ -838,6 +839,10 @@ func (r *EnvironmentReconciler) rotateSandboxdCredentials(ctx context.Context, e
 	if err != nil {
 		return "", nil, "", err
 	}
+	filesystemToken, err := randomCredential(32)
+	if err != nil {
+		return "", nil, "", err
+	}
 	observationToken, err := randomCredential(32)
 	if err != nil {
 		return "", nil, "", err
@@ -850,6 +855,7 @@ func (r *EnvironmentReconciler) rotateSandboxdCredentials(ctx context.Context, e
 		{TokenHash: sandboxdauth.TokenVerifier(terminalToken), Capabilities: []sandboxdauth.Capability{sandboxdauth.CapabilityHealth, sandboxdauth.CapabilityTerminal}},
 		{TokenHash: sandboxdauth.TokenVerifier(healthToken), Capabilities: []sandboxdauth.Capability{sandboxdauth.CapabilityHealth}},
 		{TokenHash: sandboxdauth.TokenVerifier(processToken), Capabilities: []sandboxdauth.Capability{sandboxdauth.CapabilityProcess}},
+		{TokenHash: sandboxdauth.TokenVerifier(filesystemToken), Capabilities: []sandboxdauth.Capability{sandboxdauth.CapabilityFilesystem}},
 		{TokenHash: sandboxdauth.TokenVerifier(observationToken), Capabilities: []sandboxdauth.Capability{sandboxdauth.CapabilityServiceObservation}},
 		{TokenHash: sandboxdauth.TokenVerifier(portalToken), Capabilities: []sandboxdauth.Capability{sandboxdauth.CapabilityPortal}},
 	}})
@@ -865,7 +871,7 @@ func (r *EnvironmentReconciler) rotateSandboxdCredentials(ctx context.Context, e
 		if err := controllerutil.SetControllerReference(env, &secret, r.Scheme); err != nil {
 			return "", nil, "", err
 		}
-		secret.Data = sandboxdCredentialData(certificate, privateKey, capabilities, healthToken, processToken, observationToken, portalToken)
+		secret.Data = sandboxdCredentialData(certificate, privateKey, capabilities, healthToken, processToken, filesystemToken, observationToken, portalToken)
 		secret.Annotations = map[string]string{sandboxdauth.IdentityAnnotation: serverName}
 		if err := r.Create(ctx, &secret); err != nil {
 			return "", nil, "", collisionOnAlreadyExists(err, "Secret", key.Name)
@@ -876,7 +882,7 @@ func (r *EnvironmentReconciler) rotateSandboxdCredentials(ctx context.Context, e
 		if !exactControllerOwner(&secret, platformv1alpha1.GroupVersion.String(), "Environment", env.Name, env.UID) {
 			return "", nil, "", &childOwnershipCollisionError{kind: "Secret", name: secret.Name}
 		}
-		secret.Data = sandboxdCredentialData(certificate, privateKey, capabilities, healthToken, processToken, observationToken, portalToken)
+		secret.Data = sandboxdCredentialData(certificate, privateKey, capabilities, healthToken, processToken, filesystemToken, observationToken, portalToken)
 		if secret.Annotations == nil {
 			secret.Annotations = map[string]string{}
 		}
@@ -888,13 +894,14 @@ func (r *EnvironmentReconciler) rotateSandboxdCredentials(ctx context.Context, e
 	return serverName, certificate, terminalToken, nil
 }
 
-func sandboxdCredentialData(certificate, privateKey, capabilities []byte, healthToken, processToken, observationToken, portalToken string) map[string][]byte {
+func sandboxdCredentialData(certificate, privateKey, capabilities []byte, healthToken, processToken, filesystemToken, observationToken, portalToken string) map[string][]byte {
 	return map[string][]byte{
 		sandboxdauth.TLSCertKey:                 certificate,
 		sandboxdauth.TLSKeyKey:                  privateKey,
 		sandboxdauth.CapabilitiesKey:            capabilities,
 		sandboxdauth.HealthTokenKey:             []byte(healthToken),
 		sandboxdauth.ProcessTokenKey:            []byte(processToken),
+		sandboxdauth.FilesystemTokenKey:         []byte(filesystemToken),
 		sandboxdauth.ServiceObservationTokenKey: []byte(observationToken),
 		sandboxdauth.PortalTokenKey:             []byte(portalToken),
 	}

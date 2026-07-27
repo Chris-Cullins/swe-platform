@@ -57,10 +57,12 @@ type portalGateway struct {
 }
 
 type PortalRoute struct {
-	URL            string `json:"url"`
-	EnvironmentUID string `json:"environmentUID"`
-	Service        string `json:"service"`
-	Revision       int64  `json:"revision"`
+	URL                   string `json:"url"`
+	EnvironmentUID        string `json:"environmentUID"`
+	Service               string `json:"service"`
+	Revision              int64  `json:"revision"`
+	DeclarationInstanceID string `json:"declarationInstanceID"`
+	RouteGeneration       int64  `json:"routeGeneration"`
 }
 
 func newPortalGateway(s *Server, o ServerOptions) *portalGateway {
@@ -237,7 +239,7 @@ func (g *portalGateway) discover(w http.ResponseWriter, r *http.Request, ns, nam
 				return
 			}
 		}
-		writeJSON(w, http.StatusOK, PortalRoute{URL: fmt.Sprintf("%s://%s.%s", g.scheme, route.Locator, g.suffix), EnvironmentUID: string(env.UID), Service: service, Revision: decl.Revision})
+		writeJSON(w, http.StatusOK, PortalRoute{URL: fmt.Sprintf("%s://%s.%s", g.scheme, route.Locator, g.suffix), EnvironmentUID: string(env.UID), Service: service, Revision: decl.Revision, DeclarationInstanceID: decl.InstanceID, RouteGeneration: route.Generation})
 		return
 	}
 	writeProblem(w, 409, "conflict", "Conflict", "portal route changed concurrently")
