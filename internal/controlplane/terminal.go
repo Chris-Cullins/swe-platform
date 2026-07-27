@@ -54,6 +54,7 @@ type KubernetesTerminalDialer struct {
 	Client             client.Client
 	Metrics            *Metrics
 	policyPollInterval time.Duration
+	beforeLeaseAttach  func(*terminalConnectionLease)
 }
 
 type activeTerminalConnection struct {
@@ -204,28 +205,34 @@ func (d KubernetesTerminalDialer) dialTerminal(ctx context.Context, namespace, n
 	}
 	executionFence = lifecycle.CaptureExecutionFence(&environment)
 	terminal, health, execution, closeConnection, err := (sandboxclient.Connector{Reader: d.Client}).DialTerminal(ctx, executionFence)
-	if d.Metrics != nil {
-		outcome := "granted"
-		if err != nil {
-			outcome = "failed"
-		}
-		d.Metrics.terminalLeaseGrants.WithLabelValues(outcome).Inc()
-	}
 	if err != nil {
+		d.observeTerminalLeaseGrant("failed")
 		return nil, nil, nil, fmt.Errorf("connect to sandboxd: %w", err)
 	}
 	if association != nil {
 		if err := d.validateRunTerminalAssociation(ctx, namespace, association, nil); err != nil {
 			closeConnection()
+			d.observeTerminalLeaseGrant("failed")
 			return nil, nil, nil, err
 		}
 	}
+	if d.beforeLeaseAttach != nil {
+		d.beforeLeaseAttach(connectionLease)
+	}
 	if !connectionLease.attach(closeFunc(closeConnection), execution, executionFence) {
+		d.observeTerminalLeaseGrant("failed")
 		return nil, nil, nil, fmt.Errorf("environment became explicitly held while opening terminal")
 	}
+	d.observeTerminalLeaseGrant("granted")
 	closer := &activeTerminalConnection{Closer: connectionLease, cancel: cancelHeartbeat}
 	heartbeatTransferred = true
 	return terminal, health, closer, nil
+}
+
+func (d KubernetesTerminalDialer) observeTerminalLeaseGrant(outcome string) {
+	if d.Metrics != nil {
+		d.Metrics.terminalLeaseGrants.WithLabelValues(outcome).Inc()
+	}
 }
 
 func terminalAccessPolicyError(environment *platformv1alpha1.Environment) error {
