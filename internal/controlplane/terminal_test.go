@@ -29,6 +29,7 @@ import (
 	"google.golang.org/grpc/test/bufconn"
 	corev1 "k8s.io/api/core/v1"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -600,7 +601,7 @@ func TestTerminalPolicyRetriesDisabledHoldRevisionRacingExecutionProof(t *testin
 	}
 	applyReadyTerminalStatus(environment, "env-env-1")
 	pod := currentExecutionPod(environment, "pod-uid")
-	template := &platformv1alpha1.EnvironmentTemplate{ObjectMeta: metav1.ObjectMeta{Name: "default", Namespace: environment.Namespace}}
+	template := &platformv1alpha1.EnvironmentTemplate{ObjectMeta: metav1.ObjectMeta{Name: "default", Namespace: environment.Namespace, UID: "template-uid", Generation: 1}}
 	baseClient := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(environment).WithObjects(environment, pod, template).Build()
 	execution, err := (sandboxclient.Connector{Reader: baseClient}).ResolveExecution(context.Background(), lifecycle.CaptureExecutionFence(environment))
 	if err != nil {
@@ -661,7 +662,7 @@ func TestTerminalHoldRefreshRevalidatesBoundExecution(t *testing.T) {
 	}
 	applyReadyTerminalStatus(environment, "env-env-1")
 	pod := currentExecutionPod(environment, "pod-uid")
-	template := &platformv1alpha1.EnvironmentTemplate{ObjectMeta: metav1.ObjectMeta{Name: "default", Namespace: environment.Namespace}}
+	template := &platformv1alpha1.EnvironmentTemplate{ObjectMeta: metav1.ObjectMeta{Name: "default", Namespace: environment.Namespace, UID: "template-uid", Generation: 1}}
 	baseClient := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(environment).WithObjects(environment, pod, template).Build()
 	execution, err := (sandboxclient.Connector{Reader: baseClient}).ResolveExecution(context.Background(), lifecycle.CaptureExecutionFence(environment))
 	if err != nil {
@@ -1001,7 +1002,7 @@ func TestTerminalHeartbeatRevokesConnectionWhenBoundExecutionChanges(t *testing.
 			}
 			applyReadyTerminalStatus(environment, "env-env-1")
 			pod := currentExecutionPod(environment, "pod-uid-1")
-			template := &platformv1alpha1.EnvironmentTemplate{ObjectMeta: metav1.ObjectMeta{Name: "default", Namespace: environment.Namespace}}
+			template := &platformv1alpha1.EnvironmentTemplate{ObjectMeta: metav1.ObjectMeta{Name: "default", Namespace: environment.Namespace, UID: "template-uid", Generation: 1}}
 			baseClient := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(environment).WithObjects(environment, pod, template).Build()
 			kubeClient := &activityCountingClient{Client: baseClient}
 			// Delay the ordinary policy poll so only the activity timer's
@@ -1110,7 +1111,7 @@ func TestTerminalExecutionPolicyPollRetriesTransientPodRead(t *testing.T) {
 	}
 	applyReadyTerminalStatus(environment, "env-env-1")
 	pod := currentExecutionPod(environment, "pod-uid")
-	template := &platformv1alpha1.EnvironmentTemplate{ObjectMeta: metav1.ObjectMeta{Name: "default", Namespace: environment.Namespace}}
+	template := &platformv1alpha1.EnvironmentTemplate{ObjectMeta: metav1.ObjectMeta{Name: "default", Namespace: environment.Namespace, UID: "template-uid", Generation: 1}}
 	baseClient := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(environment).WithObjects(environment, pod, template).Build()
 	failed := make(chan struct{}, 1)
 	kubeClient := &transientPodGetClient{Client: baseClient, failures: 1, failed: failed}
@@ -1486,7 +1487,7 @@ func TestKubernetesTerminalDialerCountsOnlyAttachedLeaseAsGranted(t *testing.T) 
 			Status:     platformv1alpha1.EnvironmentStatus{ClaimedBy: &platformv1alpha1.RunReference{Name: run.Name, UID: run.UID}},
 		}
 		applyReadyTerminalStatus(environment, "env-pod")
-		template := &platformv1alpha1.EnvironmentTemplate{ObjectMeta: metav1.ObjectMeta{Name: "default", Namespace: environment.Namespace}}
+		template := &platformv1alpha1.EnvironmentTemplate{ObjectMeta: metav1.ObjectMeta{Name: "default", Namespace: environment.Namespace, UID: "template-uid", Generation: 1}}
 		pod := &corev1.Pod{
 			ObjectMeta: metav1.ObjectMeta{
 				Name: "env-pod", Namespace: environment.Namespace, UID: "pod-uid",
@@ -1591,7 +1592,7 @@ func TestKubernetesTerminalDialerActivityPreservesReadyGeneration(t *testing.T) 
 		Spec:       platformv1alpha1.EnvironmentSpec{TemplateRef: "default"},
 	}
 	applyReadyTerminalStatus(environment, "env-pod")
-	template := &platformv1alpha1.EnvironmentTemplate{ObjectMeta: metav1.ObjectMeta{Name: "default", Namespace: environment.Namespace}}
+	template := &platformv1alpha1.EnvironmentTemplate{ObjectMeta: metav1.ObjectMeta{Name: "default", Namespace: environment.Namespace, UID: "template-uid", Generation: 1}}
 	pod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: "env-pod", Namespace: environment.Namespace, UID: "pod-uid",
@@ -1649,8 +1650,9 @@ func TestKubernetesTerminalDialerUsesRecreatedPodCredentialsAfterWake(t *testing
 			Lifecycle: platformv1alpha1.EnvironmentLifecycleStatus{Suspended: true, SuspensionReason: platformv1alpha1.EnvironmentSuspensionReasonIdle, Epoch: 1},
 		},
 	}
+	environment.Status.Provisioning = terminalTestProvisioning(environment)
 	template := &platformv1alpha1.EnvironmentTemplate{
-		ObjectMeta: metav1.ObjectMeta{Name: "default", Namespace: environment.Namespace},
+		ObjectMeta: metav1.ObjectMeta{Name: "default", Namespace: environment.Namespace, UID: "template-uid", Generation: 1},
 	}
 	newPod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
@@ -1714,8 +1716,9 @@ func TestTerminalHeartbeatProtectsSlowWakeBeforeConnection(t *testing.T) {
 		Spec:       platformv1alpha1.EnvironmentSpec{TemplateRef: "default"},
 		Status:     platformv1alpha1.EnvironmentStatus{ExecutionGeneration: 1, Phase: platformv1alpha1.EnvironmentPhasePaused, Lifecycle: platformv1alpha1.EnvironmentLifecycleStatus{Suspended: true, SuspensionReason: platformv1alpha1.EnvironmentSuspensionReasonIdle, Epoch: 1}},
 	}
+	environment.Status.Provisioning = terminalTestProvisioning(environment)
 	template := &platformv1alpha1.EnvironmentTemplate{
-		ObjectMeta: metav1.ObjectMeta{Name: "default", Namespace: environment.Namespace},
+		ObjectMeta: metav1.ObjectMeta{Name: "default", Namespace: environment.Namespace, UID: "template-uid", Generation: 1},
 		Spec:       platformv1alpha1.EnvironmentTemplateSpec{IdleTimeout: &metav1.Duration{Duration: 40 * time.Millisecond}},
 	}
 	pod := &corev1.Pod{
@@ -1782,7 +1785,7 @@ func TestTerminalHeartbeatCancelsWhenWakeOrDialFails(t *testing.T) {
 			} else {
 				applyReadyTerminalStatus(environment, "missing-pod")
 			}
-			template := &platformv1alpha1.EnvironmentTemplate{ObjectMeta: metav1.ObjectMeta{Name: "default", Namespace: environment.Namespace}, Spec: platformv1alpha1.EnvironmentTemplateSpec{IdleTimeout: &metav1.Duration{Duration: 40 * time.Millisecond}}}
+			template := &platformv1alpha1.EnvironmentTemplate{ObjectMeta: metav1.ObjectMeta{Name: "default", Namespace: environment.Namespace, UID: "template-uid", Generation: 1}, Spec: platformv1alpha1.EnvironmentTemplateSpec{IdleTimeout: &metav1.Duration{Duration: 40 * time.Millisecond}}}
 			baseClient := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(environment).WithObjects(environment, template).Build()
 			activityClient := &activityCountingClient{Client: baseClient}
 			var kubeClient client.Client = activityClient
@@ -1910,6 +1913,7 @@ func (*failingWakeClient) Patch(context.Context, client.Object, client.Patch, ..
 }
 
 func applyReadyTerminalStatus(environment *platformv1alpha1.Environment, podName string) {
+	environment.Status.Provisioning = terminalTestProvisioning(environment)
 	environment.Status.ExecutionGeneration = 1
 	environment.Status.Phase = platformv1alpha1.EnvironmentPhaseReady
 	environment.Status.Lifecycle.Suspended = false
@@ -1921,6 +1925,15 @@ func applyReadyTerminalStatus(environment *platformv1alpha1.Environment, podName
 		Type: platformv1alpha1.EnvironmentConditionReady, Status: metav1.ConditionTrue,
 		ObservedGeneration: environment.Generation, Reason: "SandboxdReady", Message: "sandboxd is ready",
 	})
+}
+
+func terminalTestProvisioning(environment *platformv1alpha1.Environment) *platformv1alpha1.EnvironmentProvisioningSnapshot {
+	return &platformv1alpha1.EnvironmentProvisioningSnapshot{
+		Template: platformv1alpha1.EnvironmentProvisioningTemplate{Name: environment.Spec.TemplateRef, UID: "template-uid", Generation: 1},
+		Backend:  platformv1alpha1.EnvironmentBackendPod, Image: "test", Size: "tiny",
+		Resources: map[string]resource.Quantity{"cpu": resource.MustParse("1"), "memory": resource.MustParse("2Gi")},
+		DiskSize:  resource.MustParse("1Gi"), TemplateVerified: true,
+	}
 }
 
 func currentExecutionPod(environment *platformv1alpha1.Environment, uid types.UID) *corev1.Pod {
@@ -2135,6 +2148,7 @@ func TestKubernetesTerminalDialerRejectsPodOwnedByAnotherEnvironmentIncarnation(
 			Conditions: []metav1.Condition{{Type: platformv1alpha1.EnvironmentConditionReady, Status: metav1.ConditionTrue, Reason: "SandboxdReady", Message: "sandboxd is ready"}},
 		},
 	}
+	environment.Status.Provisioning = terminalTestProvisioning(environment)
 	pod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: "env-env-1", Namespace: "project-1",
@@ -2144,7 +2158,7 @@ func TestKubernetesTerminalDialerRejectsPodOwnedByAnotherEnvironmentIncarnation(
 		},
 		Status: corev1.PodStatus{PodIP: "192.0.2.10"},
 	}
-	template := &platformv1alpha1.EnvironmentTemplate{ObjectMeta: metav1.ObjectMeta{Name: "default", Namespace: "project-1"}}
+	template := &platformv1alpha1.EnvironmentTemplate{ObjectMeta: metav1.ObjectMeta{Name: "default", Namespace: "project-1", UID: "template-uid", Generation: 1}}
 	dialer := KubernetesTerminalDialer{Client: fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(environment).WithObjects(environment, pod, template).Build()}
 
 	_, _, _, err := dialer.DialTerminal(context.Background(), "project-1", "env-1", string(environment.UID))

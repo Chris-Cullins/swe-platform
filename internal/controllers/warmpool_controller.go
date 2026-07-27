@@ -102,7 +102,7 @@ func (r *WarmPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 	ready := int32(0)
 	for i := range environments.Items {
 		env := &environments.Items[i]
-		if warmPoolMember(env, &tmpl) && platformv1alpha1.IsEnvironmentReady(env) && env.Status.ClaimedBy == nil {
+		if warmPoolMemberCurrent(env, &tmpl) && platformv1alpha1.IsEnvironmentReady(env) && env.Status.ClaimedBy == nil {
 			ready++
 		}
 	}
@@ -131,7 +131,7 @@ func (r *WarmPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 			continue
 		}
 		statusCurrent := env.Status.ObservedGeneration == env.Generation
-		if environmentSuspended(env) || statusCurrent && (env.Status.Phase == platformv1alpha1.EnvironmentPhaseFailed || env.Status.Phase == platformv1alpha1.EnvironmentPhaseTerminated) {
+		if !warmPoolMemberCurrent(env, &tmpl) || environmentSuspended(env) || statusCurrent && (env.Status.Phase == platformv1alpha1.EnvironmentPhaseFailed || env.Status.Phase == platformv1alpha1.EnvironmentPhaseTerminated) {
 			quarantined++
 			unusableSince, marked := warmPoolUnusableSince(env)
 			if !marked || unusableSince.After(now) {
@@ -216,6 +216,20 @@ func (r *WarmPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 		if err := r.Create(ctx, env); err != nil {
 			return ctrl.Result{}, fmt.Errorf("create warm environment: %w", err)
 		}
+		if current, err := r.templateCurrent(ctx, &tmpl); err != nil {
+			return ctrl.Result{}, err
+		} else if !current {
+			var created platformv1alpha1.Environment
+			if err := reader.Get(ctx, client.ObjectKeyFromObject(env), &created); err != nil && !apierrors.IsNotFound(err) {
+				return ctrl.Result{}, fmt.Errorf("re-read stale warm environment: %w", err)
+			} else if err == nil {
+				uid, resourceVersion := created.UID, created.ResourceVersion
+				if err := r.Delete(ctx, &created, client.Preconditions{UID: &uid, ResourceVersion: &resourceVersion}); err != nil && !apierrors.IsNotFound(err) && !apierrors.IsConflict(err) {
+					return ctrl.Result{}, fmt.Errorf("delete stale warm environment: %w", err)
+				}
+			}
+			return ctrl.Result{Requeue: true}, nil
+		}
 		active = append(active, env)
 	}
 
@@ -252,6 +266,10 @@ func (r *WarmPoolReconciler) now() time.Time {
 func warmPoolMember(env *platformv1alpha1.Environment, tmpl *platformv1alpha1.EnvironmentTemplate) bool {
 	return env.Labels[warmPoolLabel] == tmpl.Name && env.Spec.TemplateRef == tmpl.Name &&
 		exactControllerOwner(env, platformv1alpha1.GroupVersion.String(), "EnvironmentTemplate", tmpl.Name, tmpl.UID)
+}
+
+func warmPoolMemberCurrent(env *platformv1alpha1.Environment, tmpl *platformv1alpha1.EnvironmentTemplate) bool {
+	return warmPoolMember(env, tmpl) && env.Spec.ProjectRef == "" && platformv1alpha1.ProvisioningSnapshotCurrentTemplate(env.Status.Provisioning, tmpl)
 }
 
 func warmPoolUnusableSince(env *platformv1alpha1.Environment) (time.Time, bool) {

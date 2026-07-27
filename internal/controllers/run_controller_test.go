@@ -177,6 +177,11 @@ func reconciler(t *testing.T, adapter agent.AdapterLifecycle, objects ...client.
 			}
 			env.Status.ExecutionGeneration = 1
 			applyEnvironmentStatus(env, env.Status.Phase, env.Status.PodName, env.Status.Endpoints.Sandboxd, "SandboxdReady", "sandboxd is ready", env.Status.LastActiveAt)
+			for _, candidate := range objects {
+				if tmpl, ok := candidate.(*platformv1alpha1.EnvironmentTemplate); ok && tmpl.Name == env.Spec.TemplateRef && tmpl.Namespace == env.Namespace && env.Labels[warmPoolLabel] != "" {
+					setTestProvisioningSnapshot(env, tmpl, nil)
+				}
+			}
 		}
 	}
 	// Most lifecycle tests predate the ownership/endpoint security fences. Give
@@ -211,9 +216,21 @@ func reconciler(t *testing.T, adapter agent.AdapterLifecycle, objects ...client.
 			continue
 		}
 		key := types.NamespacedName{Namespace: env.Namespace, Name: env.Spec.TemplateRef}
+		var template *platformv1alpha1.EnvironmentTemplate
 		if !templates[key] {
-			objects = append(objects, &platformv1alpha1.EnvironmentTemplate{ObjectMeta: metav1.ObjectMeta{Name: key.Name, Namespace: key.Namespace}})
+			template = &platformv1alpha1.EnvironmentTemplate{ObjectMeta: metav1.ObjectMeta{Name: key.Name, Namespace: key.Namespace, UID: types.UID(key.Name + "-uid"), Generation: 1}, Spec: platformv1alpha1.EnvironmentTemplateSpec{Image: "test/image", Size: "small"}}
+			objects = append(objects, template)
 			templates[key] = true
+		} else {
+			for _, candidate := range objects {
+				if current, ok := candidate.(*platformv1alpha1.EnvironmentTemplate); ok && current.Name == key.Name && current.Namespace == key.Namespace {
+					template = current
+					break
+				}
+			}
+		}
+		if template != nil {
+			setTestProvisioningSnapshot(env, template, nil)
 		}
 		objects = append(objects, runExecutionPod(env, types.UID("pod-"+env.Name), "10.0.0.1"))
 	}
@@ -2297,7 +2314,7 @@ func TestMissedPauseTransitionReacceptsFreshEnvironmentEpoch(t *testing.T) {
 				t.Fatal(err)
 			}
 			livePod := runExecutionPod(&currentEnv, "pod-e-1", "10.0.0.2")
-			template := &platformv1alpha1.EnvironmentTemplate{ObjectMeta: metav1.ObjectMeta{Name: currentEnv.Spec.TemplateRef, Namespace: currentEnv.Namespace}}
+			template := &platformv1alpha1.EnvironmentTemplate{ObjectMeta: metav1.ObjectMeta{Name: currentEnv.Spec.TemplateRef, Namespace: currentEnv.Namespace, UID: currentEnv.Status.Provisioning.Template.UID, Generation: currentEnv.Status.Provisioning.Template.Generation}}
 			r.APIReader = fake.NewClientBuilder().WithScheme(r.Scheme).WithObjects(currentEnv.DeepCopy(), template, livePod, profile.DeepCopy(), rotatedSecret).Build()
 
 			fenced := reconcileRun(t, r, run.Name)

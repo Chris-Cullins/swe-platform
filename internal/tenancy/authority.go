@@ -124,6 +124,20 @@ func (v Verifier) VerifyInstallation(ctx context.Context) error {
 }
 
 func (v Verifier) VerifyNamespace(ctx context.Context, namespace string) (Claim, error) {
+	claim, err := v.verifyNamespaceIdentity(ctx, namespace)
+	if err != nil {
+		return Claim{}, err
+	}
+	if err := v.verifyProjectClaim(ctx, namespace, claim); err != nil {
+		return Claim{}, err
+	}
+	return claim, nil
+}
+
+// verifyNamespaceIdentity validates the installation-owned namespace identity
+// and its complete, internally valid annotated Project claim. It intentionally
+// does not establish that the claimed Project object still exists.
+func (v Verifier) verifyNamespaceIdentity(ctx context.Context, namespace string) (Claim, error) {
 	if err := v.VerifyInstallation(ctx); err != nil {
 		return Claim{}, err
 	}
@@ -165,14 +179,22 @@ func (v Verifier) VerifyNamespace(ctx context.Context, namespace string) (Claim,
 	default:
 		return Claim{}, fmt.Errorf("%w: Namespace %q has invalid lifecycle %q", ErrOutOfScope, namespace, claim.Lifecycle)
 	}
+	return claim, nil
+}
+
+// verifyProjectClaim proves that the annotated identity is the sole live
+// Project incarnation in the namespace. Reader failures remain distinguishable
+// from an invalid claim so callers can never turn transient failures into
+// authority.
+func (v Verifier) verifyProjectClaim(ctx context.Context, namespace string, claim Claim) error {
 	var projects platformv1alpha1.ProjectList
 	if err := v.Reader.List(ctx, &projects, client.InNamespace(namespace)); err != nil {
-		return Claim{}, fmt.Errorf("list Projects in Namespace %q: %w", namespace, err)
+		return fmt.Errorf("list Projects in Namespace %q: %w", namespace, err)
 	}
 	if len(projects.Items) != 1 || projects.Items[0].Name != claim.ProjectName || projects.Items[0].UID != claim.ProjectUID || !projects.Items[0].DeletionTimestamp.IsZero() {
-		return Claim{}, fmt.Errorf("%w: Namespace %q must contain exactly Project %s (%s)", ErrOutOfScope, namespace, claim.ProjectName, claim.ProjectUID)
+		return fmt.Errorf("%w: Namespace %q must contain exactly Project %s (%s)", ErrOutOfScope, namespace, claim.ProjectName, claim.ProjectUID)
 	}
-	return claim, nil
+	return nil
 }
 
 func (v Verifier) ValidateConfiguredNamespaces(ctx context.Context, namespaces []string) error {

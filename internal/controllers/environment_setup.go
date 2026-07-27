@@ -35,12 +35,12 @@ func environmentProjectRefIndex(object client.Object) []string {
 	return []string{environment.Spec.ProjectRef}
 }
 
-func templateRuntimeClassIndex(object client.Object) []string {
-	template := object.(*platformv1alpha1.EnvironmentTemplate)
-	if template.Spec.RuntimeClass == "" {
+func environmentRuntimeClassIndex(object client.Object) []string {
+	environment := object.(*platformv1alpha1.Environment)
+	if environment.Status.Provisioning == nil || environment.Status.Provisioning.RuntimeClassName == "" {
 		return nil
 	}
-	return []string{template.Spec.RuntimeClass}
+	return []string{environment.Status.Provisioning.RuntimeClassName}
 }
 
 func (r *EnvironmentReconciler) environmentReferenceRequests(ctx context.Context, namespace, field, name string) []reconcile.Request {
@@ -57,15 +57,14 @@ func (r *EnvironmentReconciler) environmentReferenceRequests(ctx context.Context
 }
 
 func (r *EnvironmentReconciler) runtimeClassReferenceRequests(ctx context.Context, name string) []reconcile.Request {
-	var templates platformv1alpha1.EnvironmentTemplateList
-	if err := r.List(ctx, &templates, client.MatchingFields{runtimeClassField: name}); err != nil {
-		log.FromContext(ctx).Error(err, "list templates for RuntimeClass", "runtimeClass", name)
+	var environments platformv1alpha1.EnvironmentList
+	if err := r.List(ctx, &environments, client.MatchingFields{provisioningRuntimeClassField: name}); err != nil {
+		log.FromContext(ctx).Error(err, "list environments for RuntimeClass", "runtimeClass", name)
 		return nil
 	}
-	var requests []reconcile.Request
-	for i := range templates.Items {
-		template := &templates.Items[i]
-		requests = append(requests, r.environmentReferenceRequests(ctx, template.Namespace, templateRefField, template.Name)...)
+	requests := make([]reconcile.Request, 0, len(environments.Items))
+	for i := range environments.Items {
+		requests = append(requests, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(&environments.Items[i])})
 	}
 	return requests
 }
@@ -79,8 +78,8 @@ func (r *EnvironmentReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	if err := mgr.GetFieldIndexer().IndexField(context.Background(), &platformv1alpha1.Environment{}, projectRefField, environmentProjectRefIndex); err != nil {
 		return fmt.Errorf("index environments by project: %w", err)
 	}
-	if err := mgr.GetFieldIndexer().IndexField(context.Background(), &platformv1alpha1.EnvironmentTemplate{}, runtimeClassField, templateRuntimeClassIndex); err != nil {
-		return fmt.Errorf("index templates by RuntimeClass: %w", err)
+	if err := mgr.GetFieldIndexer().IndexField(context.Background(), &platformv1alpha1.Environment{}, provisioningRuntimeClassField, environmentRuntimeClassIndex); err != nil {
+		return fmt.Errorf("index environments by RuntimeClass: %w", err)
 	}
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&platformv1alpha1.Environment{}, builder.WithPredicates(predicate.Funcs{UpdateFunc: func(e event.UpdateEvent) bool {

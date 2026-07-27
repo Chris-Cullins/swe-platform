@@ -221,6 +221,7 @@ spec:
               projectRef:
                 description: ProjectRef is the name of the Project this environment
                   belongs to.
+                minLength: 1
                 type: string
               services:
                 description: |-
@@ -357,6 +358,15 @@ spec:
             - templateRef
             type: object
             x-kubernetes-validations:
+            - message: templateRef is immutable
+              rule: self.templateRef == oldSelf.templateRef
+            - message: backend is immutable
+              rule: has(self.backend) == has(oldSelf.backend) && (!has(self.backend)
+                || self.backend == oldSelf.backend)
+            - message: projectRef may only transition once from empty to non-empty
+              rule: '(!has(oldSelf.projectRef) || oldSelf.projectRef.size() == 0)
+                ? (!has(self.projectRef) || self.projectRef.size() > 0) : (has(self.projectRef)
+                && self.projectRef == oldSelf.projectRef)'
             - message: hold policy cannot be removed; disable it at a higher revision
               rule: '!has(oldSelf.lifecycle) || !has(oldSelf.lifecycle.hold) || (has(self.lifecycle)
                 && has(self.lifecycle.hold))'
@@ -654,6 +664,132 @@ spec:
                   type: object
                 maxItems: 64
                 type: array
+              provisioning:
+                description: |-
+                  Provisioning freezes all child-creation inputs. It is published before any
+                  child is created and may only gain its one-time Project binding.
+                properties:
+                  backend:
+                    description: |-
+                      EnvironmentBackend selects where the environment executes. The v1alpha1 Go
+                      API retains planned backend names for compatibility, but CRD admission only
+                      accepts pod until another backend is implemented.
+                    enum:
+                    - pod
+                    type: string
+                  diskSize:
+                    anyOf:
+                    - type: integer
+                    - type: string
+                    pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                    x-kubernetes-int-or-string: true
+                  image:
+                    minLength: 1
+                    type: string
+                  project:
+                    properties:
+                      generation:
+                        format: int64
+                        minimum: 1
+                        type: integer
+                      name:
+                        minLength: 1
+                        type: string
+                      repository:
+                        minLength: 1
+                        type: string
+                      uid:
+                        description: |-
+                          UID is a type that holds unique ID values, including UUIDs.  Because we
+                          don't ONLY use UUIDs, this is an alias to string.  Being a type captures
+                          intent and helps make sure that UIDs and names do not get conflated.
+                        type: string
+                    required:
+                    - generation
+                    - name
+                    - repository
+                    - uid
+                    type: object
+                    x-kubernetes-validations:
+                    - message: project UID must not be empty
+                      rule: self.uid.size() > 0
+                  projectVerified:
+                    description: |-
+                      ProjectVerified records the controller's post-publication verification of
+                      the exact Environment and Project source incarnation.
+                    type: boolean
+                  resources:
+                    additionalProperties:
+                      anyOf:
+                      - type: integer
+                      - type: string
+                      pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                      x-kubernetes-int-or-string: true
+                    description: Resources is the resolved CPU and memory request/limit
+                      map.
+                    maxProperties: 2
+                    type: object
+                  runtimeClassName:
+                    type: string
+                  size:
+                    minLength: 1
+                    type: string
+                  template:
+                    properties:
+                      generation:
+                        format: int64
+                        minimum: 1
+                        type: integer
+                      name:
+                        minLength: 1
+                        type: string
+                      uid:
+                        description: |-
+                          UID is a type that holds unique ID values, including UUIDs.  Because we
+                          don't ONLY use UUIDs, this is an alias to string.  Being a type captures
+                          intent and helps make sure that UIDs and names do not get conflated.
+                        type: string
+                    required:
+                    - generation
+                    - name
+                    - uid
+                    type: object
+                    x-kubernetes-validations:
+                    - message: template UID must not be empty
+                      rule: self.uid.size() > 0
+                  templateVerified:
+                    description: |-
+                      TemplateVerified records the controller's post-publication verification
+                      of the exact Environment and Template source incarnations.
+                    type: boolean
+                required:
+                - backend
+                - diskSize
+                - image
+                - projectVerified
+                - resources
+                - runtimeClassName
+                - size
+                - template
+                - templateVerified
+                type: object
+                x-kubernetes-validations:
+                - message: resolved provisioning inputs are immutable
+                  rule: self.template == oldSelf.template && self.backend == oldSelf.backend
+                    && self.image == oldSelf.image && self.size == oldSelf.size &&
+                    self.resources.all(k, k in oldSelf.resources && quantity(self.resources[k]).compareTo(quantity(oldSelf.resources[k]))
+                    == 0) && oldSelf.resources.all(k, k in self.resources) && self.runtimeClassName
+                    == oldSelf.runtimeClassName && quantity(self.diskSize).compareTo(quantity(oldSelf.diskSize))
+                    == 0
+                - message: project may only be added once and must start unverified
+                  rule: 'has(oldSelf.project) ? (has(self.project) && self.project
+                    == oldSelf.project) : (!has(self.project) || !self.projectVerified)'
+                - message: template verification cannot be reset
+                  rule: '!oldSelf.templateVerified || self.templateVerified'
+                - message: project verification cannot be reset
+                  rule: '!oldSelf.projectVerified || self.projectVerified'
+                - message: project verification requires a project snapshot
+                  rule: has(self.project) || !self.projectVerified
               recovery:
                 description: Recovery is backend-neutral terminal execution recovery
                   state.
@@ -784,6 +920,8 @@ spec:
             - message: nextPortalRouteGeneration cannot decrease or be removed
               rule: '!has(oldSelf.nextPortalRouteGeneration) || (has(self.nextPortalRouteGeneration)
                 && self.nextPortalRouteGeneration >= oldSelf.nextPortalRouteGeneration)'
+            - message: provisioning snapshot cannot be removed
+              rule: '!has(oldSelf.provisioning) || has(self.provisioning)'
         type: object
     served: true
     storage: true

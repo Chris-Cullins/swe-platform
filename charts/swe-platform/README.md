@@ -266,6 +266,14 @@ checked-in CRD definition authoritative when ownership moves from Helm's initial
 server-side apply. The Argo CD preset does not need this manual step because Argo synchronizes
 the chart's `crds/` files as manifests.
 
+Environment provisioning inputs are captured in controller-owned `status.provisioning` before
+child resources are created, then verified against uncached exact source incarnations in a
+separate reconcile before provisioning proceeds. Updating a catalog or managed Template's image, size, disk,
+RuntimeClass, or backend affects new Environments (and rolls stale warm-pool members), not an
+existing Environment's replacement or resume; `idleTimeout` and `warmPool.min` remain live
+policy. PVC expansion is unsupported, so disk-size changes require a new Environment. Apply the
+CRD upgrade above before relying on this status schema and selector immutability admission.
+
 The production presets create a `medium` catalog source using the published `env-base` image;
 onboarding creates each runnable Project-local Template copy. Operator, control-plane, and
 env-base tags default to the chart
