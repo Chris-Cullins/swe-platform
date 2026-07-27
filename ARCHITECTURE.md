@@ -274,10 +274,10 @@ in this declaration-only API.
 
 ### Adapters, processes, and transcripts
 
-The agent layer is adapters. Platform code supplies an immutable Run UID/task, an ephemeral
-credential, a backend-neutral sandboxd process dialer, and an opaque event sink. Adapters own
-agent command/protocol details and event payload meaning; the platform does not impose a shared
-transcript schema.
+The agent layer is adapters. `internal/agent` is the exact adapter contract boundary. Platform
+code supplies an immutable Run UID/task, an ephemeral credential, a backend-neutral sandboxd
+process dialer, and an opaque event sink. Adapters own agent command/protocol details and event
+payload meaning; the platform does not impose a shared transcript schema.
 
 The registered `claude-code` (default), `amp`, `codex`, and `pi` adapters each run a foreground
 CLI through sandboxd's keyed managed-process service. Starts are duplicate-safe within one

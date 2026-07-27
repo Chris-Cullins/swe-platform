@@ -8,6 +8,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 
 	platformv1alpha1 "github.com/Chris-Cullins/swe-platform/api/v1alpha1"
+	"github.com/Chris-Cullins/swe-platform/internal/agent"
 	"github.com/Chris-Cullins/swe-platform/internal/lifecycle"
 )
 
@@ -77,7 +78,7 @@ func (r *fenceRejectionRecorder) observe(err error) {
 
 // NewOperatorMetrics registers one process-owned collector set. Tests should
 // pass a fresh registry; the operator passes controller-runtime's registry.
-func NewOperatorMetrics(registerer prometheus.Registerer, adapters map[string]AdapterLifecycle) *OperatorMetrics {
+func NewOperatorMetrics(registerer prometheus.Registerer, adapters map[string]agent.AdapterLifecycle) *OperatorMetrics {
 	m := &OperatorMetrics{
 		registeredAdapters: make(map[string]struct{}, len(adapters)),
 		runAllocations: prometheus.NewHistogramVec(prometheus.HistogramOpts{
@@ -172,9 +173,9 @@ func (m *OperatorMetrics) observeAdapter(adapter, operation string, started time
 	}
 	outcome := adapterOutcomeSuccess
 	switch {
-	case operation == adapterOperationEnsureAccepted && errors.Is(err, ErrAdapterTaskRejected):
+	case operation == adapterOperationEnsureAccepted && errors.Is(err, agent.ErrAdapterTaskRejected):
 		outcome = adapterOutcomeRejected
-	case operation == adapterOperationCancel && errors.Is(err, ErrAdapterCancellationPending):
+	case operation == adapterOperationCancel && errors.Is(err, agent.ErrAdapterCancellationPending):
 		outcome = adapterOutcomePending
 	case err != nil:
 		outcome = adapterOutcomeError

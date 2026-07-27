@@ -14,7 +14,7 @@ import (
 	"google.golang.org/grpc/status"
 
 	platformv1alpha1 "github.com/Chris-Cullins/swe-platform/api/v1alpha1"
-	"github.com/Chris-Cullins/swe-platform/internal/controllers"
+	"github.com/Chris-Cullins/swe-platform/internal/agent"
 	sandboxdv1 "github.com/Chris-Cullins/swe-platform/sandboxd/gen/proto/sandboxd/v1"
 )
 
@@ -31,8 +31,10 @@ type Adapter struct {
 	pending    map[cursor]pendingEvent
 }
 
+var _ agent.AdapterLifecycle = (*Adapter)(nil)
+
 type pendingEvent struct {
-	event      controllers.AdapterEvent
+	event      agent.AdapterEvent
 	nextOffset uint64
 }
 
@@ -67,11 +69,11 @@ func (a *Adapter) executable() string {
 	return "amp"
 }
 
-func key(task controllers.AdapterTask) *sandboxdv1.ProcessKey {
+func key(task agent.AdapterTask) *sandboxdv1.ProcessKey {
 	return &sandboxdv1.ProcessKey{OwnerId: task.ID, Role: processRole}
 }
 
-func (a *Adapter) spec(task controllers.AdapterTask) *sandboxdv1.ProcessSpec {
+func (a *Adapter) spec(task agent.AdapterTask) *sandboxdv1.ProcessSpec {
 	// --execute=<prompt> is deliberately one argv element. The pinned CLI does
 	// not treat "--" after --execute as a flag terminator for a flag-like prompt.
 	return &sandboxdv1.ProcessSpec{
@@ -81,9 +83,9 @@ func (a *Adapter) spec(task controllers.AdapterTask) *sandboxdv1.ProcessSpec {
 }
 
 // EnsureAccepted duplicate-safely starts (or recovers) the Run-keyed process.
-func (a *Adapter) EnsureAccepted(ctx context.Context, task controllers.AdapterTask, sandbox controllers.AdapterSandbox, credential *controllers.AdapterCredential) error {
+func (a *Adapter) EnsureAccepted(ctx context.Context, task agent.AdapterTask, sandbox agent.AdapterSandbox, credential *agent.AdapterCredential) error {
 	if credential != nil && credential.Type != platformv1alpha1.AgentCredentialTypeAPIKey {
-		return fmt.Errorf("%w: unsupported credential type %q", controllers.ErrAdapterTaskRejected, credential.Type)
+		return fmt.Errorf("%w: unsupported credential type %q", agent.ErrAdapterTaskRejected, credential.Type)
 	}
 	client, closeConnection, err := sandbox.DialProcess(ctx)
 	if err != nil {
@@ -104,7 +106,7 @@ func (a *Adapter) EnsureAccepted(ctx context.Context, task controllers.AdapterTa
 }
 
 // Observe forwards bounded process output and maps Amp's terminal result event.
-func (a *Adapter) Observe(ctx context.Context, task controllers.AdapterTask, sandbox controllers.AdapterSandbox) (controllers.AdapterObservation, string, error) {
+func (a *Adapter) Observe(ctx context.Context, task agent.AdapterTask, sandbox agent.AdapterSandbox) (agent.AdapterObservation, string, error) {
 	client, closeConnection, err := sandbox.DialProcess(ctx)
 	if err != nil {
 		return "", "", err
@@ -113,58 +115,58 @@ func (a *Adapter) Observe(ctx context.Context, task controllers.AdapterTask, san
 	process, err := client.Get(ctx, &sandboxdv1.GetProcessRequest{Key: key(task)})
 	if err != nil {
 		if status.Code(err) == codes.NotFound {
-			return controllers.AdapterObservationFailed, "Amp execution is absent in the current sandbox epoch", nil
+			return agent.AdapterObservationFailed, "Amp execution is absent in the current sandbox epoch", nil
 		}
 		return "", "", err
 	}
 	if err := a.forward(ctx, client, task, sandbox, process); err != nil {
-		if errors.Is(err, controllers.ErrAdapterEventRejected) {
-			return controllers.AdapterObservationFailed, "Amp transcript output was permanently rejected", nil
+		if errors.Is(err, agent.ErrAdapterEventRejected) {
+			return agent.AdapterObservationFailed, "Amp transcript output was permanently rejected", nil
 		}
 		return "", "", err
 	}
 	switch process.State {
 	case sandboxdv1.ProcessState_PROCESS_STATE_RUNNING, sandboxdv1.ProcessState_PROCESS_STATE_STOPPING:
-		return controllers.AdapterObservationRunning, "Amp is running", nil
+		return agent.AdapterObservationRunning, "Amp is running", nil
 	case sandboxdv1.ProcessState_PROCESS_STATE_FAILED:
-		return controllers.AdapterObservationFailed, message("Amp failed to start", process.Error), nil
+		return agent.AdapterObservationFailed, message("Amp failed to start", process.Error), nil
 	case sandboxdv1.ProcessState_PROCESS_STATE_EXITED:
 		if process.ExitCode == nil {
-			return controllers.AdapterObservationFailed, "Amp exited without an exit code", nil
+			return agent.AdapterObservationFailed, "Amp exited without an exit code", nil
 		}
 		if process.GetExitCode() != 0 {
-			return controllers.AdapterObservationFailed, fmt.Sprintf("Amp exited with code %d", process.GetExitCode()), nil
+			return agent.AdapterObservationFailed, fmt.Sprintf("Amp exited with code %d", process.GetExitCode()), nil
 		}
 		output, err := readOutput(ctx, client, key(task), process.ExecutionId)
 		if err != nil {
 			var truncated *outputTruncatedError
 			if errors.As(err, &truncated) {
-				return controllers.AdapterObservationFailed, message("Amp stdout was truncated before terminal validation", truncated.Error()), nil
+				return agent.AdapterObservationFailed, message("Amp stdout was truncated before terminal validation", truncated.Error()), nil
 			}
 			return "", "", err
 		}
 		result, ok := finalResult(output)
 		if !ok {
-			return controllers.AdapterObservationFailed, "Amp exited without a valid result event", nil
+			return agent.AdapterObservationFailed, "Amp exited without a valid result event", nil
 		}
 		if result.IsError == nil {
-			return controllers.AdapterObservationFailed, "Amp result is missing is_error", nil
+			return agent.AdapterObservationFailed, "Amp result is missing is_error", nil
 		}
 		if *result.IsError || result.Subtype != "success" {
 			detail := result.Result
 			if detail == "" {
 				detail = errorDetail(result.Error)
 			}
-			return controllers.AdapterObservationFailed, message("Amp reported "+result.Subtype, detail), nil
+			return agent.AdapterObservationFailed, message("Amp reported "+result.Subtype, detail), nil
 		}
-		return controllers.AdapterObservationSucceeded, message("Amp completed", result.Result), nil
+		return agent.AdapterObservationSucceeded, message("Amp completed", result.Result), nil
 	default:
-		return controllers.AdapterObservationFailed, fmt.Sprintf("Amp returned invalid process state %s", process.State), nil
+		return agent.AdapterObservationFailed, fmt.Sprintf("Amp returned invalid process state %s", process.State), nil
 	}
 }
 
 // Cancel idempotently stops only this Run UID's managed process tree.
-func (a *Adapter) Cancel(ctx context.Context, task controllers.AdapterTask, sandbox controllers.AdapterSandbox) error {
+func (a *Adapter) Cancel(ctx context.Context, task agent.AdapterTask, sandbox agent.AdapterSandbox) error {
 	client, closeConnection, err := sandbox.DialProcess(ctx)
 	if err != nil {
 		return err
@@ -176,10 +178,10 @@ func (a *Adapter) Cancel(ctx context.Context, task controllers.AdapterTask, sand
 	}
 	switch process.State {
 	case sandboxdv1.ProcessState_PROCESS_STATE_RUNNING, sandboxdv1.ProcessState_PROCESS_STATE_STOPPING:
-		return controllers.ErrAdapterCancellationPending
+		return agent.ErrAdapterCancellationPending
 	case sandboxdv1.ProcessState_PROCESS_STATE_EXITED, sandboxdv1.ProcessState_PROCESS_STATE_FAILED:
 		err := a.forward(ctx, client, task, sandbox, process)
-		if errors.Is(err, controllers.ErrAdapterEventRejected) {
+		if errors.Is(err, agent.ErrAdapterEventRejected) {
 			return nil
 		}
 		return err
@@ -188,7 +190,7 @@ func (a *Adapter) Cancel(ctx context.Context, task controllers.AdapterTask, sand
 	}
 }
 
-func (a *Adapter) forward(ctx context.Context, client sandboxdv1.ProcessServiceClient, task controllers.AdapterTask, sandbox controllers.AdapterSandbox, process *sandboxdv1.Process) error {
+func (a *Adapter) forward(ctx context.Context, client sandboxdv1.ProcessServiceClient, task agent.AdapterTask, sandbox agent.AdapterSandbox, process *sandboxdv1.Process) error {
 	if sandbox.EmitEvent == nil || process.ExecutionId == "" {
 		return nil
 	}
@@ -216,7 +218,7 @@ func (a *Adapter) forward(ctx context.Context, client sandboxdv1.ProcessServiceC
 				return err
 			}
 			digest := sha256.Sum256(payload)
-			event := controllers.AdapterEvent{Source: "amp", IdempotencyKey: fmt.Sprintf("v1:%s:%x", streamName(stream), digest), Type: "amp.process-output", Data: payload}
+			event := agent.AdapterEvent{Source: "amp", IdempotencyKey: fmt.Sprintf("v1:%s:%x", streamName(stream), digest), Type: "amp.process-output", Data: payload}
 			a.setPending(c, pendingEvent{event: event, nextOffset: response.NextOffset})
 			if err := sandbox.EmitEvent(ctx, event); err != nil {
 				return err

@@ -2,7 +2,6 @@ package controllers
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"reflect"
@@ -24,6 +23,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 
 	platformv1alpha1 "github.com/Chris-Cullins/swe-platform/api/v1alpha1"
+	"github.com/Chris-Cullins/swe-platform/internal/agent"
 	"github.com/Chris-Cullins/swe-platform/internal/lifecycle"
 	"github.com/Chris-Cullins/swe-platform/internal/sandboxclient"
 	"github.com/Chris-Cullins/swe-platform/internal/tenancy"
@@ -40,94 +40,12 @@ var errExplicitEnvironmentClaimed = errors.New("explicit environment is already 
 var errExplicitEnvironmentHeld = errors.New("explicit environment is held")
 var errExplicitEnvironmentSuspensionNotWakeable = errors.New("explicit environment suspension is not wakeable")
 
-// ErrAdapterCancellationPending means cancellation was accepted but the
-// adapter-owned execution tree has not reached a terminal state yet.
-var ErrAdapterCancellationPending = errors.New("adapter cancellation is pending")
-
-// ErrAdapterEventRejected means the transcript transport permanently rejected
-// an adapter event. Retrying the same event cannot make progress.
-var ErrAdapterEventRejected = errors.New("adapter event permanently rejected")
-
-// ErrAdapterTaskRejected means an adapter permanently rejected the immutable
-// task intent. Retrying acceptance cannot make progress.
-var ErrAdapterTaskRejected = errors.New("adapter task permanently rejected")
-
 const (
 	runConditionEnvironmentReady           = "EnvironmentReady"
 	runConditionCredentialProfileBound     = "CredentialProfileBound"
 	runConditionAdapterAcceptanceAttempted = "AdapterAcceptanceAttempted"
 	runConditionAdapterAccepted            = "AdapterAccepted"
 )
-
-// AdapterObservation is the adapter-neutral state observed for accepted work.
-type AdapterObservation string
-
-const (
-	AdapterObservationAccepted   AdapterObservation = "Accepted"
-	AdapterObservationRunning    AdapterObservation = "Running"
-	AdapterObservationNeedsInput AdapterObservation = "NeedsInput"
-	AdapterObservationSucceeded  AdapterObservation = "Succeeded"
-	AdapterObservationFailed     AdapterObservation = "Failed"
-)
-
-// AdapterTask contains immutable task identity and input. ID is the Run UID
-// and is the adapter's idempotency key across retries and controller restarts.
-type AdapterTask struct {
-	ID     string
-	Prompt string
-}
-
-// AdapterCredential is ephemeral launch-only credential material. Callers must
-// not retain APIKey after EnsureAccepted returns.
-type AdapterCredential struct {
-	Type   platformv1alpha1.AgentCredentialType
-	APIKey []byte
-}
-
-// AdapterEvent is an adapter-owned transcript event carried by the platform's
-// generic transcript transport. Data is opaque to the controller.
-type AdapterEvent struct {
-	Source         string
-	IdempotencyKey string
-	Type           string
-	Data           json.RawMessage
-}
-
-// AdapterEventSink forwards opaque adapter events for one namespaced Run. The
-// runUID is the exact reconciled immutable Run UID; the control plane fences
-// append identity against it so a delete/recreate replacement never receives
-// stale events. Permanent rejection wraps ErrAdapterEventRejected; other
-// errors are retryable.
-type AdapterEventSink interface {
-	Append(context.Context, string, string, string, AdapterEvent) error
-}
-
-// AdapterSandbox is the backend-neutral handle exposed to adapters. Adapters
-// use sandboxd and never inspect pods, containers, VMs, PIDs, or OS signals.
-type AdapterSandbox struct {
-	EnvironmentName string
-	EnvironmentUID  types.UID
-	DialProcess     func(context.Context) (sandboxdv1.ProcessServiceClient, func() error, error)
-	EmitEvent       func(context.Context, AdapterEvent) error
-}
-
-// AdapterLifecycle translates one agent's execution model into normalized Run
-// lifecycle events. Every operation must be idempotent. EnsureAccepted may be
-// repeated after an uncertain response or environment resume and may wrap
-// ErrAdapterTaskRejected for permanent intent rejection; Cancel succeeds when
-// work is already absent or terminal and returns
-// ErrAdapterCancellationPending while its execution tree is still stopping.
-type AdapterLifecycle interface {
-	EnsureAccepted(context.Context, AdapterTask, AdapterSandbox, *AdapterCredential) error
-	Observe(context.Context, AdapterTask, AdapterSandbox) (AdapterObservation, string, error)
-	Cancel(context.Context, AdapterTask, AdapterSandbox) error
-}
-
-// AdapterCredentialPolicy is an optional adapter capability. Adapters that
-// return false reject credential profiles before any profile or Secret read.
-type AdapterCredentialPolicy interface {
-	SupportsCredentialProfiles() bool
-}
 
 // RunReconciler turns a Run intent into one Environment allocation and drives
 // its adapter lifecycle. sandboxd, reached through an adapter, owns all agent
@@ -137,8 +55,8 @@ type RunReconciler struct {
 	APIReader client.Reader
 	Scheme    *runtime.Scheme
 	Scope     *tenancy.ReconcileScope
-	Adapters  map[string]AdapterLifecycle
-	EventSink AdapterEventSink
+	Adapters  map[string]agent.AdapterLifecycle
+	EventSink agent.AdapterEventSink
 	Connector sandboxclient.Connector
 	Metrics   *OperatorMetrics
 }
@@ -218,7 +136,7 @@ func (r *RunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.R
 	}
 	if run.Status.EnvironmentRef == nil {
 		if run.Spec.CredentialProfileRef != "" {
-			if policy, ok := r.Adapters[run.Spec.Agent].(AdapterCredentialPolicy); ok && !policy.SupportsCredentialProfiles() {
+			if policy, ok := r.Adapters[run.Spec.Agent].(agent.AdapterCredentialPolicy); ok && !policy.SupportsCredentialProfiles() {
 				return ctrl.Result{}, r.failCredential(ctx, &run, "CredentialProfilesUnsupported", fmt.Sprintf("adapter %q does not support credential profiles", run.Spec.Agent))
 			}
 		}
@@ -311,7 +229,7 @@ func (r *RunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.R
 			cancelErr := adapter.Cancel(ctx, adapterTask(&run), r.adapterSandbox(&run, env, executionFence, fenceRejections))
 			r.Metrics.observeAdapter(run.Spec.Agent, adapterOperationCancel, started, cancelErr)
 			if cancelErr != nil {
-				if errors.Is(cancelErr, ErrAdapterCancellationPending) {
+				if errors.Is(cancelErr, agent.ErrAdapterCancellationPending) {
 					return ctrl.Result{RequeueAfter: adapterPollInterval}, nil
 				}
 				return ctrl.Result{}, cancelErr
@@ -403,7 +321,7 @@ func (r *RunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.R
 			return ctrl.Result{Requeue: true}, nil
 		}
 		if acceptErr != nil {
-			if errors.Is(acceptErr, ErrAdapterTaskRejected) {
+			if errors.Is(acceptErr, agent.ErrAdapterTaskRejected) {
 				return ctrl.Result{}, r.setRunState(ctx, &run, platformv1alpha1.RunStateFailed, "AdapterRejected", acceptErr.Error(), true)
 			}
 			return ctrl.Result{}, acceptErr
@@ -429,7 +347,7 @@ func (r *RunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.R
 	metricErr := err
 	if metricErr == nil {
 		switch observation {
-		case AdapterObservationAccepted, AdapterObservationRunning, AdapterObservationNeedsInput, AdapterObservationSucceeded, AdapterObservationFailed:
+		case agent.AdapterObservationAccepted, agent.AdapterObservationRunning, agent.AdapterObservationNeedsInput, agent.AdapterObservationSucceeded, agent.AdapterObservationFailed:
 		default:
 			metricErr = fmt.Errorf("adapter %q returned unknown observation %q", run.Spec.Agent, observation)
 		}
@@ -447,14 +365,14 @@ func (r *RunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.R
 	}
 	state := platformv1alpha1.RunStateAdapterAccepted
 	switch observation {
-	case AdapterObservationAccepted:
-	case AdapterObservationRunning:
+	case agent.AdapterObservationAccepted:
+	case agent.AdapterObservationRunning:
 		state = platformv1alpha1.RunStateRunning
-	case AdapterObservationNeedsInput:
+	case agent.AdapterObservationNeedsInput:
 		state = platformv1alpha1.RunStateNeedsInput
-	case AdapterObservationSucceeded:
+	case agent.AdapterObservationSucceeded:
 		state = platformv1alpha1.RunStateSucceeded
-	case AdapterObservationFailed:
+	case agent.AdapterObservationFailed:
 		state = platformv1alpha1.RunStateFailed
 	default:
 		return ctrl.Result{}, metricErr
@@ -549,7 +467,7 @@ func (r *RunReconciler) failCredential(ctx context.Context, run *platformv1alpha
 	return r.setRunState(ctx, run, platformv1alpha1.RunStateFailed, reason, message, run.Status.EnvironmentRef != nil)
 }
 
-func (r *RunReconciler) resolveCredential(ctx context.Context, run *platformv1alpha1.Run) (*AdapterCredential, string, error) {
+func (r *RunReconciler) resolveCredential(ctx context.Context, run *platformv1alpha1.Run) (*agent.AdapterCredential, string, error) {
 	if run.Spec.CredentialProfileRef == "" {
 		return nil, "", nil
 	}
@@ -606,7 +524,7 @@ func (r *RunReconciler) resolveCredential(ctx context.Context, run *platformv1al
 	if secret.Type != platformv1alpha1.AgentCredentialAPIKeySecretType || len(secret.Data) != 1 || !ok || len(value) == 0 || len(value) > platformv1alpha1.AgentCredentialAPIKeyMaxBytes || !utf8.Valid(value) || bytesContainNUL(value) {
 		return nil, "MalformedSecret", errors.New("credential secret is malformed")
 	}
-	return &AdapterCredential{Type: platformv1alpha1.AgentCredentialTypeAPIKey, APIKey: append([]byte(nil), value...)}, "", nil
+	return &agent.AdapterCredential{Type: platformv1alpha1.AgentCredentialTypeAPIKey, APIKey: append([]byte(nil), value...)}, "", nil
 }
 
 func exactCredentialSecretOwner(profile *platformv1alpha1.AgentCredentialProfile, object metav1.Object) bool {
@@ -1058,7 +976,7 @@ func (r *RunReconciler) cleanupTerminal(ctx context.Context, run *platformv1alph
 		cancelErr := adapter.Cancel(ctx, adapterTask(run), r.adapterSandbox(run, env, executionFence, fenceRejections))
 		r.Metrics.observeAdapter(run.Spec.Agent, adapterOperationCancel, started, cancelErr)
 		if cancelErr != nil {
-			if errors.Is(cancelErr, ErrAdapterCancellationPending) {
+			if errors.Is(cancelErr, agent.ErrAdapterCancellationPending) {
 				return ctrl.Result{RequeueAfter: adapterPollInterval}, nil
 			}
 			return ctrl.Result{}, cancelErr
@@ -1142,7 +1060,7 @@ func (r *RunReconciler) finalize(ctx context.Context, run *platformv1alpha1.Run)
 				cancelErr := adapter.Cancel(ctx, adapterTask(run), r.adapterSandbox(run, env, executionFence, fenceRejections))
 				r.Metrics.observeAdapter(run.Spec.Agent, adapterOperationCancel, started, cancelErr)
 				if cancelErr != nil {
-					if errors.Is(cancelErr, ErrAdapterCancellationPending) {
+					if errors.Is(cancelErr, agent.ErrAdapterCancellationPending) {
 						return ctrl.Result{RequeueAfter: adapterPollInterval}, nil
 					}
 					return ctrl.Result{}, cancelErr
@@ -1181,7 +1099,7 @@ func (r *RunReconciler) setRunState(ctx context.Context, run *platformv1alpha1.R
 	before := run.Status.DeepCopy()
 	run.Status.State = state
 	run.Status.ObservedGeneration = run.Generation
-	adapterAccepted := runAccepted(run) || state == platformv1alpha1.RunStateAdapterAccepted || state == platformv1alpha1.RunStateRunning || state == platformv1alpha1.RunStateNeedsInput || state == platformv1alpha1.RunStateSucceeded || (state == platformv1alpha1.RunStateFailed && reason == string(AdapterObservationFailed))
+	adapterAccepted := runAccepted(run) || state == platformv1alpha1.RunStateAdapterAccepted || state == platformv1alpha1.RunStateRunning || state == platformv1alpha1.RunStateNeedsInput || state == platformv1alpha1.RunStateSucceeded || (state == platformv1alpha1.RunStateFailed && reason == string(agent.AdapterObservationFailed))
 	if adapterAccepted && run.Status.StartedAt == nil {
 		startedAt := metav1.Now()
 		run.Status.StartedAt = &startedAt
@@ -1228,12 +1146,12 @@ func terminalRunState(state platformv1alpha1.RunState) bool {
 	return state == platformv1alpha1.RunStateSucceeded || state == platformv1alpha1.RunStateFailed || state == platformv1alpha1.RunStateCancelled
 }
 
-func adapterTask(run *platformv1alpha1.Run) AdapterTask {
-	return AdapterTask{ID: string(run.UID), Prompt: run.Spec.Prompt}
+func adapterTask(run *platformv1alpha1.Run) agent.AdapterTask {
+	return agent.AdapterTask{ID: string(run.UID), Prompt: run.Spec.Prompt}
 }
 
-func (r *RunReconciler) adapterSandbox(run *platformv1alpha1.Run, env *platformv1alpha1.Environment, fence lifecycle.ExecutionFence, fenceRejections *fenceRejectionRecorder) AdapterSandbox {
-	sandbox := AdapterSandbox{EnvironmentName: env.Name, EnvironmentUID: env.UID,
+func (r *RunReconciler) adapterSandbox(run *platformv1alpha1.Run, env *platformv1alpha1.Environment, fence lifecycle.ExecutionFence, fenceRejections *fenceRejectionRecorder) agent.AdapterSandbox {
+	sandbox := agent.AdapterSandbox{EnvironmentName: env.Name, EnvironmentUID: string(env.UID),
 		DialProcess: func(ctx context.Context) (sandboxdv1.ProcessServiceClient, func() error, error) {
 			reader := r.apiReader()
 			// Mandatory uncached pre-call association proof: a still-current
@@ -1257,7 +1175,7 @@ func (r *RunReconciler) adapterSandbox(run *platformv1alpha1.Run, env *platformv
 		}}
 	if r.EventSink != nil {
 		runUID := string(run.UID)
-		sandbox.EmitEvent = func(ctx context.Context, event AdapterEvent) error {
+		sandbox.EmitEvent = func(ctx context.Context, event agent.AdapterEvent) error {
 			return r.EventSink.Append(ctx, run.Namespace, run.Name, runUID, event)
 		}
 	}

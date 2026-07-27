@@ -34,6 +34,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
 	platformv1alpha1 "github.com/Chris-Cullins/swe-platform/api/v1alpha1"
+	"github.com/Chris-Cullins/swe-platform/internal/agent"
 	"github.com/Chris-Cullins/swe-platform/internal/lifecycle"
 	sandboxdauth "github.com/Chris-Cullins/swe-platform/sandboxd/auth"
 )
@@ -4094,7 +4095,7 @@ func TestHoldAcceptsSuspendFenceAndAllowsRunCleanupInEitherOrdering(t *testing.T
 			}
 			kubeClient := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(environment, run).WithObjects(environment, run, pod, credentials).Build()
 			environmentReconciler := &EnvironmentReconciler{Client: kubeClient, Scheme: scheme}
-			runReconciler := &RunReconciler{Client: kubeClient, Scheme: scheme, Adapters: map[string]AdapterLifecycle{"test": &scriptedAdapter{}}}
+			runReconciler := &RunReconciler{Client: kubeClient, Scheme: scheme, Adapters: map[string]agent.AdapterLifecycle{"test": &scriptedAdapter{}}}
 			key := client.ObjectKeyFromObject(environment)
 			reconcileEnvironment := func() {
 				t.Helper()

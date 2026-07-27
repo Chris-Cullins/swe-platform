@@ -12,7 +12,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/Chris-Cullins/swe-platform/internal/controllers"
+	"github.com/Chris-Cullins/swe-platform/internal/agent"
 	"github.com/Chris-Cullins/swe-platform/internal/controlplane"
 )
 
@@ -33,7 +33,7 @@ func TestAppendUsesProjectedCredentialAndOpaqueEvent(t *testing.T) {
 	}))
 	defer server.Close()
 
-	event := controllers.AdapterEvent{Source: "claude-code", IdempotencyKey: "execution:stdout:0", Type: "claude.output", Data: json.RawMessage(`{"adapter":"owned"}`)}
+	event := agent.AdapterEvent{Source: "claude-code", IdempotencyKey: "execution:stdout:0", Type: "claude.output", Data: json.RawMessage(`{"adapter":"owned"}`)}
 	if err := (Client{BaseURL: server.URL, TokenFile: tokenFile, HTTP: server.Client()}).Append(context.Background(), "team", "run-1", "run-1-uid", event); err != nil {
 		t.Fatal(err)
 	}
@@ -77,8 +77,8 @@ func TestAppendClassifiesControlPlaneFailures(t *testing.T) {
 				http.Error(w, "rejected", test.status)
 			}))
 			defer server.Close()
-			err := (Client{BaseURL: server.URL, TokenFile: tokenFile}).Append(context.Background(), "ns", "run", "run-uid", controllers.AdapterEvent{Source: "a", IdempotencyKey: "k", Type: "t", Data: json.RawMessage(`{}`)})
-			if err == nil || errors.Is(err, controllers.ErrAdapterEventRejected) != test.permanent {
+			err := (Client{BaseURL: server.URL, TokenFile: tokenFile}).Append(context.Background(), "ns", "run", "run-uid", agent.AdapterEvent{Source: "a", IdempotencyKey: "k", Type: "t", Data: json.RawMessage(`{}`)})
+			if err == nil || errors.Is(err, agent.ErrAdapterEventRejected) != test.permanent {
 				t.Fatalf("Append() error = %v, permanent = %t", err, test.permanent)
 			}
 		})
@@ -108,7 +108,7 @@ func TestAppendDrainsSuccessfulResponse(t *testing.T) {
 	httpClient := &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
 		return &http.Response{StatusCode: http.StatusCreated, Status: "201 Created", Body: body, Header: make(http.Header)}, nil
 	})}
-	err := (Client{BaseURL: "http://control-plane", TokenFile: tokenFile, HTTP: httpClient}).Append(context.Background(), "ns", "run", "run-uid", controllers.AdapterEvent{Source: "a", IdempotencyKey: "k", Type: "t", Data: json.RawMessage(`{}`)})
+	err := (Client{BaseURL: "http://control-plane", TokenFile: tokenFile, HTTP: httpClient}).Append(context.Background(), "ns", "run", "run-uid", agent.AdapterEvent{Source: "a", IdempotencyKey: "k", Type: "t", Data: json.RawMessage(`{}`)})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -126,8 +126,8 @@ func TestAppendTransportFailureIsRetryable(t *testing.T) {
 	httpClient := &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
 		return nil, transportErr
 	})}
-	err := (Client{BaseURL: "http://control-plane", TokenFile: tokenFile, HTTP: httpClient}).Append(context.Background(), "ns", "run", "run-uid", controllers.AdapterEvent{Source: "a", IdempotencyKey: "k", Type: "t", Data: json.RawMessage(`{}`)})
-	if !errors.Is(err, transportErr) || errors.Is(err, controllers.ErrAdapterEventRejected) {
+	err := (Client{BaseURL: "http://control-plane", TokenFile: tokenFile, HTTP: httpClient}).Append(context.Background(), "ns", "run", "run-uid", agent.AdapterEvent{Source: "a", IdempotencyKey: "k", Type: "t", Data: json.RawMessage(`{}`)})
+	if !errors.Is(err, transportErr) || errors.Is(err, agent.ErrAdapterEventRejected) {
 		t.Fatalf("Append() error = %v, want retryable transport error", err)
 	}
 }
