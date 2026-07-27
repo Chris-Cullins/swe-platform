@@ -9,6 +9,7 @@ import (
 	"crypto/x509/pkix"
 	"encoding/json"
 	"encoding/pem"
+	"errors"
 	"math/big"
 	"strings"
 	"testing"
@@ -407,6 +408,29 @@ func TestResolveExecutionProvisioningSources(t *testing.T) {
 	edited.Spec.Backend = platformv1alpha1.EnvironmentBackendKubeVirt
 	if err := resolve(env.Status.Provisioning.DeepCopy(), edited, project.DeepCopy()); err != nil {
 		t.Fatalf("same-UID live provisioning edit changed authoritative snapshot backend: %v", err)
+	}
+
+	base := fake.NewClientBuilder().WithScheme(scheme).WithObjects(env.DeepCopy(), pod.DeepCopy(), template.DeepCopy(), project.DeepCopy()).Build()
+	transient := errors.New("transient template read failure")
+	reader := interceptor.NewClient(base, interceptor.Funcs{
+		Get: func(ctx context.Context, underlying client.WithWatch, key client.ObjectKey, object client.Object, options ...client.GetOption) error {
+			if _, ok := object.(*platformv1alpha1.EnvironmentTemplate); ok {
+				return transient
+			}
+			return underlying.Get(ctx, key, object, options...)
+		},
+	})
+	current, err := (Connector{Reader: reader}).ExecutionCurrent(context.Background(), lifecycle.CaptureExecutionFence(env), executionForPod(env, pod))
+	if current || !errors.Is(err, transient) {
+		t.Fatalf("ExecutionCurrent() after transient source read = (%t, %v), want (false, transient error)", current, err)
+	}
+
+	replacementTemplate := template.DeepCopy()
+	replacementTemplate.UID = "replacement"
+	replacementReader := fake.NewClientBuilder().WithScheme(scheme).WithObjects(env.DeepCopy(), pod.DeepCopy(), replacementTemplate, project.DeepCopy()).Build()
+	current, err = (Connector{Reader: replacementReader}).ExecutionCurrent(context.Background(), lifecycle.CaptureExecutionFence(env), executionForPod(env, pod))
+	if current || err != nil {
+		t.Fatalf("ExecutionCurrent() after source replacement = (%t, %v), want (false, nil)", current, err)
 	}
 }
 
