@@ -32,6 +32,7 @@ type scriptedAdapter struct {
 	accepted, observed    int
 	cancelled             int
 	acceptErr             error
+	observeErr            error
 	onAccept              func()
 	onCancel              func()
 	cancelErr             error
@@ -132,6 +133,9 @@ func (a *scriptedAdapter) Cancel(context.Context, AdapterTask, AdapterSandbox) e
 }
 func (a *scriptedAdapter) Observe(context.Context, AdapterTask, AdapterSandbox) (AdapterObservation, string, error) {
 	a.observed++
+	if a.observeErr != nil {
+		return "", "", a.observeErr
+	}
 	o := a.observations[0]
 	if len(a.observations) > 1 {
 		a.observations = a.observations[1:]
@@ -2825,7 +2829,7 @@ func TestAdapterSandboxEmitEventSendsExactRunUID(t *testing.T) {
 		return nil
 	})
 	r := &RunReconciler{EventSink: sink}
-	sandbox := r.adapterSandbox(run, env, lifecycle.CaptureExecutionFence(env))
+	sandbox := r.adapterSandbox(run, env, lifecycle.CaptureExecutionFence(env), &fenceRejectionRecorder{callSite: fenceCallSiteEnsureAccepted})
 	if sandbox.EmitEvent == nil {
 		t.Fatal("EmitEvent closure was not wired")
 	}

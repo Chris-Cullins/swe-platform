@@ -20,6 +20,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
+	controllermetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
 	platformv1alpha1 "github.com/Chris-Cullins/swe-platform/api/v1alpha1"
@@ -150,12 +151,15 @@ func main() {
 		os.Exit(1)
 	}
 	connector := sandboxclient.Connector{Reader: mgr.GetAPIReader(), ProcessPool: processConnections}
+	adapters := registeredAdapters()
+	operatorMetrics := controllers.NewOperatorMetrics(controllermetrics.Registry, adapters)
 	if mode == tenancy.ModeScoped && len(tenancyNamespaces) == 0 {
 		setupLog.Info("scoped installation has no configured Project namespaces; catalog is ready for onboarding and workload controllers are disabled")
 	} else if err := (&controllers.EnvironmentReconciler{
 		Client:                        guardedClient,
 		Scheme:                        mgr.GetScheme(),
 		Scope:                         scope,
+		Metrics:                       operatorMetrics,
 		ControlPlaneNamespace:         controlPlaneNamespace,
 		ControlPlaneName:              controlPlaneName,
 		ControlPlaneInstance:          controlPlaneInstance,
@@ -187,9 +191,10 @@ func main() {
 			APIReader: mgr.GetAPIReader(),
 			Scheme:    mgr.GetScheme(),
 			Scope:     scope,
-			Adapters:  registeredAdapters(),
+			Adapters:  adapters,
 			EventSink: eventSink,
 			Connector: connector,
+			Metrics:   operatorMetrics,
 		}).SetupWithManager(mgr); err != nil {
 			setupLog.Error(err, "unable to create controller", "controller", "Run")
 			os.Exit(1)

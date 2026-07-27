@@ -142,6 +142,7 @@ type EnvironmentReconciler struct {
 	APIReader                     client.Reader
 	Scheme                        *runtime.Scheme
 	Scope                         *tenancy.ReconcileScope
+	Metrics                       *OperatorMetrics
 	ControlPlaneNamespace         string
 	ControlPlaneName              string
 	ControlPlaneInstance          string
@@ -394,6 +395,8 @@ func (r *EnvironmentReconciler) reconcileLifecycleIntent(ctx context.Context, en
 	}
 
 	before := env.Status.DeepCopy()
+	wasSuspended := env.Status.Lifecycle.Suspended
+	previousReason := env.Status.Lifecycle.SuspensionReason
 	lifecycleStatus := &env.Status.Lifecycle
 	lifecycleStatus.ObservedHoldPolicyRevision = policyRevision
 	now := metav1.NewTime(r.now())
@@ -478,6 +481,11 @@ func (r *EnvironmentReconciler) reconcileLifecycleIntent(ctx context.Context, en
 	if err := r.Status().Update(ctx, env); err != nil {
 		return false, err
 	}
+	if !wasSuspended && lifecycleStatus.Suspended {
+		r.Metrics.observeLifecycle("suspend", lifecycleStatus.SuspensionReason)
+	} else if wasSuspended && !lifecycleStatus.Suspended {
+		r.Metrics.observeLifecycle("resume", previousReason)
+	}
 	return true, nil
 }
 
@@ -552,6 +560,7 @@ func (r *EnvironmentReconciler) reconcilePendingPodRecovery(ctx context.Context,
 		}
 		return ctrl.Result{}, true, err
 	}
+	r.Metrics.observePodRecovery("attempt")
 	// Reconcile again before deleting or creating so the persisted attempt marker
 	// is always observed, including across a concurrent generation change.
 	return ctrl.Result{Requeue: true}, true, nil
@@ -580,6 +589,7 @@ func (r *EnvironmentReconciler) reconcileTerminalPod(ctx context.Context, env *p
 				}
 				return ctrl.Result{}, err
 			}
+			r.Metrics.observePodRecovery("exhausted")
 			log.FromContext(ctx).Info("environment pod recovery exhausted", "environment", env.Name, "pod", pod.Name, "attempts", attempts)
 			return ctrl.Result{}, nil
 		}
@@ -788,6 +798,7 @@ func (r *EnvironmentReconciler) reconcileIdle(ctx context.Context, env *platform
 	if err := r.Status().Update(ctx, env); err != nil {
 		return ctrl.Result{}, fmt.Errorf("record idle suspension: %w", err)
 	}
+	r.Metrics.observeLifecycle("suspend", platformv1alpha1.EnvironmentSuspensionReasonIdle)
 	return ctrl.Result{Requeue: true}, nil
 }
 

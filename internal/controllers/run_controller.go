@@ -140,6 +140,7 @@ type RunReconciler struct {
 	Adapters  map[string]AdapterLifecycle
 	EventSink AdapterEventSink
 	Connector sandboxclient.Connector
+	Metrics   *OperatorMetrics
 }
 
 // +kubebuilder:rbac:groups=swe.dev,resources=runs,verbs=get;list;watch;update;patch
@@ -232,12 +233,14 @@ func (r *RunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.R
 	}
 
 	if run.Status.EnvironmentRef == nil {
+		allocatedNow := false
 		ref, err := r.recoverEnvironmentReference(ctx, &run)
 		if err != nil {
 			return ctrl.Result{}, err
 		}
 		if ref == nil {
 			ref, err = r.allocateEnvironment(ctx, &run)
+			allocatedNow = ref != nil && err == nil
 		} else if ref.Ownership == platformv1alpha1.EnvironmentOwnershipClaimed {
 			var recovered platformv1alpha1.Environment
 			if getErr := r.Get(ctx, types.NamespacedName{Namespace: run.Namespace, Name: ref.Name}, &recovered); getErr != nil {
@@ -260,6 +263,7 @@ func (r *RunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.R
 		}
 		if ref == nil && err == nil {
 			ref, err = r.allocateEnvironment(ctx, &run)
+			allocatedNow = ref != nil && err == nil
 		}
 		if err != nil {
 			if errors.Is(err, errExplicitEnvironmentClaimed) || errors.Is(err, errExplicitEnvironmentHeld) || errors.Is(err, errExplicitEnvironmentSuspensionNotWakeable) {
@@ -268,7 +272,17 @@ func (r *RunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.R
 			return ctrl.Result{}, err
 		}
 		run.Status.EnvironmentRef = ref
-		return ctrl.Result{Requeue: true}, r.setRunState(ctx, &run, platformv1alpha1.RunStateAllocating, "EnvironmentAllocated", fmt.Sprintf("environment %s allocated", ref.Name), false)
+		if err := r.setRunState(ctx, &run, platformv1alpha1.RunStateAllocating, "EnvironmentAllocated", fmt.Sprintf("environment %s allocated", ref.Name), false); err != nil {
+			return ctrl.Result{Requeue: true}, err
+		}
+		if allocatedNow && run.Spec.EnvironmentRef == "" {
+			path := allocationOwnedCreate
+			if ref.Ownership == platformv1alpha1.EnvironmentOwnershipClaimed {
+				path = allocationWarmClaim
+			}
+			r.Metrics.observeAllocation(run.CreationTimestamp.Time, path)
+		}
+		return ctrl.Result{Requeue: true}, nil
 	}
 
 	env, err := r.getAllocatedEnvironment(ctx, &run)
@@ -284,7 +298,8 @@ func (r *RunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.R
 			if !environmentReachable(env) || adapter == nil {
 				return r.requestEnvironmentFence(ctx, env)
 			}
-			execution, current, err := r.resolveAllocatedExecution(ctx, &run, env)
+			fenceRejections := &fenceRejectionRecorder{metrics: r.Metrics, callSite: fenceCallSiteRunCancel}
+			execution, current, err := r.resolveAllocatedExecution(ctx, &run, env, fenceRejections)
 			if err != nil {
 				return ctrl.Result{}, err
 			}
@@ -292,13 +307,16 @@ func (r *RunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.R
 				return ctrl.Result{Requeue: true}, nil
 			}
 			executionFence := lifecycle.CaptureExecutionFence(env)
-			if err := adapter.Cancel(ctx, adapterTask(&run), r.adapterSandbox(&run, env, executionFence)); err != nil {
-				if errors.Is(err, ErrAdapterCancellationPending) {
+			started := time.Now()
+			cancelErr := adapter.Cancel(ctx, adapterTask(&run), r.adapterSandbox(&run, env, executionFence, fenceRejections))
+			r.Metrics.observeAdapter(run.Spec.Agent, adapterOperationCancel, started, cancelErr)
+			if cancelErr != nil {
+				if errors.Is(cancelErr, ErrAdapterCancellationPending) {
 					return ctrl.Result{RequeueAfter: adapterPollInterval}, nil
 				}
-				return ctrl.Result{}, err
+				return ctrl.Result{}, cancelErr
 			}
-			current, err = r.allocatedExecutionCurrent(ctx, &run, env, execution)
+			current, err = r.allocatedExecutionCurrent(ctx, &run, env, execution, fenceRejections)
 			if err != nil {
 				return ctrl.Result{}, err
 			}
@@ -366,15 +384,18 @@ func (r *RunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.R
 			defer clear(credential.APIKey)
 		}
 		executionFence := lifecycle.CaptureExecutionFence(env)
-		execution, current, err := r.resolveAllocatedExecution(ctx, &run, env)
+		fenceRejections := &fenceRejectionRecorder{metrics: r.Metrics, callSite: fenceCallSiteEnsureAccepted}
+		execution, current, err := r.resolveAllocatedExecution(ctx, &run, env, fenceRejections)
 		if err != nil {
 			return ctrl.Result{}, err
 		}
 		if !current {
 			return ctrl.Result{Requeue: true}, nil
 		}
-		acceptErr := adapter.EnsureAccepted(ctx, adapterTask(&run), r.adapterSandbox(&run, env, executionFence), credential)
-		current, err = r.allocatedExecutionCurrent(ctx, &run, env, execution)
+		started := time.Now()
+		acceptErr := adapter.EnsureAccepted(ctx, adapterTask(&run), r.adapterSandbox(&run, env, executionFence, fenceRejections), credential)
+		r.Metrics.observeAdapter(run.Spec.Agent, adapterOperationEnsureAccepted, started, acceptErr)
+		current, err = r.allocatedExecutionCurrent(ctx, &run, env, execution, fenceRejections)
 		if err != nil {
 			return ctrl.Result{}, err
 		}
@@ -394,7 +415,8 @@ func (r *RunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.R
 		return ctrl.Result{Requeue: true}, r.setRunState(ctx, &run, platformv1alpha1.RunStateAdapterAccepted, "AdapterAccepted", "adapter accepted the task", true)
 	}
 
-	execution, current, err := r.resolveAllocatedExecution(ctx, &run, env)
+	fenceRejections := &fenceRejectionRecorder{metrics: r.Metrics, callSite: fenceCallSiteObserve}
+	execution, current, err := r.resolveAllocatedExecution(ctx, &run, env, fenceRejections)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
@@ -402,11 +424,13 @@ func (r *RunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.R
 		return ctrl.Result{Requeue: true}, nil
 	}
 	executionFence := lifecycle.CaptureExecutionFence(env)
-	observation, message, err := adapter.Observe(ctx, adapterTask(&run), r.adapterSandbox(&run, env, executionFence))
+	started := time.Now()
+	observation, message, err := adapter.Observe(ctx, adapterTask(&run), r.adapterSandbox(&run, env, executionFence, fenceRejections))
+	r.Metrics.observeAdapter(run.Spec.Agent, adapterOperationObserve, started, err)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
-	current, err = r.allocatedExecutionCurrent(ctx, &run, env, execution)
+	current, err = r.allocatedExecutionCurrent(ctx, &run, env, execution, fenceRejections)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
@@ -676,7 +700,10 @@ func getAllocatedEnvironment(ctx context.Context, reader client.Reader, run *pla
 		return nil, err
 	}
 	if env.UID != ref.UID {
-		return nil, fmt.Errorf("%w: environment %q was replaced (wanted UID %s, got %s)", errAllocatedEnvironmentGone, env.Name, ref.UID, env.UID)
+		// Preserve the exact replacement object for execution-fence metric
+		// classification. Other association failures below return no object:
+		// they are not tuple mismatches and must not be counted as fence changes.
+		return &env, fmt.Errorf("%w: environment %q was replaced (wanted UID %s, got %s)", errAllocatedEnvironmentGone, env.Name, ref.UID, env.UID)
 	}
 	switch ref.Ownership {
 	case platformv1alpha1.EnvironmentOwnershipOwned:
@@ -1010,7 +1037,8 @@ func (r *RunReconciler) cleanupTerminal(ctx context.Context, run *platformv1alph
 		if !environmentReachable(env) || adapter == nil {
 			return r.requestEnvironmentFence(ctx, env)
 		}
-		execution, current, err := r.resolveAllocatedExecution(ctx, run, env)
+		fenceRejections := &fenceRejectionRecorder{metrics: r.Metrics, callSite: fenceCallSiteTerminalCleanup}
+		execution, current, err := r.resolveAllocatedExecution(ctx, run, env, fenceRejections)
 		if err != nil {
 			return ctrl.Result{}, err
 		}
@@ -1018,13 +1046,16 @@ func (r *RunReconciler) cleanupTerminal(ctx context.Context, run *platformv1alph
 			return ctrl.Result{Requeue: true}, nil
 		}
 		executionFence := lifecycle.CaptureExecutionFence(env)
-		if err := adapter.Cancel(ctx, adapterTask(run), r.adapterSandbox(run, env, executionFence)); err != nil {
-			if errors.Is(err, ErrAdapterCancellationPending) {
+		started := time.Now()
+		cancelErr := adapter.Cancel(ctx, adapterTask(run), r.adapterSandbox(run, env, executionFence, fenceRejections))
+		r.Metrics.observeAdapter(run.Spec.Agent, adapterOperationCancel, started, cancelErr)
+		if cancelErr != nil {
+			if errors.Is(cancelErr, ErrAdapterCancellationPending) {
 				return ctrl.Result{RequeueAfter: adapterPollInterval}, nil
 			}
-			return ctrl.Result{}, err
+			return ctrl.Result{}, cancelErr
 		}
-		current, err = r.allocatedExecutionCurrent(ctx, run, env, execution)
+		current, err = r.allocatedExecutionCurrent(ctx, run, env, execution, fenceRejections)
 		if err != nil {
 			return ctrl.Result{}, err
 		}
@@ -1090,7 +1121,8 @@ func (r *RunReconciler) finalize(ctx context.Context, run *platformv1alpha1.Run)
 				if !environmentReachable(env) || adapter == nil {
 					return r.requestEnvironmentFence(ctx, env)
 				}
-				execution, current, resolveErr := r.resolveAllocatedExecution(ctx, run, env)
+				fenceRejections := &fenceRejectionRecorder{metrics: r.Metrics, callSite: fenceCallSiteFinalizerCleanup}
+				execution, current, resolveErr := r.resolveAllocatedExecution(ctx, run, env, fenceRejections)
 				if resolveErr != nil {
 					return ctrl.Result{}, resolveErr
 				}
@@ -1098,13 +1130,16 @@ func (r *RunReconciler) finalize(ctx context.Context, run *platformv1alpha1.Run)
 					return ctrl.Result{Requeue: true}, nil
 				}
 				executionFence := lifecycle.CaptureExecutionFence(env)
-				if err := adapter.Cancel(ctx, adapterTask(run), r.adapterSandbox(run, env, executionFence)); err != nil {
-					if errors.Is(err, ErrAdapterCancellationPending) {
+				started := time.Now()
+				cancelErr := adapter.Cancel(ctx, adapterTask(run), r.adapterSandbox(run, env, executionFence, fenceRejections))
+				r.Metrics.observeAdapter(run.Spec.Agent, adapterOperationCancel, started, cancelErr)
+				if cancelErr != nil {
+					if errors.Is(cancelErr, ErrAdapterCancellationPending) {
 						return ctrl.Result{RequeueAfter: adapterPollInterval}, nil
 					}
-					return ctrl.Result{}, err
+					return ctrl.Result{}, cancelErr
 				}
-				current, resolveErr = r.allocatedExecutionCurrent(ctx, run, env, execution)
+				current, resolveErr = r.allocatedExecutionCurrent(ctx, run, env, execution, fenceRejections)
 				if resolveErr != nil {
 					return ctrl.Result{}, resolveErr
 				}
@@ -1189,7 +1224,7 @@ func adapterTask(run *platformv1alpha1.Run) AdapterTask {
 	return AdapterTask{ID: string(run.UID), Prompt: run.Spec.Prompt}
 }
 
-func (r *RunReconciler) adapterSandbox(run *platformv1alpha1.Run, env *platformv1alpha1.Environment, fence lifecycle.ExecutionFence) AdapterSandbox {
+func (r *RunReconciler) adapterSandbox(run *platformv1alpha1.Run, env *platformv1alpha1.Environment, fence lifecycle.ExecutionFence, fenceRejections *fenceRejectionRecorder) AdapterSandbox {
 	sandbox := AdapterSandbox{EnvironmentName: env.Name, EnvironmentUID: env.UID,
 		DialProcess: func(ctx context.Context) (sandboxdv1.ProcessServiceClient, func() error, error) {
 			reader := r.apiReader()
@@ -1199,12 +1234,18 @@ func (r *RunReconciler) adapterSandbox(run *platformv1alpha1.Run, env *platformv
 			// complete fence before leasing a pooled physical connection.
 			current, err := getAllocatedEnvironment(ctx, reader, run)
 			if err != nil {
+				if current != nil {
+					fenceRejections.observe(fence.Validate(current))
+				}
 				return nil, nil, err
 			}
 			if err := fence.Validate(current); err != nil {
+				fenceRejections.observe(err)
 				return nil, nil, err
 			}
-			return r.connector().DialProcess(ctx, fence)
+			process, closeProcess, err := r.connector().DialProcess(ctx, fence)
+			fenceRejections.observe(err)
+			return process, closeProcess, err
 		}}
 	if r.EventSink != nil {
 		runUID := string(run.UID)
@@ -1215,45 +1256,61 @@ func (r *RunReconciler) adapterSandbox(run *platformv1alpha1.Run, env *platformv
 	return sandbox
 }
 
-func (r *RunReconciler) resolveAllocatedExecution(ctx context.Context, run *platformv1alpha1.Run, expected *platformv1alpha1.Environment) (sandboxclient.Execution, bool, error) {
+func (r *RunReconciler) resolveAllocatedExecution(ctx context.Context, run *platformv1alpha1.Run, expected *platformv1alpha1.Environment, fenceRejections *fenceRejectionRecorder) (sandboxclient.Execution, bool, error) {
 	fence := lifecycle.CaptureExecutionFence(expected)
 	// Mandatory uncached pre-call association proof. ResolveExecution then
 	// proves the connector-private exact Pod execution used for the later
 	// post-adapter currentness comparison.
 	current, err := getAllocatedEnvironment(ctx, r.apiReader(), run)
 	if apierrors.IsNotFound(err) || errors.Is(err, errAllocatedEnvironmentGone) {
+		if current != nil {
+			fenceRejections.observe(fence.Validate(current))
+		}
 		return sandboxclient.Execution{}, false, nil
 	}
 	if err != nil {
 		return sandboxclient.Execution{}, false, err
 	}
-	if err := fence.Validate(current); err != nil || !environmentReachable(current) {
+	if err := fence.Validate(current); err != nil {
+		fenceRejections.observe(err)
+		return sandboxclient.Execution{}, false, nil
+	}
+	if !environmentReachable(current) {
 		return sandboxclient.Execution{}, false, nil
 	}
 	execution, err := r.connector().ResolveExecution(ctx, fence)
 	if err != nil {
+		fenceRejections.observe(err)
 		return sandboxclient.Execution{}, false, err
 	}
 	return execution, true, nil
 }
 
-func (r *RunReconciler) allocatedExecutionCurrent(ctx context.Context, run *platformv1alpha1.Run, expected *platformv1alpha1.Environment, execution sandboxclient.Execution) (bool, error) {
+func (r *RunReconciler) allocatedExecutionCurrent(ctx context.Context, run *platformv1alpha1.Run, expected *platformv1alpha1.Environment, execution sandboxclient.Execution, fenceRejections *fenceRejectionRecorder) (bool, error) {
 	fence := lifecycle.CaptureExecutionFence(expected)
 	// Mandatory uncached post-call association proof: adapter results cannot be
 	// published after allocation moved, even when the old execution still
 	// answers. ExecutionCurrent adds the exact live backend proof.
 	current, err := getAllocatedEnvironment(ctx, r.apiReader(), run)
 	if apierrors.IsNotFound(err) || errors.Is(err, errAllocatedEnvironmentGone) {
+		if current != nil {
+			fenceRejections.observe(fence.Validate(current))
+		}
 		return false, nil
 	}
 	if err != nil {
 		return false, err
 	}
-	if err := fence.Validate(current); err != nil || !environmentReachable(current) {
+	if err := fence.Validate(current); err != nil {
+		fenceRejections.observe(err)
+		return false, nil
+	}
+	if !environmentReachable(current) {
 		return false, nil
 	}
 	currentExecution, err := r.connector().ExecutionCurrent(ctx, fence, execution)
 	if errors.Is(err, lifecycle.ErrExecutionFenceChanged) {
+		fenceRejections.observe(err)
 		return false, nil
 	}
 	return currentExecution, err
