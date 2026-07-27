@@ -499,7 +499,8 @@ Setup and resume hooks receive only the controller's
 non-secret repository and timeout values. They are limited to 30 minutes each. Failed or
 completed environment pods are replaced with bounded exponential
 backoff while retaining the workspace PVC; recovery progress and exhaustion are reported by
-the `Ready` condition and pod-recovery status fields. Environment readiness is reported by
+the `Ready` condition and nested backend-neutral `status.recovery` fields. Environment readiness
+is reported by
 the current-generation `Ready` condition only after initialization completes and the sandboxd
 startup/readiness probes pass; `status.phase` is a display summary rather than the scheduling
 contract. GitHub App token minting is not implemented yet.

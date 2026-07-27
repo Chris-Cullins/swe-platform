@@ -551,28 +551,6 @@ spec:
               podName:
                 description: PodName is the name of the backing pod, when one exists.
                 type: string
-              podRecoveryAttempts:
-                description: |-
-                  PodRecoveryAttempts is the number of terminal Pod replacements attempted
-                  since the current Pod recovery sequence last became ready.
-                format: int32
-                type: integer
-              podRecoveryExhausted:
-                description: |-
-                  PodRecoveryExhausted reports that automatic terminal Pod replacement has
-                  consumed its retry budget. It remains set until sandboxd becomes ready.
-                type: boolean
-              podRecoveryNextAttemptAt:
-                description: |-
-                  PodRecoveryNextAttemptAt is when the controller may next replace a
-                  terminal Pod.
-                format: date-time
-                type: string
-              podRecoveryUID:
-                description: |-
-                  PodRecoveryUID identifies the exact terminal Pod covered by the pending or
-                  in-progress recovery attempt.
-                type: string
               portalRoutes:
                 description: |-
                   PortalRoutes is bounded gateway-owned state. Other status writers must
@@ -612,6 +590,34 @@ spec:
                   type: object
                 maxItems: 64
                 type: array
+              recovery:
+                description: Recovery is backend-neutral terminal execution recovery
+                  state.
+                properties:
+                  attempts:
+                    description: |-
+                      Attempts is the number of terminal execution replacements attempted since
+                      the recovery sequence last became ready.
+                    format: int32
+                    type: integer
+                  executionGeneration:
+                    description: |-
+                      ExecutionGeneration identifies the exact backend execution whose recovery
+                      is pending or being accounted. Zero means there is no recovery identity.
+                    format: int64
+                    minimum: 0
+                    type: integer
+                  exhausted:
+                    description: |-
+                      Exhausted reports that automatic terminal execution replacement has
+                      consumed its retry budget. It remains set until sandboxd becomes ready.
+                    type: boolean
+                  nextAttemptAt:
+                    description: NextAttemptAt is when the controller may next replace
+                      a terminal execution.
+                    format: date-time
+                    type: string
+                type: object
               serviceObservations:
                 description: |-
                   ServiceObservations is advisory point-in-time service state owned solely

@@ -69,6 +69,7 @@ var (
 	errPodReplacing                  = stderrors.New("environment pod is being replaced")
 	errPodRecoveryChanged            = stderrors.New("environment pod recovery state changed")
 	errEnvironmentIncarnationChanged = stderrors.New("environment incarnation changed")
+	errEnvironmentExecutionChanged   = stderrors.New("environment execution changed")
 )
 
 type childOwnershipCollisionError struct {
@@ -1103,10 +1104,11 @@ func (r *EnvironmentReconciler) updatePodRecoveryStatus(ctx context.Context, env
 }
 
 func samePodRecoveryState(left, right *platformv1alpha1.EnvironmentStatus) bool {
-	return left.PodRecoveryAttempts == right.PodRecoveryAttempts &&
-		left.PodRecoveryExhausted == right.PodRecoveryExhausted &&
-		left.PodRecoveryUID == right.PodRecoveryUID &&
-		apiequality.Semantic.DeepEqual(left.PodRecoveryNextAttemptAt, right.PodRecoveryNextAttemptAt)
+	return left.ExecutionGeneration == right.ExecutionGeneration &&
+		left.Recovery.Attempts == right.Recovery.Attempts &&
+		left.Recovery.Exhausted == right.Recovery.Exhausted &&
+		left.Recovery.ExecutionGeneration == right.Recovery.ExecutionGeneration &&
+		apiequality.Semantic.DeepEqual(left.Recovery.NextAttemptAt, right.Recovery.NextAttemptAt)
 }
 
 func applyEnvironmentStatus(env *platformv1alpha1.Environment, phase platformv1alpha1.EnvironmentPhase, podName, sandboxdEndpoint, reason, message string, lastActiveAt *metav1.Time) {
