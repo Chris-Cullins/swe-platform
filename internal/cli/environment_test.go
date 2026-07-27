@@ -245,9 +245,9 @@ func TestEnvironmentServiceDeclarationsAreRevisionedAndIdempotent(t *testing.T) 
 	if err := listEnvironmentServices(context.Background(), kube, key, &output); err != nil {
 		t.Fatal(err)
 	}
-	want := "NAME\tREVISION\tPROTOCOL\tTARGET-PORT\tVISIBILITY\tREADINESS\tSTATE\tREASON\tOBSERVED-AT\tFRESHNESS\n" +
-		"alias\t1\tHTTP\t3000\tProject\tTCPConnect\t-\t-\t-\tNO-OBSERVATION\n" +
-		"web\t2\tHTTP\t3001\tProject\tTCPConnect\t-\t-\t-\tNO-OBSERVATION\n"
+	want := "NAME\tSOURCE\tREVISION\tPROTOCOL\tTARGET-PORT\tVISIBILITY\tREADINESS\tSTATE\tREASON\tOBSERVED-AT\tFRESHNESS\n" +
+		"alias\tAPI\t1\tHTTP\t3000\tProject\tTCPConnect\t-\t-\t-\tNO-OBSERVATION\n" +
+		"web\tAPI\t2\tHTTP\t3001\tProject\tTCPConnect\t-\t-\t-\tNO-OBSERVATION\n"
 	if output.String() != want {
 		t.Fatalf("service list:\n%s\nwant:\n%s", output.String(), want)
 	}
@@ -284,6 +284,48 @@ func TestEnvironmentServiceUpdateBackfillsLegacyInstanceID(t *testing.T) {
 	service, err = writeEnvironmentService(context.Background(), kube, client.ObjectKeyFromObject(environment), "web", 3000, true)
 	if err != nil || service.Revision != 5 || service.InstanceID != stableID {
 		t.Fatalf("idempotent migrated update = %#v, %v", service, err)
+	}
+}
+
+func TestEnvironmentServiceMutationsRefuseRepositoryOwnedDeclaration(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := platformv1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	repository := desiredEnvironmentService("web", 3000, 1, "abcdefghijklmnopqrst")
+	repository.Source = platformv1alpha1.EnvironmentServiceSourceRepository
+	repository.Launch = &platformv1alpha1.EnvironmentServiceLaunch{Argv: []platformv1alpha1.EnvironmentServiceLaunchArgument{"npm", "run", "dev"}}
+	environment := &platformv1alpha1.Environment{ObjectMeta: metav1.ObjectMeta{Name: "shared", Namespace: "ns", UID: "env-uid"}, Spec: platformv1alpha1.EnvironmentSpec{Services: []platformv1alpha1.EnvironmentServiceDeclaration{repository}}}
+	kube := fake.NewClientBuilder().WithScheme(scheme).WithObjects(environment).Build()
+	key := client.ObjectKeyFromObject(environment)
+
+	for _, test := range []struct {
+		name string
+		run  func() error
+	}{
+		{"declare", func() error {
+			_, err := writeEnvironmentService(context.Background(), kube, key, "web", 3000, false)
+			return err
+		}},
+		{"update", func() error {
+			_, err := writeEnvironmentService(context.Background(), kube, key, "web", 3001, true)
+			return err
+		}},
+		{"remove", func() error { return removeEnvironmentService(context.Background(), kube, key, "web") }},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if err := test.run(); err == nil || !strings.Contains(err.Error(), "Repository-owned") {
+				t.Fatalf("error = %v, want clear Repository-owned refusal", err)
+			}
+		})
+	}
+
+	var output bytes.Buffer
+	if err := listEnvironmentServices(context.Background(), kube, key, &output); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(output.String(), "web\tRepository\t1\tHTTP\t3000") || strings.Contains(output.String(), "npm") {
+		t.Fatalf("repository service list = %q", output.String())
 	}
 }
 

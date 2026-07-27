@@ -241,6 +241,28 @@ spec:
                       minLength: 20
                       pattern: ^[a-z0-9]{20,63}$
                       type: string
+                    launch:
+                      description: Launch is required only for repository-supervised
+                        services.
+                      properties:
+                        argv:
+                          description: Argv is the non-empty executable and argument
+                            vector.
+                          items:
+                            description: EnvironmentServiceLaunchArgument is one bounded
+                              argv element.
+                            maxLength: 4096
+                            minLength: 1
+                            type: string
+                          maxItems: 64
+                          minItems: 1
+                          type: array
+                      required:
+                      - argv
+                      type: object
+                      x-kubernetes-validations:
+                      - message: argv must not exceed 16384 aggregate characters
+                        rule: self.argv.join("").size() <= 16384
                     name:
                       description: Name is the stable service name within this Environment.
                       maxLength: 63
@@ -269,6 +291,13 @@ spec:
                       format: int64
                       minimum: 1
                       type: integer
+                    source:
+                      description: Source identifies the owner responsible for launching
+                        the service.
+                      enum:
+                      - API
+                      - Repository
+                      type: string
                     targetPort:
                       description: |-
                         TargetPort is an explicit port on the Environment's logical loopback.
@@ -292,6 +321,7 @@ spec:
                   - protocol
                   - readiness
                   - revision
+                  - source
                   - targetPort
                   - visibility
                   type: object
@@ -306,6 +336,11 @@ spec:
                       ? (has(self.instanceID) && self.instanceID == oldSelf.value().instanceID)
                       : (self == oldSelf.value() || (has(self.instanceID) && self.revision
                       > oldSelf.value().revision)))'
+                  - message: source is immutable for a service declaration incarnation;
+                      remove and re-add the declaration to change ownership
+                    rule: self.source == oldSelf.source
+                  - message: launch must be present exactly when source is Repository
+                    rule: (self.source == 'Repository') == has(self.launch)
                 maxItems: 32
                 type: array
                 x-kubernetes-list-map-keys:
