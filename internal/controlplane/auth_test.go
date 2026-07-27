@@ -7,6 +7,8 @@ import (
 	"net/http/httptest"
 	"testing"
 
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	authenticationv1 "k8s.io/api/authentication/v1"
 	authorizationv1 "k8s.io/api/authorization/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -15,6 +17,7 @@ import (
 )
 
 func TestKubernetesAccessControllerReviewsExactResourceIdentity(t *testing.T) {
+	metrics := NewMetrics(prometheus.NewRegistry())
 	client := fake.NewClientset()
 	client.PrependReactor("create", "tokenreviews", func(action ktesting.Action) (bool, runtime.Object, error) {
 		review := action.(ktesting.CreateAction).GetObject().(*authenticationv1.TokenReview)
@@ -53,11 +56,20 @@ func TestKubernetesAccessControllerReviewsExactResourceIdentity(t *testing.T) {
 
 	request := httptest.NewRequest(http.MethodGet, transcriptURL, nil)
 	request.Header.Set("Authorization", "Bearer reader-token")
-	err := (KubernetesAccessController{Client: client}).Authorize(request, ResourceAccess{
+	err := (KubernetesAccessController{Client: client, Metrics: metrics}).Authorize(request, ResourceAccess{
 		Namespace: "project-a", Verb: "get", Resource: "runs", Subresource: "transcript", Name: "shared",
 	}, true)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if got := testutil.ToFloat64(metrics.tokenReviews.WithLabelValues("authenticated")); got != 1 {
+		t.Fatalf("authenticated TokenReviews = %v, want 1", got)
+	}
+	if got := testutil.ToFloat64(metrics.subjectAccessReviews.WithLabelValues("allowed")); got != 1 {
+		t.Fatalf("allowed SubjectAccessReviews = %v, want 1", got)
+	}
+	if got := histogramCount(t, metrics.tokenReviewLatency.WithLabelValues("authenticated")); got != 1 {
+		t.Fatalf("TokenReview latency observations = %d, want 1", got)
 	}
 }
 
@@ -69,6 +81,7 @@ func TestKubernetesAccessControllerRejectsAnonymousAndDeniedUsers(t *testing.T) 
 	}
 
 	client := fake.NewClientset()
+	metrics := NewMetrics(prometheus.NewRegistry())
 	client.PrependReactor("create", "tokenreviews", func(ktesting.Action) (bool, runtime.Object, error) {
 		return true, &authenticationv1.TokenReview{Status: authenticationv1.TokenReviewStatus{
 			Authenticated: true,
@@ -80,8 +93,46 @@ func TestKubernetesAccessControllerRejectsAnonymousAndDeniedUsers(t *testing.T) 
 		return true, &authorizationv1.SubjectAccessReview{Status: authorizationv1.SubjectAccessReviewStatus{Allowed: false}}, nil
 	})
 	request.Header.Set("Authorization", "Bearer producer-token")
-	if err := (KubernetesAccessController{Client: client}).Authorize(request, ResourceAccess{}, false); !errors.Is(err, errForbidden) {
+	if err := (KubernetesAccessController{Client: client, Metrics: metrics}).Authorize(request, ResourceAccess{}, false); !errors.Is(err, errForbidden) {
 		t.Fatalf("denied error = %v, want forbidden", err)
+	}
+	if got := testutil.ToFloat64(metrics.subjectAccessReviews.WithLabelValues("denied")); got != 1 {
+		t.Fatalf("denied SubjectAccessReviews = %v, want 1", got)
+	}
+}
+
+func TestKubernetesAccessControllerRecordsReviewErrors(t *testing.T) {
+	metrics := NewMetrics(prometheus.NewRegistry())
+	tokenFailure := fake.NewClientset()
+	tokenFailure.PrependReactor("create", "tokenreviews", func(ktesting.Action) (bool, runtime.Object, error) {
+		return true, nil, errors.New("token webhook unavailable")
+	})
+	request := httptest.NewRequest(http.MethodGet, transcriptURL, nil)
+	request.Header.Set("Authorization", "Bearer token")
+	if err := (KubernetesAccessController{Client: tokenFailure, Metrics: metrics}).Authorize(request, ResourceAccess{}, false); err == nil {
+		t.Fatal("TokenReview failure was accepted")
+	}
+
+	sarFailure := fake.NewClientset()
+	sarFailure.PrependReactor("create", "tokenreviews", func(ktesting.Action) (bool, runtime.Object, error) {
+		return true, &authenticationv1.TokenReview{Status: authenticationv1.TokenReviewStatus{
+			Authenticated: true, Audiences: []string{defaultTokenAudience}, User: authenticationv1.UserInfo{Username: "reader"},
+		}}, nil
+	})
+	sarFailure.PrependReactor("create", "subjectaccessreviews", func(ktesting.Action) (bool, runtime.Object, error) {
+		return true, &authorizationv1.SubjectAccessReview{Status: authorizationv1.SubjectAccessReviewStatus{EvaluationError: "authorization webhook unavailable"}}, nil
+	})
+	if err := (KubernetesAccessController{Client: sarFailure, Metrics: metrics}).Authorize(request, ResourceAccess{}, false); err == nil {
+		t.Fatal("SubjectAccessReview evaluation failure was accepted")
+	}
+	if got := testutil.ToFloat64(metrics.tokenReviews.WithLabelValues("error")); got != 1 {
+		t.Fatalf("TokenReview errors = %v, want 1", got)
+	}
+	if got := testutil.ToFloat64(metrics.subjectAccessReviews.WithLabelValues("error")); got != 1 {
+		t.Fatalf("SubjectAccessReview errors = %v, want 1", got)
+	}
+	if got := histogramCount(t, metrics.subjectAccessLatency.WithLabelValues("error")); got != 1 {
+		t.Fatalf("SubjectAccessReview error latency observations = %d, want 1", got)
 	}
 }
 

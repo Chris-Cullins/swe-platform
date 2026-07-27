@@ -16,6 +16,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -33,6 +34,7 @@ const shutdownTimeout = 10 * time.Second
 
 func main() {
 	address := flag.String("listen-address", ":8080", "Address for the control-plane HTTP API")
+	metricsAddress := flag.String("metrics-bind-address", "127.0.0.1:8082", "Address for the internal Prometheus metrics endpoint")
 	flag.Parse()
 
 	log := slog.New(slog.NewJSONHandler(os.Stdout, nil))
@@ -67,11 +69,15 @@ func main() {
 		os.Exit(1)
 	}
 	defer closeStores()
+	metricsRegistry := prometheus.NewRegistry()
+	metricsRegistry.MustRegister(prometheus.NewGoCollector(), prometheus.NewProcessCollector(prometheus.ProcessCollectorOpts{}))
+	metrics := controlplane.NewMetrics(metricsRegistry)
 	access := controlplane.KubernetesAccessController{
 		Client:         clientset,
 		BootstrapToken: bootstrapToken,
 		Audience:       os.Getenv("SWE_TOKEN_AUDIENCE"),
 		Sessions:       sessions,
+		Metrics:        metrics,
 	}
 	mode, err := tenancy.ParseMode(os.Getenv("SWE_TENANCY_MODE"))
 	if err != nil {
@@ -109,7 +115,7 @@ func main() {
 	resources := &controlplane.KubernetesResourceService{Client: kubeClient}
 	streamLifecycle, cancelStreams := context.WithCancel(context.Background())
 	defer cancelStreams()
-	server := &http.Server{
+	apiServer := &http.Server{
 		Addr: *address,
 		Handler: controlplane.NewServer(log, controlplane.ServerOptions{
 			Access:                resourceAccess,
@@ -117,27 +123,83 @@ func main() {
 			Resources:             resources,
 			Runs:                  controlplane.KubernetesRunResolver{Client: kubeClient},
 			TranscriptStore:       transcripts,
-			TerminalDialer:        controlplane.KubernetesTerminalDialer{Client: kubeClient},
+			TerminalDialer:        controlplane.KubernetesTerminalDialer{Client: kubeClient, Metrics: metrics},
 			ConsoleAssets:         consoleui.Assets(),
 			TrustProxy:            strings.EqualFold(os.Getenv("SWE_TRUST_PROXY_HEADERS"), "true"),
 			AllowInsecureSessions: strings.EqualFold(os.Getenv("SWE_ALLOW_INSECURE_SESSIONS"), "true"),
 			StreamLifecycle:       streamLifecycle,
+			Metrics:               metrics,
 		}).Handler(),
 		ReadHeaderTimeout: 5 * time.Second,
 		IdleTimeout:       2 * time.Minute,
 	}
-	listener, err := net.Listen("tcp", *address)
+	metricsServer := &http.Server{
+		Addr:              *metricsAddress,
+		Handler:           controlplane.MetricsHandler(metricsRegistry),
+		ReadHeaderTimeout: 5 * time.Second,
+		IdleTimeout:       30 * time.Second,
+	}
+	apiListener, err := net.Listen("tcp", *address)
 	if err != nil {
 		log.Error("listen for control-plane API", "address", *address, "error", err)
 		os.Exit(1)
 	}
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
-	log.Info("starting control-plane API", "address", *address)
-	if err := runHTTPServer(ctx, log, server, listener, shutdownTimeout, cancelStreams); err != nil {
-		log.Error("control-plane API stopped", "error", err)
+	metricsListener, err := net.Listen("tcp", *metricsAddress)
+	if err != nil {
+		_ = apiListener.Close()
+		log.Error("listen for control-plane metrics", "address", *metricsAddress, "error", err)
 		os.Exit(1)
 	}
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	log.Info("starting control-plane", "apiAddress", *address, "metricsAddress", *metricsAddress)
+	if err := runHTTPServers(ctx, log, []httpServerListener{
+		{name: "API", server: apiServer, listener: apiListener, cancelStreams: cancelStreams},
+		{name: "metrics", server: metricsServer, listener: metricsListener},
+	}, shutdownTimeout); err != nil {
+		log.Error("control-plane stopped", "error", err)
+		os.Exit(1)
+	}
+}
+
+type httpServerListener struct {
+	name          string
+	server        *http.Server
+	listener      net.Listener
+	cancelStreams context.CancelFunc
+}
+
+func runHTTPServers(ctx context.Context, log *slog.Logger, servers []httpServerListener, drainTimeout time.Duration) error {
+	serveContext, cancel := context.WithCancel(ctx)
+	defer cancel()
+	type result struct {
+		name string
+		err  error
+	}
+	results := make(chan result, len(servers))
+	for _, configured := range servers {
+		configured := configured
+		cancelStreams := configured.cancelStreams
+		if cancelStreams == nil {
+			cancelStreams = func() {}
+		}
+		go func() {
+			results <- result{configured.name, runHTTPServer(serveContext, log, configured.server, configured.listener, drainTimeout, cancelStreams)}
+		}()
+	}
+	first := <-results
+	cancel()
+	var firstErr error
+	if first.err != nil {
+		firstErr = fmt.Errorf("%s server: %w", first.name, first.err)
+	}
+	for range len(servers) - 1 {
+		completed := <-results
+		if firstErr == nil && completed.err != nil {
+			firstErr = fmt.Errorf("%s server: %w", completed.name, completed.err)
+		}
+	}
+	return firstErr
 }
 
 func parseTenancyNamespaces(value string) (map[string]struct{}, error) {

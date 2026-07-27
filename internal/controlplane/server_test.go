@@ -13,6 +13,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/testutil"
+	dto "github.com/prometheus/client_model/go"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
@@ -21,10 +24,20 @@ import (
 const transcriptURL = "/api/v1/namespaces/project-1/runs/run-1/transcript"
 
 func TestTranscriptReplayAndLiveStream(t *testing.T) {
-	server := httptest.NewServer(newTestServer(&fakeAccess{}).Handler())
+	metrics := NewMetrics(prometheus.NewRegistry())
+	server := httptest.NewServer(NewServer(nil, ServerOptions{
+		Access: &fakeAccess{}, Runs: &fakeRunResolver{},
+		TranscriptStore: NewMemoryTranscriptStore(MemoryTranscriptStoreOptions{}), Metrics: metrics,
+	}).Handler())
 	defer server.Close()
 
 	postEvent(t, server.URL, `{"source":"adapter","idempotencyKey":"first","type":"output","data":{"text":"first"}}`)
+	if got := testutil.ToFloat64(metrics.transcriptAppends.WithLabelValues("committed")); got != 1 {
+		t.Fatalf("committed append metric = %v, want 1", got)
+	}
+	if got := histogramCount(t, metrics.transcriptAppendLatency.WithLabelValues("committed")); got != 1 {
+		t.Fatalf("append latency observations = %d, want 1", got)
+	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -59,8 +72,28 @@ func TestTranscriptReplayAndLiveStream(t *testing.T) {
 	}()
 
 	assertEventText(t, nextLine(t, lines), "first")
+	if got := testutil.ToFloat64(metrics.transcriptSubscribers); got != 1 {
+		t.Fatalf("SSE subscriber gauge = %v, want 1", got)
+	}
 	postEvent(t, server.URL, `{"source":"adapter","idempotencyKey":"second","type":"output","data":{"text":"second"}}`)
 	assertEventText(t, nextLine(t, lines), "second")
+	if got := testutil.ToFloat64(metrics.transcriptDeliveries.WithLabelValues("replay", "delivered")); got != 1 {
+		t.Fatalf("replay delivery metric = %v, want 1", got)
+	}
+	if got := testutil.ToFloat64(metrics.transcriptDeliveries.WithLabelValues("live", "delivered")); got != 1 {
+		t.Fatalf("live delivery metric = %v, want 1", got)
+	}
+	if got := histogramCount(t, metrics.transcriptDeliveryLag.WithLabelValues("replay")); got != 1 {
+		t.Fatalf("replay lag observations = %d, want 1", got)
+	}
+	cancel()
+	_ = response.Body.Close()
+	for deadline := time.Now().Add(time.Second); testutil.ToFloat64(metrics.transcriptSubscribers) != 0 && time.Now().Before(deadline); {
+		time.Sleep(time.Millisecond)
+	}
+	if got := testutil.ToFloat64(metrics.transcriptSubscribers); got != 0 {
+		t.Fatalf("SSE subscriber gauge after close = %v, want 0", got)
+	}
 }
 
 func TestTranscriptStreamSendsHeartbeat(t *testing.T) {
@@ -92,6 +125,24 @@ func TestTranscriptStreamSendsHeartbeat(t *testing.T) {
 	}
 	if got := scanner.Text(); got != ": ping" {
 		t.Fatalf("heartbeat = %q, want %q", got, ": ping")
+	}
+}
+
+func TestMetricsHandlerDoesNotExposeApplicationRoutes(t *testing.T) {
+	registry := prometheus.NewRegistry()
+	NewMetrics(registry)
+	handler := MetricsHandler(registry)
+	metrics := httptest.NewRecorder()
+	handler.ServeHTTP(metrics, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	if metrics.Code != http.StatusOK || !strings.Contains(metrics.Body.String(), "swe_control_plane_transcript_sse_subscribers") {
+		t.Fatalf("metrics response = %d %q", metrics.Code, metrics.Body.String())
+	}
+	for _, path := range []string{"/healthz", "/api/v1/session", transcriptURL, "/"} {
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, path, nil))
+		if response.Code != http.StatusNotFound {
+			t.Fatalf("metrics listener path %q status = %d, want 404", path, response.Code)
+		}
 	}
 }
 
@@ -599,4 +650,17 @@ func assertEventText(t *testing.T, line, want string) {
 	if data.Text != want {
 		t.Fatalf("event text = %q, want %q", data.Text, want)
 	}
+}
+
+func histogramCount(t *testing.T, observer prometheus.Observer) uint64 {
+	t.Helper()
+	metric, ok := observer.(prometheus.Metric)
+	if !ok {
+		t.Fatal("histogram observer does not implement prometheus.Metric")
+	}
+	var value dto.Metric
+	if err := metric.Write(&value); err != nil {
+		t.Fatal(err)
+	}
+	return value.GetHistogram().GetSampleCount()
 }

@@ -33,7 +33,10 @@ const (
 	maxTerminalUIDLength          = 128
 )
 
-var errTerminalEnvironmentIncarnationChanged = errors.New("environment incarnation changed")
+var (
+	errTerminalEnvironmentIncarnationChanged = errors.New("environment incarnation changed")
+	errTerminalExecutionChanged              = errors.New("terminal execution changed")
+)
 
 const (
 	RunUIDHeader         = "SWE-Run-UID"
@@ -49,6 +52,7 @@ type TerminalDialer interface {
 // KubernetesTerminalDialer resolves environment pods through the Kubernetes API.
 type KubernetesTerminalDialer struct {
 	Client             client.Client
+	Metrics            *Metrics
 	policyPollInterval time.Duration
 }
 
@@ -61,6 +65,7 @@ type terminalConnectionLease struct {
 	mu        sync.Mutex
 	closer    io.Closer
 	execution sandboxclient.TerminalExecution
+	fence     lifecycle.ExecutionFence
 	closed    bool
 }
 
@@ -73,11 +78,12 @@ func (c *activeTerminalConnection) Close() error {
 	return c.Closer.Close()
 }
 
-func (l *terminalConnectionLease) attach(closer io.Closer, execution sandboxclient.TerminalExecution) bool {
+func (l *terminalConnectionLease) attach(closer io.Closer, execution sandboxclient.TerminalExecution, fence lifecycle.ExecutionFence) bool {
 	l.mu.Lock()
 	if !l.closed {
 		l.closer = closer
 		l.execution = execution
+		l.fence = fence
 		l.mu.Unlock()
 		return true
 	}
@@ -86,25 +92,30 @@ func (l *terminalConnectionLease) attach(closer io.Closer, execution sandboxclie
 	return false
 }
 
-func (l *terminalConnectionLease) boundExecution() (sandboxclient.TerminalExecution, bool) {
+func (l *terminalConnectionLease) boundExecution() (sandboxclient.TerminalExecution, lifecycle.ExecutionFence, bool) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	return l.execution, l.closer != nil && !l.closed
+	return l.execution, l.fence, l.closer != nil && !l.closed
 }
 
 func (l *terminalConnectionLease) Close() error {
+	_, err := l.revoke()
+	return err
+}
+
+func (l *terminalConnectionLease) revoke() (bool, error) {
 	l.mu.Lock()
 	if l.closed {
 		l.mu.Unlock()
-		return nil
+		return false, nil
 	}
 	l.closed = true
 	closer := l.closer
 	l.mu.Unlock()
 	if closer != nil {
-		return closer.Close()
+		return true, closer.Close()
 	}
-	return nil
+	return false, nil
 }
 
 // DialTerminal records terminal activity, wakes a paused environment, and then
@@ -151,7 +162,10 @@ func (d KubernetesTerminalDialer) dialTerminal(ctx context.Context, namespace, n
 		}
 	}()
 	connectionLease := &terminalConnectionLease{}
-	go d.heartbeatActivity(heartbeatContext, types.NamespacedName{Namespace: namespace, Name: name}, executionFence, heartbeatInterval, association, connectionLease.boundExecution, func() { _ = connectionLease.Close() })
+	go d.heartbeatActivity(heartbeatContext, types.NamespacedName{Namespace: namespace, Name: name}, executionFence, heartbeatInterval, association, connectionLease.boundExecution, func() bool {
+		revoked, _ := connectionLease.revoke()
+		return revoked
+	})
 	if err := d.Client.Get(ctx, types.NamespacedName{Namespace: namespace, Name: name}, &environment); err != nil {
 		return nil, nil, nil, fmt.Errorf("refresh environment lifecycle: %w", err)
 	}
@@ -190,6 +204,13 @@ func (d KubernetesTerminalDialer) dialTerminal(ctx context.Context, namespace, n
 	}
 	executionFence = lifecycle.CaptureExecutionFence(&environment)
 	terminal, health, execution, closeConnection, err := (sandboxclient.Connector{Reader: d.Client}).DialTerminal(ctx, executionFence)
+	if d.Metrics != nil {
+		outcome := "granted"
+		if err != nil {
+			outcome = "failed"
+		}
+		d.Metrics.terminalLeaseGrants.WithLabelValues(outcome).Inc()
+	}
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("connect to sandboxd: %w", err)
 	}
@@ -199,7 +220,7 @@ func (d KubernetesTerminalDialer) dialTerminal(ctx context.Context, namespace, n
 			return nil, nil, nil, err
 		}
 	}
-	if !connectionLease.attach(closeFunc(closeConnection), execution) {
+	if !connectionLease.attach(closeFunc(closeConnection), execution, executionFence) {
 		return nil, nil, nil, fmt.Errorf("environment became explicitly held while opening terminal")
 	}
 	closer := &activeTerminalConnection{Closer: connectionLease, cancel: cancelHeartbeat}
@@ -237,7 +258,12 @@ func (d KubernetesTerminalDialer) activityHeartbeatInterval(ctx context.Context,
 	return timeout / 2, nil
 }
 
-func (d KubernetesTerminalDialer) heartbeatActivity(ctx context.Context, key types.NamespacedName, fence lifecycle.ExecutionFence, interval time.Duration, association *RunTerminalAssociation, boundExecution func() (sandboxclient.TerminalExecution, bool), revoke func()) {
+func (d KubernetesTerminalDialer) heartbeatActivity(ctx context.Context, key types.NamespacedName, fence lifecycle.ExecutionFence, interval time.Duration, association *RunTerminalAssociation, boundExecution func() (sandboxclient.TerminalExecution, lifecycle.ExecutionFence, bool), revoke func() bool) {
+	revokeLease := func(reason string) {
+		if revoked := revoke(); revoked && d.Metrics != nil {
+			d.Metrics.terminalRevocations.WithLabelValues(reason).Inc()
+		}
+	}
 	retryInterval := interval / 4
 	if retryInterval <= 0 || retryInterval > time.Second {
 		retryInterval = time.Second
@@ -251,25 +277,33 @@ func (d KubernetesTerminalDialer) heartbeatActivity(ctx context.Context, key typ
 		case <-ctx.Done():
 			return
 		case <-policyTicker.C:
+			currentFence, held, err := d.readTerminalPolicy(ctx, key, fence, boundExecution)
+			if err != nil {
+				if errors.Is(err, errTerminalEnvironmentIncarnationChanged) {
+					revokeLease("environment_changed")
+					return
+				}
+				if errors.Is(err, errTerminalExecutionChanged) {
+					revokeLease("execution_changed")
+					return
+				}
+				continue
+			}
 			if association != nil {
 				if err := d.validateRunTerminalAssociation(ctx, key.Namespace, association, nil); err != nil {
+					if errors.Is(err, errTerminalEnvironmentIncarnationChanged) {
+						revokeLease("environment_changed")
+						return
+					}
 					if errors.Is(err, errRunTerminalAssociation) || errors.Is(err, errRunUIDConflict) {
-						revoke()
+						revokeLease("run_association_changed")
 						return
 					}
 					continue
 				}
 			}
-			currentFence, held, err := d.readTerminalPolicy(ctx, key, fence, boundExecution)
-			if err != nil {
-				if errors.Is(err, errTerminalEnvironmentIncarnationChanged) {
-					revoke()
-					return
-				}
-				continue
-			}
 			if held || currentFence.HoldPolicyRevision() < fence.HoldPolicyRevision() {
-				revoke()
+				revokeLease("hold_policy_changed")
 				return
 			}
 			fence = currentFence
@@ -278,14 +312,18 @@ func (d KubernetesTerminalDialer) heartbeatActivity(ctx context.Context, key typ
 				currentFence, held, err := d.readTerminalPolicy(ctx, key, fence, boundExecution)
 				if err != nil {
 					if errors.Is(err, errTerminalEnvironmentIncarnationChanged) {
-						revoke()
+						revokeLease("environment_changed")
+						return
+					}
+					if errors.Is(err, errTerminalExecutionChanged) {
+						revokeLease("execution_changed")
 						return
 					}
 					timer.Reset(retryInterval)
 					break
 				}
 				if held || currentFence.HoldPolicyRevision() < fence.HoldPolicyRevision() {
-					revoke()
+					revokeLease("hold_policy_changed")
 					return
 				}
 				fence = currentFence
@@ -295,12 +333,12 @@ func (d KubernetesTerminalDialer) heartbeatActivity(ctx context.Context, key typ
 					break
 				}
 				if errors.Is(err, errTerminalEnvironmentIncarnationChanged) {
-					revoke()
+					revokeLease("environment_changed")
 					return
 				}
 				if errors.Is(err, lifecycle.ErrExecutionFenceChanged) && !errors.Is(err, lifecycle.ErrHoldPolicyChanged) {
-					if _, bound := boundExecution(); bound {
-						revoke()
+					if _, _, bound := boundExecution(); bound {
+						revokeLease("execution_changed")
 						return
 					}
 					timer.Reset(retryInterval)
@@ -310,14 +348,18 @@ func (d KubernetesTerminalDialer) heartbeatActivity(ctx context.Context, key typ
 					refreshedFence, held, refreshErr := d.refreshHoldPolicy(ctx, key, fence, boundExecution)
 					if refreshErr != nil {
 						if errors.Is(refreshErr, errTerminalEnvironmentIncarnationChanged) {
-							revoke()
+							revokeLease("environment_changed")
+							return
+						}
+						if errors.Is(refreshErr, errTerminalExecutionChanged) {
+							revokeLease("execution_changed")
 							return
 						}
 						timer.Reset(retryInterval)
 						break
 					}
 					if held || refreshedFence.HoldPolicyRevision() <= fence.HoldPolicyRevision() {
-						revoke()
+						revokeLease("hold_policy_changed")
 						return
 					}
 					fence = refreshedFence
@@ -334,15 +376,12 @@ func (d KubernetesTerminalDialer) validateRunTerminalAssociation(ctx context.Con
 	var environment platformv1alpha1.Environment
 	if knownEnvironment == nil {
 		if err := d.Client.Get(ctx, types.NamespacedName{Namespace: namespace, Name: association.EnvironmentName}, &environment); err != nil {
-			if apierrors.IsNotFound(err) {
-				return fmt.Errorf("%w: environment no longer exists", errRunTerminalAssociation)
-			}
 			return err
 		}
 		knownEnvironment = &environment
 	}
 	if string(knownEnvironment.UID) != association.EnvironmentUID {
-		return fmt.Errorf("%w: environment incarnation changed", errRunTerminalAssociation)
+		return fmt.Errorf("%w: %w", errRunTerminalAssociation, errTerminalEnvironmentIncarnationChanged)
 	}
 	var run platformv1alpha1.Run
 	if err := d.Client.Get(ctx, types.NamespacedName{Namespace: namespace, Name: association.RunName}, &run); err != nil {
@@ -367,33 +406,47 @@ func (d KubernetesTerminalDialer) holdPolicyPollInterval() time.Duration {
 	return terminalPolicyPollInterval
 }
 
-func (d KubernetesTerminalDialer) readTerminalPolicy(ctx context.Context, key types.NamespacedName, previousFence lifecycle.ExecutionFence, boundExecution func() (sandboxclient.TerminalExecution, bool)) (lifecycle.ExecutionFence, bool, error) {
+func (d KubernetesTerminalDialer) readTerminalPolicy(ctx context.Context, key types.NamespacedName, previousFence lifecycle.ExecutionFence, boundExecution func() (sandboxclient.TerminalExecution, lifecycle.ExecutionFence, bool)) (lifecycle.ExecutionFence, bool, error) {
 	var environment platformv1alpha1.Environment
 	if err := d.Client.Get(ctx, key, &environment); err != nil {
 		return lifecycle.ExecutionFence{}, false, err
 	}
-	if environment.UID != previousFence.EnvironmentUID() {
-		return lifecycle.ExecutionFence{}, false, errTerminalEnvironmentIncarnationChanged
+	var execution sandboxclient.TerminalExecution
+	bound := false
+	if boundExecution != nil {
+		var boundFence lifecycle.ExecutionFence
+		execution, boundFence, bound = boundExecution()
+		if bound {
+			previousFence = boundFence
+		}
+	}
+	if err := previousFence.Validate(&environment); err != nil && !errors.Is(err, lifecycle.ErrHoldPolicyChanged) &&
+		(bound || errors.Is(err, lifecycle.ErrEnvironmentIncarnationChanged)) {
+		if errors.Is(err, lifecycle.ErrEnvironmentIncarnationChanged) {
+			return lifecycle.ExecutionFence{}, false, errTerminalEnvironmentIncarnationChanged
+		}
+		return lifecycle.ExecutionFence{}, false, errTerminalExecutionChanged
 	}
 	currentFence := lifecycle.CaptureExecutionFence(&environment)
-	if boundExecution != nil {
-		if execution, bound := boundExecution(); bound {
-			current, err := (sandboxclient.Connector{Reader: d.Client}).ExecutionCurrent(ctx, currentFence, execution)
-			if err != nil {
-				if errors.Is(err, lifecycle.ErrExecutionFenceChanged) && !errors.Is(err, lifecycle.ErrHoldPolicyChanged) {
-					return lifecycle.ExecutionFence{}, false, errTerminalEnvironmentIncarnationChanged
-				}
-				return lifecycle.ExecutionFence{}, false, err
-			}
-			if !current {
+	if bound {
+		current, err := (sandboxclient.Connector{Reader: d.Client}).ExecutionCurrent(ctx, currentFence, execution)
+		if err != nil {
+			if errors.Is(err, lifecycle.ErrEnvironmentIncarnationChanged) {
 				return lifecycle.ExecutionFence{}, false, errTerminalEnvironmentIncarnationChanged
 			}
+			if errors.Is(err, lifecycle.ErrExecutionFenceChanged) && !errors.Is(err, lifecycle.ErrHoldPolicyChanged) {
+				return lifecycle.ExecutionFence{}, false, errTerminalExecutionChanged
+			}
+			return lifecycle.ExecutionFence{}, false, err
+		}
+		if !current {
+			return lifecycle.ExecutionFence{}, false, errTerminalExecutionChanged
 		}
 	}
 	return currentFence, environment.Spec.Lifecycle.Hold != nil && environment.Spec.Lifecycle.Hold.Enabled, nil
 }
 
-func (d KubernetesTerminalDialer) refreshHoldPolicy(ctx context.Context, key types.NamespacedName, previousFence lifecycle.ExecutionFence, boundExecution func() (sandboxclient.TerminalExecution, bool)) (lifecycle.ExecutionFence, bool, error) {
+func (d KubernetesTerminalDialer) refreshHoldPolicy(ctx context.Context, key types.NamespacedName, previousFence lifecycle.ExecutionFence, boundExecution func() (sandboxclient.TerminalExecution, lifecycle.ExecutionFence, bool)) (lifecycle.ExecutionFence, bool, error) {
 	currentFence, held, err := d.readTerminalPolicy(ctx, key, previousFence, boundExecution)
 	if err != nil {
 		return lifecycle.ExecutionFence{}, false, err

@@ -51,6 +51,7 @@ type Server struct {
 	watchAdmission        *watchAdmission
 	terminalOpenTimeout   time.Duration
 	terminalWriteTimeout  time.Duration
+	metrics               *Metrics
 }
 
 // RunResolver verifies that a namespaced Run exists before transcript state is used.
@@ -89,6 +90,7 @@ type ServerOptions struct {
 	// TranscriptHeartbeatInterval controls SSE keepalive comments. Values less
 	// than or equal to zero use the production default.
 	TranscriptHeartbeatInterval time.Duration
+	Metrics                     *Metrics
 }
 
 // NewServer constructs a control-plane API handler.
@@ -120,6 +122,7 @@ func NewServer(log *slog.Logger, options ServerOptions) *Server {
 		watchAdmission:        processWatchAdmission,
 		terminalOpenTimeout:   terminalHandshakeTimeout,
 		terminalWriteTimeout:  terminalStreamingWriteTimeout,
+		metrics:               options.Metrics,
 	}
 }
 
@@ -388,6 +391,7 @@ func (s *Server) appendTranscript(w http.ResponseWriter, r *http.Request, run Ru
 		return
 	}
 
+	appendStarted := time.Now()
 	result, err := s.store.Append(r.Context(), run, AppendTranscriptInput{
 		Source:         request.Source,
 		SourceSequence: request.SourceSequence,
@@ -396,11 +400,21 @@ func (s *Server) appendTranscript(w http.ResponseWriter, r *http.Request, run Ru
 		Data:           request.Data,
 	})
 	if err != nil {
+		outcome := "error"
+		if isTranscriptContractError(err) {
+			outcome = "rejected"
+		}
+		s.metrics.observeAppend(appendStarted, outcome)
 		if !isTranscriptContractError(err) {
 			s.log.Error("append transcript event", "namespace", run.Namespace, "runUID", run.UID, "error", err)
 		}
 		writeTranscriptStoreError(w, err)
 		return
+	}
+	if result.Replayed {
+		s.metrics.observeAppend(appendStarted, "replayed")
+	} else {
+		s.metrics.observeAppend(appendStarted, "committed")
 	}
 	w.Header().Set("Content-Type", "application/json")
 	if legacy {
@@ -435,6 +449,10 @@ func (s *Server) streamTranscript(w http.ResponseWriter, r *http.Request, run Ru
 		return
 	}
 	defer subscription.Unsubscribe()
+	if s.metrics != nil {
+		s.metrics.transcriptSubscribers.Inc()
+		defer s.metrics.transcriptSubscribers.Dec()
+	}
 
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
@@ -463,22 +481,30 @@ func (s *Server) streamTranscript(w http.ResponseWriter, r *http.Request, run Ru
 		if err != nil {
 			return err
 		}
-		return write(fmt.Sprintf("id: %s\nevent: transcript\ndata: %s\n\n", event.ID, payload))
+		if err := write(fmt.Sprintf("id: %s\nevent: transcript\ndata: %s\n\n", event.ID, payload)); err != nil {
+			return err
+		}
+		return nil
 	}
 	if subscription.Gap != nil {
 		payload, marshalErr := json.Marshal(subscription.Gap)
 		if marshalErr != nil {
+			s.metrics.observeDelivery("gap", "error", nil)
 			return
 		}
 		if err = write(fmt.Sprintf("event: transcript-gap\ndata: %s\n\n", payload)); err != nil {
+			s.metrics.observeDelivery("gap", "error", nil)
 			return
 		}
+		s.metrics.observeDelivery("gap", "delivered", nil)
 	}
 
 	for _, event := range subscription.History {
 		if err := writeEvent(event); err != nil {
+			s.metrics.observeDelivery("replay", "error", nil)
 			return
 		}
+		s.metrics.observeDelivery("replay", "delivered", &event)
 	}
 	subscription.History = nil
 	if err := controller.Flush(); err != nil {
@@ -491,9 +517,12 @@ func (s *Server) streamTranscript(w http.ResponseWriter, r *http.Request, run Ru
 		select {
 		case event := <-subscription.Events:
 			if err := writeEvent(event); err != nil {
+				s.metrics.observeDelivery("live", "error", nil)
 				return
 			}
+			s.metrics.observeDelivery("live", "delivered", &event)
 		case <-subscription.Dropped:
+			s.metrics.observeDelivery("live", "dropped", nil)
 			s.log.Warn("closing dropped transcript subscriber", "namespace", run.Namespace, "runUID", run.UID)
 			return
 		case <-heartbeats.C:

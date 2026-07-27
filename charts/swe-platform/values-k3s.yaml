@@ -6,6 +6,8 @@ tenancy:
   mode: scoped
 
 controlPlane:
+  metrics:
+    port: 8082
   sessions:
     backend: postgres
     keyringSecret:

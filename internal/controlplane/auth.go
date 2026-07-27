@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"time"
 
 	authenticationv1 "k8s.io/api/authentication/v1"
 	authorizationv1 "k8s.io/api/authorization/v1"
@@ -63,6 +64,7 @@ type KubernetesAccessController struct {
 	BootstrapToken string
 	Audience       string
 	Sessions       SessionStore
+	Metrics        *Metrics
 }
 
 // Authorize authenticates a bearer token (or, for browser reads, a session cookie) and
@@ -93,6 +95,7 @@ func (a KubernetesAccessController) AuthorizePrincipal(r *http.Request, access R
 	if a.Client == nil {
 		return "", fmt.Errorf("authorize request: Kubernetes client is unavailable")
 	}
+	reviewStarted := time.Now()
 	review, err := a.Client.AuthorizationV1().SubjectAccessReviews().Create(r.Context(), &authorizationv1.SubjectAccessReview{
 		Spec: authorizationv1.SubjectAccessReviewSpec{
 			User:   user.name,
@@ -111,14 +114,18 @@ func (a KubernetesAccessController) AuthorizePrincipal(r *http.Request, access R
 		},
 	}, metav1.CreateOptions{})
 	if err != nil {
+		a.Metrics.observeReview("subject_access", "error", reviewStarted)
 		return "", fmt.Errorf("authorize request: %w", err)
 	}
 	if review.Status.EvaluationError != "" {
+		a.Metrics.observeReview("subject_access", "error", reviewStarted)
 		return "", fmt.Errorf("authorize request: %s", review.Status.EvaluationError)
 	}
 	if !review.Status.Allowed {
+		a.Metrics.observeReview("subject_access", "denied", reviewStarted)
 		return "", errForbidden
 	}
+	a.Metrics.observeReview("subject_access", "allowed", reviewStarted)
 	if user.uid != "" {
 		return user.uid, nil
 	}
@@ -228,16 +235,20 @@ func (a KubernetesAccessController) authenticate(ctx context.Context, token stri
 	if audience == "" {
 		audience = defaultTokenAudience
 	}
+	reviewStarted := time.Now()
 	review, err := a.Client.AuthenticationV1().TokenReviews().Create(ctx, &authenticationv1.TokenReview{
 		Spec: authenticationv1.TokenReviewSpec{Token: token, Audiences: []string{audience}},
 	}, metav1.CreateOptions{})
 	if err != nil {
+		a.Metrics.observeReview("token", "error", reviewStarted)
 		return principal{}, fmt.Errorf("authenticate request: %w", err)
 	}
 	if review.Status.Error != "" {
+		a.Metrics.observeReview("token", "error", reviewStarted)
 		return principal{}, fmt.Errorf("authenticate request: %s", review.Status.Error)
 	}
 	if !review.Status.Authenticated {
+		a.Metrics.observeReview("token", "denied", reviewStarted)
 		return principal{}, errUnauthenticated
 	}
 	audienceMatched := false
@@ -248,8 +259,10 @@ func (a KubernetesAccessController) authenticate(ctx context.Context, token stri
 		}
 	}
 	if !audienceMatched {
+		a.Metrics.observeReview("token", "denied", reviewStarted)
 		return principal{}, errUnauthenticated
 	}
+	a.Metrics.observeReview("token", "authenticated", reviewStarted)
 	extra := make(map[string]authorizationv1.ExtraValue, len(review.Status.User.Extra))
 	for key, values := range review.Status.User.Extra {
 		extra[key] = append(authorizationv1.ExtraValue(nil), values...)
