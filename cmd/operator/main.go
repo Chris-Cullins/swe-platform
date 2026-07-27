@@ -28,6 +28,7 @@ import (
 	"github.com/Chris-Cullins/swe-platform/internal/adapters/codex"
 	"github.com/Chris-Cullins/swe-platform/internal/adapters/pi"
 	"github.com/Chris-Cullins/swe-platform/internal/controllers"
+	"github.com/Chris-Cullins/swe-platform/internal/sandboxclient"
 	"github.com/Chris-Cullins/swe-platform/internal/tenancy"
 	"github.com/Chris-Cullins/swe-platform/internal/transcriptclient"
 )
@@ -143,6 +144,12 @@ func main() {
 	verifier.Reader = mgr.GetAPIReader()
 	scope := &tenancy.ReconcileScope{Verifier: verifier}
 	guardedClient := tenancy.GuardedClient{Client: mgr.GetClient(), Verifier: verifier}
+	processConnections := sandboxclient.NewProcessConnectionPool(mgr.GetAPIReader())
+	if err := mgr.Add(processConnections); err != nil {
+		setupLog.Error(err, "unable to register sandboxd process connection pool")
+		os.Exit(1)
+	}
+	connector := sandboxclient.Connector{Reader: mgr.GetAPIReader(), ProcessPool: processConnections}
 	if mode == tenancy.ModeScoped && len(tenancyNamespaces) == 0 {
 		setupLog.Info("scoped installation has no configured Project namespaces; catalog is ready for onboarding and workload controllers are disabled")
 	} else if err := (&controllers.EnvironmentReconciler{
@@ -158,7 +165,7 @@ func main() {
 		os.Exit(1)
 	}
 	if !(mode == tenancy.ModeScoped && len(tenancyNamespaces) == 0) {
-		if err := (&controllers.ServiceObservationReconciler{Client: guardedClient, APIReader: mgr.GetAPIReader(), Scope: scope}).SetupWithManager(mgr); err != nil {
+		if err := (&controllers.ServiceObservationReconciler{Client: guardedClient, APIReader: mgr.GetAPIReader(), Scope: scope, Observer: connector}).SetupWithManager(mgr); err != nil {
 			setupLog.Error(err, "unable to create controller", "controller", "ServiceObservation")
 			os.Exit(1)
 		}
@@ -182,6 +189,7 @@ func main() {
 			Scope:     scope,
 			Adapters:  registeredAdapters(),
 			EventSink: eventSink,
+			Connector: connector,
 		}).SetupWithManager(mgr); err != nil {
 			setupLog.Error(err, "unable to create controller", "controller", "Run")
 			os.Exit(1)
