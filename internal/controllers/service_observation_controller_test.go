@@ -57,7 +57,7 @@ func TestServiceObservationFinalBackendProofFailureDiscardsResult(t *testing.T) 
 	o := &fakeServiceObserver{current: &current, result: sandboxclient.ServiceObservationResult{Probes: []sandboxclient.ServiceProbeResult{{Name: "z", Outcome: sandboxclient.ServiceProbeConnected}, {Name: "a", Outcome: sandboxclient.ServiceProbeConnected}}}}
 	c := fake.NewClientBuilder().WithScheme(observationTestScheme(t)).WithStatusSubresource(env).WithObjects(env).Build()
 	result, err := (&ServiceObservationReconciler{Client: c, Observer: o}).Reconcile(context.Background(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(env)})
-	if err != nil || !result.Requeue || o.currentCalls != 1 {
+	if err != nil || !result.Requeue || result.RequeueAfter != 0 || o.currentCalls != 1 {
 		t.Fatalf("result = %#v, error = %v, current calls = %d", result, err, o.currentCalls)
 	}
 	var got platformv1alpha1.Environment
@@ -73,7 +73,7 @@ func TestServiceObservationStatusConflictDiscardsResult(t *testing.T) {
 	conflicting := &observationConflictClient{Client: base}
 	o := &fakeServiceObserver{result: sandboxclient.ServiceObservationResult{Probes: []sandboxclient.ServiceProbeResult{{Name: "z", Outcome: sandboxclient.ServiceProbeConnected}, {Name: "a", Outcome: sandboxclient.ServiceProbeConnected}}}}
 	result, err := (&ServiceObservationReconciler{Client: conflicting, APIReader: base, Observer: o}).Reconcile(context.Background(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(env)})
-	if err != nil || !result.Requeue || conflicting.patches != 1 {
+	if err != nil || !result.Requeue || result.RequeueAfter != 0 || conflicting.patches != 1 {
 		t.Fatalf("result = %#v, error = %v, patches = %d", result, err, conflicting.patches)
 	}
 	var got platformv1alpha1.Environment
@@ -233,7 +233,7 @@ func TestServiceObservationPostRPCRacesAreDiscarded(t *testing.T) {
 			var mutationErr error
 			o.after = func() { mutationErr = mutate(context.Background(), c, env) }
 			result, err := (&ServiceObservationReconciler{Client: c, APIReader: c, Observer: o}).Reconcile(context.Background(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(env)})
-			if err != nil || mutationErr != nil || !result.Requeue {
+			if err != nil || mutationErr != nil || !result.Requeue || result.RequeueAfter != 0 {
 				t.Fatalf("result = %#v, reconcile error = %v, mutation error = %v", result, err, mutationErr)
 			}
 			var got platformv1alpha1.Environment
@@ -261,7 +261,7 @@ func TestServiceObservationSameNameReplacementCannotInherit(t *testing.T) {
 		}
 	}
 	result, err := (&ServiceObservationReconciler{Client: c, APIReader: c, Observer: o}).Reconcile(context.Background(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(env)})
-	if err != nil || mutationErr != nil || !result.Requeue {
+	if err != nil || mutationErr != nil || !result.Requeue || result.RequeueAfter != 0 {
 		t.Fatalf("result = %#v, reconcile error = %v, mutation error = %v", result, err, mutationErr)
 	}
 	var got platformv1alpha1.Environment

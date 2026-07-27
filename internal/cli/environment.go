@@ -334,7 +334,7 @@ func listEnvironmentServicesAt(ctx context.Context, kube client.Reader, key type
 						classificationCurrent = observations.ExecutionGeneration != nil && *observations.ExecutionGeneration == environment.Status.ExecutionGeneration && ready && !suspended
 					}
 					age := now.Sub(observations.ObservedAt.Time)
-					if observations.ObservedGeneration == environment.Generation && observation.DeclarationRevision == service.Revision && observations.LifecycleEpoch == environment.Status.Lifecycle.Epoch && observations.HoldRevision == lifecycle.HoldPolicyRevision(&environment) && classificationCurrent && age >= 0 && age <= serviceObservationMaxAge {
+					if environment.DeletionTimestamp.IsZero() && observations.ObservedGeneration == environment.Generation && observation.DeclarationRevision == service.Revision && observations.LifecycleEpoch == environment.Status.Lifecycle.Epoch && observations.HoldRevision == lifecycle.HoldPolicyRevision(&environment) && classificationCurrent && age >= 0 && age <= serviceObservationMaxAge {
 						freshness = "CURRENT"
 					}
 					break

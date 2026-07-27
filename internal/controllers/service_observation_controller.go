@@ -122,6 +122,9 @@ func (r *ServiceObservationReconciler) Reconcile(ctx context.Context, req ctrl.R
 	if err != nil {
 		return result, err
 	}
+	if result.Requeue {
+		return result, nil
+	}
 	result.RequeueAfter = observationJitter(env.UID)
 	return result, nil
 }

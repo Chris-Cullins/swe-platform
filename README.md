@@ -56,8 +56,8 @@ implemented today, approved next contracts, and remaining open work.
 
 - **`sandboxd`** — a small daemon inside every environment exposing one gRPC contract:
   exec, filesystem, terminal, health, and bounded stateless loopback service observations.
-  No platform connector or declaration observer uses that internal observation primitive yet;
-  the control plane never touches a pod except through sandboxd.
+  The operator's dedicated declaration observer invokes that primitive through an exact fenced
+  connector; the control plane never touches a pod except through sandboxd.
 - **Operator + CRDs** — `Installation`, `Environment`, `EnvironmentTemplate`, `Run`, `Project`, with
   controllers for lifecycle, warm pools (pre-booted environments), and idle reaping.
 - **Control plane** — API, auth, transcripts, resource watches, and a web terminal sharing
