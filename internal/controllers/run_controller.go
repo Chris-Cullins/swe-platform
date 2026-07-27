@@ -290,7 +290,8 @@ func (r *RunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.R
 			if !current {
 				return ctrl.Result{Requeue: true}, nil
 			}
-			if err := adapter.Cancel(ctx, adapterTask(&run), r.adapterSandbox(&run, env)); err != nil {
+			executionFence := lifecycle.CaptureExecutionFence(env)
+			if err := adapter.Cancel(ctx, adapterTask(&run), r.adapterSandbox(&run, env, executionFence)); err != nil {
 				if errors.Is(err, ErrAdapterCancellationPending) {
 					return ctrl.Result{RequeueAfter: adapterPollInterval}, nil
 				}
@@ -363,8 +364,7 @@ func (r *RunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.R
 		if credential != nil {
 			defer clear(credential.APIKey)
 		}
-		expectedExecutionGeneration := env.Status.ExecutionGeneration
-		expectedEpoch := env.Status.Lifecycle.Epoch
+		executionFence := lifecycle.CaptureExecutionFence(env)
 		execution, current, err := r.resolveAllocatedExecution(ctx, &run, env)
 		if err != nil {
 			return ctrl.Result{}, err
@@ -372,7 +372,7 @@ func (r *RunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.R
 		if !current {
 			return ctrl.Result{Requeue: true}, nil
 		}
-		acceptErr := adapter.EnsureAccepted(ctx, adapterTask(&run), r.adapterSandbox(&run, env), credential)
+		acceptErr := adapter.EnsureAccepted(ctx, adapterTask(&run), r.adapterSandbox(&run, env, executionFence), credential)
 		current, err = r.allocatedExecutionCurrent(ctx, &run, env, execution)
 		if err != nil {
 			return ctrl.Result{}, err
@@ -386,8 +386,10 @@ func (r *RunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.R
 			}
 			return ctrl.Result{}, acceptErr
 		}
-		run.Status.AcceptedEnvironmentEpoch = &expectedEpoch
-		run.Status.AcceptedEnvironmentExecutionGeneration = &expectedExecutionGeneration
+		acceptedEpoch := executionFence.LifecycleEpoch()
+		acceptedExecutionGeneration := executionFence.ExecutionGeneration()
+		run.Status.AcceptedEnvironmentEpoch = &acceptedEpoch
+		run.Status.AcceptedEnvironmentExecutionGeneration = &acceptedExecutionGeneration
 		return ctrl.Result{Requeue: true}, r.setRunState(ctx, &run, platformv1alpha1.RunStateAdapterAccepted, "AdapterAccepted", "adapter accepted the task", true)
 	}
 
@@ -398,7 +400,8 @@ func (r *RunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.R
 	if !current {
 		return ctrl.Result{Requeue: true}, nil
 	}
-	observation, message, err := adapter.Observe(ctx, adapterTask(&run), r.adapterSandbox(&run, env))
+	executionFence := lifecycle.CaptureExecutionFence(env)
+	observation, message, err := adapter.Observe(ctx, adapterTask(&run), r.adapterSandbox(&run, env, executionFence))
 	if err != nil {
 		return ctrl.Result{}, err
 	}
@@ -1013,7 +1016,8 @@ func (r *RunReconciler) cleanupTerminal(ctx context.Context, run *platformv1alph
 		if !current {
 			return ctrl.Result{Requeue: true}, nil
 		}
-		if err := adapter.Cancel(ctx, adapterTask(run), r.adapterSandbox(run, env)); err != nil {
+		executionFence := lifecycle.CaptureExecutionFence(env)
+		if err := adapter.Cancel(ctx, adapterTask(run), r.adapterSandbox(run, env, executionFence)); err != nil {
 			if errors.Is(err, ErrAdapterCancellationPending) {
 				return ctrl.Result{RequeueAfter: adapterPollInterval}, nil
 			}
@@ -1092,7 +1096,8 @@ func (r *RunReconciler) finalize(ctx context.Context, run *platformv1alpha1.Run)
 				if !current {
 					return ctrl.Result{Requeue: true}, nil
 				}
-				if err := adapter.Cancel(ctx, adapterTask(run), r.adapterSandbox(run, env)); err != nil {
+				executionFence := lifecycle.CaptureExecutionFence(env)
+				if err := adapter.Cancel(ctx, adapterTask(run), r.adapterSandbox(run, env, executionFence)); err != nil {
 					if errors.Is(err, ErrAdapterCancellationPending) {
 						return ctrl.Result{RequeueAfter: adapterPollInterval}, nil
 					}
@@ -1183,9 +1188,7 @@ func adapterTask(run *platformv1alpha1.Run) AdapterTask {
 	return AdapterTask{ID: string(run.UID), Prompt: run.Spec.Prompt}
 }
 
-func (r *RunReconciler) adapterSandbox(run *platformv1alpha1.Run, env *platformv1alpha1.Environment) AdapterSandbox {
-	expectedEpoch := env.Status.Lifecycle.Epoch
-	expectedExecutionGeneration := env.Status.ExecutionGeneration
+func (r *RunReconciler) adapterSandbox(run *platformv1alpha1.Run, env *platformv1alpha1.Environment, fence lifecycle.ExecutionFence) AdapterSandbox {
 	sandbox := AdapterSandbox{EnvironmentName: env.Name, EnvironmentUID: env.UID,
 		DialProcess: func(ctx context.Context) (sandboxdv1.ProcessServiceClient, func() error, error) {
 			reader := r.apiReader()
@@ -1193,10 +1196,10 @@ func (r *RunReconciler) adapterSandbox(run *platformv1alpha1.Run, env *platformv
 			if err != nil {
 				return nil, nil, err
 			}
-			if current.Status.ExecutionGeneration != expectedExecutionGeneration {
-				return nil, nil, fmt.Errorf("environment execution generation changed")
+			if err := fence.Validate(current); err != nil {
+				return nil, nil, err
 			}
-			return (sandboxclient.Connector{Reader: reader}).DialProcessForExecution(ctx, current.Namespace, current.Name, current.UID, expectedExecutionGeneration, expectedEpoch)
+			return (sandboxclient.Connector{Reader: reader}).DialProcess(ctx, fence)
 		}}
 	if r.EventSink != nil {
 		runUID := string(run.UID)
@@ -1208,6 +1211,7 @@ func (r *RunReconciler) adapterSandbox(run *platformv1alpha1.Run, env *platformv
 }
 
 func (r *RunReconciler) resolveAllocatedExecution(ctx context.Context, run *platformv1alpha1.Run, expected *platformv1alpha1.Environment) (sandboxclient.Execution, bool, error) {
+	fence := lifecycle.CaptureExecutionFence(expected)
 	current, err := getAllocatedEnvironment(ctx, r.apiReader(), run)
 	if apierrors.IsNotFound(err) || errors.Is(err, errAllocatedEnvironmentGone) {
 		return sandboxclient.Execution{}, false, nil
@@ -1215,11 +1219,10 @@ func (r *RunReconciler) resolveAllocatedExecution(ctx context.Context, run *plat
 	if err != nil {
 		return sandboxclient.Execution{}, false, err
 	}
-	if current.UID != expected.UID || current.Status.ExecutionGeneration != expected.Status.ExecutionGeneration ||
-		current.Status.Lifecycle.Epoch != expected.Status.Lifecycle.Epoch || !environmentReachable(current) {
+	if err := fence.Validate(current); err != nil || !environmentReachable(current) {
 		return sandboxclient.Execution{}, false, nil
 	}
-	execution, err := (sandboxclient.Connector{Reader: r.apiReader()}).ResolveExecution(ctx, current.Namespace, current.Name, current.UID, current.Status.ExecutionGeneration, current.Status.Lifecycle.Epoch)
+	execution, err := (sandboxclient.Connector{Reader: r.apiReader()}).ResolveExecution(ctx, fence)
 	if err != nil {
 		return sandboxclient.Execution{}, false, err
 	}
@@ -1227,6 +1230,7 @@ func (r *RunReconciler) resolveAllocatedExecution(ctx context.Context, run *plat
 }
 
 func (r *RunReconciler) allocatedExecutionCurrent(ctx context.Context, run *platformv1alpha1.Run, expected *platformv1alpha1.Environment, execution sandboxclient.Execution) (bool, error) {
+	fence := lifecycle.CaptureExecutionFence(expected)
 	current, err := getAllocatedEnvironment(ctx, r.apiReader(), run)
 	if apierrors.IsNotFound(err) || errors.Is(err, errAllocatedEnvironmentGone) {
 		return false, nil
@@ -1234,11 +1238,14 @@ func (r *RunReconciler) allocatedExecutionCurrent(ctx context.Context, run *plat
 	if err != nil {
 		return false, err
 	}
-	if current.UID != expected.UID || current.Status.ExecutionGeneration != expected.Status.ExecutionGeneration ||
-		current.Status.Lifecycle.Epoch != expected.Status.Lifecycle.Epoch || !environmentReachable(current) {
+	if err := fence.Validate(current); err != nil || !environmentReachable(current) {
 		return false, nil
 	}
-	return (sandboxclient.Connector{Reader: r.apiReader()}).ExecutionCurrent(ctx, current.Namespace, current.Name, execution)
+	currentExecution, err := (sandboxclient.Connector{Reader: r.apiReader()}).ExecutionCurrent(ctx, fence, execution)
+	if errors.Is(err, lifecycle.ErrExecutionFenceChanged) {
+		return false, nil
+	}
+	return currentExecution, err
 }
 
 // SetupWithManager registers Run watches. Owned Environments enqueue through

@@ -14,7 +14,6 @@ import (
 
 	"github.com/gorilla/websocket"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
@@ -133,12 +132,11 @@ func (d KubernetesTerminalDialer) dialTerminal(ctx context.Context, namespace, n
 			return nil, nil, nil, err
 		}
 	}
-	policyRevision := lifecycle.HoldPolicyRevision(&environment)
-	executionGeneration := environment.Status.ExecutionGeneration
+	executionFence := lifecycle.CaptureExecutionFence(&environment)
 	if err := terminalAccessPolicyError(&environment); err != nil {
 		return nil, nil, nil, err
 	}
-	if err := d.markActive(ctx, &environment, expectedEnvironmentUID, executionGeneration, policyRevision); err != nil {
+	if err := d.markActive(ctx, executionFence); err != nil {
 		return nil, nil, nil, err
 	}
 	heartbeatInterval, err := d.activityHeartbeatInterval(ctx, &environment)
@@ -153,7 +151,7 @@ func (d KubernetesTerminalDialer) dialTerminal(ctx context.Context, namespace, n
 		}
 	}()
 	connectionLease := &terminalConnectionLease{}
-	go d.heartbeatActivity(heartbeatContext, types.NamespacedName{Namespace: namespace, Name: name}, expectedEnvironmentUID, executionGeneration, policyRevision, heartbeatInterval, association, connectionLease.boundExecution, func() { _ = connectionLease.Close() })
+	go d.heartbeatActivity(heartbeatContext, types.NamespacedName{Namespace: namespace, Name: name}, executionFence, heartbeatInterval, association, connectionLease.boundExecution, func() { _ = connectionLease.Close() })
 	if err := d.Client.Get(ctx, types.NamespacedName{Namespace: namespace, Name: name}, &environment); err != nil {
 		return nil, nil, nil, fmt.Errorf("refresh environment lifecycle: %w", err)
 	}
@@ -170,13 +168,14 @@ func (d KubernetesTerminalDialer) dialTerminal(ctx context.Context, namespace, n
 	}
 	if environment.Status.Lifecycle.Suspended {
 		requestID := fmt.Sprintf("terminal/wake/%d", time.Now().UnixNano())
-		if err := lifecycle.RequestWake(ctx, d.Client, types.NamespacedName{Namespace: namespace, Name: name}, expectedEnvironmentUID, policyRevision, requestID); err != nil {
+		if err := lifecycle.RequestWake(ctx, d.Client, types.NamespacedName{Namespace: namespace, Name: name}, expectedEnvironmentUID, executionFence.HoldPolicyRevision(), requestID); err != nil {
 			return nil, nil, nil, fmt.Errorf("wake environment: %w", err)
 		}
 		if err := d.waitUntilReady(ctx, namespace, name, expectedEnvironmentUID, &environment); err != nil {
 			return nil, nil, nil, err
 		}
-		if err := d.markActive(ctx, &environment, expectedEnvironmentUID, environment.Status.ExecutionGeneration, policyRevision); err != nil {
+		executionFence = lifecycle.CaptureExecutionFence(&environment)
+		if err := d.markActive(ctx, executionFence); err != nil {
 			return nil, nil, nil, err
 		}
 	}
@@ -189,7 +188,8 @@ func (d KubernetesTerminalDialer) dialTerminal(ctx context.Context, namespace, n
 	if !platformv1alpha1.IsEnvironmentReady(&environment) {
 		return nil, nil, nil, fmt.Errorf("environment is not ready for its current generation")
 	}
-	terminal, health, execution, closeConnection, err := (sandboxclient.Connector{Reader: d.Client}).DialTerminal(ctx, namespace, name, expectedEnvironmentUID)
+	executionFence = lifecycle.CaptureExecutionFence(&environment)
+	terminal, health, execution, closeConnection, err := (sandboxclient.Connector{Reader: d.Client}).DialTerminal(ctx, executionFence)
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("connect to sandboxd: %w", err)
 	}
@@ -237,7 +237,7 @@ func (d KubernetesTerminalDialer) activityHeartbeatInterval(ctx context.Context,
 	return timeout / 2, nil
 }
 
-func (d KubernetesTerminalDialer) heartbeatActivity(ctx context.Context, key types.NamespacedName, expectedUID types.UID, executionGeneration, policyRevision int64, interval time.Duration, association *RunTerminalAssociation, boundExecution func() (sandboxclient.TerminalExecution, bool), revoke func()) {
+func (d KubernetesTerminalDialer) heartbeatActivity(ctx context.Context, key types.NamespacedName, fence lifecycle.ExecutionFence, interval time.Duration, association *RunTerminalAssociation, boundExecution func() (sandboxclient.TerminalExecution, bool), revoke func()) {
 	retryInterval := interval / 4
 	if retryInterval <= 0 || retryInterval > time.Second {
 		retryInterval = time.Second
@@ -260,7 +260,7 @@ func (d KubernetesTerminalDialer) heartbeatActivity(ctx context.Context, key typ
 					continue
 				}
 			}
-			generation, revision, held, err := d.readTerminalPolicy(ctx, key, expectedUID, boundExecution)
+			currentFence, held, err := d.readTerminalPolicy(ctx, key, fence, boundExecution)
 			if err != nil {
 				if errors.Is(err, errTerminalEnvironmentIncarnationChanged) {
 					revoke()
@@ -268,17 +268,14 @@ func (d KubernetesTerminalDialer) heartbeatActivity(ctx context.Context, key typ
 				}
 				continue
 			}
-			if held || revision < policyRevision {
+			if held || currentFence.HoldPolicyRevision() < fence.HoldPolicyRevision() {
 				revoke()
 				return
 			}
-			if revision > policyRevision {
-				policyRevision = revision
-			}
-			executionGeneration = generation
+			fence = currentFence
 		case <-timer.C:
 			for {
-				generation, revision, held, err := d.readTerminalPolicy(ctx, key, expectedUID, boundExecution)
+				currentFence, held, err := d.readTerminalPolicy(ctx, key, fence, boundExecution)
 				if err != nil {
 					if errors.Is(err, errTerminalEnvironmentIncarnationChanged) {
 						revoke()
@@ -287,16 +284,12 @@ func (d KubernetesTerminalDialer) heartbeatActivity(ctx context.Context, key typ
 					timer.Reset(retryInterval)
 					break
 				}
-				if held || revision < policyRevision {
+				if held || currentFence.HoldPolicyRevision() < fence.HoldPolicyRevision() {
 					revoke()
 					return
 				}
-				if revision > policyRevision {
-					policyRevision = revision
-				}
-				executionGeneration = generation
-				environment := platformv1alpha1.Environment{ObjectMeta: metav1.ObjectMeta{Namespace: key.Namespace, Name: key.Name}}
-				err = d.markActive(ctx, &environment, expectedUID, executionGeneration, policyRevision)
+				fence = currentFence
+				err = d.markActive(ctx, fence)
 				if err == nil {
 					timer.Reset(interval)
 					break
@@ -305,7 +298,7 @@ func (d KubernetesTerminalDialer) heartbeatActivity(ctx context.Context, key typ
 					revoke()
 					return
 				}
-				if errors.Is(err, lifecycle.ErrExecutionGenerationChanged) {
+				if errors.Is(err, lifecycle.ErrExecutionFenceChanged) && !errors.Is(err, lifecycle.ErrHoldPolicyChanged) {
 					if _, bound := boundExecution(); bound {
 						revoke()
 						return
@@ -314,7 +307,7 @@ func (d KubernetesTerminalDialer) heartbeatActivity(ctx context.Context, key typ
 					break
 				}
 				if errors.Is(err, lifecycle.ErrHoldPolicyChanged) {
-					generation, revision, held, refreshErr := d.refreshHoldPolicy(ctx, key, expectedUID, policyRevision)
+					refreshedFence, held, refreshErr := d.refreshHoldPolicy(ctx, key, fence, boundExecution)
 					if refreshErr != nil {
 						if errors.Is(refreshErr, errTerminalEnvironmentIncarnationChanged) {
 							revoke()
@@ -323,12 +316,11 @@ func (d KubernetesTerminalDialer) heartbeatActivity(ctx context.Context, key typ
 						timer.Reset(retryInterval)
 						break
 					}
-					executionGeneration = generation
-					if held || revision <= policyRevision {
+					if held || refreshedFence.HoldPolicyRevision() <= fence.HoldPolicyRevision() {
 						revoke()
 						return
 					}
-					policyRevision = revision
+					fence = refreshedFence
 					continue
 				}
 				timer.Reset(retryInterval)
@@ -375,44 +367,46 @@ func (d KubernetesTerminalDialer) holdPolicyPollInterval() time.Duration {
 	return terminalPolicyPollInterval
 }
 
-func (d KubernetesTerminalDialer) readTerminalPolicy(ctx context.Context, key types.NamespacedName, expectedUID types.UID, boundExecution func() (sandboxclient.TerminalExecution, bool)) (int64, int64, bool, error) {
+func (d KubernetesTerminalDialer) readTerminalPolicy(ctx context.Context, key types.NamespacedName, previousFence lifecycle.ExecutionFence, boundExecution func() (sandboxclient.TerminalExecution, bool)) (lifecycle.ExecutionFence, bool, error) {
 	var environment platformv1alpha1.Environment
 	if err := d.Client.Get(ctx, key, &environment); err != nil {
-		return 0, 0, false, err
+		return lifecycle.ExecutionFence{}, false, err
 	}
-	if environment.UID != expectedUID {
-		return 0, 0, false, errTerminalEnvironmentIncarnationChanged
+	if environment.UID != previousFence.EnvironmentUID() {
+		return lifecycle.ExecutionFence{}, false, errTerminalEnvironmentIncarnationChanged
 	}
+	currentFence := lifecycle.CaptureExecutionFence(&environment)
 	if boundExecution != nil {
 		if execution, bound := boundExecution(); bound {
-			current, err := (sandboxclient.Connector{Reader: d.Client}).ExecutionCurrent(ctx, key.Namespace, key.Name, execution)
+			current, err := (sandboxclient.Connector{Reader: d.Client}).ExecutionCurrent(ctx, currentFence, execution)
 			if err != nil {
-				return 0, 0, false, err
+				if errors.Is(err, lifecycle.ErrExecutionFenceChanged) && !errors.Is(err, lifecycle.ErrHoldPolicyChanged) {
+					return lifecycle.ExecutionFence{}, false, errTerminalEnvironmentIncarnationChanged
+				}
+				return lifecycle.ExecutionFence{}, false, err
 			}
 			if !current {
-				return 0, 0, false, errTerminalEnvironmentIncarnationChanged
+				return lifecycle.ExecutionFence{}, false, errTerminalEnvironmentIncarnationChanged
 			}
 		}
 	}
-	revision := lifecycle.HoldPolicyRevision(&environment)
-	return environment.Status.ExecutionGeneration, revision, environment.Spec.Lifecycle.Hold != nil && environment.Spec.Lifecycle.Hold.Enabled, nil
+	return currentFence, environment.Spec.Lifecycle.Hold != nil && environment.Spec.Lifecycle.Hold.Enabled, nil
 }
 
-func (d KubernetesTerminalDialer) refreshHoldPolicy(ctx context.Context, key types.NamespacedName, expectedUID types.UID, previousRevision int64) (int64, int64, bool, error) {
-	generation, revision, held, err := d.readTerminalPolicy(ctx, key, expectedUID, nil)
+func (d KubernetesTerminalDialer) refreshHoldPolicy(ctx context.Context, key types.NamespacedName, previousFence lifecycle.ExecutionFence, boundExecution func() (sandboxclient.TerminalExecution, bool)) (lifecycle.ExecutionFence, bool, error) {
+	currentFence, held, err := d.readTerminalPolicy(ctx, key, previousFence, boundExecution)
 	if err != nil {
-		return 0, 0, false, err
+		return lifecycle.ExecutionFence{}, false, err
 	}
-	if revision <= previousRevision {
-		return generation, revision, true, nil
+	if currentFence.HoldPolicyRevision() <= previousFence.HoldPolicyRevision() {
+		return currentFence, true, nil
 	}
-	return generation, revision, held, nil
+	return currentFence, held, nil
 }
 
-func (d KubernetesTerminalDialer) markActive(ctx context.Context, environment *platformv1alpha1.Environment, expectedUID types.UID, executionGeneration, policyRevision int64) error {
-	key := client.ObjectKeyFromObject(environment)
+func (d KubernetesTerminalDialer) markActive(ctx context.Context, fence lifecycle.ExecutionFence) error {
 	requestID := fmt.Sprintf("terminal/activity/%d", time.Now().UnixNano())
-	if err := lifecycle.RecordActivity(ctx, d.Client, key, expectedUID, executionGeneration, policyRevision, platformv1alpha1.EnvironmentActivitySourceTerminal, requestID); err != nil {
+	if err := lifecycle.RecordActivity(ctx, d.Client, fence, platformv1alpha1.EnvironmentActivitySourceTerminal, requestID); err != nil {
 		if errors.Is(err, lifecycle.ErrEnvironmentIncarnationChanged) {
 			return fmt.Errorf("record environment activity: %w", errTerminalEnvironmentIncarnationChanged)
 		}

@@ -729,7 +729,7 @@ func TestAcceptedRunIgnoresActivityWithoutRereadingCredentials(t *testing.T) {
 				return apierrors.NewNotFound(platformv1alpha1.GroupVersion.WithResource("agentcredentialprofiles").GroupResource(), "removed-profile")
 			}})
 
-			if err := lifecycle.RecordActivity(context.Background(), r.Client, client.ObjectKeyFromObject(environment), environment.UID, 1, 0, platformv1alpha1.EnvironmentActivitySourceTerminal, "terminal-1"); err != nil {
+			if err := lifecycle.RecordActivity(context.Background(), r.Client, lifecycle.CaptureExecutionFence(environment), platformv1alpha1.EnvironmentActivitySourceTerminal, "terminal-1"); err != nil {
 				t.Fatal(err)
 			}
 			var activity platformv1alpha1.Environment
@@ -2825,7 +2825,7 @@ func TestAdapterSandboxEmitEventSendsExactRunUID(t *testing.T) {
 		return nil
 	})
 	r := &RunReconciler{EventSink: sink}
-	sandbox := r.adapterSandbox(run, env)
+	sandbox := r.adapterSandbox(run, env, lifecycle.CaptureExecutionFence(env))
 	if sandbox.EmitEvent == nil {
 		t.Fatal("EmitEvent closure was not wired")
 	}

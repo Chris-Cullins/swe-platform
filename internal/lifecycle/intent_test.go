@@ -27,13 +27,14 @@ func TestRecordActivityIsSourceBoundedAndFenced(t *testing.T) {
 	environment.Spec.Lifecycle.Hold = &platformv1alpha1.EnvironmentHoldPolicy{Revision: 3}
 	kubeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(environment).Build()
 	key := client.ObjectKeyFromObject(environment)
+	fence := CaptureExecutionFence(environment)
 
 	for _, requestID := range []string{"terminal-1", "terminal-1", "terminal-2"} {
-		if err := RecordActivity(context.Background(), kubeClient, key, environment.UID, 4, 3, platformv1alpha1.EnvironmentActivitySourceTerminal, requestID); err != nil {
+		if err := RecordActivity(context.Background(), kubeClient, fence, platformv1alpha1.EnvironmentActivitySourceTerminal, requestID); err != nil {
 			t.Fatal(err)
 		}
 	}
-	if err := RecordActivity(context.Background(), kubeClient, key, environment.UID, 4, 3, platformv1alpha1.EnvironmentActivitySourcePortal, "portal-1"); err != nil {
+	if err := RecordActivity(context.Background(), kubeClient, fence, platformv1alpha1.EnvironmentActivitySourcePortal, "portal-1"); err != nil {
 		t.Fatal(err)
 	}
 	var updated platformv1alpha1.Environment
@@ -47,7 +48,9 @@ func TestRecordActivityIsSourceBoundedAndFenced(t *testing.T) {
 	if updated.Generation != environment.Generation || len(updated.Spec.Lifecycle.Activity) != 0 {
 		t.Fatalf("activity changed execution spec: generation=%d spec=%#v", updated.Generation, updated.Spec.Lifecycle)
 	}
-	if err := RecordActivity(context.Background(), kubeClient, key, types.UID("replacement"), 4, 3, platformv1alpha1.EnvironmentActivitySourceInbox, "stale"); err == nil {
+	replacement := environment.DeepCopy()
+	replacement.UID = types.UID("replacement")
+	if err := RecordActivity(context.Background(), kubeClient, CaptureExecutionFence(replacement), platformv1alpha1.EnvironmentActivitySourceInbox, "stale"); err == nil {
 		t.Fatal("replacement UID activity was accepted")
 	}
 }
@@ -81,7 +84,13 @@ func TestRecordActivityRejectsMalformedRequests(t *testing.T) {
 		{name: "negative revision", uid: environment.UID, executionGeneration: 4, revision: -1, source: platformv1alpha1.EnvironmentActivitySourceTerminal, id: "request"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			if err := RecordActivity(context.Background(), kubeClient, key, test.uid, test.executionGeneration, test.revision, test.source, test.id); err == nil {
+			candidate := environment.DeepCopy()
+			candidate.UID = test.uid
+			candidate.Status.ExecutionGeneration = test.executionGeneration
+			if test.revision != 0 {
+				candidate.Spec.Lifecycle.Hold = &platformv1alpha1.EnvironmentHoldPolicy{Revision: test.revision}
+			}
+			if err := RecordActivity(context.Background(), kubeClient, CaptureExecutionFence(candidate), test.source, test.id); err == nil {
 				t.Fatal("RecordActivity() accepted malformed request")
 			}
 		})
@@ -297,7 +306,7 @@ func TestRecordActivityAtomicallyRejectsExecutionTransition(t *testing.T) {
 		},
 	})
 
-	err := RecordActivity(context.Background(), kubeClient, client.ObjectKeyFromObject(environment), environment.UID, 1, 0, platformv1alpha1.EnvironmentActivitySourceTerminal, "stale-terminal")
+	err := RecordActivity(context.Background(), kubeClient, CaptureExecutionFence(environment), platformv1alpha1.EnvironmentActivitySourceTerminal, "stale-terminal")
 	if !errors.Is(err, ErrExecutionGenerationChanged) {
 		t.Fatalf("RecordActivity() error = %v, want execution-generation fence", err)
 	}

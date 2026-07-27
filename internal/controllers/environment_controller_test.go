@@ -4387,7 +4387,7 @@ func TestActivityIntentPreservesReadyGenerationAndProtectsIdle(t *testing.T) {
 	reconciler := &EnvironmentReconciler{Client: kubeClient, Scheme: scheme, Now: func() time.Time { return now }}
 	key := client.ObjectKeyFromObject(environment)
 
-	if err := lifecycle.RecordActivity(context.Background(), kubeClient, key, environment.UID, 1, 2, platformv1alpha1.EnvironmentActivitySourceTerminal, "terminal-2"); err != nil {
+	if err := lifecycle.RecordActivity(context.Background(), kubeClient, lifecycle.CaptureExecutionFence(environment), platformv1alpha1.EnvironmentActivitySourceTerminal, "terminal-2"); err != nil {
 		t.Fatal(err)
 	}
 	var activity platformv1alpha1.Environment
