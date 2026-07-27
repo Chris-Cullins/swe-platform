@@ -14,6 +14,10 @@
 {{- printf "%s-control-plane" (include "swe-platform.fullname" . | trunc 49 | trimSuffix "-") -}}
 {{- end }}
 
+{{- define "swe-platform.operatorMetricsFullname" -}}
+{{- printf "%s-operator-metrics" (include "swe-platform.fullname" . | trunc 46 | trimSuffix "-") -}}
+{{- end }}
+
 {{- define "swe-platform.clusterFullname" -}}
 {{- printf "%s-%s" (include "swe-platform.fullname" . | trunc 53 | trimSuffix "-") (sha256sum .Release.Namespace | trunc 8) | trunc 63 | trimSuffix "-" -}}
 {{- end }}
