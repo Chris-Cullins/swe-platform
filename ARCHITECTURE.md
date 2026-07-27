@@ -270,12 +270,16 @@ lifecycle epoch, hold revision, and observation time. Pending and suspended resu
 carry no execution generation; probe and transport outcomes are publishable only after an
 uncached post-call proof of the full `lifecycle.ExecutionFence`, declaration snapshot, Pod,
 template, backend, endpoint, TLS identity, and private observation capability. This advisory
-state is reader-freshness-qualified and never route authority. Nothing exposes a route today.
-A Project-less Environment may retain declarations but cannot receive a future route until an exact current
-Project and Installation claim authorizes it. Removal permanently revokes any future old route
-generation; re-adding the same name must receive a new route generation and can never resurrect
-an old route or URL. Route generations are gateway state and deliberately are not represented
-in this declaration-only API.
+state is reader-freshness-qualified and never route authority. The implemented control-plane
+gateway separately owns bounded durable
+`status.portalRoutes` records containing opaque locators, declaration identity/revision,
+monotonic route generations, and active/tombstone state. These records are routing state, not
+service-observation state: observations remain advisory and every connection still proves the
+current declaration, execution, and private sandboxd backend. A Project-less Environment may
+retain declarations but cannot receive a route until an exact current Project and Installation
+claim authorizes it. Removal tombstones the old route; re-adding the same name receives a new
+route generation and locator and can never resurrect an old URL. Declarations intentionally
+contain no route, locator, or URL input.
 
 ### Adapters, processes, and transcripts
 
@@ -457,8 +461,8 @@ environment base for amd64/arm64.
 
 ## Implemented portal contract and approved next contracts
 
-These decisions constrain the future portions of the contracts. They do not imply that the
-listed controllers, proxies, or gateways already exist.
+This section distinguishes the implemented portal gateway from approved future contracts.
+Only capabilities explicitly described as future work remain unimplemented.
 
 ### Gateway ownership
 

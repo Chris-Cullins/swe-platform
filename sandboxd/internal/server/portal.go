@@ -99,6 +99,8 @@ func (s *PortalServer) Tunnel(stream sandboxdv1.PortalService_TunnelServer) erro
 	clientWriteClosed := first.WriteEof
 	for {
 		select {
+		case <-stream.Context().Done():
+			return stream.Context().Err()
 		case err = <-targetDone:
 			if errors.Is(err, io.EOF) {
 				return nil

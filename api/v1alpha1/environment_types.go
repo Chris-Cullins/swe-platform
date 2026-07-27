@@ -224,15 +224,15 @@ const (
 	EnvironmentBackendExternalRunner EnvironmentBackend = "external-runner"
 )
 
-// EnvironmentServiceProtocol is the application protocol a future gateway
-// may use for a declared service.
+// EnvironmentServiceProtocol is the application protocol the portal gateway
+// uses for a declared service.
 // +kubebuilder:validation:Enum=HTTP
 type EnvironmentServiceProtocol string
 
 const EnvironmentServiceProtocolHTTP EnvironmentServiceProtocol = "HTTP"
 
-// EnvironmentServiceVisibility is the authorization scope a future gateway
-// must enforce. Anonymous and public visibility are not supported.
+// EnvironmentServiceVisibility is the authorization scope the portal gateway
+// enforces. Anonymous and public visibility are not supported.
 // +kubebuilder:validation:Enum=Project
 type EnvironmentServiceVisibility string
 
