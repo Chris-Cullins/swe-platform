@@ -14,7 +14,7 @@ import (
 	"google.golang.org/grpc/status"
 
 	platformv1alpha1 "github.com/Chris-Cullins/swe-platform/api/v1alpha1"
-	"github.com/Chris-Cullins/swe-platform/internal/controllers"
+	"github.com/Chris-Cullins/swe-platform/internal/agent"
 	sandboxdv1 "github.com/Chris-Cullins/swe-platform/sandboxd/gen/proto/sandboxd/v1"
 )
 
@@ -29,12 +29,15 @@ type Adapter struct {
 	cursors    map[cursor]uint64
 	pending    map[cursor]pendingEvent
 }
+
+var _ agent.AdapterLifecycle = (*Adapter)(nil)
+
 type cursor struct {
 	environment, owner, execution string
 	stream                        sandboxdv1.OutputStream
 }
 type pendingEvent struct {
-	event      controllers.AdapterEvent
+	event      agent.AdapterEvent
 	nextOffset uint64
 }
 type outputEvent struct {
@@ -72,19 +75,19 @@ func (a *Adapter) executable() string {
 	}
 	return "codex"
 }
-func key(t controllers.AdapterTask) *sandboxdv1.ProcessKey {
+func key(t agent.AdapterTask) *sandboxdv1.ProcessKey {
 	return &sandboxdv1.ProcessKey{OwnerId: t.ID, Role: processRole}
 }
-func (a *Adapter) spec(t controllers.AdapterTask) *sandboxdv1.ProcessSpec {
+func (a *Adapter) spec(t agent.AdapterTask) *sandboxdv1.ProcessSpec {
 	return &sandboxdv1.ProcessSpec{Argv: []string{a.executable(), "exec", "--json", "--ephemeral", "--ignore-user-config", "--ignore-rules", "--sandbox", "workspace-write", "--color", "never", "--skip-git-repo-check", "--", t.Prompt}, EnvMode: sandboxdv1.EnvironmentMode_ENVIRONMENT_MODE_INHERIT}
 }
 
-func (a *Adapter) EnsureAccepted(ctx context.Context, task controllers.AdapterTask, sandbox controllers.AdapterSandbox, credential *controllers.AdapterCredential) error {
+func (a *Adapter) EnsureAccepted(ctx context.Context, task agent.AdapterTask, sandbox agent.AdapterSandbox, credential *agent.AdapterCredential) error {
 	if task.Prompt == "-" {
-		return fmt.Errorf("%w: Codex prompt '-' requires managed stdin", controllers.ErrAdapterTaskRejected)
+		return fmt.Errorf("%w: Codex prompt '-' requires managed stdin", agent.ErrAdapterTaskRejected)
 	}
 	if credential != nil && credential.Type != platformv1alpha1.AgentCredentialTypeAPIKey {
-		return fmt.Errorf("%w: unsupported credential type %q", controllers.ErrAdapterTaskRejected, credential.Type)
+		return fmt.Errorf("%w: unsupported credential type %q", agent.ErrAdapterTaskRejected, credential.Type)
 	}
 	client, closeConnection, err := sandbox.DialProcess(ctx)
 	if err != nil {
@@ -101,7 +104,7 @@ func (a *Adapter) EnsureAccepted(ctx context.Context, task controllers.AdapterTa
 	return err
 }
 
-func (a *Adapter) Observe(ctx context.Context, task controllers.AdapterTask, sandbox controllers.AdapterSandbox) (controllers.AdapterObservation, string, error) {
+func (a *Adapter) Observe(ctx context.Context, task agent.AdapterTask, sandbox agent.AdapterSandbox) (agent.AdapterObservation, string, error) {
 	client, closeConnection, err := sandbox.DialProcess(ctx)
 	if err != nil {
 		return "", "", err
@@ -110,43 +113,43 @@ func (a *Adapter) Observe(ctx context.Context, task controllers.AdapterTask, san
 	p, err := client.Get(ctx, &sandboxdv1.GetProcessRequest{Key: key(task)})
 	if err != nil {
 		if status.Code(err) == codes.NotFound {
-			return controllers.AdapterObservationFailed, "Codex execution is absent in the current sandbox epoch", nil
+			return agent.AdapterObservationFailed, "Codex execution is absent in the current sandbox epoch", nil
 		}
 		return "", "", err
 	}
 	if err = a.forward(ctx, client, task, sandbox, p); err != nil {
-		if errors.Is(err, controllers.ErrAdapterEventRejected) {
-			return controllers.AdapterObservationFailed, "Codex transcript output was permanently rejected", nil
+		if errors.Is(err, agent.ErrAdapterEventRejected) {
+			return agent.AdapterObservationFailed, "Codex transcript output was permanently rejected", nil
 		}
 		return "", "", err
 	}
 	switch p.State {
 	case sandboxdv1.ProcessState_PROCESS_STATE_RUNNING, sandboxdv1.ProcessState_PROCESS_STATE_STOPPING:
-		return controllers.AdapterObservationRunning, "Codex is running", nil
+		return agent.AdapterObservationRunning, "Codex is running", nil
 	case sandboxdv1.ProcessState_PROCESS_STATE_FAILED:
-		return controllers.AdapterObservationFailed, message("Codex failed to start", p.Error), nil
+		return agent.AdapterObservationFailed, message("Codex failed to start", p.Error), nil
 	case sandboxdv1.ProcessState_PROCESS_STATE_EXITED:
 		if p.ExitCode == nil {
-			return controllers.AdapterObservationFailed, "Codex exited without an exit code", nil
+			return agent.AdapterObservationFailed, "Codex exited without an exit code", nil
 		}
 		if p.GetExitCode() != 0 {
-			return controllers.AdapterObservationFailed, fmt.Sprintf("Codex exited with code %d", p.GetExitCode()), nil
+			return agent.AdapterObservationFailed, fmt.Sprintf("Codex exited with code %d", p.GetExitCode()), nil
 		}
 		out, e := readOutput(ctx, client, key(task), p.ExecutionId)
 		if e != nil {
 			var truncated *outputTruncatedError
 			if errors.As(e, &truncated) {
-				return controllers.AdapterObservationFailed, message("Codex stdout was truncated before terminal validation", truncated.Error()), nil
+				return agent.AdapterObservationFailed, message("Codex stdout was truncated before terminal validation", truncated.Error()), nil
 			}
 			return "", "", e
 		}
 		thread, detail, ok := terminal(out)
 		if !ok {
-			return controllers.AdapterObservationFailed, message("Codex exited without a coherent completed turn", detail), nil
+			return agent.AdapterObservationFailed, message("Codex exited without a coherent completed turn", detail), nil
 		}
-		return controllers.AdapterObservationSucceeded, "Codex completed thread " + thread, nil
+		return agent.AdapterObservationSucceeded, "Codex completed thread " + thread, nil
 	default:
-		return controllers.AdapterObservationFailed, fmt.Sprintf("Codex returned invalid process state %s", p.State), nil
+		return agent.AdapterObservationFailed, fmt.Sprintf("Codex returned invalid process state %s", p.State), nil
 	}
 }
 
@@ -204,7 +207,7 @@ func terminal(output []byte) (string, string, bool) {
 	return thread, "", true
 }
 
-func (a *Adapter) Cancel(ctx context.Context, task controllers.AdapterTask, sandbox controllers.AdapterSandbox) error {
+func (a *Adapter) Cancel(ctx context.Context, task agent.AdapterTask, sandbox agent.AdapterSandbox) error {
 	client, closeConnection, err := sandbox.DialProcess(ctx)
 	if err != nil {
 		return err
@@ -219,10 +222,10 @@ func (a *Adapter) Cancel(ctx context.Context, task controllers.AdapterTask, sand
 	}
 	switch p.State {
 	case sandboxdv1.ProcessState_PROCESS_STATE_RUNNING, sandboxdv1.ProcessState_PROCESS_STATE_STOPPING:
-		return controllers.ErrAdapterCancellationPending
+		return agent.ErrAdapterCancellationPending
 	case sandboxdv1.ProcessState_PROCESS_STATE_EXITED, sandboxdv1.ProcessState_PROCESS_STATE_FAILED:
 		err = a.forward(ctx, client, task, sandbox, p)
-		if errors.Is(err, controllers.ErrAdapterEventRejected) {
+		if errors.Is(err, agent.ErrAdapterEventRejected) {
 			return nil
 		}
 		return err
@@ -231,7 +234,7 @@ func (a *Adapter) Cancel(ctx context.Context, task controllers.AdapterTask, sand
 	}
 }
 
-func (a *Adapter) forward(ctx context.Context, client sandboxdv1.ProcessServiceClient, task controllers.AdapterTask, sandbox controllers.AdapterSandbox, p *sandboxdv1.Process) error {
+func (a *Adapter) forward(ctx context.Context, client sandboxdv1.ProcessServiceClient, task agent.AdapterTask, sandbox agent.AdapterSandbox, p *sandboxdv1.Process) error {
 	if sandbox.EmitEvent == nil || p.ExecutionId == "" {
 		return nil
 	}
@@ -256,7 +259,7 @@ func (a *Adapter) forward(ctx context.Context, client sandboxdv1.ProcessServiceC
 			}
 			payload, _ := json.Marshal(outputEvent{p.ExecutionId, streamName(stream), r.Offset, r.NextOffset, r.GapBytes, r.RetainedStart, r.ProducedEnd, r.Eof, r.Data})
 			digest := sha256.Sum256(payload)
-			event := controllers.AdapterEvent{Source: "codex", Type: "codex.process-output", IdempotencyKey: fmt.Sprintf("v1:%s:%x", streamName(stream), digest), Data: payload}
+			event := agent.AdapterEvent{Source: "codex", Type: "codex.process-output", IdempotencyKey: fmt.Sprintf("v1:%s:%x", streamName(stream), digest), Data: payload}
 			a.setPending(c, pendingEvent{event, r.NextOffset})
 			if err = sandbox.EmitEvent(ctx, event); err != nil {
 				return err

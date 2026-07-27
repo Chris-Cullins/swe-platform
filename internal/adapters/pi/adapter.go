@@ -14,7 +14,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
-	"github.com/Chris-Cullins/swe-platform/internal/controllers"
+	"github.com/Chris-Cullins/swe-platform/internal/agent"
 	sandboxdv1 "github.com/Chris-Cullins/swe-platform/sandboxd/gen/proto/sandboxd/v1"
 )
 
@@ -29,12 +29,18 @@ type Adapter struct {
 	cursors    map[cursor]uint64
 	pending    map[cursor]pendingEvent
 }
+
+var (
+	_ agent.AdapterLifecycle        = (*Adapter)(nil)
+	_ agent.AdapterCredentialPolicy = (*Adapter)(nil)
+)
+
 type cursor struct {
 	environment, owner, execution string
 	stream                        sandboxdv1.OutputStream
 }
 type pendingEvent struct {
-	event      controllers.AdapterEvent
+	event      agent.AdapterEvent
 	nextOffset uint64
 }
 type outputEvent struct {
@@ -69,19 +75,19 @@ func (a *Adapter) executable() string {
 	}
 	return "pi"
 }
-func key(t controllers.AdapterTask) *sandboxdv1.ProcessKey {
+func key(t agent.AdapterTask) *sandboxdv1.ProcessKey {
 	return &sandboxdv1.ProcessKey{OwnerId: t.ID, Role: processRole}
 }
-func (a *Adapter) spec(t controllers.AdapterTask) *sandboxdv1.ProcessSpec {
+func (a *Adapter) spec(t agent.AdapterTask) *sandboxdv1.ProcessSpec {
 	return &sandboxdv1.ProcessSpec{Argv: []string{a.executable(), "--mode", "json", "--no-session", "-p", t.Prompt}, EnvMode: sandboxdv1.EnvironmentMode_ENVIRONMENT_MODE_INHERIT}
 }
 
-func (a *Adapter) EnsureAccepted(ctx context.Context, task controllers.AdapterTask, sandbox controllers.AdapterSandbox, credential *controllers.AdapterCredential) error {
+func (a *Adapter) EnsureAccepted(ctx context.Context, task agent.AdapterTask, sandbox agent.AdapterSandbox, credential *agent.AdapterCredential) error {
 	if credential != nil {
-		return fmt.Errorf("%w: Pi does not support credential profiles", controllers.ErrAdapterTaskRejected)
+		return fmt.Errorf("%w: Pi does not support credential profiles", agent.ErrAdapterTaskRejected)
 	}
 	if strings.HasPrefix(task.Prompt, "-") || strings.HasPrefix(task.Prompt, "@") {
-		return fmt.Errorf("%w: Pi prompt begins with unsupported parser prefix", controllers.ErrAdapterTaskRejected)
+		return fmt.Errorf("%w: Pi prompt begins with unsupported parser prefix", agent.ErrAdapterTaskRejected)
 	}
 	c, close, err := sandbox.DialProcess(ctx)
 	if err != nil {
@@ -91,7 +97,7 @@ func (a *Adapter) EnsureAccepted(ctx context.Context, task controllers.AdapterTa
 	_, err = c.Start(ctx, &sandboxdv1.StartProcessRequest{Key: key(task), Spec: a.spec(task)})
 	return err
 }
-func (a *Adapter) Observe(ctx context.Context, task controllers.AdapterTask, sandbox controllers.AdapterSandbox) (controllers.AdapterObservation, string, error) {
+func (a *Adapter) Observe(ctx context.Context, task agent.AdapterTask, sandbox agent.AdapterSandbox) (agent.AdapterObservation, string, error) {
 	c, close, err := sandbox.DialProcess(ctx)
 	if err != nil {
 		return "", "", err
@@ -100,43 +106,43 @@ func (a *Adapter) Observe(ctx context.Context, task controllers.AdapterTask, san
 	p, err := c.Get(ctx, &sandboxdv1.GetProcessRequest{Key: key(task)})
 	if err != nil {
 		if status.Code(err) == codes.NotFound {
-			return controllers.AdapterObservationFailed, "Pi execution is absent in the current sandbox epoch", nil
+			return agent.AdapterObservationFailed, "Pi execution is absent in the current sandbox epoch", nil
 		}
 		return "", "", err
 	}
 	if err = a.forward(ctx, c, task, sandbox, p); err != nil {
-		if errors.Is(err, controllers.ErrAdapterEventRejected) {
-			return controllers.AdapterObservationFailed, "Pi transcript output was permanently rejected", nil
+		if errors.Is(err, agent.ErrAdapterEventRejected) {
+			return agent.AdapterObservationFailed, "Pi transcript output was permanently rejected", nil
 		}
 		return "", "", err
 	}
 	switch p.State {
 	case sandboxdv1.ProcessState_PROCESS_STATE_RUNNING, sandboxdv1.ProcessState_PROCESS_STATE_STOPPING:
-		return controllers.AdapterObservationRunning, "Pi is running", nil
+		return agent.AdapterObservationRunning, "Pi is running", nil
 	case sandboxdv1.ProcessState_PROCESS_STATE_FAILED:
-		return controllers.AdapterObservationFailed, message("Pi failed to start", p.Error), nil
+		return agent.AdapterObservationFailed, message("Pi failed to start", p.Error), nil
 	case sandboxdv1.ProcessState_PROCESS_STATE_EXITED:
 		if p.ExitCode == nil {
-			return controllers.AdapterObservationFailed, "Pi exited without an exit code", nil
+			return agent.AdapterObservationFailed, "Pi exited without an exit code", nil
 		}
 		if p.GetExitCode() != 0 {
-			return controllers.AdapterObservationFailed, fmt.Sprintf("Pi exited with code %d", p.GetExitCode()), nil
+			return agent.AdapterObservationFailed, fmt.Sprintf("Pi exited with code %d", p.GetExitCode()), nil
 		}
 		out, e := readOutput(ctx, c, key(task), p.ExecutionId)
 		if e != nil {
 			var gap *outputTruncatedError
 			if errors.As(e, &gap) {
-				return controllers.AdapterObservationFailed, message("Pi stdout was truncated before terminal validation", gap.Error()), nil
+				return agent.AdapterObservationFailed, message("Pi stdout was truncated before terminal validation", gap.Error()), nil
 			}
 			return "", "", e
 		}
 		detail, ok := terminal(out)
 		if !ok {
-			return controllers.AdapterObservationFailed, message("Pi exited without a coherent final agent_end", detail), nil
+			return agent.AdapterObservationFailed, message("Pi exited without a coherent final agent_end", detail), nil
 		}
-		return controllers.AdapterObservationSucceeded, "Pi completed", nil
+		return agent.AdapterObservationSucceeded, "Pi completed", nil
 	default:
-		return controllers.AdapterObservationFailed, fmt.Sprintf("Pi returned invalid process state %s", p.State), nil
+		return agent.AdapterObservationFailed, fmt.Sprintf("Pi returned invalid process state %s", p.State), nil
 	}
 }
 func terminal(out []byte) (string, bool) {
@@ -183,7 +189,7 @@ func terminal(out []byte) (string, bool) {
 		return "final assistant has invalid stopReason", false
 	}
 }
-func (a *Adapter) Cancel(ctx context.Context, task controllers.AdapterTask, sandbox controllers.AdapterSandbox) error {
+func (a *Adapter) Cancel(ctx context.Context, task agent.AdapterTask, sandbox agent.AdapterSandbox) error {
 	c, close, err := sandbox.DialProcess(ctx)
 	if err != nil {
 		return err
@@ -198,10 +204,10 @@ func (a *Adapter) Cancel(ctx context.Context, task controllers.AdapterTask, sand
 	}
 	switch p.State {
 	case sandboxdv1.ProcessState_PROCESS_STATE_RUNNING, sandboxdv1.ProcessState_PROCESS_STATE_STOPPING:
-		return controllers.ErrAdapterCancellationPending
+		return agent.ErrAdapterCancellationPending
 	case sandboxdv1.ProcessState_PROCESS_STATE_EXITED, sandboxdv1.ProcessState_PROCESS_STATE_FAILED:
 		err = a.forward(ctx, c, task, sandbox, p)
-		if errors.Is(err, controllers.ErrAdapterEventRejected) {
+		if errors.Is(err, agent.ErrAdapterEventRejected) {
 			return nil
 		}
 		return err
@@ -209,7 +215,7 @@ func (a *Adapter) Cancel(ctx context.Context, task controllers.AdapterTask, sand
 		return fmt.Errorf("Pi cancellation returned invalid process state %s", p.State)
 	}
 }
-func (a *Adapter) forward(ctx context.Context, c sandboxdv1.ProcessServiceClient, task controllers.AdapterTask, s controllers.AdapterSandbox, p *sandboxdv1.Process) error {
+func (a *Adapter) forward(ctx context.Context, c sandboxdv1.ProcessServiceClient, task agent.AdapterTask, s agent.AdapterSandbox, p *sandboxdv1.Process) error {
 	if s.EmitEvent == nil || p.ExecutionId == "" {
 		return nil
 	}
@@ -234,7 +240,7 @@ func (a *Adapter) forward(ctx context.Context, c sandboxdv1.ProcessServiceClient
 			}
 			payload, _ := json.Marshal(outputEvent{p.ExecutionId, streamName(stream), r.Offset, r.NextOffset, r.GapBytes, r.RetainedStart, r.ProducedEnd, r.Eof, r.Data})
 			digest := sha256.Sum256(payload)
-			event := controllers.AdapterEvent{Source: "pi", Type: "pi.process-output", IdempotencyKey: fmt.Sprintf("v1:%s:%x", streamName(stream), digest), Data: payload}
+			event := agent.AdapterEvent{Source: "pi", Type: "pi.process-output", IdempotencyKey: fmt.Sprintf("v1:%s:%x", streamName(stream), digest), Data: payload}
 			a.setPending(k, pendingEvent{event, r.NextOffset})
 			if err = s.EmitEvent(ctx, event); err != nil {
 				return err
