@@ -62,9 +62,12 @@ Pi deliberately supports no credential profiles or credential injection.
   `internal/controllers/`, `cmd/{operator,swe}`. The exact adapter contract boundary is
   `internal/agent/`. Shared fenced Environment intent
   publication and validation belongs in `internal/lifecycle/`; controllers remain
-  the sole owners of observed lifecycle transitions. `sandboxd/` is a **separate Go
-  module** with its own `go.mod`: keep its dependencies minimal so it stays portable and
-  the environment base image stays small.
+  the sole owners of observed lifecycle transitions. Environment reconciliation is split
+  within `internal/controllers/` into ordered gate orchestration, lifecycle intent,
+  provisioning/resources, pod recovery, status, and manager setup files; keep gate names
+  bounded and preserve the ordering contract in its direct test. `sandboxd/` is a
+  **separate Go module** with its own `go.mod`: keep its dependencies minimal so it stays
+  portable and the environment base image stays small.
   Generated protobuf code lives in `sandboxd/gen/` and is committed.
 - **APIs:** CRDs are `v1alpha1`; breaking changes are acceptable pre-1.0. Whenever CRD
   fields or contracts change, update the relevant current resource table and
