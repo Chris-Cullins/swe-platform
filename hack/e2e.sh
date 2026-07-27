@@ -208,6 +208,11 @@ manage_observation_listener() {
 		fi
 		sleep 1
 	done
+	if ! grep -q 'Forwarding from' /tmp/swe-platform-observation-port-forward.log; then
+		cat /tmp/swe-platform-observation-port-forward.log >&2
+		echo "FAIL: sandboxd observation port-forward did not become ready" >&2
+		return 1
+	fi
 	if [[ "$action" == "service-start" ]]; then
 		go run ./hack/e2e-process-check "$action" 127.0.0.1:15052 "$identity" /tmp/swe-platform-observation-cert-"$$" /tmp/swe-platform-observation-process-token-"$$" "$owner" "$role" "$port"
 	else
@@ -2031,6 +2036,11 @@ done
 if [[ -z "$WOKEN_PORTAL_POD" ]]; then
 	kill "$PORTAL_WAKE_PID" >/dev/null 2>&1 || true
 	echo "FAIL: portal request did not create a fresh pod for Idle wake"
+	exit 1
+fi
+if ! kubectl -n "$PROJECT_NAMESPACE" wait --for=condition=Ready pod/"$WOKEN_PORTAL_POD" --timeout=90s; then
+	kill "$PORTAL_WAKE_PID" >/dev/null 2>&1 || true
+	echo "FAIL: portal wake replacement pod did not become ready"
 	exit 1
 fi
 manage_observation_listener service-start "$WOKEN_PORTAL_POD" "$OBSERVATION_OWNER" portal-idle-listener 3002
