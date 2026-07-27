@@ -79,7 +79,7 @@ All current CRDs are namespaced:
 | `Installation` | Empty-spec identity object in the system namespace. Its immutable Kubernetes UID is the stable installation identity used by namespace claims, catalog sources, managed Template copies, and baseline resources. |
 | `Project` | One repository URL (represented as a one-item list), a same-namespace default Template reference, changes-workflow metadata, and a reserved egress allowlist. A non-empty allowlist is rejected when an Environment uses the Project. |
 | `EnvironmentTemplate` | Pod image, size/resources, disk, runtime class, idle timeout, warm-pool minimum, and backend. Admission currently permits only the `pod` backend. Chart-owned system-namespace objects are inert catalog sources; execution accepts only installation-managed same-namespace copies bound to exact Installation, source, and Project identities. |
-| `Environment` | Template/Project selection, explicit hold policy, bounded wake/suspend/activity intents, and up to 32 service declarations. New declarations have an immutable-per-incarnation random `instanceID`; upgrade-retained legacy declarations may omit it, receive no portal route, and can add it only with a higher revision. Status owns lifecycle/execution, claim, observation, activity and recovery state; the gateway owns bounded `portalRoutes` and monotonic `nextPortalRouteGeneration`. Inactive routes are denial tombstones preserved by other status writers. |
+| `Environment` | Template/Project selection, explicit hold policy, bounded wake/suspend/activity intents, and up to 32 service declarations. New declarations have an immutable-per-incarnation random `instanceID`; upgrade-retained legacy declarations may omit it, receive no portal route, and can add it only with a higher revision. Status owns lifecycle/execution, claim, observation, activity, and nested backend-neutral recovery state; recovery records attempts, exhaustion, the exact failed execution generation being accounted, and the next allowed attempt time, while generation zero means no recovery identity. The gateway owns bounded `portalRoutes` and monotonic `nextPortalRouteGeneration`; inactive routes are denial tombstones preserved by other status writers. |
 | `Run` | Immutable agent task and Environment/Project/Template/credential selection plus monotonic cancellation; status records normalized lifecycle, exact Environment name/UID and ownership, exact credential profile identity, accepted lifecycle epoch, and accepted execution generation. `notify` and `parentRef` are schema placeholders without an implemented inbox. |
 | `AgentCredentialProfile` | Immutable adapter and `APIKey` type metadata. Key bytes live in an owner-linked Secret whose name is derived from the profile UID. |
 
@@ -240,8 +240,10 @@ are therefore discarded even if Environment status has not yet advanced.
 
 Only the Pod backend performs execution today. Project-backed initialization clones the
 Project's single repository into `/workspace`, runs `.agents/setup` once per workspace when
-present, and runs `.agents/resume` after resume when present. Terminal Pod failure has bounded
-replacement/backoff while retaining the PVC. Warm pools maintain ready unclaimed Environments;
+present, and runs `.agents/resume` after resume when present. Terminal execution failure has
+bounded replacement/backoff while retaining the PVC. `Environment.status.recovery` persists
+that backend-neutral progress and deduplicates the exact failed execution by execution
+generation; raw Pod identity remains connector-private. Warm pools maintain ready unclaimed Environments;
 claiming a generic warm member for a Project recreates its pod so Project initialization runs
 before the Run becomes ready.
 

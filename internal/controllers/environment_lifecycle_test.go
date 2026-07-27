@@ -73,7 +73,7 @@ func TestSyncStatusPublishesSandboxdEndpoint(t *testing.T) {
 	nextRecovery := metav1.Now()
 	env := &platformv1alpha1.Environment{ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default", Generation: 4}, Status: platformv1alpha1.EnvironmentStatus{
 		ExecutionGeneration: 1,
-		PodRecoveryAttempts: 2, PodRecoveryExhausted: true, PodRecoveryUID: "old-pod", PodRecoveryNextAttemptAt: &nextRecovery,
+		Recovery:            platformv1alpha1.EnvironmentRecoveryStatus{Attempts: 2, Exhausted: true, ExecutionGeneration: 1, NextAttemptAt: &nextRecovery},
 	}}
 	reconciler := &EnvironmentReconciler{
 		Client: fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(env).WithObjects(env).Build(),
@@ -105,8 +105,52 @@ func TestSyncStatusPublishesSandboxdEndpoint(t *testing.T) {
 	if updated.Status.ObservedGeneration != updated.Generation || ready == nil || ready.Status != metav1.ConditionTrue || ready.ObservedGeneration != updated.Generation || ready.Reason != "SandboxdReady" {
 		t.Fatalf("generation-aware Ready condition = %#v, status generation = %d", ready, updated.Status.ObservedGeneration)
 	}
-	if updated.Status.PodRecoveryAttempts != 0 || updated.Status.PodRecoveryExhausted || updated.Status.PodRecoveryUID != "" || updated.Status.PodRecoveryNextAttemptAt != nil {
+	if updated.Status.Recovery.Attempts != 0 || updated.Status.Recovery.Exhausted || updated.Status.Recovery.ExecutionGeneration != 0 || updated.Status.Recovery.NextAttemptAt != nil {
 		t.Fatalf("recovery budget was not reset after health-aware readiness: %#v", updated.Status)
+	}
+}
+
+func TestSyncStatusRejectsReadyObservationAfterExecutionChanges(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	if err := platformv1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	nextRecovery := metav1.Now()
+	stored := &platformv1alpha1.Environment{
+		ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default", UID: "environment-uid"},
+		Status: platformv1alpha1.EnvironmentStatus{
+			ExecutionGeneration: 3,
+			Recovery: platformv1alpha1.EnvironmentRecoveryStatus{
+				Attempts: 2, ExecutionGeneration: 2, NextAttemptAt: &nextRecovery,
+			},
+		},
+	}
+	stale := stored.DeepCopy()
+	stale.Status.ExecutionGeneration = 2
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "env-test", Namespace: "default", Annotations: map[string]string{executionGenerationAnnotation: "2"}},
+		Status: corev1.PodStatus{
+			Phase: corev1.PodRunning, PodIP: "10.0.0.2",
+			Conditions: []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}},
+		},
+	}
+	reconciler := &EnvironmentReconciler{
+		Client: fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(stored).WithObjects(stored).Build(),
+		Scheme: scheme,
+	}
+
+	if err := reconciler.syncStatus(context.Background(), stale, pod); !stderrors.Is(err, errEnvironmentExecutionChanged) {
+		t.Fatalf("stale ready observation error = %v, want execution-change rejection", err)
+	}
+	var retained platformv1alpha1.Environment
+	if err := reconciler.Get(context.Background(), client.ObjectKeyFromObject(stored), &retained); err != nil {
+		t.Fatal(err)
+	}
+	if retained.Status.ExecutionGeneration != 3 || retained.Status.Endpoints.Sandboxd != "" || retained.Status.Recovery.Attempts != 2 || retained.Status.Recovery.NextAttemptAt == nil || len(retained.Status.Conditions) != 0 {
+		t.Fatalf("stale ready observation changed newer execution status: %#v", retained.Status)
 	}
 }
 

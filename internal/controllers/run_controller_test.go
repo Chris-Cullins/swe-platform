@@ -688,7 +688,7 @@ func TestRunEnvironmentWatchIgnoresOnlyActivityUpdates(t *testing.T) {
 		t.Fatal("claim update was filtered from Run reconciliation")
 	}
 	recovery := activity.DeepCopy()
-	recovery.Status.PodRecoveryAttempts = 1
+	recovery.Status.Recovery.Attempts = 1
 	if !runRelevantEnvironmentUpdate(activity, recovery) {
 		t.Fatal("pod recovery update was filtered from Run reconciliation")
 	}

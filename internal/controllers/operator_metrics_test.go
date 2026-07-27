@@ -282,9 +282,9 @@ func TestOperatorMetricsCountRecoveryTransitionsOnce(t *testing.T) {
 	}
 	now := time.Now()
 	due := metav1.NewTime(now.Add(-time.Second))
-	pending := &platformv1alpha1.Environment{ObjectMeta: metav1.ObjectMeta{Name: "pending", Namespace: "ns", UID: "pending-uid"}, Status: platformv1alpha1.EnvironmentStatus{PodRecoveryUID: "dead", PodRecoveryNextAttemptAt: &due}}
-	exhausted := &platformv1alpha1.Environment{ObjectMeta: metav1.ObjectMeta{Name: "exhausted", Namespace: "ns", UID: "exhausted-uid"}, Status: platformv1alpha1.EnvironmentStatus{PodRecoveryAttempts: podRecoveryLimit, PodRecoveryUID: "previous"}}
-	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "env-exhausted", Namespace: "ns", UID: "terminal"}, Status: corev1.PodStatus{Phase: corev1.PodFailed}}
+	pending := &platformv1alpha1.Environment{ObjectMeta: metav1.ObjectMeta{Name: "pending", Namespace: "ns", UID: "pending-uid"}, Status: platformv1alpha1.EnvironmentStatus{ExecutionGeneration: 1, Recovery: platformv1alpha1.EnvironmentRecoveryStatus{ExecutionGeneration: 1, NextAttemptAt: &due}}}
+	exhausted := &platformv1alpha1.Environment{ObjectMeta: metav1.ObjectMeta{Name: "exhausted", Namespace: "ns", UID: "exhausted-uid"}, Status: platformv1alpha1.EnvironmentStatus{ExecutionGeneration: 2, Recovery: platformv1alpha1.EnvironmentRecoveryStatus{Attempts: podRecoveryLimit, ExecutionGeneration: 1}}}
+	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "env-exhausted", Namespace: "ns", UID: "terminal", Annotations: map[string]string{executionGenerationAnnotation: "2"}}, Status: corev1.PodStatus{Phase: corev1.PodFailed}}
 	metrics, _ := testOperatorMetrics(t)
 	r := &EnvironmentReconciler{
 		Client: fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(pending, exhausted).WithObjects(pending, exhausted).Build(),

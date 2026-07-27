@@ -31,17 +31,29 @@ func (r *EnvironmentReconciler) syncStatus(ctx context.Context, env *platformv1a
 			env.Status.LastActiveAt = &now
 		}
 	}
-	return r.updateEnvironmentStatus(ctx, env, func(current *platformv1alpha1.Environment) {
+	executionChanged := false
+	err := r.updateEnvironmentStatus(ctx, env, func(current *platformv1alpha1.Environment) {
+		if current.Status.ExecutionGeneration != executionGeneration {
+			executionChanged = true
+			return
+		}
 		applyEnvironmentStatus(current, phase, pod.Name, sandboxdEndpoint, reason, message, env.Status.LastActiveAt)
 		current.Status.ImageID = environmentImageID(pod)
 		if phase == platformv1alpha1.EnvironmentPhaseReady {
-			current.Status.PodRecoveryAttempts = 0
-			current.Status.PodRecoveryExhausted = false
-			current.Status.PodRecoveryUID = ""
-			current.Status.PodRecoveryNextAttemptAt = nil
+			current.Status.Recovery.Attempts = 0
+			current.Status.Recovery.Exhausted = false
+			current.Status.Recovery.ExecutionGeneration = 0
+			current.Status.Recovery.NextAttemptAt = nil
 		}
 		clearChildOwnershipCollision(current)
 	})
+	if err != nil {
+		return err
+	}
+	if executionChanged {
+		return errEnvironmentExecutionChanged
+	}
+	return nil
 }
 
 func environmentImageID(pod *corev1.Pod) string {

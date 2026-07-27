@@ -335,6 +335,9 @@ func reconcileEnvironmentProvisioningGate(r *EnvironmentReconciler, ctx context.
 func reconcileEnvironmentStatusIdleGate(r *EnvironmentReconciler, ctx context.Context, state *environmentReconcileState) environmentPhaseOutcome {
 	env, tmpl, pod := &state.env, &state.template, state.pod
 	if err := r.syncStatus(ctx, env, pod); err != nil {
+		if stderrors.Is(err, errEnvironmentExecutionChanged) {
+			return phaseHandled(ctrl.Result{Requeue: true}, nil)
+		}
 		return phaseHandled(ctrl.Result{}, err)
 	}
 	if pod.Status.Phase != corev1.PodRunning {

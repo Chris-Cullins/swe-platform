@@ -411,6 +411,29 @@ type EnvironmentPortalRoute struct {
 	Active     bool  `json:"active"`
 }
 
+// EnvironmentRecoveryStatus is controller-owned backend-neutral recovery state.
+type EnvironmentRecoveryStatus struct {
+	// Attempts is the number of terminal execution replacements attempted since
+	// the recovery sequence last became ready.
+	// +optional
+	Attempts int32 `json:"attempts,omitempty"`
+
+	// Exhausted reports that automatic terminal execution replacement has
+	// consumed its retry budget. It remains set until sandboxd becomes ready.
+	// +optional
+	Exhausted bool `json:"exhausted,omitempty"`
+
+	// ExecutionGeneration identifies the exact backend execution whose recovery
+	// is pending or being accounted. Zero means there is no recovery identity.
+	// +kubebuilder:validation:Minimum=0
+	// +optional
+	ExecutionGeneration int64 `json:"executionGeneration,omitempty"`
+
+	// NextAttemptAt is when the controller may next replace a terminal execution.
+	// +optional
+	NextAttemptAt *metav1.Time `json:"nextAttemptAt,omitempty"`
+}
+
 // EnvironmentStatus defines the observed state of Environment.
 // +kubebuilder:validation:XValidation:rule="!has(oldSelf.executionGeneration) || (has(self.executionGeneration) && self.executionGeneration >= oldSelf.executionGeneration)",message="executionGeneration cannot decrease or be removed"
 // +kubebuilder:validation:XValidation:rule="!has(oldSelf.nextPortalRouteGeneration) || (has(self.nextPortalRouteGeneration) && self.nextPortalRouteGeneration >= oldSelf.nextPortalRouteGeneration)",message="nextPortalRouteGeneration cannot decrease or be removed"
@@ -472,25 +495,9 @@ type EnvironmentStatus struct {
 	// +optional
 	LastActiveAt *metav1.Time `json:"lastActiveAt,omitempty"`
 
-	// PodRecoveryAttempts is the number of terminal Pod replacements attempted
-	// since the current Pod recovery sequence last became ready.
+	// Recovery is backend-neutral terminal execution recovery state.
 	// +optional
-	PodRecoveryAttempts int32 `json:"podRecoveryAttempts,omitempty"`
-
-	// PodRecoveryExhausted reports that automatic terminal Pod replacement has
-	// consumed its retry budget. It remains set until sandboxd becomes ready.
-	// +optional
-	PodRecoveryExhausted bool `json:"podRecoveryExhausted,omitempty"`
-
-	// PodRecoveryUID identifies the exact terminal Pod covered by the pending or
-	// in-progress recovery attempt.
-	// +optional
-	PodRecoveryUID types.UID `json:"podRecoveryUID,omitempty"`
-
-	// PodRecoveryNextAttemptAt is when the controller may next replace a
-	// terminal Pod.
-	// +optional
-	PodRecoveryNextAttemptAt *metav1.Time `json:"podRecoveryNextAttemptAt,omitempty"`
+	Recovery EnvironmentRecoveryStatus `json:"recovery,omitempty"`
 
 	// +optional
 	// +listType=map
