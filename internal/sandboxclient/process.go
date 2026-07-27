@@ -176,6 +176,7 @@ type processConnectionProof struct {
 	secretIdentity        string
 	secretPodUID          string
 	certificateHash       [sha256.Size]byte
+	capabilitiesHash      [sha256.Size]byte
 	tokenHash             [sha256.Size]byte
 }
 
@@ -208,12 +209,15 @@ func (c Connector) resolveProcessTargetForEnvironment(ctx context.Context, env *
 	if token == "" {
 		return nil, nil, processConnectionProof{}, fmt.Errorf("sandboxd credential has no process capability")
 	}
+	if !exactCapability(secret.Data[sandboxdauth.CapabilitiesKey], token, sandboxdauth.CapabilityProcess) {
+		return nil, nil, processConnectionProof{}, fmt.Errorf("sandboxd credential has no exact process capability")
+	}
 	proof := processConnectionProof{
 		execution: executionForPod(env, pod), holdPolicyRevision: lifecycle.HoldPolicyRevision(env),
 		templateUID: template.UID, templateGeneration: template.Generation, templateSpec: template.Spec,
 		secretName: secret.Name, secretUID: secret.UID, secretResourceVersion: secret.ResourceVersion,
 		identity: identity, secretIdentity: secret.Annotations[sandboxdauth.IdentityAnnotation], secretPodUID: secret.Annotations[sandboxdauth.PodUIDAnnotation],
-		certificateHash: sha256.Sum256(secret.Data[sandboxdauth.TLSCertKey]), tokenHash: sha256.Sum256([]byte(token)),
+		certificateHash: sha256.Sum256(secret.Data[sandboxdauth.TLSCertKey]), capabilitiesHash: sha256.Sum256(secret.Data[sandboxdauth.CapabilitiesKey]), tokenHash: sha256.Sum256([]byte(token)),
 	}
 	return env, &secret, proof, nil
 }
@@ -238,7 +242,8 @@ func (p processConnectionProof) matches(other processConnectionProof) bool {
 		p.templateUID == other.templateUID && p.templateGeneration == other.templateGeneration &&
 		reflect.DeepEqual(p.templateSpec, other.templateSpec) && p.secretName == other.secretName && p.secretUID == other.secretUID &&
 		p.secretResourceVersion == other.secretResourceVersion && p.identity == other.identity && p.secretIdentity == other.secretIdentity &&
-		p.secretPodUID == other.secretPodUID && p.certificateHash == other.certificateHash && p.tokenHash == other.tokenHash
+		p.secretPodUID == other.secretPodUID && p.certificateHash == other.certificateHash &&
+		p.capabilitiesHash == other.capabilitiesHash && p.tokenHash == other.tokenHash
 }
 
 func processEnvironmentReachable(env *platformv1alpha1.Environment) bool {

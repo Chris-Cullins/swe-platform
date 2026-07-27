@@ -635,6 +635,12 @@ spec:
                       type: string
                     name:
                       type: string
+                    presentationID:
+                      description: |-
+                        PresentationID is an opaque gateway-owned identity for the URL scheme and
+                        suffix used by this route. A changed presentation receives a new route.
+                      pattern: ^[a-f0-9]{16}$
+                      type: string
                   required:
                   - active
                   - declarationInstanceID
@@ -642,6 +648,7 @@ spec:
                   - generation
                   - locator
                   - name
+                  - presentationID
                   type: object
                 maxItems: 64
                 type: array

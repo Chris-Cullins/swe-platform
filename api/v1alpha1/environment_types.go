@@ -432,6 +432,10 @@ type EnvironmentServiceObservations struct {
 // opaque and never reused; inactive records are denial tombstones.
 type EnvironmentPortalRoute struct {
 	Name string `json:"name"`
+	// PresentationID is an opaque gateway-owned identity for the URL scheme and
+	// suffix used by this route. A changed presentation receives a new route.
+	// +kubebuilder:validation:Pattern=`^[a-f0-9]{16}$`
+	PresentationID string `json:"presentationID"`
 	// +kubebuilder:validation:MinLength=20
 	// +kubebuilder:validation:MaxLength=63
 	// +kubebuilder:validation:Pattern=`^[a-z0-9]{20,63}$`

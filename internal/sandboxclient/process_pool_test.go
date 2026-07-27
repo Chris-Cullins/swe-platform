@@ -3,6 +3,7 @@ package sandboxclient
 import (
 	"context"
 	"crypto/tls"
+	"encoding/json"
 	"encoding/pem"
 	"errors"
 	"net"
@@ -110,10 +111,14 @@ func newProcessPoolFixtureAt(t *testing.T, identity, podIP string, certificate [
 		Spec:   corev1.PodSpec{RestartPolicy: corev1.RestartPolicyNever},
 		Status: corev1.PodStatus{PodIP: podIP, Conditions: []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}}},
 	}
+	capabilities, err := json.Marshal(sandboxdauth.Config{Grants: []sandboxdauth.Grant{{TokenHash: sandboxdauth.TokenVerifier("process-token"), Capabilities: []sandboxdauth.Capability{sandboxdauth.CapabilityProcess}}}})
+	if err != nil {
+		t.Fatal(err)
+	}
 	secret := &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{Name: "credential", Namespace: "ns", UID: "secret-uid", ResourceVersion: "1", OwnerReferences: owner,
 			Annotations: map[string]string{sandboxdauth.IdentityAnnotation: identity, sandboxdauth.PodUIDAnnotation: "pod-uid"}},
-		Data: map[string][]byte{sandboxdauth.TLSCertKey: certificate, sandboxdauth.ProcessTokenKey: []byte("process-token")},
+		Data: map[string][]byte{sandboxdauth.TLSCertKey: certificate, sandboxdauth.CapabilitiesKey: capabilities, sandboxdauth.ProcessTokenKey: []byte("process-token")},
 	}
 	template := &platformv1alpha1.EnvironmentTemplate{ObjectMeta: metav1.ObjectMeta{Name: "default", Namespace: "ns", UID: "template-uid", Generation: 1}}
 	scheme := runtime.NewScheme()
@@ -383,10 +388,15 @@ func TestProcessConnectionPoolCompleteHitProofInvalidatesDrift(t *testing.T) {
 				}
 			})
 		}},
-		{name: "Secret process token", wantReplacement: true, mutate: func(_ *testing.T, reader *processPoolCountingReader) {
+		{name: "Secret process token", wantReplacement: true, mutate: func(t *testing.T, reader *processPoolCountingReader) {
+			capabilities, err := json.Marshal(sandboxdauth.Config{Grants: []sandboxdauth.Grant{{TokenHash: sandboxdauth.TokenVerifier("replacement-process-token"), Capabilities: []sandboxdauth.Capability{sandboxdauth.CapabilityProcess}}}})
+			if err != nil {
+				t.Fatal(err)
+			}
 			reader.setMutation(func(object client.Object) {
 				if secret, ok := object.(*corev1.Secret); ok {
 					secret.Data[sandboxdauth.ProcessTokenKey] = []byte("replacement-process-token")
+					secret.Data[sandboxdauth.CapabilitiesKey] = capabilities
 				}
 			})
 		}},

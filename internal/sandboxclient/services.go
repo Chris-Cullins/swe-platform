@@ -129,7 +129,7 @@ func exactCapability(data []byte, token string, capability sandboxdauth.Capabili
 }
 
 // ReconcileRepositoryServices publishes a complete declaration-fenced process set.
-func (c Connector) ReconcileRepositoryServices(ctx context.Context, fence lifecycle.ExecutionFence, declarations []platformv1alpha1.EnvironmentServiceDeclaration, intentRevision uint64, services []*sandboxdv1.ManagedServiceSpec) error {
+func (c Connector) ReconcileRepositoryServices(ctx context.Context, fence lifecycle.ExecutionFence, declarations []platformv1alpha1.EnvironmentServiceDeclaration, routes []platformv1alpha1.EnvironmentPortalRoute, intentRevision, routeRevision uint64, services []*sandboxdv1.ManagedServiceSpec) error {
 	if intentRevision == 0 {
 		return errors.New("managed service intent revision must be positive")
 	}
@@ -137,7 +137,7 @@ func (c Connector) ReconcileRepositoryServices(ctx context.Context, fence lifecy
 	if err != nil {
 		return err
 	}
-	if !reflect.DeepEqual(env.Spec.Services, declarations) {
+	if !reflect.DeepEqual(env.Spec.Services, declarations) || !managedServiceRoutesCurrent(env, routes) {
 		return errors.New("service declarations changed before process reconcile")
 	}
 	client, release, err := c.DialProcess(ctx, fence)
@@ -145,19 +145,34 @@ func (c Connector) ReconcileRepositoryServices(ctx context.Context, fence lifecy
 		return err
 	}
 	defer release()
-	response, err := client.ReconcileManagedServices(ctx, &sandboxdv1.ReconcileManagedServicesRequest{OwnerId: string(fence.EnvironmentUID()), IntentRevision: intentRevision, Services: services})
+	response, err := client.ReconcileManagedServices(ctx, &sandboxdv1.ReconcileManagedServicesRequest{OwnerId: string(fence.EnvironmentUID()), IntentRevision: intentRevision, RouteRevision: routeRevision, Services: services})
 	if err != nil {
 		return fmt.Errorf("reconcile repository services: %w", err)
 	}
-	if response.OwnerId != string(fence.EnvironmentUID()) || response.IntentRevision != intentRevision {
+	if response.OwnerId != string(fence.EnvironmentUID()) || response.IntentRevision != intentRevision || response.RouteRevision != routeRevision {
 		return errors.New("sandboxd returned mismatched managed service intent")
 	}
 	env, _, currentProof, err := c.resolveProcessTarget(ctx, fence)
 	if err != nil {
 		return err
 	}
-	if !proof.matches(currentProof) || !reflect.DeepEqual(env.Spec.Services, declarations) {
+	if !proof.matches(currentProof) || !reflect.DeepEqual(env.Spec.Services, declarations) || !managedServiceRoutesCurrent(env, routes) {
 		return errors.New("service declarations changed during process reconcile")
 	}
 	return nil
+}
+
+func managedServiceRoutesCurrent(env *platformv1alpha1.Environment, routes []platformv1alpha1.EnvironmentPortalRoute) bool {
+	for _, want := range routes {
+		count := 0
+		for _, current := range env.Status.PortalRoutes {
+			if reflect.DeepEqual(current, want) {
+				count++
+			}
+		}
+		if count != 1 {
+			return false
+		}
+	}
+	return true
 }

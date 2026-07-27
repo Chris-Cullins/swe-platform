@@ -137,3 +137,133 @@ func TestManagedServicesRevisionReplaceRemoveReaddAndClose(t *testing.T) {
 		t.Fatalf("close did not suppress restart: %d -> %d", before, got)
 	}
 }
+
+func TestManagedServicesRouteRevisionOrdersSameIntentRevision(t *testing.T) {
+	s := NewProcessServer(t.TempDir())
+	marker := filepath.Join(t.TempDir(), "starts")
+	first := managedRequest("uid", 4, "svc", marker, "first", nil)
+	first.RouteRevision = 7
+	if _, err := s.ReconcileManagedServices(context.Background(), first); err != nil {
+		t.Fatal(err)
+	}
+	changed := managedRequest("uid", 4, "svc", marker, "changed-url", nil)
+	changed.RouteRevision = 8
+	if _, err := s.ReconcileManagedServices(context.Background(), changed); err != nil {
+		t.Fatalf("higher gateway route revision was rejected: %v", err)
+	}
+	stale := managedRequest("uid", 4, "svc", marker, "stale", nil)
+	stale.RouteRevision = 7
+	if _, err := s.ReconcileManagedServices(context.Background(), stale); status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("stale gateway route revision = %v", err)
+	}
+	s.Close()
+}
+
+func TestManagedServiceIntentRejectsOrdinaryAdmission(t *testing.T) {
+	s := NewProcessServer(t.TempDir())
+	marker := filepath.Join(t.TempDir(), "starts")
+	request := managedRequest("uid", 1, "svc", marker, "managed", map[string]string{"WAIT": "1"})
+	if _, err := s.ReconcileManagedServices(context.Background(), request); err != nil {
+		t.Fatal(err)
+	}
+	waitLines(t, marker, 1)
+	key := &sandboxdv1.ProcessKey{OwnerId: "uid", Role: "svc"}
+	for name, ordinary := range map[string]func() error{
+		"identical spec": func() error {
+			_, err := s.Start(context.Background(), &sandboxdv1.StartProcessRequest{Key: key, Spec: request.Services[0].Spec})
+			return err
+		},
+		"different spec": func() error {
+			_, err := s.Start(context.Background(), &sandboxdv1.StartProcessRequest{Key: key, Spec: &sandboxdv1.ProcessSpec{Argv: []string{os.Args[0], "-test.run=TestSetManagedProcessHelper"}, EnvMode: sandboxdv1.EnvironmentMode_ENVIRONMENT_MODE_REPLACE, Env: map[string]string{"SANDBOXD_MANAGED_HELPER": "1", "MARKER": marker, "VALUE": "ordinary"}}})
+			return err
+		},
+		"launch material": func() error {
+			_, err := s.StartWithLaunchMaterial(context.Background(), &sandboxdv1.StartProcessWithLaunchMaterialRequest{Key: key, Spec: request.Services[0].Spec, LaunchMaterial: &sandboxdv1.LaunchMaterial{SecretEnv: map[string][]byte{"TOKEN": []byte("secret")}}})
+			return err
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if err := ordinary(); status.Code(err) != codes.FailedPrecondition {
+				t.Fatalf("ordinary collision error = %v", err)
+			}
+		})
+	}
+	s.Close()
+}
+
+func TestStopSuppressesManagedStartFailureRestart(t *testing.T) {
+	s := NewProcessServer(t.TempDir())
+	s.restartInitial = 100 * time.Millisecond
+	request := &sandboxdv1.ReconcileManagedServicesRequest{OwnerId: "uid", IntentRevision: 1, Services: []*sandboxdv1.ManagedServiceSpec{{Role: "svc", Spec: &sandboxdv1.ProcessSpec{Argv: []string{filepath.Join(t.TempDir(), "missing")}}}}}
+	response, err := s.ReconcileManagedServices(context.Background(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	failed := response.Services[0].Process
+	if failed.State != sandboxdv1.ProcessState_PROCESS_STATE_FAILED || failed.ExecutionId == "" {
+		t.Fatalf("managed start = %#v, want failed execution", failed)
+	}
+	if _, err := s.Stop(context.Background(), &sandboxdv1.StopProcessRequest{Key: failed.Key, Mode: sandboxdv1.StopMode_STOP_MODE_FORCE}); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(250 * time.Millisecond)
+	current, err := s.Get(context.Background(), &sandboxdv1.GetProcessRequest{Key: failed.Key})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if current.ExecutionId != failed.ExecutionId || current.State != sandboxdv1.ProcessState_PROCESS_STATE_FAILED {
+		t.Fatalf("stopped failed execution restarted: before=%#v after=%#v", failed, current)
+	}
+	s.Close()
+}
+
+func TestManagedRestartAdmissionSerializesNewerRemoval(t *testing.T) {
+	s := NewProcessServer(t.TempDir())
+	s.restartInitial = 5 * time.Millisecond
+	marker := filepath.Join(t.TempDir(), "starts")
+	request := managedRequest("uid", 1, "svc", marker, "old", map[string]string{"WAIT": "1"})
+	if _, err := s.ReconcileManagedServices(context.Background(), request); err != nil {
+		t.Fatal(err)
+	}
+	waitLines(t, marker, 1)
+
+	entered, release := make(chan struct{}), make(chan struct{})
+	s.beforeManagedStart = func() {
+		close(entered)
+		<-release
+	}
+	s.mu.Lock()
+	p := s.processes[processKey{"uid", "svc"}]
+	s.mu.Unlock()
+	s.requestTermination(processKey{"uid", "svc"}, p, sandboxdv1.TerminationReason_TERMINATION_REASON_TERMINATED, true)
+	select {
+	case <-entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("restart did not reach managed admission hook")
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := s.ReconcileManagedServices(context.Background(), managedRequest("uid", 2, "", marker, "", nil))
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		t.Fatalf("newer removal crossed in-flight admission: %v", err)
+	case <-time.After(25 * time.Millisecond):
+	}
+	close(release)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	s.beforeManagedStart = nil
+	time.Sleep(100 * time.Millisecond)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if owner := s.managedOwners["uid"]; owner == nil || len(owner.desired) != 0 {
+		t.Fatalf("newer empty desired set was not retained: %#v", owner)
+	}
+	if current := s.processes[processKey{"uid", "svc"}]; current != nil && (current.state == sandboxdv1.ProcessState_PROCESS_STATE_RUNNING || current.state == sandboxdv1.ProcessState_PROCESS_STATE_STOPPING) {
+		t.Fatalf("obsolete service survived newer removal: %#v", processResponse(current))
+	}
+}
