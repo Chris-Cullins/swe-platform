@@ -149,7 +149,12 @@ rules:
     verbs: ["get", "list"]
   - apiGroups: ["swe.dev"]
     resources: ["environments"]
-    verbs: ["get", "list", "patch"]
+    verbs:
+      - "get"
+      - "patch"
+      {{- if .Values.controlPlane.portal.enabled }}
+      - "list"
+      {{- end }}
   - apiGroups: ["swe.dev"]
     resources: ["environments/status"]
     verbs: ["get", "update"]

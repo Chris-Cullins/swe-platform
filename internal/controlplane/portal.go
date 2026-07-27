@@ -373,6 +373,16 @@ func terminalRunState(s platformv1alpha1.RunState) bool {
 }
 
 func (g *portalGateway) serveLocator(w http.ResponseWriter, r *http.Request, locator string) {
+	authenticator, ok := g.server.access.(principalAuthenticator)
+	if !ok {
+		portal404(w)
+		return
+	}
+	principal, err := authenticator.AuthenticatePrincipal(r, true)
+	if err != nil || principal == "bootstrap" {
+		portal404(w)
+		return
+	}
 	select {
 	case g.requests <- struct{}{}:
 		defer func() { <-g.requests }()

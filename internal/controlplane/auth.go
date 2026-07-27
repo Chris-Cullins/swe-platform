@@ -49,6 +49,10 @@ type principalAccessController interface {
 	AuthorizePrincipal(*http.Request, ResourceAccess, bool) (string, error)
 }
 
+type principalAuthenticator interface {
+	AuthenticatePrincipal(*http.Request, bool) (string, error)
+}
+
 // SessionAuthenticator validates Kubernetes credentials for browser session
 // exchange without issuing or retaining a platform credential.
 type SessionAuthenticator interface {
@@ -76,17 +80,8 @@ func (a KubernetesAccessController) Authorize(r *http.Request, access ResourceAc
 
 // AuthorizePrincipal authorizes access and returns a stable, non-secret admission key.
 func (a KubernetesAccessController) AuthorizePrincipal(r *http.Request, access ResourceAccess, allowSession bool) (string, error) {
-	token, bearer, sessionID, err := a.requestCredential(r, allowSession)
+	user, err := a.authenticateRequest(r, allowSession)
 	if err != nil {
-		return "", err
-	}
-	user, err := a.authenticate(r.Context(), token, bearer)
-	if err != nil {
-		if sessionID != "" && errors.Is(err, errUnauthenticated) {
-			if deleteErr := a.Sessions.Delete(r.Context(), sessionID); deleteErr != nil {
-				return "", errors.Join(err, sessionStoreAccessError(deleteErr))
-			}
-		}
 		return "", err
 	}
 	if user.bootstrap {
@@ -126,10 +121,45 @@ func (a KubernetesAccessController) AuthorizePrincipal(r *http.Request, access R
 		return "", errForbidden
 	}
 	a.Metrics.observeReview("subject_access", "allowed", reviewStarted)
-	if user.uid != "" {
-		return user.uid, nil
+	return principalKey(user), nil
+}
+
+// AuthenticatePrincipal performs live bearer/session authentication without
+// authorizing a guessed resource. Callers must still perform exact SARs after
+// resolving the resource identity.
+func (a KubernetesAccessController) AuthenticatePrincipal(r *http.Request, allowSession bool) (string, error) {
+	user, err := a.authenticateRequest(r, allowSession)
+	if err != nil {
+		return "", err
 	}
-	return user.name, nil
+	if user.bootstrap {
+		return "bootstrap", nil
+	}
+	return principalKey(user), nil
+}
+
+func (a KubernetesAccessController) authenticateRequest(r *http.Request, allowSession bool) (principal, error) {
+	token, bearer, sessionID, err := a.requestCredential(r, allowSession)
+	if err != nil {
+		return principal{}, err
+	}
+	user, err := a.authenticate(r.Context(), token, bearer)
+	if err != nil {
+		if sessionID != "" && errors.Is(err, errUnauthenticated) {
+			if deleteErr := a.Sessions.Delete(r.Context(), sessionID); deleteErr != nil {
+				return principal{}, errors.Join(err, sessionStoreAccessError(deleteErr))
+			}
+		}
+		return principal{}, err
+	}
+	return user, nil
+}
+
+func principalKey(user principal) string {
+	if user.uid != "" {
+		return user.uid
+	}
+	return user.name
 }
 
 // CreateSession validates an explicit bearer credential and stores it behind a

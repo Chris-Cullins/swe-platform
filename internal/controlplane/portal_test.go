@@ -44,6 +44,21 @@ func (a *recordingPrincipalAccess) AuthorizePrincipal(_ *http.Request, access Re
 	return principal, a.err
 }
 
+func (a *recordingPrincipalAccess) AuthenticatePrincipal(_ *http.Request, _ bool) (string, error) {
+	principal := a.principal
+	if principal == "" {
+		principal = "user"
+	}
+	return principal, a.err
+}
+
+type countingPortalEnumerator struct{ calls int }
+
+func (e *countingPortalEnumerator) ListPortalEnvironments(context.Context) ([]platformv1alpha1.Environment, error) {
+	e.calls++
+	return nil, nil
+}
+
 func TestPortalHostValidation(t *testing.T) {
 	valid := "abcdefghijklmnopqrst.portal.example"
 	for _, tc := range []struct {
@@ -149,6 +164,18 @@ func TestPortalNotFoundIsMinimalAndStable(t *testing.T) {
 		if w.Code != 404 || w.Body.String() != portalNotFoundBody || w.Header().Get("Cache-Control") != "private, no-store" {
 			t.Fatalf("response %d %q", w.Code, w.Body.String())
 		}
+	}
+}
+
+func TestPortalAuthenticatesBeforeEnvironmentEnumeration(t *testing.T) {
+	access := &recordingPrincipalAccess{err: errUnauthenticated}
+	enumerator := &countingPortalEnumerator{}
+	gateway := &portalGateway{server: &Server{access: access}, enumerator: enumerator, requests: make(chan struct{}, 1)}
+	request := httptest.NewRequest(http.MethodGet, "http://abcdefghijklmnopqrst.portal.example/", nil)
+	response := httptest.NewRecorder()
+	gateway.serveLocator(response, request, "abcdefghijklmnopqrst")
+	if response.Code != http.StatusNotFound || response.Body.String() != portalNotFoundBody || enumerator.calls != 0 || len(gateway.requests) != 0 {
+		t.Fatalf("unauthenticated portal = status %d body %q enumerations %d admissions %d", response.Code, response.Body.String(), enumerator.calls, len(gateway.requests))
 	}
 }
 
