@@ -1602,11 +1602,14 @@ fi
 echo "==> verifying real stateless service observations and duplicate-port correlation"
 OBSERVATION_OWNER=$(kubectl get environment "$ENV_NAME" -o jsonpath='{.metadata.uid}')
 OBSERVATION_SECRET=$(kubectl get pod "$POD_NAME" -o jsonpath='{.metadata.annotations.swe\.dev/sandboxd-secret-name}')
-if ! kubectl get secret "$OBSERVATION_SECRET" -o json | jq -e '.data["service-observation-token"] | length > 0' >/dev/null ||
+OBSERVATION_TOKEN=$(kubectl get secret "$OBSERVATION_SECRET" -o jsonpath='{.data.service-observation-token}' | base64 --decode)
+OBSERVATION_POD_JSON=$(kubectl get pod "$POD_NAME" -o json)
+if [[ -z "$OBSERVATION_TOKEN" || "$OBSERVATION_POD_JSON" == *"$OBSERVATION_TOKEN"* ]] ||
 	kubectl exec "$POD_NAME" -- test -e /var/run/swe-platform/sandboxd/service-observation-token; then
 	echo "FAIL: observation token was absent from its Secret or exposed to the Environment pod"
 	exit 1
 fi
+unset OBSERVATION_TOKEN OBSERVATION_POD_JSON
 manage_observation_listener service-start "$POD_NAME" "$OBSERVATION_OWNER" observation-listener-a 3000
 wait_service_observation "$ENV_NAME" web 1 Healthy
 wait_service_observation "$ENV_NAME" web-alias 1 Healthy
