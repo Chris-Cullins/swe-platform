@@ -31,7 +31,7 @@ func main() {
 }
 
 func run() error {
-	if len(os.Args) >= 2 && (os.Args[1] == "service-start" || os.Args[1] == "service-stop") {
+	if len(os.Args) >= 2 && (os.Args[1] == "service-start" || os.Args[1] == "service-stop" || os.Args[1] == "service-state") {
 		return runServiceProcess(os.Args[1:])
 	}
 	if len(os.Args) != 6 {
@@ -131,11 +131,11 @@ func run() error {
 
 func runServiceProcess(args []string) error {
 	wantArgs := 7
-	if args[0] == "service-start" {
+	if args[0] == "service-start" || args[0] == "service-state" {
 		wantArgs = 8
 	}
 	if len(args) != wantArgs {
-		return fmt.Errorf("usage: e2e-process-check service-{start|stop} ADDRESS SERVER_NAME CERT TOKEN OWNER ROLE [PORT]")
+		return fmt.Errorf("usage: e2e-process-check service-{start|stop|state} ADDRESS SERVER_NAME CERT TOKEN OWNER ROLE [PORT|EXPECTED_STATE]")
 	}
 	certificate, err := os.ReadFile(args[3])
 	if err != nil {
@@ -162,6 +162,23 @@ func runServiceProcess(args []string) error {
 	defer cancel()
 	processes := sandboxdv1.NewProcessServiceClient(connection)
 	key := &sandboxdv1.ProcessKey{OwnerId: args[5], Role: args[6]}
+	if args[0] == "service-state" {
+		process, err := processes.Get(ctx, &sandboxdv1.GetProcessRequest{Key: key})
+		if err != nil {
+			return fmt.Errorf("get managed service: %w", err)
+		}
+		running := process.State == sandboxdv1.ProcessState_PROCESS_STATE_RUNNING
+		if args[7] == "running" && !running {
+			return fmt.Errorf("managed service is %s, want running", process.State)
+		}
+		if args[7] == "stopped" && (running || process.State == sandboxdv1.ProcessState_PROCESS_STATE_STOPPING) {
+			return fmt.Errorf("managed service is %s, want stopped", process.State)
+		}
+		if args[7] != "running" && args[7] != "stopped" {
+			return fmt.Errorf("expected state must be running or stopped")
+		}
+		return nil
+	}
 	if args[0] == "service-stop" {
 		process, err := processes.Stop(ctx, &sandboxdv1.StopProcessRequest{Key: key, Mode: sandboxdv1.StopMode_STOP_MODE_FORCE})
 		if err != nil {
@@ -214,9 +231,9 @@ func checkPublicProcess(process *sandboxdv1.Process, forbidden []byte) error {
 		return fmt.Errorf("public Process contains launch material")
 	}
 	if spec := process.GetSpec(); spec != nil {
-		for _, name := range []string{"ANTHROPIC_API_KEY", "AMP_API_KEY"} {
+		for _, name := range []string{"ANTHROPIC_API_KEY", "AMP_API_KEY", "CODEX_API_KEY", "PORT", "PUBLIC_URL"} {
 			if _, exposed := spec.Env[name]; exposed {
-				return fmt.Errorf("public ProcessSpec contains secret environment name")
+				return fmt.Errorf("non-service ProcessSpec contains isolated environment name %q", name)
 			}
 		}
 		for _, value := range spec.Env {
