@@ -1847,6 +1847,7 @@ done
 if [[ -z "${REPOSITORY_SERVICE:-}" ]] || ! jq -e '.source == "Repository" and .revision == 1' <<<"$REPOSITORY_SERVICE" >/dev/null 2>&1; then
 	echo "FAIL: .swe/services.yaml did not converge beside the API-owned declaration"
 	kubectl get environment "$ENV_NAME" -o yaml
+	kubectl -n "$SYSTEM_NAMESPACE" logs deployment/"$INSTALLATION_NAME" --since=10m | grep -E 'repository service|declared-service' || true
 	exit 1
 fi
 REPOSITORY_PORT=$(jq -r '.targetPort' <<<"$REPOSITORY_SERVICE")
