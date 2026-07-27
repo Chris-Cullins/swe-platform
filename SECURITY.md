@@ -35,6 +35,11 @@ into the workload. Portal transport accepts bounded byte frames only to one vali
 loopback port, refuses sandboxd's own control port, bounds concurrent tunnels, and applies a
 dial timeout. Portal URLs and authorization are gateway authority; advisory service status
 is never route or authorization proof.
+`filesystem` authorizes the declaration controller's bounded workspace-only read of
+`.swe/services.yaml`; `process` separately authorizes supervised-process reconciliation. Their
+raw tokens are never mounted or injected into services. Connector calls prove the current
+Environment UID/execution, backend, Pod, endpoint, TLS identity, Secret, and exact capability
+before and after each operation.
 `service-observation` authorizes only bounded stateless TCP-connect probes against sandboxd's
 logical loopback. The operator issues a distinct observation-only token and its connector uses
 it; the control plane's Secret read authority is rendered only when portals are enabled and is
@@ -158,8 +163,13 @@ Production requires wildcard DNS and HTTPS. The chart's optional Ingress owns on
 and references an administrator-owned wildcard TLS Secret; it creates no certificate/Secret and
 claims no ordinary API ingress. Operators own DNS, termination, and hairpin routing. A forwarded
 Service plus exact Host exercises gateway hairpin but does not provide in-Environment wildcard
-DNS. Issue #70 remains separate: no services-file ingestion, `$PUBLIC_URL` injection, bootstrap
-service credential, or ambient portal credential exists.
+DNS. Repository services receive `PORT` and the exact gateway-discovered `PUBLIC_URL`, but no
+portal credential or projected service-account token. The operator uses a rotating projected
+token and only exact `get` authority on the two virtual portal resources for authenticated
+discovery; it never constructs a URL. Disabled or unavailable discovery preserves declarations
+but prevents launch. Process reconciliation is fenced by Environment UID and monotonic revision;
+pause/resume creates a new daemon epoch, and pause, removal, or replacement revokes the old
+process and URL. Portal UI work (#95) remains out of scope.
 
 ## Browser sessions
 

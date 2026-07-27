@@ -16,8 +16,9 @@ to ~$0. Reviewable diff, branch, and PR publication remain planned work.
 > environments pause automatically before terminal requests wake them. Template warm
 > pools keep unclaimed environments ready for `swe run` to claim. The `claude-code` (default),
 > `amp`, `codex`, and `pi` adapters run through sandboxd's managed-process API. Environments
-> accept bounded durable desired service declarations and publish fenced advisory TCP-connect
-> observations and exposes declared HTTP services through authenticated, fenced portal URLs.
+> accept bounded durable desired service declarations from the API or strict repository-owned
+> `.swe/services.yaml`, supervise repository services, publish fenced advisory TCP-connect
+> observations, and expose declared HTTP services through authenticated, fenced portal URLs.
 > The Helm chart installs the
 > operator, control plane, CRDs, a stable Installation identity, and inert Template catalog
 > sources in a system namespace. `swe project onboard` creates a dedicated claimed namespace,
@@ -62,8 +63,10 @@ implemented today, approved next contracts, and remaining open work.
   controllers for lifecycle, warm pools (pre-booted environments), and idle reaping.
 - **Control plane** — API, auth, transcripts, resource watches, a web terminal, and the
   authenticated portal host gateway; terminal and portal requests can wake Idle suspension.
-- **Desired services** — `Environment.spec.services` and the CLI hold bounded durable HTTP
-  loopback target declarations. A dedicated controller publishes fenced advisory TCP-connect
+- **Desired services** — `Environment.spec.services` is the canonical bounded durable HTTP
+  loopback declaration set. The CLI manages API-owned entries; a dedicated controller strictly
+  parses and converges repository-owned `.swe/services.yaml` entries and supervises their direct
+  argv processes. Another controller publishes fenced advisory TCP-connect
   state without URLs; `services list` marks it CURRENT only while both exact execution/intent
   correlation and a short wall-clock age bound hold. It remains advisory and is never route
   authority; the portal gateway revalidates declaration, lifecycle, authorization, and execution.
@@ -78,6 +81,30 @@ implemented today, approved next contracts, and remaining open work.
           └──────── terminal via sandboxd ─────┘  workspace volume
                     (gVisor when configured)
 ```
+
+### Repository services
+
+Repositories may declare at most 32 services in `.swe/services.yaml`. Version 1 is a strict
+schema: `services` is a mapping from a DNS-1123 service name (at most 32 bytes) to a required,
+non-empty direct argv array `command` and optional integer `port` (1–65535 except sandboxd's
+50051). Commands are not shell strings.
+
+```yaml
+version: 1
+services:
+  web:
+    command: ["npm", "run", "dev", "--", "--host=127.0.0.1"]
+    port: 3000
+  docs:
+    command: ["python", "-m", "http.server"]
+```
+
+The parser rejects unknown or duplicate fields/names, aliases, anchors, merge keys, multiple
+documents, invalid UTF-8, files over 64 KiB, more than 64 arguments, arguments over 4096 bytes,
+and argv over 16 KiB. If `port` is omitted, the operator durably assigns a deterministic free
+port in 49152–65535. Services receive `PORT` and the gateway-discovered `PUBLIC_URL`; they never
+receive a portal credential. Invalid declarations, name collisions with API-owned services,
+repository process port collisions, or unavailable/disabled portal discovery fail closed.
 
 ### Run and process lifecycle
 
@@ -174,9 +201,9 @@ swe --namespace my-project environment release my-environment
 An Environment can also retain up to 32 explicit desired service declarations. Declarations
 alone do not observe a listener, create a route or URL, wake an Environment, or grant network
 access. v1 fixes protocol to `HTTP`, visibility to authenticated `Project` access, readiness
-intent to a TCP connect from the Environment's logical loopback, and requires an explicit port
-from 1 through 65535 other than sandboxd control port 50051. There is no address input or port
-allocation, and multiple names may deliberately alias one target port:
+intent to a TCP connect from the Environment's logical loopback. API declarations require an
+explicit port from 1 through 65535 other than sandboxd control port 50051; they have no address
+input and multiple API names may deliberately alias one target port:
 
 ```sh
 swe --namespace my-project environment services declare my-environment web --target-port 3000
@@ -197,9 +224,10 @@ explicit `Host` header). In-Environment access uses the same authenticated gatew
 wildcard DNS and an internal path to the gateway are cluster-operator prerequisites; the
 platform does not weaken authorization or grant arbitrary egress to manufacture a hairpin.
 
-Issue [#70](https://github.com/Chris-Cullins/swe-platform/issues/70) is a separate boundary:
-the platform does not ingest `.swe/services.yaml` and does not inject `$PUBLIC_URL` (or any
-portal URL) into managed processes. Services must be declared explicitly through the CLI/API.
+Repository declarations use the strict `.swe/services.yaml` contract above. They converge beside
+preserved API declarations; same-name collisions fail closed, and the services CLI refuses to
+mutate repository-owned entries. Repository processes receive the retained explicit or allocated
+`PORT` and exact gateway-discovered `PUBLIC_URL` without receiving portal credentials.
 
 Service names are DNS-1123 labels. `declare` is idempotent only for the exact existing intent;
 use `update` for a real configuration change, which strictly increases its revision. `remove`

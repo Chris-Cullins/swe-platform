@@ -82,6 +82,9 @@ func Parse(input []byte) ([]Declaration, error) {
 	if services == nil || services.Kind != yaml.MappingNode {
 		return nil, errors.New("services is required and must be a mapping")
 	}
+	if len(services.Content)/2 > 32 {
+		return nil, errors.New("services must contain at most 32 declarations")
+	}
 	result := make([]Declaration, 0, len(services.Content)/2)
 	for i := 0; i < len(services.Content); i += 2 {
 		declaration, err := parseService(services.Content[i], services.Content[i+1])
@@ -135,14 +138,11 @@ func parseService(key, value *yaml.Node) (Declaration, error) {
 		if !utf8.ValidString(argument.Value) || bytes.IndexByte([]byte(argument.Value), 0) >= 0 {
 			return Declaration{}, fmt.Errorf("service %q command argument %d contains invalid text", name, i)
 		}
-		if len(argument.Value) > MaxArgBytes {
-			return Declaration{}, fmt.Errorf("service %q command argument %d exceeds %d bytes", name, i, MaxArgBytes)
+		if len(argument.Value) == 0 || len(argument.Value) > MaxArgBytes {
+			return Declaration{}, fmt.Errorf("service %q command argument %d must contain between 1 and %d bytes", name, i, MaxArgBytes)
 		}
 		total += len(argument.Value)
 		declaration.Argv[i] = argument.Value
-	}
-	if declaration.Argv[0] == "" {
-		return Declaration{}, fmt.Errorf("service %q command argv[0] must not be empty", name)
 	}
 	if total > MaxArgvBytes {
 		return Declaration{}, fmt.Errorf("service %q command exceeds %d aggregate bytes", name, MaxArgvBytes)
