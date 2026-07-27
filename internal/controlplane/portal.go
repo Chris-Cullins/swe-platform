@@ -433,8 +433,9 @@ func (g *portalGateway) serveLocator(w http.ResponseWriter, r *http.Request, loc
 		return
 	}
 	nextActivity := time.Time{}
+	lastActivityFence := lifecycle.ExecutionFence{}
 	recordActivity := func() error {
-		return g.recordAdmissionActivity(ctx, &env, &nextActivity)
+		return g.recordAdmissionActivity(ctx, &env, &nextActivity, &lastActivityFence)
 	}
 	if recordActivity() != nil {
 		portal404(w)
@@ -448,16 +449,26 @@ func (g *portalGateway) serveLocator(w http.ResponseWriter, r *http.Request, loc
 			portal404(w)
 			return
 		}
-		for !platformv1alpha1.IsEnvironmentReady(&env) {
+		for {
 			select {
 			case <-ctx.Done():
 				portal404(w)
 				return
 			case <-time.After(250 * time.Millisecond):
 			}
-			if g.resolver.Get(ctx, client.ObjectKeyFromObject(&env), &env) != nil || portalPolicyError(&env) != nil || recordActivity() != nil {
+			if g.resolver.Get(ctx, client.ObjectKeyFromObject(&env), &env) != nil || portalPolicyError(&env) != nil {
 				portal404(w)
 				return
+			}
+			if err := recordActivity(); err != nil {
+				if errors.Is(err, lifecycle.ErrExecutionFenceChanged) {
+					continue
+				}
+				portal404(w)
+				return
+			}
+			if platformv1alpha1.IsEnvironmentReady(&env) {
+				break
 			}
 		}
 	}
@@ -479,7 +490,20 @@ func (g *portalGateway) serveLocator(w http.ResponseWriter, r *http.Request, loc
 		snapshot sandboxclient.ServiceDeclarationSnapshot
 	)
 	for {
-		if g.resolver.Get(ctx, client.ObjectKeyFromObject(&env), &env) != nil || g.authorize(authRequest, env.Namespace, env.Name, route.Name, &env) != nil || !platformv1alpha1.IsEnvironmentReady(&env) || portalPolicyError(&env) != nil || recordActivity() != nil {
+		if g.resolver.Get(ctx, client.ObjectKeyFromObject(&env), &env) != nil || g.authorize(authRequest, env.Namespace, env.Name, route.Name, &env) != nil || !platformv1alpha1.IsEnvironmentReady(&env) || portalPolicyError(&env) != nil {
+			portal404(w)
+			return
+		}
+		if err := recordActivity(); err != nil {
+			if woke && errors.Is(err, lifecycle.ErrExecutionFenceChanged) {
+				select {
+				case <-ctx.Done():
+					portal404(w)
+					return
+				case <-time.After(250 * time.Millisecond):
+				}
+				continue
+			}
 			portal404(w)
 			return
 		}
@@ -520,18 +544,24 @@ func (g *portalGateway) serveLocator(w http.ResponseWriter, r *http.Request, loc
 	g.proxy(w, r.WithContext(lifetimeCtx), conn)
 }
 
-func (g *portalGateway) recordAdmissionActivity(ctx context.Context, env *platformv1alpha1.Environment, next *time.Time) error {
+func (g *portalGateway) recordAdmissionActivity(ctx context.Context, env *platformv1alpha1.Environment, next *time.Time, previousFence *lifecycle.ExecutionFence) error {
 	now := time.Now()
+	fence := lifecycle.CaptureExecutionFence(env)
+	if fence != *previousFence {
+		*next = time.Time{}
+	}
 	if now.Before(*next) {
 		return nil
 	}
-	if err := lifecycle.RecordActivity(ctx, g.resolver, lifecycle.CaptureExecutionFence(env), platformv1alpha1.EnvironmentActivitySourcePortal, fmt.Sprintf("portal/admission/%d", now.UnixNano())); err != nil {
+	if err := lifecycle.RecordActivity(ctx, g.resolver, fence, platformv1alpha1.EnvironmentActivitySourcePortal, fmt.Sprintf("portal/admission/%d", now.UnixNano())); err != nil {
+		*next = time.Time{}
 		return err
 	}
 	interval := g.admissionHeartbeat
 	if interval <= 0 {
 		interval = portalAdmissionHeartbeat
 	}
+	*previousFence = fence
 	*next = now.Add(interval)
 	return nil
 }

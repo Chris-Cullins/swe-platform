@@ -433,7 +433,8 @@ func TestPortalAdmissionActivityRefreshesForCurrentExecution(t *testing.T) {
 	resolver := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(environment).WithObjects(environment).Build()
 	gateway := &portalGateway{resolver: resolver, admissionHeartbeat: time.Millisecond}
 	next := time.Time{}
-	if err := gateway.recordAdmissionActivity(context.Background(), environment, &next); err != nil {
+	previousFence := lifecycle.ExecutionFence{}
+	if err := gateway.recordAdmissionActivity(context.Background(), environment, &next, &previousFence); err != nil {
 		t.Fatal(err)
 	}
 	var current platformv1alpha1.Environment
@@ -449,8 +450,7 @@ func TestPortalAdmissionActivityRefreshesForCurrentExecution(t *testing.T) {
 	if err := resolver.Status().Update(context.Background(), &current); err != nil {
 		t.Fatal(err)
 	}
-	time.Sleep(2 * time.Millisecond)
-	if err := gateway.recordAdmissionActivity(context.Background(), &current, &next); err != nil {
+	if err := gateway.recordAdmissionActivity(context.Background(), &current, &next, &previousFence); err != nil {
 		t.Fatal(err)
 	}
 	if err := resolver.Get(context.Background(), client.ObjectKeyFromObject(environment), &current); err != nil {
