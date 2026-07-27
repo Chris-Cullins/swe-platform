@@ -214,6 +214,13 @@ func TestStopSuppressesManagedStartFailureRestart(t *testing.T) {
 	if current.ExecutionId != failed.ExecutionId || current.State != sandboxdv1.ProcessState_PROCESS_STATE_FAILED {
 		t.Fatalf("stopped failed execution restarted: before=%#v after=%#v", failed, current)
 	}
+	marker := filepath.Join(t.TempDir(), "re-enabled")
+	if _, err := s.ReconcileManagedServices(context.Background(), managedRequest("uid", 2, "svc", marker, "new-intent", nil)); err != nil {
+		t.Fatal(err)
+	}
+	if lines := waitLines(t, marker, 1); !strings.HasPrefix(lines[0], "new-intent:") {
+		t.Fatalf("newer intent did not clear explicit suppression: %v", lines)
+	}
 	s.Close()
 }
 
