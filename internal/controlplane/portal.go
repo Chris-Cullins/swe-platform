@@ -26,9 +26,10 @@ import (
 
 const portalNotFoundBody = "not found\n"
 const (
-	maxPortalResponseBytes  int64 = 64 << 20
-	portalAdmissionTimeout        = 2 * time.Minute
-	portalLeasePollInterval       = 2 * time.Second
+	maxPortalResponseBytes   int64 = 64 << 20
+	portalAdmissionTimeout         = 2 * time.Minute
+	portalAdmissionHeartbeat       = time.Second
+	portalLeasePollInterval        = 2 * time.Second
 )
 
 // PortalResolver is the narrow durable route authority used by the gateway.
@@ -45,13 +46,14 @@ type PortalDialer interface {
 }
 
 type portalGateway struct {
-	server         *Server
-	resolver       PortalResolver
-	enumerator     PortalEnvironmentEnumerator
-	dialer         PortalDialer
-	suffix, scheme string
-	requests       chan struct{}
-	leasePoll      time.Duration
+	server             *Server
+	resolver           PortalResolver
+	enumerator         PortalEnvironmentEnumerator
+	dialer             PortalDialer
+	suffix, scheme     string
+	requests           chan struct{}
+	admissionHeartbeat time.Duration
+	leasePoll          time.Duration
 }
 
 type PortalRoute struct {
@@ -420,6 +422,14 @@ func (g *portalGateway) serveLocator(w http.ResponseWriter, r *http.Request, loc
 		portal404(w)
 		return
 	}
+	nextActivity := time.Time{}
+	recordActivity := func() error {
+		return g.recordAdmissionActivity(ctx, &env, &nextActivity)
+	}
+	if recordActivity() != nil {
+		portal404(w)
+		return
+	}
 	woke := false
 	if env.Status.Lifecycle.Suspended {
 		woke = true
@@ -435,7 +445,7 @@ func (g *portalGateway) serveLocator(w http.ResponseWriter, r *http.Request, loc
 				return
 			case <-time.After(250 * time.Millisecond):
 			}
-			if g.resolver.Get(ctx, client.ObjectKeyFromObject(&env), &env) != nil || portalPolicyError(&env) != nil {
+			if g.resolver.Get(ctx, client.ObjectKeyFromObject(&env), &env) != nil || portalPolicyError(&env) != nil || recordActivity() != nil {
 				portal404(w)
 				return
 			}
@@ -445,7 +455,7 @@ func (g *portalGateway) serveLocator(w http.ResponseWriter, r *http.Request, loc
 		portal404(w)
 		return
 	}
-	if err := lifecycle.RecordActivity(ctx, g.resolver, lifecycle.CaptureExecutionFence(&env), platformv1alpha1.EnvironmentActivitySourcePortal, fmt.Sprintf("portal/%d", time.Now().UnixNano())); err != nil {
+	if err := recordActivity(); err != nil {
 		portal404(w)
 		return
 	}
@@ -459,7 +469,7 @@ func (g *portalGateway) serveLocator(w http.ResponseWriter, r *http.Request, loc
 		snapshot sandboxclient.ServiceDeclarationSnapshot
 	)
 	for {
-		if g.resolver.Get(ctx, client.ObjectKeyFromObject(&env), &env) != nil || g.authorize(authRequest, env.Namespace, env.Name, route.Name, &env) != nil || !platformv1alpha1.IsEnvironmentReady(&env) || portalPolicyError(&env) != nil {
+		if g.resolver.Get(ctx, client.ObjectKeyFromObject(&env), &env) != nil || g.authorize(authRequest, env.Namespace, env.Name, route.Name, &env) != nil || !platformv1alpha1.IsEnvironmentReady(&env) || portalPolicyError(&env) != nil || recordActivity() != nil {
 			portal404(w)
 			return
 		}
@@ -498,6 +508,22 @@ func (g *portalGateway) serveLocator(w http.ResponseWriter, r *http.Request, loc
 	defer cancelLease()
 	go g.revalidatePortalLease(leaseCtx, r, conn, client.ObjectKeyFromObject(&post), fence, snapshot, route)
 	g.proxy(w, r.WithContext(lifetimeCtx), conn)
+}
+
+func (g *portalGateway) recordAdmissionActivity(ctx context.Context, env *platformv1alpha1.Environment, next *time.Time) error {
+	now := time.Now()
+	if now.Before(*next) {
+		return nil
+	}
+	if err := lifecycle.RecordActivity(ctx, g.resolver, lifecycle.CaptureExecutionFence(env), platformv1alpha1.EnvironmentActivitySourcePortal, fmt.Sprintf("portal/admission/%d", now.UnixNano())); err != nil {
+		return err
+	}
+	interval := g.admissionHeartbeat
+	if interval <= 0 {
+		interval = portalAdmissionHeartbeat
+	}
+	*next = now.Add(interval)
+	return nil
 }
 
 func (g *portalGateway) revalidatePortalLease(ctx context.Context, request *http.Request, conn net.Conn, key types.NamespacedName, fence lifecycle.ExecutionFence, snapshot sandboxclient.ServiceDeclarationSnapshot, route platformv1alpha1.EnvironmentPortalRoute) {
