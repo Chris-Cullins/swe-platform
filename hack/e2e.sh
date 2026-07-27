@@ -83,7 +83,8 @@ cleanup() {
 	if [[ -n "$E2E_SESSION_FIXTURE" ]]; then
 		rm -rf "$E2E_SESSION_FIXTURE"
 	fi
-	rm -f /tmp/swe-platform-sandboxd-cert-"$$" /tmp/swe-platform-sandboxd-token-"$$"
+	rm -f /tmp/swe-platform-sandboxd-cert-"$$" /tmp/swe-platform-sandboxd-token-"$$" \
+		/tmp/swe-platform-observation-cert-"$$" /tmp/swe-platform-observation-process-token-"$$"
 	if [[ "${KEEP_CLUSTER:-false}" != "true" && "${E2E_USE_EXISTING_CLUSTER:-false}" != "true" ]]; then
 		kind delete cluster --name "$CLUSTER" >/dev/null 2>&1 || true
 	fi
@@ -1601,8 +1602,7 @@ fi
 echo "==> verifying real stateless service observations and duplicate-port correlation"
 OBSERVATION_OWNER=$(kubectl get environment "$ENV_NAME" -o jsonpath='{.metadata.uid}')
 OBSERVATION_SECRET=$(kubectl get pod "$POD_NAME" -o jsonpath='{.metadata.annotations.swe\.dev/sandboxd-secret-name}')
-OBSERVATION_TOKEN=$(kubectl get secret "$OBSERVATION_SECRET" -o jsonpath='{.data.service-observation-token}' | base64 --decode)
-if [[ -z "$OBSERVATION_TOKEN" ]] || kubectl get pod "$POD_NAME" -o json | grep -Fq "$OBSERVATION_TOKEN" ||
+if ! kubectl get secret "$OBSERVATION_SECRET" -o json | jq -e '.data["service-observation-token"] | length > 0' >/dev/null ||
 	kubectl exec "$POD_NAME" -- test -e /var/run/swe-platform/sandboxd/service-observation-token; then
 	echo "FAIL: observation token was absent from its Secret or exposed to the Environment pod"
 	exit 1

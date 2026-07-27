@@ -280,6 +280,14 @@ func TestServiceListCurrentRequiresExecutionAndWallClockFreshness(t *testing.T) 
 	if !strings.Contains(list(now), "\tCURRENT\n") {
 		t.Fatal("exact fresh execution was not current")
 	}
+	deleting := metav1.NewTime(now)
+	env.DeletionTimestamp = &deleting
+	env.Finalizers = []string{"test"}
+	if !strings.Contains(list(now), "\tSTALE\n") {
+		t.Fatal("deleting environment retained a current observation")
+	}
+	env.DeletionTimestamp = nil
+	env.Finalizers = nil
 	if !strings.Contains(list(now.Add(serviceObservationMaxAge+time.Second)), "\tSTALE\n") {
 		t.Fatal("old observation remained current")
 	}
