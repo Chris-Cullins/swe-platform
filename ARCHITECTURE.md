@@ -43,21 +43,26 @@ CLI / TUI / local MCP / browser console
   labels; they never label tenant or resource identity.
 - **Control plane.** A singleton HTTP service exposes typed Run and Environment operations,
   Run watches, transcript ingestion/SSE, browser sessions, the embedded operations console,
-  and terminal WebSockets. A separate internal HTTP listener exposes bounded-cardinality
+  terminal WebSockets, and a wildcard-host portal gateway. Portal discovery allocates durable
+  opaque route/tombstone state; every request repeats authorization, policy, currentness, and
+  wake checks. A separate internal HTTP listener exposes bounded-cardinality
   Prometheus process and operational metrics at `/metrics`; it does not serve application
   routes. The control plane acts through Kubernetes APIs and the sandboxd connector; it does
   not exec into Environment pods.
 - **Clients.** `swe run`, `logs`, `attach`, `tui`, and the bounded local stdio MCP server use
   the control-plane or Kubernetes contracts appropriate to each command. The React console
-  uses the same control-plane resource, transcript, and terminal APIs.
+  uses the same control-plane resource, transcript, and terminal APIs; portal UI remains out of
+  scope. The CLI `swe portal ENV SERVICE` performs authenticated discovery and prints the exact
+  stable URL.
 - **`sandboxd`.** A small daemon in each Environment provides authenticated gRPC services for
   connection-bound exec, keyed managed processes, workspace-confined filesystem access, one
-  shared terminal, health, and bounded stateless TCP-connect observations from its logical
-  loopback. The observation primitive retains no declarations or results; an operator-only
+  shared terminal, health, bounded stateless TCP-connect observations, and a capability-gated
+  byte tunnel to one declared logical-loopback port. sandboxd does not interpret HTTP or choose
+  routes. The observation primitive retains no declarations or results; an operator-only
   connector invokes it with an observation-only credential and a dedicated controller owns the
   fenced advisory status envelope.
 
-Portal proxying, inbox delivery and child-run spawning, branch/PR publication, and non-Pod
+Inbox delivery and child-run spawning, branch/PR publication, and non-Pod
 Environment backends are not implemented.
 
 ### Current CRDs and sources of truth
@@ -74,7 +79,7 @@ All current CRDs are namespaced:
 | `Installation` | Empty-spec identity object in the system namespace. Its immutable Kubernetes UID is the stable installation identity used by namespace claims, catalog sources, managed Template copies, and baseline resources. |
 | `Project` | One repository URL (represented as a one-item list), a same-namespace default Template reference, changes-workflow metadata, and a reserved egress allowlist. A non-empty allowlist is rejected when an Environment uses the Project. |
 | `EnvironmentTemplate` | Pod image, size/resources, disk, runtime class, idle timeout, warm-pool minimum, and backend. Admission currently permits only the `pod` backend. Chart-owned system-namespace objects are inert catalog sources; execution accepts only installation-managed same-namespace copies bound to exact Installation, source, and Project identities. |
-| `Environment` | Template/Project selection, explicit hold policy, bounded wake/suspend/activity intents, and up to 32 durable desired service declarations; status owns readiness, lifecycle suspension and epoch, backend-neutral execution generation, exact Run claim, backend observations, activity, recovery state, and the service-observation controller's atomic advisory observation envelope. |
+| `Environment` | Template/Project selection, explicit hold policy, bounded wake/suspend/activity intents, and up to 32 service declarations, each with an immutable-per-incarnation random `instanceID`. Status owns lifecycle/execution, claim, observation, activity and recovery state; the gateway owns bounded `portalRoutes` and monotonic `nextPortalRouteGeneration`. Inactive routes are denial tombstones preserved by other status writers. |
 | `Run` | Immutable agent task and Environment/Project/Template/credential selection plus monotonic cancellation; status records normalized lifecycle, exact Environment name/UID and ownership, exact credential profile identity, accepted lifecycle epoch, and accepted execution generation. `notify` and `parentRef` are schema placeholders without an implemented inbox. |
 | `AgentCredentialProfile` | Immutable adapter and `APIKey` type metadata. Key bytes live in an owner-linked Secret whose name is derived from the profile UID. |
 
@@ -408,16 +413,18 @@ revokes the lease.
 The embedded React console and terminal TUI are agent-neutral operations clients. They list,
 watch, create, inspect, and cancel Runs; show exact Environment detail and opaque transcripts;
 and attach only when the API returns exact terminal identities. They do not contact Kubernetes
-or sandboxd directly. Portal UI/proxying and Project/Template/credential administration are
+or sandboxd directly. Project/Template/credential administration is
 not implemented.
 
 ### Chart, presets, tests, and deployment topology
 
 The Helm chart installs CRDs, a system-namespaced Installation identity, operator, singleton
 control plane, service accounts/RBAC, and inert system-namespaced EnvironmentTemplate catalog
-sources. Project resources and their namespaced workload RoleBindings are installed by the
-CLI onboarding path, not by Helm. It does not install PostgreSQL, ingress/TLS,
-StorageClasses, RuntimeClasses, an egress proxy, or a portal gateway. The control plane is
+sources. Optional portal values configure the gateway and a wildcard-only Ingress to the
+control-plane Service; the chart never creates TLS material or claims ordinary API ingress.
+Project resources and their namespaced workload RoleBindings are installed by the
+CLI onboarding path, not by Helm. It does not install PostgreSQL, TLS material,
+StorageClasses, RuntimeClasses, or an egress proxy. The control plane is
 fixed at one replica with `Recreate`; PostgreSQL makes transcripts and browser sessions
 durable across replacement, but open streams disconnect and clients must reconnect. No
 multi-replica or control-plane HA claim is made.
@@ -448,7 +455,7 @@ Argo mirror uses a separate `swe-argo` cluster tracking pushed `main`; the two o
 never reconcile the same resources. Published images are operator, control plane, and
 environment base for amd64/arm64.
 
-## Approved next contracts (not implemented)
+## Implemented portal contract and approved next contracts
 
 These decisions constrain the future portions of the contracts. They do not imply that the
 listed controllers, proxies, or gateways already exist.
@@ -458,18 +465,19 @@ listed controllers, proxies, or gateways already exist.
 The maintainer approved the [three-owner service model in #16](https://github.com/Chris-Cullins/swe-platform/issues/16#issuecomment-5078805652):
 
 - the Environment owns the durable desired Service records described above;
-- future `.swe/services.yaml` ingestion joins the implemented CLI declaration path; listening
+- future `.swe/services.yaml` ingestion (#70) may join the implemented CLI declaration path; listening
   alone never grants visibility;
 - sandboxd and the implemented observation controller report backend-portable listener state
   fenced to the exact current execution; and
 - the control-plane/gateway owns Project-only URLs, authentication, authorization, routing,
   route generation, and revocation.
 
-A stable service URL may survive a process restart, showing unavailable until healthy, but
-never an Environment replacement. Pause disables routing immediately; resume republishes only
-after fresh-execution health. Uncertain or stale identity and health fail closed. Old execution
-observations and routes cannot target a resumed, recovered, or same-name replacement
-Environment. Anonymous/public exposure is deferred.
+A stable service URL survives listener and pod restarts, but never declaration remove/re-add or
+Environment replacement. A locator is not authentication. Discovery and every host request
+require TokenReview and exact Environment/service SARs plus current Run or Project authority.
+Hold, Requested suspension, stale association/declaration/route/execution, and uncertainty return
+the same 404 as an unknown locator. Idle requests wake and await a fresh execution. The proxy
+strips credentials, session cookies, and hop-by-hop headers and supports WebSocket upgrade.
 
 ### Fail-closed proxy-only egress
 
@@ -499,13 +507,8 @@ path forcing ship together after Project namespace claims.
 
 ## Remaining decisions and open work
 
-The remaining approved service contract requires gateway implementation (#69) and optional
-`.swe/services.yaml` ingestion (#70). The observation connector and controller are implemented.
-Future portal routes and egress identity must capture and revalidate
-the mandatory `lifecycle.ExecutionFence` without exposing backend-specific identity or selecting
-individual fence components.
-
-Other unimplemented areas include portal transport, inbox and child-run semantics, changes
+The remaining service work is `.swe/services.yaml` ingestion and process URL injection (#70),
+neither of which is implemented. Other unimplemented areas include inbox and child-run semantics, changes
 publication, transcript garbage collection, additional credential forms, ConPTY, non-Pod
 backends, and control-plane HA. Their detailed contracts remain issue work unless and until a
 maintainer decision is recorded. In particular, schema placeholders or portable interfaces do

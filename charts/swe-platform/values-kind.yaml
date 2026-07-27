@@ -6,6 +6,8 @@ image:
 controlPlane:
   metrics:
     port: 8082
+  portal:
+    enabled: false
   # Development sessions are intentionally process-local.
   sessions:
     backend: memory

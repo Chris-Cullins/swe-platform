@@ -25,22 +25,31 @@ to a different environment, a stale pod, or a process without the current privat
 fails.
 
 Bearer tokens are random per incarnation and map to explicit service capabilities (`health`,
-`terminal`, `exec`, `process`, `filesystem`, and `service-observation`). sandboxd interceptors
+`terminal`, `exec`, `process`, `filesystem`, `service-observation`, and `portal`). sandboxd interceptors
 authorize both unary and streaming RPCs before handlers run. The terminal credential grants
-`health` and `terminal`; a separate operator-held adapter credential grants only `process`.
+`health` and `terminal`; separate operator/control-plane-held credentials grant only
+`process`, `service-observation`, or `portal`. When portals are enabled, RBAC grants the control
+plane Secret `get` (never list/watch) in onboarded namespaces; connector code reads only the exact
+Environment-owned Secret named by the current pod. These raw private tokens are never projected
+into the workload. Portal transport accepts bounded byte frames only to one validated logical
+loopback port, refuses sandboxd's own control port, bounds concurrent tunnels, and applies a
+dial timeout. Portal URLs and authorization are gateway authority; advisory service status
+is never route or authorization proof.
 `service-observation` authorizes only bounded stateless TCP-connect probes against sandboxd's
 logical loopback. The operator issues a distinct observation-only token and its connector uses
-it; the control plane has no Secret access. The mounted authorization file contains SHA-256
-verifiers, not raw tokens, and the raw process and observation tokens exist only in the
-Environment-owned Secret: neither is mounted, injected, or published in pod annotations.
+it; the control plane's Secret read authority is rendered only when portals are enabled and is
+used only inside sandboxclient for portal transport. The mounted authorization file contains SHA-256
+verifiers, not raw tokens, and the raw process, observation, and portal tokens exist only in the
+Environment-owned Secret: none is mounted, injected, or published in pod annotations.
 Possession of
 one environment's token grants nothing in another environment.
 
 The Environment-owned Secret contains the private key, authorization configuration, and raw
-process and observation tokens. The public trust certificate and terminal token are published atomically as pod
+process, observation, and portal tokens. The public trust certificate and terminal token are published atomically as pod
 annotations, which makes pod `get` plus `pods/portforward` the Kubernetes authorization boundary
 for CLI attachment without granting callers access to arbitrary namespace Secrets. The control
-plane has pod `get` but not Secret access. The operator validates the exact Run, Environment,
+plane has pod `get` and, when portals are enabled, namespaced Secret `get`; sandboxclient resolves
+only the current pod's exact credential. The operator validates the exact Run, Environment,
 pod, and Secret incarnations before constructing a pinned process-only connection for an
 adapter. HTTP authorization for the control-plane terminal endpoint remains a separate
 requirement.
@@ -121,6 +130,36 @@ fences before drain and retains the Namespace, workspace PVCs, credential profil
 owned Secrets, and transcript data. Suspending an Environment still revokes its ephemeral
 per-pod sandboxd credential Secret as described above. Destructive Project purge is not
 implemented.
+
+## Portal gateway
+
+Portal locators are random host-routing keys, not credentials or disclosure authority. There is
+no anonymous, public, bootstrap-token, magic-link, URL credential, or shared Domain-cookie path.
+Every request performs TokenReview and exact SARs for `environments/portal` on the Environment
+and `environmentservices/portal` on `<environment>.<service>`, then requires exact current Run
+`get` or Project `get` authority. Released claimed Runs immediately lose Run-derived authority.
+
+Bearer exchange occurs only at the exact portal host's `/api/v1/session`. The purpose-scoped
+server-side session cookie is random, HttpOnly, SameSite=Strict, host-only, and Secure outside
+explicit HTTP development. Exchange requires an explicit bearer over the configured secure
+origin; every cookie use repeats TokenReview/SAR, and cookie-authenticated mutations and
+WebSocket upgrades enforce exact Origin/CSRF policy. Unknown, unauthorized, held, stale, and
+unavailable routes share one 404.
+
+Requests revalidate Environment UID, declaration instance/revision, route generation,
+association, lifecycle, execution fence, pod, Secret, TLS identity, and exact portal capability.
+Idle may queue a bounded wake; hold and Requested suspension do not. Remove/re-add tombstones the
+old locator. Authorization, platform session cookies, and hop-by-hop headers are stripped before
+forwarding; response hop-by-hop headers are filtered. WebSocket upgrades use the same checks.
+Environment NetworkPolicy still admits only sandboxd port 50051 from installation-labeled
+operator/control-plane pods; Ingress reaches the control-plane Service, never pods directly.
+
+Production requires wildcard DNS and HTTPS. The chart's optional Ingress owns only `*.suffix`
+and references an administrator-owned wildcard TLS Secret; it creates no certificate/Secret and
+claims no ordinary API ingress. Operators own DNS, termination, and hairpin routing. A forwarded
+Service plus exact Host exercises gateway hairpin but does not provide in-Environment wildcard
+DNS. Issue #70 remains separate: no services-file ingestion, `$PUBLIC_URL` injection, bootstrap
+service credential, or ambient portal credential exists.
 
 ## Browser sessions
 

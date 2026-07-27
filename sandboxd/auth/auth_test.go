@@ -122,6 +122,31 @@ func TestServiceObservationCapabilityIsExact(t *testing.T) {
 	}
 }
 
+func TestPortalCapabilityIsExact(t *testing.T) {
+	authorizer := newTestAuthorizer(t, Config{Grants: []Grant{
+		{TokenHash: TokenVerifier("portal-token"), Capabilities: []Capability{CapabilityPortal}},
+		{TokenHash: TokenVerifier("process-token"), Capabilities: []Capability{CapabilityProcess}},
+		{TokenHash: TokenVerifier("terminal-token"), Capabilities: []Capability{CapabilityTerminal}},
+		{TokenHash: TokenVerifier("observer-token"), Capabilities: []Capability{CapabilityServiceObservation}},
+	}})
+	contextFor := func(token string) context.Context {
+		return metadata.NewIncomingContext(context.Background(), metadata.Pairs("authorization", "Bearer "+token))
+	}
+	if err := authorizer.authorize(contextFor("portal-token"), "/sandboxd.v1.PortalService/Tunnel"); err != nil {
+		t.Fatalf("authorize portal: %v", err)
+	}
+	for _, method := range []string{"/sandboxd.v1.ProcessService/Start", "/sandboxd.v1.TerminalService/Terminal", "/sandboxd.v1.ServiceObservationService/Observe"} {
+		if err := authorizer.authorize(contextFor("portal-token"), method); status.Code(err) != codes.PermissionDenied {
+			t.Fatalf("portal token method %s = %v", method, err)
+		}
+	}
+	for _, token := range []string{"process-token", "terminal-token", "observer-token"} {
+		if err := authorizer.authorize(contextFor(token), "/sandboxd.v1.PortalService/Tunnel"); status.Code(err) != codes.PermissionDenied {
+			t.Fatalf("%s portal status = %v", token, err)
+		}
+	}
+}
+
 func TestTLSAndCapabilityInterceptorsEndToEnd(t *testing.T) {
 	const (
 		serverName   = "incarnation-a.sandboxd.swe.dev"

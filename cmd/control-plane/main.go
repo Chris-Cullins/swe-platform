@@ -26,6 +26,7 @@ import (
 
 	platformv1alpha1 "github.com/Chris-Cullins/swe-platform/api/v1alpha1"
 	"github.com/Chris-Cullins/swe-platform/internal/controlplane"
+	"github.com/Chris-Cullins/swe-platform/internal/sandboxclient"
 	"github.com/Chris-Cullins/swe-platform/internal/tenancy"
 	consoleui "github.com/Chris-Cullins/swe-platform/ui"
 )
@@ -113,22 +114,32 @@ func main() {
 	}
 	resourceAccess := controlplane.TenancyAccessController{Access: access, Verifier: verifier, Namespaces: configuredNamespaces}
 	resources := &controlplane.KubernetesResourceService{Client: kubeClient}
+	portalSuffix, portalScheme := os.Getenv("SWE_PORTAL_SUFFIX"), portalSchemeFromEnvironment()
+	if err := controlplane.ValidatePortalConfiguration(portalSuffix, portalScheme); err != nil {
+		log.Error("invalid portal configuration", "error", err)
+		os.Exit(1)
+	}
 	streamLifecycle, cancelStreams := context.WithCancel(context.Background())
 	defer cancelStreams()
 	apiServer := &http.Server{
 		Addr: *address,
 		Handler: controlplane.NewServer(log, controlplane.ServerOptions{
-			Access:                resourceAccess,
-			Sessions:              access,
-			Resources:             resources,
-			Runs:                  controlplane.KubernetesRunResolver{Client: kubeClient},
-			TranscriptStore:       transcripts,
-			TerminalDialer:        controlplane.KubernetesTerminalDialer{Client: kubeClient, Metrics: metrics},
-			ConsoleAssets:         consoleui.Assets(),
-			TrustProxy:            strings.EqualFold(os.Getenv("SWE_TRUST_PROXY_HEADERS"), "true"),
-			AllowInsecureSessions: strings.EqualFold(os.Getenv("SWE_ALLOW_INSECURE_SESSIONS"), "true"),
-			StreamLifecycle:       streamLifecycle,
-			Metrics:               metrics,
+			Access:                      resourceAccess,
+			Sessions:                    access,
+			Resources:                   resources,
+			Runs:                        controlplane.KubernetesRunResolver{Client: kubeClient},
+			TranscriptStore:             transcripts,
+			TerminalDialer:              controlplane.KubernetesTerminalDialer{Client: kubeClient, Metrics: metrics},
+			PortalResolver:              kubeClient,
+			PortalEnvironmentEnumerator: controlplane.KubernetesPortalEnvironmentEnumerator{Client: kubeClient, Verifier: verifier, Namespaces: configuredNamespaces},
+			PortalDialer:                sandboxclient.Connector{Reader: kubeClient},
+			PortalSuffix:                portalSuffix,
+			PortalScheme:                portalScheme,
+			ConsoleAssets:               consoleui.Assets(),
+			TrustProxy:                  strings.EqualFold(os.Getenv("SWE_TRUST_PROXY_HEADERS"), "true"),
+			AllowInsecureSessions:       strings.EqualFold(os.Getenv("SWE_ALLOW_INSECURE_SESSIONS"), "true"),
+			StreamLifecycle:             streamLifecycle,
+			Metrics:                     metrics,
 		}).Handler(),
 		ReadHeaderTimeout: 5 * time.Second,
 		IdleTimeout:       2 * time.Minute,
@@ -200,6 +211,14 @@ func runHTTPServers(ctx context.Context, log *slog.Logger, servers []httpServerL
 		}
 	}
 	return firstErr
+}
+
+func portalSchemeFromEnvironment() string {
+	scheme := strings.TrimSpace(os.Getenv("SWE_PORTAL_SCHEME"))
+	if scheme == "" {
+		return "https"
+	}
+	return scheme
 }
 
 func parseTenancyNamespaces(value string) (map[string]struct{}, error) {

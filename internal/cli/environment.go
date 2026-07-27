@@ -2,10 +2,13 @@ package cli
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/base32"
 	"fmt"
 	"io"
 	"math"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -200,9 +203,14 @@ func validateEnvironmentServiceInput(name string, targetPort uint32) error {
 	return nil
 }
 
-func desiredEnvironmentService(name string, targetPort int32, revision int64) platformv1alpha1.EnvironmentServiceDeclaration {
+func desiredEnvironmentService(name string, targetPort int32, revision int64, instanceID ...string) platformv1alpha1.EnvironmentServiceDeclaration {
+	id := ""
+	if len(instanceID) != 0 {
+		id = instanceID[0]
+	}
 	return platformv1alpha1.EnvironmentServiceDeclaration{
 		Name:       name,
+		InstanceID: id,
 		Revision:   revision,
 		Protocol:   platformv1alpha1.EnvironmentServiceProtocolHTTP,
 		TargetPort: targetPort,
@@ -236,11 +244,15 @@ func writeEnvironmentService(ctx context.Context, kube client.Client, key types.
 			if len(environment.Spec.Services) >= platformv1alpha1.EnvironmentServiceMaxDeclarations {
 				return fmt.Errorf("environment already has the maximum of %d service declarations", platformv1alpha1.EnvironmentServiceMaxDeclarations)
 			}
-			result = desiredEnvironmentService(name, targetPort, 1)
+			instanceID, err := randomServiceInstanceID()
+			if err != nil {
+				return err
+			}
+			result = desiredEnvironmentService(name, targetPort, 1, instanceID)
 			environment.Spec.Services = append(environment.Spec.Services, result)
 		} else {
 			existing := environment.Spec.Services[index]
-			desired := desiredEnvironmentService(name, targetPort, existing.Revision)
+			desired := desiredEnvironmentService(name, targetPort, existing.Revision, existing.InstanceID)
 			if existing == desired {
 				result = existing
 				return nil
@@ -261,6 +273,26 @@ func writeEnvironmentService(ctx context.Context, kube client.Client, key types.
 		return platformv1alpha1.EnvironmentServiceDeclaration{}, fmt.Errorf("%s service %q on environment %q: %w", map[bool]string{false: "declare", true: "update"}[update], name, key.Name, err)
 	}
 	return result, nil
+}
+
+func randomServiceInstanceID() (string, error) {
+	b := make([]byte, 20)
+	if _, err := rand.Read(b); err != nil {
+		return "", fmt.Errorf("generate service declaration instance ID: %w", err)
+	}
+	return strings.ToLower(base32.StdEncoding.WithPadding(base32.NoPadding).EncodeToString(b)), nil
+}
+
+func validServiceInstanceID(value string) bool {
+	if len(value) < 20 || len(value) > 63 {
+		return false
+	}
+	for _, c := range value {
+		if (c < 'a' || c > 'z') && (c < '0' || c > '9') {
+			return false
+		}
+	}
+	return true
 }
 
 func removeEnvironmentService(ctx context.Context, kube client.Client, key types.NamespacedName, name string) error {

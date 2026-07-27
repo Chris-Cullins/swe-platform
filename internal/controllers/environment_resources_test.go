@@ -243,7 +243,7 @@ func TestEnsurePodCreatesAndRotatesEphemeralSandboxdCredentials(t *testing.T) {
 		t.Fatalf("credential mode = %v, want readable by non-root sandboxd", pod.Spec.Volumes[1].Secret.DefaultMode)
 	}
 	for _, item := range pod.Spec.Volumes[1].Secret.Items {
-		if item.Key == sandboxdauth.ProcessTokenKey || item.Key == sandboxdauth.ServiceObservationTokenKey {
+		if item.Key == sandboxdauth.ProcessTokenKey || item.Key == sandboxdauth.ServiceObservationTokenKey || item.Key == sandboxdauth.PortalTokenKey {
 			t.Fatal("private operator capability token was mounted into the environment pod")
 		}
 	}
@@ -259,10 +259,11 @@ func TestEnsurePodCreatesAndRotatesEphemeralSandboxdCredentials(t *testing.T) {
 	if err := json.Unmarshal(first.Data[sandboxdauth.CapabilitiesKey], &capabilityConfig); err != nil {
 		t.Fatal(err)
 	}
-	if len(capabilityConfig.Grants) != 4 || len(capabilityConfig.Grants[0].Capabilities) != 2 ||
+	if len(capabilityConfig.Grants) != 5 || len(capabilityConfig.Grants[0].Capabilities) != 2 ||
 		len(capabilityConfig.Grants[1].Capabilities) != 1 || capabilityConfig.Grants[1].Capabilities[0] != sandboxdauth.CapabilityHealth ||
 		len(capabilityConfig.Grants[2].Capabilities) != 1 || capabilityConfig.Grants[2].Capabilities[0] != sandboxdauth.CapabilityProcess ||
-		len(capabilityConfig.Grants[3].Capabilities) != 1 || capabilityConfig.Grants[3].Capabilities[0] != sandboxdauth.CapabilityServiceObservation {
+		len(capabilityConfig.Grants[3].Capabilities) != 1 || capabilityConfig.Grants[3].Capabilities[0] != sandboxdauth.CapabilityServiceObservation ||
+		len(capabilityConfig.Grants[4].Capabilities) != 1 || capabilityConfig.Grants[4].Capabilities[0] != sandboxdauth.CapabilityPortal {
 		t.Fatalf("capability grants = %#v, want terminal, probe health, process, and distinct observation grants", capabilityConfig.Grants)
 	}
 	if _, published := pod.Annotations[sandboxdauth.ProcessTokenKey]; published {
@@ -1015,7 +1016,7 @@ func TestTerminatingFailedPodPersistsRecoveryBeforeReplacement(t *testing.T) {
 		Annotations: map[string]string{sandboxdauth.IdentityAnnotation: "sandboxd.test", sandboxdauth.PodUIDAnnotation: string(pod.UID)},
 	}, Data: map[string][]byte{
 		sandboxdauth.TLSCertKey: []byte("cert"), sandboxdauth.TLSKeyKey: []byte("key"),
-		sandboxdauth.CapabilitiesKey: []byte("capabilities"), sandboxdauth.HealthTokenKey: []byte("health"), sandboxdauth.ProcessTokenKey: []byte("process"), sandboxdauth.ServiceObservationTokenKey: []byte("observe"),
+		sandboxdauth.CapabilitiesKey: []byte("capabilities"), sandboxdauth.HealthTokenKey: []byte("health"), sandboxdauth.ProcessTokenKey: []byte("process"), sandboxdauth.ServiceObservationTokenKey: []byte("observe"), sandboxdauth.PortalTokenKey: []byte("portal"),
 	}}
 	for _, object := range []client.Object{pvc, pod, secret} {
 		if err := controllerutil.SetControllerReference(env, object, scheme); err != nil {
@@ -1422,7 +1423,7 @@ func TestReconcileDropsStaleEnvironmentIncarnationStatusWrites(t *testing.T) {
 				Annotations: map[string]string{sandboxdauth.IdentityAnnotation: "sandboxd.u1", sandboxdauth.PodUIDAnnotation: string(pod.UID)},
 			}, Data: map[string][]byte{
 				sandboxdauth.TLSCertKey: []byte("cert"), sandboxdauth.TLSKeyKey: []byte("key"),
-				sandboxdauth.CapabilitiesKey: []byte("capabilities"), sandboxdauth.HealthTokenKey: []byte("health"), sandboxdauth.ProcessTokenKey: []byte("process"), sandboxdauth.ServiceObservationTokenKey: []byte("observe"),
+				sandboxdauth.CapabilitiesKey: []byte("capabilities"), sandboxdauth.HealthTokenKey: []byte("health"), sandboxdauth.ProcessTokenKey: []byte("process"), sandboxdauth.ServiceObservationTokenKey: []byte("observe"), sandboxdauth.PortalTokenKey: []byte("portal"),
 			}}
 			for _, object := range []client.Object{pvc, pod, secret} {
 				if err := controllerutil.SetControllerReference(stale, object, scheme); err != nil {
@@ -1535,7 +1536,7 @@ func TestReconcileUsesUncachedEnvironmentWithLiveExecution(t *testing.T) {
 				Annotations: map[string]string{sandboxdauth.IdentityAnnotation: "current.sandboxd.swe.dev", sandboxdauth.PodUIDAnnotation: string(pod.UID)},
 			}, Data: map[string][]byte{
 				sandboxdauth.TLSCertKey: []byte("cert"), sandboxdauth.TLSKeyKey: []byte("key"), sandboxdauth.CapabilitiesKey: []byte("capabilities"),
-				sandboxdauth.HealthTokenKey: []byte("health"), sandboxdauth.ProcessTokenKey: []byte("process"), sandboxdauth.ServiceObservationTokenKey: []byte("observe"),
+				sandboxdauth.HealthTokenKey: []byte("health"), sandboxdauth.ProcessTokenKey: []byte("process"), sandboxdauth.ServiceObservationTokenKey: []byte("observe"), sandboxdauth.PortalTokenKey: []byte("portal"),
 			}}
 			for _, object := range []client.Object{pod, secret} {
 				if err := controllerutil.SetControllerReference(current, object, scheme); err != nil {

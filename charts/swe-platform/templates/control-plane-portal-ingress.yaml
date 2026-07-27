@@ -1,0 +1,33 @@
+{{- if and .Values.controlPlane.enabled .Values.controlPlane.portal.enabled .Values.controlPlane.portal.ingress.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ include "swe-platform.controlPlaneFullname" . }}-portal
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "swe-platform.labels" . | nindent 4 }}
+    app.kubernetes.io/component: control-plane
+  {{- with .Values.controlPlane.portal.ingress.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  {{- with .Values.controlPlane.portal.ingress.ingressClassName }}
+  ingressClassName: {{ . | quote }}
+  {{- end }}
+  tls:
+    - hosts:
+        - {{ printf "*.%s" .Values.controlPlane.portal.suffix | quote }}
+      secretName: {{ .Values.controlPlane.portal.ingress.tls.secretName | quote }}
+  rules:
+    - host: {{ printf "*.%s" .Values.controlPlane.portal.suffix | quote }}
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ include "swe-platform.controlPlaneFullname" . }}
+                port:
+                  name: http
+{{- end }}

@@ -233,6 +233,14 @@ spec:
                     target is always that Environment's logical loopback; callers cannot supply
                     an address. Duplicate TargetPorts are allowed as explicit aliases.
                   properties:
+                    instanceID:
+                      description: |-
+                        InstanceID is a cryptographically random identity for this declaration
+                        incarnation. It is retained by updates and replaced after remove/re-add.
+                      maxLength: 63
+                      minLength: 20
+                      pattern: ^[a-z0-9]{20,63}$
+                      type: string
                     name:
                       description: Name is the stable service name within this Environment.
                       maxLength: 63
@@ -280,6 +288,7 @@ spec:
                       - Project
                       type: string
                   required:
+                  - instanceID
                   - name
                   - protocol
                   - readiness
@@ -296,6 +305,11 @@ spec:
                 x-kubernetes-list-map-keys:
                 - name
                 x-kubernetes-list-type: map
+                x-kubernetes-validations:
+                - message: instanceID is immutable for an existing same-name service
+                    declaration
+                  rule: self.all(s, !oldSelf.exists(o, o.name == s.name) || oldSelf.exists(o,
+                    o.name == s.name && o.instanceID == s.instanceID))
               templateRef:
                 description: TemplateRef is the name of the EnvironmentTemplate to
                   build from.
@@ -510,6 +524,10 @@ spec:
                       Requested suspension.
                     type: string
                 type: object
+              nextPortalRouteGeneration:
+                format: int64
+                minimum: 0
+                type: integer
               observedGeneration:
                 description: ObservedGeneration is the Environment generation reflected
                   by this status.
@@ -554,6 +572,45 @@ spec:
                   PodRecoveryUID identifies the exact terminal Pod covered by the pending or
                   in-progress recovery attempt.
                 type: string
+              portalRoutes:
+                description: |-
+                  PortalRoutes is bounded gateway-owned state. Other status writers must
+                  preserve it. NextPortalRouteGeneration is monotonic.
+                items:
+                  description: |-
+                    EnvironmentPortalRoute is gateway-owned durable route state. Locators are
+                    opaque and never reused; inactive records are denial tombstones.
+                  properties:
+                    active:
+                      type: boolean
+                    declarationInstanceID:
+                      maxLength: 63
+                      minLength: 20
+                      pattern: ^[a-z0-9]{20,63}$
+                      type: string
+                    declarationRevision:
+                      format: int64
+                      minimum: 1
+                      type: integer
+                    generation:
+                      format: int64
+                      minimum: 1
+                      type: integer
+                    locator:
+                      pattern: ^[a-z0-9]{20,63}$
+                      type: string
+                    name:
+                      type: string
+                  required:
+                  - active
+                  - declarationInstanceID
+                  - declarationRevision
+                  - generation
+                  - locator
+                  - name
+                  type: object
+                maxItems: 64
+                type: array
               serviceObservations:
                 description: |-
                   ServiceObservations is advisory point-in-time service state owned solely
@@ -653,6 +710,9 @@ spec:
             - message: executionGeneration cannot decrease or be removed
               rule: '!has(oldSelf.executionGeneration) || (has(self.executionGeneration)
                 && self.executionGeneration >= oldSelf.executionGeneration)'
+            - message: nextPortalRouteGeneration cannot decrease or be removed
+              rule: '!has(oldSelf.nextPortalRouteGeneration) || (has(self.nextPortalRouteGeneration)
+                && self.nextPortalRouteGeneration >= oldSelf.nextPortalRouteGeneration)'
         type: object
     served: true
     storage: true

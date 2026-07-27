@@ -47,6 +47,10 @@ spec:
               value: {{ .Values.controlPlane.auth.trustProxyHeaders | quote }}
             - name: SWE_ALLOW_INSECURE_SESSIONS
               value: {{ .Values.controlPlane.auth.allowInsecureSessions | quote }}
+            - name: SWE_PORTAL_SUFFIX
+              value: {{ ternary .Values.controlPlane.portal.suffix "" .Values.controlPlane.portal.enabled | quote }}
+            - name: SWE_PORTAL_SCHEME
+              value: {{ ternary .Values.controlPlane.portal.scheme "" .Values.controlPlane.portal.enabled | quote }}
             - name: SWE_SESSION_BACKEND
               value: {{ .Values.controlPlane.sessions.backend | quote }}
             {{- if eq .Values.controlPlane.sessions.backend "postgres" }}
