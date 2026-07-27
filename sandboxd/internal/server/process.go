@@ -333,7 +333,9 @@ func (s *ProcessServer) ReconcileManagedServices(_ context.Context, req *sandbox
 			}
 		} else {
 			p.managedGeneration = gen
-			delete(toStart, key.role)
+			if p.state != sandboxdv1.ProcessState_PROCESS_STATE_EXITED && p.state != sandboxdv1.ProcessState_PROCESS_STATE_FAILED {
+				delete(toStart, key.role)
+			}
 		}
 	}
 	s.mu.Unlock()
