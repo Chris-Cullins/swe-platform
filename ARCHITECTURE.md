@@ -305,7 +305,9 @@ microsecond timestamps form part of the authenticated associated data. The stric
 version-1 JSON keyring is created out of band, mounted read-only, and has one live active key.
 Sessions have a one-hour absolute TTL. Under a transaction advisory lock, creation purges
 expired rows and enforces a global 10,000-live-session cap by rejecting rather than evicting.
-Logout and failed authentication durably and idempotently revoke the row.
+Logout and definitive unauthenticated or audience-mismatch results durably and idempotently
+revoke the row. TokenReview transport or `status.error` failures return 503 and retain it;
+SAR denial returns 403 and also retains it.
 
 Startup fails on database connection, migration, keyring, or missing-live-key errors and never
 falls back to memory. Rotation adds a unique key and makes it active; old keys must remain for

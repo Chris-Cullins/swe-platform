@@ -1114,7 +1114,12 @@ if [[ "$SESSION_REPLACEMENT_STATUS" != "200" ]]; then
 	exit 1
 fi
 
-echo "==> verifying definitive browser-session rejection is durably revoked"
+# Stock kube-apiserver reports every declined non-empty bearer with TokenReview
+# status.error, which is intentionally indeterminate here and must retain the
+# session. Use the bootstrap credential as stored session material instead: it
+# is definitively rejected before TokenReview because bootstrap credentials are
+# explicit-bearer-only. Focused tests cover TokenReview authenticated:false.
+echo "==> verifying definitive bootstrap-cookie rejection is durably revoked"
 kubectl -n "$SYSTEM_NAMESPACE" port-forward service/postgres 15432:5432 >/tmp/swe-platform-postgres-port-forward.log 2>&1 &
 POSTGRES_PORT_FORWARD_PID=$!
 for _ in $(seq 1 30); do
