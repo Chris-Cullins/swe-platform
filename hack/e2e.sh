@@ -542,7 +542,25 @@ if bin/swe --namespace "$ADOPT_NAMESPACE" project onboard ownership-collision --
 fi
 echo "==> adding the onboarded Project namespace to scoped controllers"
 HELM_ARGS+=(--set-string "tenancy.namespaces[0]=$PROJECT_NAMESPACE")
-helm "${HELM_ARGS[@]}"
+if ! helm "${HELM_ARGS[@]}"; then
+	echo "FAIL: scoped-controller Helm upgrade failed; collecting operator rollout diagnostics" >&2
+	kubectl -n "$SYSTEM_NAMESPACE" get deployment "$INSTALLATION_NAME" -o json | jq '{metadata: {name: .metadata.name, generation: .metadata.generation}, spec: {replicas: .spec.replicas, strategy: .spec.strategy}, status: .status}' >&2 || true
+	kubectl -n "$SYSTEM_NAMESPACE" get replicasets \
+		-l 'app.kubernetes.io/component=operator' -o wide >&2 || true
+	OPERATOR_PODS=$(kubectl -n "$SYSTEM_NAMESPACE" get pods \
+		-l 'app.kubernetes.io/component=operator' -o name 2>/dev/null || true)
+	kubectl -n "$SYSTEM_NAMESPACE" get pods \
+		-l 'app.kubernetes.io/component=operator' -o json | jq '{items: [.items[] | {metadata: {name: .metadata.name, uid: .metadata.uid, deletionTimestamp: .metadata.deletionTimestamp, finalizers: .metadata.finalizers}, spec: {terminationGracePeriodSeconds: .spec.terminationGracePeriodSeconds}, status: {phase: .status.phase, reason: .status.reason, message: .status.message, conditions: .status.conditions, containerStatuses: .status.containerStatuses}}]}' >&2 || true
+	kubectl -n "$SYSTEM_NAMESPACE" describe deployment "$INSTALLATION_NAME" >&2 || true
+	for pod in $OPERATOR_PODS; do
+		pod=${pod#pod/}
+		kubectl -n "$SYSTEM_NAMESPACE" describe pod "$pod" >&2 || true
+		kubectl -n "$SYSTEM_NAMESPACE" logs "$pod" --container operator --tail=200 >&2 || true
+		kubectl -n "$SYSTEM_NAMESPACE" logs "$pod" --container operator --previous --tail=200 >&2 || true
+		kubectl -n "$SYSTEM_NAMESPACE" get events --field-selector "involvedObject.name=$pod" --sort-by=.lastTimestamp >&2 || true
+	done
+	exit 1
+fi
 kubectl -n "$SYSTEM_NAMESPACE" rollout status deployment/"$INSTALLATION_NAME" --timeout=2m
 kubectl -n "$SYSTEM_NAMESPACE" rollout status deployment/"$INSTALLATION_NAME-control-plane" --timeout=2m
 kubectl config set-context --current --namespace="$PROJECT_NAMESPACE" >/dev/null
