@@ -26,6 +26,16 @@ func (a TenancyAccessController) Authorize(r *http.Request, access ResourceAcces
 	return err
 }
 
+// AuthenticatePrincipal delegates credential validation without guessing a
+// namespace. Exact authorization below performs tenancy verification once the
+// resource identity is known.
+func (a TenancyAccessController) AuthenticatePrincipal(r *http.Request, allowSession bool) (string, error) {
+	if authenticator, ok := a.Access.(principalAuthenticator); ok {
+		return authenticator.AuthenticatePrincipal(r, allowSession)
+	}
+	return "", errUnauthenticated
+}
+
 func (a TenancyAccessController) AuthorizePrincipal(r *http.Request, access ResourceAccess, allowSession bool) (string, error) {
 	var principalKey string
 	var err error

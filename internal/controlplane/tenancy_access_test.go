@@ -26,6 +26,11 @@ func (a *orderedAccess) Authorize(*http.Request, ResourceAccess, bool) error {
 	return a.err
 }
 
+func (a *orderedAccess) AuthenticatePrincipal(*http.Request, bool) (string, error) {
+	a.called = true
+	return "principal", a.err
+}
+
 func tenancyAccessFixture(t *testing.T, lifecycle tenancy.Lifecycle, claimed bool) *tenancy.Verifier {
 	t.Helper()
 	scheme := runtime.NewScheme()
@@ -65,6 +70,16 @@ func TestTenancyAccessPreservesAuthorizationBeforeScopeValidation(t *testing.T) 
 	err := controller.Authorize(request, ResourceAccess{Namespace: "team", Verb: "list", Resource: "runs"}, true)
 	if !underlying.called || !errors.Is(err, errUnauthenticated) {
 		t.Fatalf("authorization ordering: called=%v err=%v", underlying.called, err)
+	}
+}
+
+func TestTenancyAccessDelegatesAuthenticationWithoutNamespaceLookup(t *testing.T) {
+	underlying := &orderedAccess{}
+	controller := TenancyAccessController{Access: underlying}
+	request := httptest.NewRequest(http.MethodGet, "https://portal.test/", nil)
+	principal, err := controller.AuthenticatePrincipal(request, true)
+	if err != nil || principal != "principal" || !underlying.called || namespaceUIDFromRequest(request) != "" {
+		t.Fatalf("authentication delegation = principal %q called %v namespace %q err %v", principal, underlying.called, namespaceUIDFromRequest(request), err)
 	}
 }
 
