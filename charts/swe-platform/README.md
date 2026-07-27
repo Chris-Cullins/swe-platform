@@ -474,10 +474,12 @@ PostgreSQL sessions survive a control-plane pod replacement, and every cookie re
 repeats Kubernetes TokenReview and exact SubjectAccessReview, so upstream expiry/revocation and
 RBAC remain authoritative. Sessions have a one-hour absolute TTL and a 10,000-session limit;
 at capacity new session exchange is rejected rather than evicting an existing session. Logout,
-expiry, or failed TokenReview removes the record. The chart intentionally enforces one control-
-plane replica and `Recreate`: replacement interrupts open SSE and WebSocket connections, which
-clients must reconnect, and neither durable sessions nor transcripts constitute a live-connection
-survival or HA claim.
+expiry, or a definitive TokenReview unauthenticated or audience-mismatch result removes the
+record. TokenReview transport or `status.error` failures return 503 and retain it; SAR denial
+returns 403 and also retains it. The chart intentionally enforces one control-plane replica and
+`Recreate`: replacement interrupts open SSE and WebSocket connections, which clients must
+reconnect, and neither durable sessions nor transcripts constitute a live-connection survival
+or HA claim.
 
 Per-Run event and byte limits do not bound total database size across Run churn. Deleting a Run
 or fencing a Project does not reclaim its UID-fenced transcript rows. New and safely associated
@@ -668,7 +670,9 @@ Every cookie-authenticated request resolves the server-side credential and repea
 before SAR, so upstream expiry and revocation still apply. Sessions have a one-hour absolute
 lifetime, credentials are limited to 16 KiB, and the backend accepts at most 10,000 active
 sessions, rejecting new exchanges at capacity rather than evicting entries. Logout, absolute
-expiry, or a failed TokenReview deletes the server-side entry.
+expiry, or a definitive TokenReview unauthenticated or audience-mismatch result deletes the
+server-side entry. TokenReview transport or `status.error` failures return 503 and retain it;
+SAR denial returns 403 and also retains it.
 Memory-backend restart logs browsers out; PostgreSQL sessions survive replacement as described
 above. `GET /api/v1/session` validates
 the current session and `DELETE /api/v1/session` revokes it. Production session exchange requires HTTPS. Only the

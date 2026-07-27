@@ -180,8 +180,10 @@ recover credentials.
 
 Sessions expire absolutely after one hour. Creation takes a global PostgreSQL advisory
 transaction lock, purges expired rows, and rejects a new exchange once 10,000 live rows remain;
-it never evicts a live session. Logout, expiry, and failed TokenReview revoke durably and
-idempotently. Every use repeats TokenReview, then exact SAR with the reviewed username, UID,
+it never evicts a live session. Logout, expiry, and definitive TokenReview unauthenticated or
+audience-mismatch results revoke durably and idempotently. TokenReview transport or
+`status.error` failures return 503 and retain the session for retry; SAR denial returns 403 and
+also retains it. Every use repeats TokenReview, then exact SAR with the reviewed username, UID,
 groups, and extras, so Kubernetes credential expiry/revocation and RBAC remain authoritative.
 Cookie security and same-origin mutation checks remain mandatory.
 
