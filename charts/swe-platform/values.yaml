@@ -9,6 +9,9 @@ image:
 controlPlane:
   enabled: true
   replicaCount: 1
+  metrics:
+    # Exposed on the internal control-plane Service as a dedicated listener.
+    port: 8082
   sessions:
     # memory is development-only. Production presets explicitly select postgres.
     backend: memory

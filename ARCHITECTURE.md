@@ -39,8 +39,10 @@ CLI / TUI / local MCP / browser console
   namespace; each onboarded Project and its resources live in one dedicated claimed namespace.
 - **Control plane.** A singleton HTTP service exposes typed Run and Environment operations,
   Run watches, transcript ingestion/SSE, browser sessions, the embedded operations console,
-  and terminal WebSockets. It acts through Kubernetes APIs and the sandboxd connector; it
-  does not exec into Environment pods.
+  and terminal WebSockets. A separate internal HTTP listener exposes bounded-cardinality
+  Prometheus process and operational metrics at `/metrics`; it does not serve application
+  routes. The control plane acts through Kubernetes APIs and the sandboxd connector; it does
+  not exec into Environment pods.
 - **Clients.** `swe run`, `logs`, `attach`, `tui`, and the bounded local stdio MCP server use
   the control-plane or Kubernetes contracts appropriate to each command. The React console
   uses the same control-plane resource, transcript, and terminal APIs.

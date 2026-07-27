@@ -16,4 +16,7 @@ spec:
     - name: http
       port: 80
       targetPort: http
+    - name: metrics
+      port: {{ int .Values.controlPlane.metrics.port }}
+      targetPort: metrics
 {{- end }}
