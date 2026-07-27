@@ -71,14 +71,21 @@ func (r *DeclaredServiceReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 	fence := lifecycle.CaptureExecutionFence(&env)
 	file, err := r.Connector.ReadWorkspaceServices(ctx, fence)
 	if err != nil {
+		ctrl.LoggerFrom(ctx).Error(err, "read repository service declarations")
 		return ctrl.Result{RequeueAfter: declaredServiceInterval}, nil
 	}
 	parsed, err := serviceconfig.Parse(file.Data)
 	if err != nil {
+		ctrl.LoggerFrom(ctx).Error(err, "parse repository service declarations")
 		return ctrl.Result{RequeueAfter: declaredServiceInterval}, nil
 	}
 	converged, collision, err := convergeRepositoryDeclarations(&env, parsed)
-	if err != nil || collision != "" {
+	if err != nil {
+		ctrl.LoggerFrom(ctx).Error(err, "converge repository service declarations")
+		return ctrl.Result{RequeueAfter: declaredServiceInterval}, nil
+	}
+	if collision != "" {
+		ctrl.LoggerFrom(ctx).Info("repository service declarations conflict with durable intent", "collision", collision)
 		return ctrl.Result{RequeueAfter: declaredServiceInterval}, nil
 	}
 	if !reflect.DeepEqual(env.Spec.Services, converged) {
@@ -106,6 +113,7 @@ func (r *DeclaredServiceReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		}
 		route, err := r.Routes.GetPortalRoute(ctx, env.Namespace, env.Name, declaration.Name)
 		if err != nil {
+			ctrl.LoggerFrom(ctx).Error(err, "discover repository service portal route", "service", declaration.Name)
 			return ctrl.Result{RequeueAfter: declaredServiceInterval}, nil
 		}
 		if route.EnvironmentUID != string(env.UID) || route.Service != declaration.Name || route.DeclarationInstanceID != declaration.InstanceID || route.Revision != declaration.Revision || route.RouteGeneration < 1 {
@@ -128,6 +136,7 @@ func (r *DeclaredServiceReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 				return ctrl.Result{RequeueAfter: declaredServiceInterval}, nil
 			}
 			if err := r.Connector.ReconcileRepositoryServices(ctx, fence, append([]platformv1alpha1.EnvironmentServiceDeclaration(nil), env.Spec.Services...), routeProofs, uint64(env.Generation), routeRevision, nil); err != nil {
+				ctrl.LoggerFrom(ctx).Error(err, "stop repository services for disabled portal authority")
 				return ctrl.Result{RequeueAfter: declaredServiceInterval}, nil
 			}
 			return ctrl.Result{RequeueAfter: declaredServiceInterval}, nil
@@ -145,6 +154,7 @@ func (r *DeclaredServiceReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		return ctrl.Result{RequeueAfter: declaredServiceInterval}, nil
 	}
 	if err := r.Connector.ReconcileRepositoryServices(ctx, fence, append([]platformv1alpha1.EnvironmentServiceDeclaration(nil), env.Spec.Services...), routeProofs, uint64(env.Generation), routeRevision, specs); err != nil {
+		ctrl.LoggerFrom(ctx).Error(err, "reconcile repository service processes")
 		return ctrl.Result{RequeueAfter: declaredServiceInterval}, nil
 	}
 	return ctrl.Result{RequeueAfter: declaredServiceInterval}, nil
