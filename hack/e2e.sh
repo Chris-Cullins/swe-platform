@@ -213,7 +213,7 @@ manage_observation_listener() {
 		echo "FAIL: sandboxd observation port-forward did not become ready" >&2
 		return 1
 	fi
-	if [[ "$action" == "service-start" ]]; then
+	if [[ "$action" == "service-start" || "$action" == "service-state" ]]; then
 		go run ./hack/e2e-process-check "$action" 127.0.0.1:15052 "$identity" /tmp/swe-platform-observation-cert-"$$" /tmp/swe-platform-observation-process-token-"$$" "$owner" "$role" "$port"
 	else
 		go run ./hack/e2e-process-check "$action" 127.0.0.1:15052 "$identity" /tmp/swe-platform-observation-cert-"$$" /tmp/swe-platform-observation-process-token-"$$" "$owner" "$role"
@@ -884,17 +884,46 @@ PROJECT_WORKTREE="$(mktemp -d /tmp/swe-e2e-worktree-XXXXXX)"
 git -C "$PROJECT_WORKTREE" init -b main >/dev/null
 git -C "$PROJECT_WORKTREE" config user.name "swe e2e"
 git -C "$PROJECT_WORKTREE" config user.email "swe-e2e@example.invalid"
-mkdir -p "$PROJECT_WORKTREE/.agents"
+mkdir -p "$PROJECT_WORKTREE/.agents" "$PROJECT_WORKTREE/.swe"
 cat > "$PROJECT_WORKTREE/.agents/setup" <<'EOF'
-if [ -n "${ANTHROPIC_API_KEY+x}" ] || [ -n "${AMP_API_KEY+x}" ]; then exit 43; fi
+if [ -n "${ANTHROPIC_API_KEY+x}" ] || [ -n "${AMP_API_KEY+x}" ] || [ -n "${PORT+x}" ] || [ -n "${PUBLIC_URL+x}" ]; then exit 43; fi
 printf '%s\n' credential-absent >> setup-result
 EOF
 cat > "$PROJECT_WORKTREE/.agents/resume" <<'EOF'
-if [ -n "${ANTHROPIC_API_KEY+x}" ] || [ -n "${AMP_API_KEY+x}" ]; then exit 44; fi
+if [ -n "${ANTHROPIC_API_KEY+x}" ] || [ -n "${AMP_API_KEY+x}" ] || [ -n "${PORT+x}" ] || [ -n "${PUBLIC_URL+x}" ]; then exit 44; fi
 printf '%s\n' credential-absent >> resume-result
 EOF
-git -C "$PROJECT_WORKTREE" add .agents/setup .agents/resume
-git -C "$PROJECT_WORKTREE" commit -m "Add e2e lifecycle hooks" >/dev/null
+cat > "$PROJECT_WORKTREE/.swe/services.yaml" <<'EOF'
+version: 1
+services:
+  repository-web:
+    command: ["node", ".swe/service.js", "v1"]
+EOF
+cat > "$PROJECT_WORKTREE/.swe/service.js" <<'EOF'
+const http = require("http");
+const crypto = require("crypto");
+const marker = process.argv[2];
+const boot = `${Date.now()}-${process.pid}-${crypto.randomBytes(8).toString("hex")}`;
+const forbidden = [
+  "ANTHROPIC_API_KEY", "AMP_API_KEY", "CODEX_API_KEY", "SWE_CONTROL_PLANE_TOKEN",
+  "POD_NAME", "POD_UID", "SANDBOXD_TOKEN", "KUBERNETES_TOKEN",
+].filter((name) => Object.prototype.hasOwnProperty.call(process.env, name));
+const server = http.createServer((request, response) => {
+  response.setHeader("Content-Type", "application/json");
+  if (request.url === "/crash") {
+    response.end(JSON.stringify({marker, boot, crashing: true}));
+    response.on("finish", () => process.exit(17));
+    return;
+  }
+  response.end(JSON.stringify({
+    marker, boot, port: process.env.PORT, publicURL: process.env.PUBLIC_URL,
+    forbidden, authorization: request.headers.authorization || "",
+  }));
+});
+server.listen(Number(process.env.PORT), "127.0.0.1");
+EOF
+git -C "$PROJECT_WORKTREE" add .agents/setup .agents/resume .swe/services.yaml .swe/service.js
+git -C "$PROJECT_WORKTREE" commit -m "Add e2e lifecycle hooks and declared service" >/dev/null
 git -C "$PROJECT_WORKTREE" bundle create "$PROJECT_REPO/repo.bundle" main
 kubectl create configmap e2e-git-repo --from-file="$PROJECT_REPO/repo.bundle"
 kubectl apply -f - <<EOF
@@ -1805,12 +1834,92 @@ if ! kubectl exec "$POD_NAME" -- sh -c 'test "$(wc -l < /workspace/setup-result)
 	exit 1
 fi
 
+echo "==> verifying repository service ingestion, supervision, and authenticated portal"
+bin/swe --namespace "$PROJECT_NAMESPACE" environment services declare "$ENV_NAME" manual-api --target-port 3999
+for _ in $(seq 1 90); do
+	REPOSITORY_SERVICE=$(kubectl get environment "$ENV_NAME" -o json | jq -c '.spec.services[]? | select(.name == "repository-web")')
+	if jq -e '.source == "Repository" and .revision == 1 and .targetPort >= 49152 and .targetPort <= 65535 and .launch.argv == ["node", ".swe/service.js", "v1"]' <<<"$REPOSITORY_SERVICE" >/dev/null 2>&1 &&
+		[[ "$(kubectl get environment "$ENV_NAME" -o jsonpath='{.spec.services[?(@.name=="manual-api")].source}')" == "API" ]]; then
+		break
+	fi
+	sleep 1
+done
+if [[ -z "${REPOSITORY_SERVICE:-}" ]] || ! jq -e '.source == "Repository" and .revision == 1' <<<"$REPOSITORY_SERVICE" >/dev/null 2>&1; then
+	echo "FAIL: .swe/services.yaml did not converge beside the API-owned declaration"
+	kubectl get environment "$ENV_NAME" -o yaml
+	exit 1
+fi
+REPOSITORY_PORT=$(jq -r '.targetPort' <<<"$REPOSITORY_SERVICE")
+wait_service_observation "$ENV_NAME" repository-web 1 Healthy
+REPOSITORY_PORTAL_URL=$(SWE_CONTROL_PLANE_URL=http://127.0.0.1:18080 SWE_CONTROL_PLANE_TOKEN="$CONSOLE_TOKEN" \
+	bin/swe --namespace "$PROJECT_NAMESPACE" portal "$ENV_NAME" repository-web)
+REPOSITORY_PORTAL_HOST=${REPOSITORY_PORTAL_URL#http://}
+for _ in $(seq 1 60); do
+	REPOSITORY_BODY=$(curl --silent --fail -H "Host: $REPOSITORY_PORTAL_HOST" -H "Authorization: Bearer $CONSOLE_TOKEN" http://127.0.0.1:18080/ 2>/dev/null || true)
+	if jq -e --arg port "$REPOSITORY_PORT" --arg url "$REPOSITORY_PORTAL_URL" \
+		'.marker == "v1" and .port == $port and .publicURL == $url and .forbidden == [] and .authorization == "" and (.boot | length > 0)' <<<"$REPOSITORY_BODY" >/dev/null 2>&1; then
+		break
+	fi
+	sleep 1
+done
+if ! jq -e --arg port "$REPOSITORY_PORT" --arg url "$REPOSITORY_PORTAL_URL" \
+	'.marker == "v1" and .port == $port and .publicURL == $url and .forbidden == [] and .authorization == ""' <<<"${REPOSITORY_BODY:-}" >/dev/null 2>&1; then
+	echo "FAIL: repository service did not receive exact PORT/PUBLIC_URL through the authenticated portal: ${REPOSITORY_BODY:-<empty>}"
+	exit 1
+fi
+REPOSITORY_BOOT=$(jq -r '.boot' <<<"$REPOSITORY_BODY")
+ENVIRONMENT_PUBLIC_JSON=$(kubectl get environment "$ENV_NAME" -o json)
+POD_PUBLIC_JSON=$(kubectl get pod "$POD_NAME" -o json)
+if [[ "$ENVIRONMENT_PUBLIC_JSON" == *"$REPOSITORY_PORTAL_URL"* || "$ENVIRONMENT_PUBLIC_JSON" == *'PUBLIC_URL'* ||
+	"$POD_PUBLIC_JSON" == *"$REPOSITORY_PORTAL_URL"* || "$POD_PUBLIC_JSON" == *'PUBLIC_URL'* ]] ||
+	kubectl exec "$POD_NAME" -- sh -c 'tr "\000" "\n" < /proc/1/environ | grep -Eq "^(PORT|PUBLIC_URL)="'; then
+	echo "FAIL: repository service URL/environment leaked into public status or sandboxd Pod state"
+	exit 1
+fi
+
+echo "==> verifying repository service crash restart"
+curl --silent --fail -H "Host: $REPOSITORY_PORTAL_HOST" -H "Authorization: Bearer $CONSOLE_TOKEN" http://127.0.0.1:18080/crash >/dev/null
+for _ in $(seq 1 60); do
+	RESTARTED_BODY=$(curl --silent --fail -H "Host: $REPOSITORY_PORTAL_HOST" -H "Authorization: Bearer $CONSOLE_TOKEN" http://127.0.0.1:18080/ 2>/dev/null || true)
+	if jq -e --arg old "$REPOSITORY_BOOT" '.marker == "v1" and .boot != $old' <<<"$RESTARTED_BODY" >/dev/null 2>&1; then
+		break
+	fi
+	sleep 1
+done
+if ! jq -e --arg old "$REPOSITORY_BOOT" '.marker == "v1" and .boot != $old' <<<"${RESTARTED_BODY:-}" >/dev/null 2>&1; then
+	echo "FAIL: sandboxd did not restart the crashed repository service"
+	exit 1
+fi
+REPOSITORY_BOOT=$(jq -r '.boot' <<<"$RESTARTED_BODY")
+wait_service_observation "$ENV_NAME" repository-web 1 Healthy
+
+echo "==> verifying malformed and API-colliding repository config fail closed"
+printf '%s' $'version: 1\nservices:\n  repository-web:\n    command: invalid\n' |
+	kubectl exec -i "$POD_NAME" -- sh -c 'cat > /workspace/.swe/services.yaml'
+sleep 25
+if [[ "$(kubectl get environment "$ENV_NAME" -o jsonpath='{.spec.services[?(@.name=="repository-web")].revision}')" != "1" ]] ||
+	! curl --silent --fail -H "Host: $REPOSITORY_PORTAL_HOST" -H "Authorization: Bearer $CONSOLE_TOKEN" http://127.0.0.1:18080/ >/dev/null; then
+	echo "FAIL: malformed repository service config replaced the last admitted intent"
+	exit 1
+fi
+printf '%s' $'version: 1\nservices:\n  repository-web:\n    command: ["node", ".swe/service.js", "v1"]\n  manual-api:\n    command: ["node", ".swe/service.js", "collision"]\n' |
+	kubectl exec -i "$POD_NAME" -- sh -c 'cat > /workspace/.swe/services.yaml'
+sleep 25
+if [[ "$(kubectl get environment "$ENV_NAME" -o jsonpath='{.spec.services[?(@.name=="manual-api")].source}')" != "API" ||
+	"$(kubectl get environment "$ENV_NAME" -o jsonpath='{.spec.services[?(@.name=="repository-web")].revision}')" != "1" ]]; then
+	echo "FAIL: repository/API same-name collision did not preserve canonical intent"
+	exit 1
+fi
+printf '%s' $'version: 1\nservices:\n  repository-web:\n    command: ["node", ".swe/service.js", "v1"]\n' |
+	kubectl exec -i "$POD_NAME" -- sh -c 'cat > /workspace/.swe/services.yaml'
+
 echo "==> verifying bounded durable Environment service declarations"
 bin/swe --namespace "$PROJECT_NAMESPACE" environment services declare "$ENV_NAME" web --target-port 3000
 bin/swe --namespace "$PROJECT_NAMESPACE" environment services declare "$ENV_NAME" web-alias --target-port 3000
 SERVICE_LIST=$(bin/swe --namespace "$PROJECT_NAMESPACE" environment services list "$ENV_NAME")
-if ! grep -Fq $'web\t1\tHTTP\t3000\tProject\tTCPConnect' <<<"$SERVICE_LIST" ||
-	! grep -Fq $'web-alias\t1\tHTTP\t3000\tProject\tTCPConnect' <<<"$SERVICE_LIST"; then
+if ! grep -Fq $'web\tAPI\t1\tHTTP\t3000\tProject\tTCPConnect' <<<"$SERVICE_LIST" ||
+	! grep -Fq $'web-alias\tAPI\t1\tHTTP\t3000\tProject\tTCPConnect' <<<"$SERVICE_LIST" ||
+	! grep -Fq $'repository-web\tRepository\t1\tHTTP' <<<"$SERVICE_LIST"; then
 	echo "FAIL: service list did not report durable declarations and duplicate-port aliases"
 	exit 1
 fi
@@ -1945,6 +2054,10 @@ if [[ "$(curl --silent --output /dev/null --write-out '%{http_code}' -H "Host: $
 	echo "FAIL: explicit hold did not uniformly deny portal routing"
 	exit 1
 fi
+if [[ "$(curl --silent --output /dev/null --write-out '%{http_code}' -H "Host: $REPOSITORY_PORTAL_HOST" -H "Authorization: Bearer $CONSOLE_TOKEN" http://127.0.0.1:18080/)" != "404" ]]; then
+	echo "FAIL: explicit hold did not fence the repository service portal"
+	exit 1
+fi
 HOLD_REVISION=$(kubectl get environment "$ENV_NAME" -o jsonpath='{.spec.lifecycle.hold.revision}')
 if [[ "$(kubectl get environment "$ENV_NAME" -o jsonpath='{.spec.lifecycle.hold.enabled}')" != "true" || -z "$HOLD_REVISION" ]]; then
 	echo "FAIL: swe environment hold did not publish enabled revisioned policy"
@@ -1959,6 +2072,21 @@ fi
 kubectl wait --for=jsonpath='{.status.phase}'=Ready environment/"$ENV_NAME" --timeout=2m
 kubectl wait --for=condition=Ready pod/"$POD_NAME" --timeout=2m
 wait_service_observation "$ENV_NAME" web 1 Unhealthy
+wait_service_observation "$ENV_NAME" repository-web 1 Healthy
+for _ in $(seq 1 60); do
+	RESUMED_REPOSITORY_BODY=$(curl --silent --fail -H "Host: $REPOSITORY_PORTAL_HOST" -H "Authorization: Bearer $CONSOLE_TOKEN" http://127.0.0.1:18080/ 2>/dev/null || true)
+	if jq -e --arg old "$REPOSITORY_BOOT" --arg url "$REPOSITORY_PORTAL_URL" \
+		'.marker == "v1" and .boot != $old and .publicURL == $url' <<<"$RESUMED_REPOSITORY_BODY" >/dev/null 2>&1; then
+		break
+	fi
+	sleep 1
+done
+if ! jq -e --arg old "$REPOSITORY_BOOT" --arg url "$REPOSITORY_PORTAL_URL" \
+	'.marker == "v1" and .boot != $old and .publicURL == $url' <<<"${RESUMED_REPOSITORY_BODY:-}" >/dev/null 2>&1; then
+	echo "FAIL: pause/resume did not launch a fresh repository process behind the stable gateway URL"
+	exit 1
+fi
+REPOSITORY_BOOT=$(jq -r '.boot' <<<"$RESUMED_REPOSITORY_BODY")
 POST_RESUME_OBSERVATION_EXECUTION=$(kubectl get environment "$ENV_NAME" -o jsonpath='{.status.serviceObservations.executionGeneration}')
 if [[ -z "$POST_RESUME_OBSERVATION_EXECUTION" || "$POST_RESUME_OBSERVATION_EXECUTION" -le "$PRE_PAUSE_OBSERVATION_EXECUTION" ]]; then
 	echo "FAIL: resumed service observation did not require a fresh execution"
@@ -1980,13 +2108,81 @@ if [[ "$NEW_PORTAL_URL" == "$PORTAL_URL" ]]; then
 fi
 bin/swe --namespace "$PROJECT_NAMESPACE" environment services remove "$ENV_NAME" web
 for _ in $(seq 1 30); do
-	if [[ -z "$(kubectl get environment "$ENV_NAME" -o jsonpath='{.status.serviceObservations}' 2>/dev/null || true)" ]]; then
+	if ! kubectl get environment "$ENV_NAME" -o json | jq -e 'any(.status.serviceObservations.records[]?; .name == "web")' >/dev/null 2>&1; then
 		break
 	fi
 	sleep 1
 done
-if [[ -n "$(kubectl get environment "$ENV_NAME" -o jsonpath='{.status.serviceObservations}' 2>/dev/null || true)" ]]; then
+if kubectl get environment "$ENV_NAME" -o json | jq -e 'any(.status.serviceObservations.records[]?; .name == "web")' >/dev/null 2>&1; then
 	echo "FAIL: removed service retained an observation record"
+	exit 1
+fi
+
+echo "==> verifying repository command change rotates route and removes stale process intent"
+printf '%s' $'version: 1\nservices:\n  repository-web:\n    command: ["node", ".swe/service.js", "v2"]\n' |
+	kubectl exec -i "$POD_NAME" -- sh -c 'cat > /workspace/.swe/services.yaml'
+for _ in $(seq 1 90); do
+	if [[ "$(kubectl get environment "$ENV_NAME" -o jsonpath='{.spec.services[?(@.name=="repository-web")].revision}')" == "2" ]]; then
+		break
+	fi
+	sleep 1
+done
+if [[ "$(kubectl get environment "$ENV_NAME" -o jsonpath='{.spec.services[?(@.name=="repository-web")].revision}')" != "2" ||
+	"$(kubectl get environment "$ENV_NAME" -o jsonpath='{.spec.services[?(@.name=="manual-api")].source}')" != "API" ]]; then
+	echo "FAIL: repository command change did not converge at a higher revision while preserving API intent"
+	exit 1
+fi
+wait_service_observation "$ENV_NAME" repository-web 2 Healthy
+if [[ "$(curl --silent --output /dev/null --write-out '%{http_code}' -H "Host: $REPOSITORY_PORTAL_HOST" -H "Authorization: Bearer $CONSOLE_TOKEN" http://127.0.0.1:18080/)" != "404" ]]; then
+	echo "FAIL: repository command change retained the stale route generation"
+	exit 1
+fi
+UPDATED_REPOSITORY_URL=$(SWE_CONTROL_PLANE_URL=http://127.0.0.1:18080 SWE_CONTROL_PLANE_TOKEN="$CONSOLE_TOKEN" \
+	bin/swe --namespace "$PROJECT_NAMESPACE" portal "$ENV_NAME" repository-web)
+UPDATED_REPOSITORY_HOST=${UPDATED_REPOSITORY_URL#http://}
+if [[ "$UPDATED_REPOSITORY_URL" == "$REPOSITORY_PORTAL_URL" ]]; then
+	echo "FAIL: repository command change reused its old revision-fenced URL"
+	exit 1
+fi
+for _ in $(seq 1 60); do
+	UPDATED_REPOSITORY_BODY=$(curl --silent --fail -H "Host: $UPDATED_REPOSITORY_HOST" -H "Authorization: Bearer $CONSOLE_TOKEN" http://127.0.0.1:18080/ 2>/dev/null || true)
+	if jq -e --arg url "$UPDATED_REPOSITORY_URL" '.marker == "v2" and .publicURL == $url and .forbidden == []' <<<"$UPDATED_REPOSITORY_BODY" >/dev/null 2>&1; then
+		break
+	fi
+	sleep 1
+done
+if ! jq -e --arg url "$UPDATED_REPOSITORY_URL" '.marker == "v2" and .publicURL == $url and .forbidden == []' <<<"${UPDATED_REPOSITORY_BODY:-}" >/dev/null 2>&1; then
+	echo "FAIL: changed repository process did not start with the new gateway-owned URL"
+	exit 1
+fi
+manage_observation_listener service-state "$POD_NAME" "$OBSERVATION_OWNER" repository-web running
+
+echo "==> verifying repository removal stops process and tombstones URL"
+printf '%s' $'version: 1\nservices: {}\n' |
+	kubectl exec -i "$POD_NAME" -- sh -c 'cat > /workspace/.swe/services.yaml'
+for _ in $(seq 1 90); do
+	if [[ -z "$(kubectl get environment "$ENV_NAME" -o jsonpath='{.spec.services[?(@.name=="repository-web")].name}')" ]]; then
+		break
+	fi
+	sleep 1
+done
+if [[ -n "$(kubectl get environment "$ENV_NAME" -o jsonpath='{.spec.services[?(@.name=="repository-web")].name}')" ||
+	"$(kubectl get environment "$ENV_NAME" -o jsonpath='{.spec.services[?(@.name=="manual-api")].source}')" != "API" ]]; then
+	echo "FAIL: repository removal did not preserve only API-owned service intent"
+	exit 1
+fi
+for _ in $(seq 1 60); do
+	if manage_observation_listener service-state "$POD_NAME" "$OBSERVATION_OWNER" repository-web stopped >/dev/null 2>&1; then
+		break
+	fi
+	sleep 1
+done
+if ! manage_observation_listener service-state "$POD_NAME" "$OBSERVATION_OWNER" repository-web stopped; then
+	echo "FAIL: repository removal did not stop its managed process"
+	exit 1
+fi
+if [[ "$(curl --silent --output /dev/null --write-out '%{http_code}' -H "Host: $UPDATED_REPOSITORY_HOST" -H "Authorization: Bearer $CONSOLE_TOKEN" http://127.0.0.1:18080/)" != "404" ]]; then
+	echo "FAIL: repository removal retained its last portal URL"
 	exit 1
 fi
 RESUMED_IMAGE_ID=$(kubectl get environment "$ENV_NAME" -o jsonpath='{.status.imageID}')
