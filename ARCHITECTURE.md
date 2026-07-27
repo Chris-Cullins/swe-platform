@@ -79,7 +79,7 @@ All current CRDs are namespaced:
 | `Installation` | Empty-spec identity object in the system namespace. Its immutable Kubernetes UID is the stable installation identity used by namespace claims, catalog sources, managed Template copies, and baseline resources. |
 | `Project` | One repository URL (represented as a one-item list), a same-namespace default Template reference, changes-workflow metadata, and a reserved egress allowlist. A non-empty allowlist is rejected when an Environment uses the Project. |
 | `EnvironmentTemplate` | Pod image, size/resources, disk, runtime class, idle timeout, warm-pool minimum, and backend. Admission currently permits only the `pod` backend. Chart-owned system-namespace objects are inert catalog sources; execution accepts only installation-managed same-namespace copies bound to exact Installation, source, and Project identities. |
-| `Environment` | Template/Project selection, explicit hold policy, bounded wake/suspend/activity intents, and up to 32 API- or Repository-owned service declarations. New declarations have an immutable-per-incarnation random `instanceID`; upgrade-retained legacy declarations may omit it, receive no portal route, and can add it only with a higher revision. Omitted legacy service ownership defaults only to `API` and is immutable thereafter. Status owns lifecycle/execution, claim, observation, activity, and nested backend-neutral recovery state; recovery records attempts, exhaustion, the exact failed execution generation being accounted, and the next allowed attempt time, while generation zero means no recovery identity. The gateway owns bounded `portalRoutes` and monotonic `nextPortalRouteGeneration`; inactive routes are denial tombstones preserved by other status writers. |
+| `Environment` | Immutable Template selection, an immutable optional backend override, one-way empty-to-nonempty Project binding, explicit hold policy, bounded wake/suspend/activity intents, and up to 32 API- or Repository-owned service declarations. New declarations have an immutable-per-incarnation random `instanceID`; upgrade-retained legacy declarations may omit it, receive no portal route, and can add it only with a higher revision. Omitted legacy service ownership defaults only to `API` and is immutable thereafter. Controller-owned status includes the immutable resolved `provisioning` snapshot, readiness, lifecycle/execution, claim, observations, activity, and nested backend-neutral recovery state; recovery records attempts, exhaustion, the exact failed execution generation being accounted, and the next allowed attempt time, while generation zero means no recovery identity. The gateway owns bounded `portalRoutes` and monotonic `nextPortalRouteGeneration`; inactive routes are denial tombstones preserved by other status writers. |
 | `Run` | Immutable agent task and Environment/Project/Template/credential selection plus monotonic cancellation; status records normalized lifecycle, exact Environment name/UID and ownership, exact credential profile identity, accepted lifecycle epoch, and accepted execution generation. `notify` and `parentRef` are schema placeholders without an implemented inbox. |
 | `AgentCredentialProfile` | Immutable adapter and `APIKey` type metadata. Key bytes live in an owner-linked Secret whose name is derived from the profile UID. |
 
@@ -113,6 +113,47 @@ The Run controller creates an owned Environment or exclusively claims a reusable
 Owned allocations have a Run controller owner reference; claimed allocations carry Run name
 and UID in `Environment.status.claimedBy`. Exact UIDs prevent same-name replacements from
 inheriting allocation, cancellation, transcript, terminal, or credential authority.
+
+Environment selector admission is deliberately narrow: `templateRef` cannot change;
+`backend` cannot change value or presence (including omitted to explicit `pod`); and
+`projectRef` may move once from absent/empty to non-empty, but can then neither change nor be
+cleared. Lifecycle and service intents remain independently mutable under their own validation.
+The Environment controller exclusively owns `status.provisioning`, whose exact schema is
+`template {name, uid, generation}`, `backend`, `image`, `size`, `resources` (resolved CPU and
+memory requests/limits), `runtimeClassName`, `diskSize`, and optional
+`project {name, uid, generation, repository}`, plus monotonic `templateVerified` and
+`projectVerified` capture-handshake bits. Status admission makes the snapshot immutable except
+for adding that Project object once, initially unverified, during warm-member promotion.
+
+Before creating any Pod, PVC, credential Secret, or NetworkPolicy, the controller uncached-reads
+the same Environment UID/generation and exact Template and optional Project UID/generation,
+resolves defaults, then atomically publishes the unverified snapshot. A later reconcile
+uncached-revalidates the exact sources and Environment selectors before monotonically marking
+the relevant capture verified; no child or warm capacity is created or counted before then. It never infers a snapshot from
+existing children: a legacy Environment with an owned provisioning child but no snapshot fails
+closed. Every later reconcile validates the complete snapshot and exact live source UIDs before
+consuming it. Deletion and recreation of a selected Template or bound Project under the same
+name therefore fences and removes execution rather than granting the replacement authority;
+the old snapshot is retained and the Environment does not silently recover.
+
+For one Environment incarnation, Template image, size/resolved CPU and memory, disk size,
+runtime-class name, and effective backend plus the Project repository are frozen provisioning
+inputs. Template generation and Project generation are recorded for diagnosis but live edits do
+not rewrite the snapshot. Template `idleTimeout` remains live lifecycle policy;
+`warmPool.min` remains live pool policy; and Project egress allowlist remains live security
+policy (currently any non-empty list fences execution as unsupported). Project-less warm members
+are current only when Template name/UID and the resolved provisioning projection match; generation
+alone is not compared because it can contain policy-only edits. A provisioning edit makes old
+members unclaimable and quarantined while bounded replacement members roll out; the existing
+five-minute cleanup grace and at-most-`2 * min` surge rules still apply. Policy-only idle/warm-pool
+edits do not stale otherwise-current members.
+
+A snapshotted non-empty RuntimeClass name is resolved on every provisioning attempt. The
+RuntimeClass UID is execution-scoped rather than stored in the snapshot: same-name UID
+replacement fences the old Pod and a subsequent attempt may use the replacement UID, while a
+missing named RuntimeClass fails before child creation. PVC expansion is not supported. The
+requested storage remains the snapshotted `diskSize`; changing a Template cannot resize an
+existing workspace, and a larger disk requires a new Environment.
 
 ### Tenancy and Project namespace lifecycle
 

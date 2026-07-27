@@ -199,6 +199,47 @@ func TestWarmPoolKeepsStaleGenerationFailure(t *testing.T) {
 	}
 }
 
+func TestWarmPoolProvisioningSnapshotCurrency(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := platformv1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	t.Run("provisioning edit quarantines stale member and replaces it", func(t *testing.T) {
+		tmpl := &platformv1alpha1.EnvironmentTemplate{ObjectMeta: metav1.ObjectMeta{Name: "small", Namespace: "default", UID: "template-uid", Generation: 1}, Spec: platformv1alpha1.EnvironmentTemplateSpec{Image: "image:v1", Size: "small", WarmPool: &platformv1alpha1.WarmPoolSpec{Min: 1}}}
+		env := &platformv1alpha1.Environment{ObjectMeta: metav1.ObjectMeta{Name: "warm-stale", Namespace: "default", UID: "env-uid", Generation: 1, Labels: map[string]string{warmPoolLabel: tmpl.Name}}, Spec: platformv1alpha1.EnvironmentSpec{TemplateRef: tmpl.Name}, Status: platformv1alpha1.EnvironmentStatus{Phase: platformv1alpha1.EnvironmentPhaseReady, ObservedGeneration: 1}}
+		setWarmPoolOwner(t, scheme, tmpl, env)
+		tmpl.Spec.Image = "image:v2"
+		tmpl.Generation++
+		base := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(tmpl).WithObjects(tmpl, env).Build()
+		r := &WarmPoolReconciler{Client: base, Scheme: scheme, Now: func() time.Time { return time.Unix(100, 0) }}
+		if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(tmpl)}); err != nil {
+			t.Fatal(err)
+		}
+		var stale platformv1alpha1.Environment
+		if err := base.Get(context.Background(), client.ObjectKeyFromObject(env), &stale); err != nil {
+			t.Fatal(err)
+		}
+		if warmPoolMemberCurrent(&stale, tmpl) || stale.Annotations[warmPoolCleanupAnnotation] == "" {
+			t.Fatalf("stale member remained claimable or unquarantined: %#v", stale)
+		}
+		var members platformv1alpha1.EnvironmentList
+		if err := base.List(context.Background(), &members, client.MatchingLabels{warmPoolLabel: tmpl.Name}); err != nil || len(members.Items) != 2 {
+			t.Fatalf("members = %d, err = %v; want stale plus replacement", len(members.Items), err)
+		}
+	})
+
+	t.Run("idle timeout edit remains current and claimable", func(t *testing.T) {
+		tmpl := &platformv1alpha1.EnvironmentTemplate{ObjectMeta: metav1.ObjectMeta{Name: "small", Namespace: "default", UID: "template-uid", Generation: 1}, Spec: platformv1alpha1.EnvironmentTemplateSpec{Image: "image:v1", Size: "small", WarmPool: &platformv1alpha1.WarmPoolSpec{Min: 1}}}
+		env := &platformv1alpha1.Environment{ObjectMeta: metav1.ObjectMeta{Name: "warm", Namespace: "default", UID: "env-uid", Labels: map[string]string{warmPoolLabel: tmpl.Name}}, Spec: platformv1alpha1.EnvironmentSpec{TemplateRef: tmpl.Name}, Status: platformv1alpha1.EnvironmentStatus{Phase: platformv1alpha1.EnvironmentPhaseReady}}
+		setWarmPoolOwner(t, scheme, tmpl, env)
+		tmpl.Spec.IdleTimeout = &metav1.Duration{Duration: 30 * time.Minute}
+		tmpl.Generation++
+		if !warmPoolMemberCurrent(env, tmpl) {
+			t.Fatal("idleTimeout-only edit made warm member unclaimable")
+		}
+	})
+}
+
 func TestWarmPoolReconcileDeletesOnlyUnclaimedUnusableEnvironment(t *testing.T) {
 	scheme := runtime.NewScheme()
 	if err := platformv1alpha1.AddToScheme(scheme); err != nil {
@@ -513,8 +554,8 @@ func TestWarmPoolReplacementSurgeRemainsBoundedWhenEveryMemberFails(t *testing.T
 		t.Fatal(err)
 	}
 	tmpl := &platformv1alpha1.EnvironmentTemplate{
-		ObjectMeta: metav1.ObjectMeta{Name: "small", Namespace: "default", UID: "template-uid"},
-		Spec:       platformv1alpha1.EnvironmentTemplateSpec{WarmPool: &platformv1alpha1.WarmPoolSpec{Min: 2}},
+		ObjectMeta: metav1.ObjectMeta{Name: "small", Namespace: "default", UID: "template-uid", Generation: 1},
+		Spec:       platformv1alpha1.EnvironmentTemplateSpec{Image: "example/environment:test", Size: "small", WarmPool: &platformv1alpha1.WarmPoolSpec{Min: 2}},
 	}
 	baseClient := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(tmpl, &platformv1alpha1.Environment{}).WithObjects(tmpl).Build()
 	r := &WarmPoolReconciler{Client: baseClient, Scheme: scheme, Now: func() time.Time { return time.Unix(4_000, 0) }}
@@ -564,8 +605,8 @@ func TestWarmPoolLiveMembershipSnapshotBoundsSurgeWithStaleCache(t *testing.T) {
 		t.Fatal(err)
 	}
 	tmpl := &platformv1alpha1.EnvironmentTemplate{
-		ObjectMeta: metav1.ObjectMeta{Name: "small", Namespace: "default", UID: "template-uid"},
-		Spec:       platformv1alpha1.EnvironmentTemplateSpec{WarmPool: &platformv1alpha1.WarmPoolSpec{Min: 2}},
+		ObjectMeta: metav1.ObjectMeta{Name: "small", Namespace: "default", UID: "template-uid", Generation: 1},
+		Spec:       platformv1alpha1.EnvironmentTemplateSpec{Image: "example/environment:test", Size: "small", WarmPool: &platformv1alpha1.WarmPoolSpec{Min: 2}},
 	}
 	liveClient := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(tmpl, &platformv1alpha1.Environment{}).WithObjects(tmpl).Build()
 	cachedMembershipLists := 0
@@ -640,6 +681,7 @@ func TestWarmPoolLiveMembershipSnapshotBoundsSurgeWithStaleCache(t *testing.T) {
 		if env.Status.Phase == platformv1alpha1.EnvironmentPhaseFailed {
 			continue
 		}
+		setTestProvisioningSnapshot(env, tmpl, nil)
 		env.Status.ExecutionGeneration = 1
 		applyEnvironmentStatus(env, platformv1alpha1.EnvironmentPhaseReady, "pod-"+env.Name, "10.0.0.1:50051", "SandboxdReady", "ready", nil)
 		if err := liveClient.Status().Update(context.Background(), env); err != nil {
@@ -848,8 +890,68 @@ func TestWarmPoolTemplateGenerationChangePreventsMemberCreation(t *testing.T) {
 	}
 }
 
+func TestWarmPoolTemplateReplacementAfterMemberCreateDeletesOldOwnerMember(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := platformv1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	tmpl := &platformv1alpha1.EnvironmentTemplate{
+		ObjectMeta: metav1.ObjectMeta{Name: "small", Namespace: "default", UID: "template-old", Generation: 1},
+		Spec:       platformv1alpha1.EnvironmentTemplateSpec{Image: "image", Size: "small", WarmPool: &platformv1alpha1.WarmPoolSpec{Min: 1}},
+	}
+	base := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(tmpl, &platformv1alpha1.Environment{}).WithObjects(tmpl).Build()
+	created := false
+	preconditionDeleted := false
+	intercepted := interceptor.NewClient(base, interceptor.Funcs{
+		Create: func(ctx context.Context, underlying client.WithWatch, object client.Object, options ...client.CreateOption) error {
+			if err := underlying.Create(ctx, object, options...); err != nil {
+				return err
+			}
+			if _, ok := object.(*platformv1alpha1.Environment); !ok || created {
+				return nil
+			}
+			created = true
+			var current platformv1alpha1.EnvironmentTemplate
+			if err := underlying.Get(ctx, client.ObjectKeyFromObject(tmpl), &current); err != nil {
+				return err
+			}
+			if err := underlying.Delete(ctx, &current); err != nil {
+				return err
+			}
+			replacement := tmpl.DeepCopy()
+			replacement.UID = "template-new"
+			replacement.ResourceVersion = ""
+			return underlying.Create(ctx, replacement)
+		},
+		Delete: func(ctx context.Context, underlying client.WithWatch, object client.Object, options ...client.DeleteOption) error {
+			if _, ok := object.(*platformv1alpha1.Environment); ok {
+				deleteOptions := (&client.DeleteOptions{}).ApplyOptions(options)
+				if deleteOptions.Preconditions == nil || deleteOptions.Preconditions.UID == nil || deleteOptions.Preconditions.ResourceVersion == nil ||
+					*deleteOptions.Preconditions.UID != object.GetUID() || *deleteOptions.Preconditions.ResourceVersion != object.GetResourceVersion() {
+					t.Fatalf("stale member delete preconditions = %#v", deleteOptions.Preconditions)
+				}
+				preconditionDeleted = true
+			}
+			return underlying.Delete(ctx, object, options...)
+		},
+	})
+	r := &WarmPoolReconciler{Client: intercepted, APIReader: base, Scheme: scheme}
+	result, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(tmpl)})
+	if err != nil || !result.Requeue || !created || !preconditionDeleted {
+		t.Fatalf("post-Create replacement Reconcile() = (%#v, %v), created=%t, preconditionDeleted=%t; want clean requeue", result, err, created, preconditionDeleted)
+	}
+	var members platformv1alpha1.EnvironmentList
+	if err := base.List(context.Background(), &members); err != nil {
+		t.Fatal(err)
+	}
+	if len(members.Items) != 0 {
+		t.Fatalf("old-owner member survived post-Create replacement: %#v", members.Items)
+	}
+}
+
 func setWarmPoolOwner(t *testing.T, scheme *runtime.Scheme, tmpl *platformv1alpha1.EnvironmentTemplate, env *platformv1alpha1.Environment) {
 	t.Helper()
+	setTestProvisioningSnapshot(env, tmpl, nil)
 	if env.Status.Phase == platformv1alpha1.EnvironmentPhaseReady || env.Status.Phase == platformv1alpha1.EnvironmentPhaseRunning {
 		env.Status.ExecutionGeneration = 1
 	}

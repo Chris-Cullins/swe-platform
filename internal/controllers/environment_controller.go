@@ -58,7 +58,7 @@ const (
 	podRecoveryDelay              = 5 * time.Second
 	templateRefField              = "spec.templateRef"
 	projectRefField               = "spec.projectRef"
-	runtimeClassField             = "spec.runtimeClass"
+	provisioningRuntimeClassField = "status.provisioning.runtimeClassName"
 	warmPoolLabel                 = "swe.dev/warm-pool"
 	projectAnnotation             = "swe.dev/project"
 	runtimeClassUIDAnnotation     = "swe.dev/runtime-class-uid"
@@ -463,7 +463,9 @@ func (r *EnvironmentReconciler) ensureWorkspacePVC(ctx context.Context, env *pla
 	}
 
 	size := resource.MustParse(defaultDiskSize)
-	if tmpl.Spec.DiskSize != nil {
+	if env.Status.Provisioning != nil {
+		size = env.Status.Provisioning.DiskSize.DeepCopy()
+	} else if tmpl.Spec.DiskSize != nil {
 		size = *tmpl.Spec.DiskSize
 	}
 
@@ -521,9 +523,13 @@ func (r *EnvironmentReconciler) ensurePod(ctx context.Context, env *platformv1al
 		return nil, err
 	}
 	runtimeClassUID := types.UID("")
-	if tmpl.Spec.RuntimeClass != "" {
+	runtimeClassName := tmpl.Spec.RuntimeClass
+	if env.Status.Provisioning != nil {
+		runtimeClassName = env.Status.Provisioning.RuntimeClassName
+	}
+	if runtimeClassName != "" {
 		var runtimeClass nodev1.RuntimeClass
-		if err := r.Get(ctx, types.NamespacedName{Name: tmpl.Spec.RuntimeClass}, &runtimeClass); err != nil {
+		if err := r.apiReader().Get(ctx, types.NamespacedName{Name: runtimeClassName}, &runtimeClass); err != nil {
 			return nil, err
 		}
 		runtimeClassUID = runtimeClass.UID
@@ -536,7 +542,7 @@ func (r *EnvironmentReconciler) resolveEnvironmentProject(ctx context.Context, e
 		return nil, nil
 	}
 	var project platformv1alpha1.Project
-	if err := r.Get(ctx, types.NamespacedName{Namespace: env.Namespace, Name: env.Spec.ProjectRef}, &project); err != nil {
+	if err := r.apiReader().Get(ctx, types.NamespacedName{Namespace: env.Namespace, Name: env.Spec.ProjectRef}, &project); err != nil {
 		wrapped := fmt.Errorf("get project %q: %w", env.Spec.ProjectRef, err)
 		if errors.IsNotFound(err) {
 			wrapped = terminalEnvironment(wrapped)
@@ -547,6 +553,9 @@ func (r *EnvironmentReconciler) resolveEnvironmentProject(ctx context.Context, e
 }
 
 func validateEnvironmentProject(project *platformv1alpha1.Project) error {
+	if project != nil && !project.DeletionTimestamp.IsZero() {
+		return terminalEnvironment(fmt.Errorf("project %q is deleting", project.Name))
+	}
 	if project != nil && len(project.Spec.Repositories) != 1 {
 		return terminalEnvironment(fmt.Errorf("project %q must have exactly one repository, got %d", project.Name, len(project.Spec.Repositories)))
 	}
@@ -644,6 +653,21 @@ func (r *EnvironmentReconciler) ensurePodForProject(ctx context.Context, env *pl
 	}
 
 	resources, ok := sizePresets[tmpl.Spec.Size]
+	image := tmpl.Spec.Image
+	runtimeClassName := tmpl.Spec.RuntimeClass
+	repository := ""
+	if env.Status.Provisioning != nil {
+		resources = make(corev1.ResourceList, len(env.Status.Provisioning.Resources))
+		for name, quantity := range env.Status.Provisioning.Resources {
+			resources[corev1.ResourceName(name)] = quantity.DeepCopy()
+		}
+		ok = true
+		image = env.Status.Provisioning.Image
+		runtimeClassName = env.Status.Provisioning.RuntimeClassName
+		if env.Status.Provisioning.Project != nil {
+			repository = env.Status.Provisioning.Project.Repository
+		}
+	}
 	if !ok {
 		resources = sizePresets["medium"]
 	}
@@ -673,8 +697,8 @@ func (r *EnvironmentReconciler) ensurePodForProject(ctx context.Context, env *pl
 			},
 			Containers: []corev1.Container{{
 				Name:            "environment",
-				Image:           tmpl.Spec.Image,
-				ImagePullPolicy: envImagePullPolicy(tmpl.Spec.Image),
+				Image:           image,
+				ImagePullPolicy: envImagePullPolicy(image),
 				Command:         []string{"sandboxd", "serve"},
 				Args: []string{
 					"-tls-cert=" + sandboxdCredentialMount + "/" + sandboxdauth.TLSCertKey,
@@ -738,12 +762,14 @@ func (r *EnvironmentReconciler) ensurePodForProject(ctx context.Context, env *pl
 			},
 		},
 	}
-	if tmpl.Spec.RuntimeClass != "" {
-		pod.Spec.RuntimeClassName = &tmpl.Spec.RuntimeClass
+	if runtimeClassName != "" {
+		pod.Spec.RuntimeClassName = &runtimeClassName
 		pod.Annotations[runtimeClassUIDAnnotation] = string(runtimeClassUID)
 	}
 	if project != nil {
-		repository := project.Spec.Repositories[0]
+		if repository == "" {
+			repository = project.Spec.Repositories[0]
+		}
 		projectEnv := []corev1.EnvVar{
 			{Name: "SWE_REPOSITORY", Value: repository},
 			{Name: "SWE_HOOK_TIMEOUT", Value: projectHookTimeout},
@@ -754,8 +780,8 @@ func (r *EnvironmentReconciler) ensurePodForProject(ctx context.Context, env *pl
 		}
 		pod.Spec.InitContainers = []corev1.Container{{
 			Name:                     "project-setup",
-			Image:                    tmpl.Spec.Image,
-			ImagePullPolicy:          envImagePullPolicy(tmpl.Spec.Image),
+			Image:                    image,
+			ImagePullPolicy:          envImagePullPolicy(image),
 			Command:                  []string{"/bin/sh", "-c", projectSetupScript},
 			Env:                      projectEnv,
 			TerminationMessagePolicy: corev1.TerminationMessageFallbackToLogsOnError,

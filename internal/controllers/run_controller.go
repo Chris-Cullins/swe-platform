@@ -752,8 +752,7 @@ func (r *RunReconciler) claimWarmEnvironment(ctx context.Context, run *platformv
 	}
 	for i := range environments.Items {
 		env := &environments.Items[i]
-		if env.Spec.TemplateRef != template || environmentSuspended(env) || !platformv1alpha1.IsEnvironmentReady(env) || env.Status.ClaimedBy != nil ||
-			!exactControllerOwner(env, platformv1alpha1.GroupVersion.String(), "EnvironmentTemplate", currentTemplate.Name, currentTemplate.UID) {
+		if environmentSuspended(env) || !platformv1alpha1.IsEnvironmentReady(env) || env.Status.ClaimedBy != nil || !warmPoolMemberCurrent(env, &currentTemplate) {
 			continue
 		}
 		now := metav1.Now()
@@ -767,7 +766,7 @@ func (r *RunReconciler) claimWarmEnvironment(ctx context.Context, run *platformv
 		}
 		var confirmedTemplate platformv1alpha1.EnvironmentTemplate
 		if err := r.apiReader().Get(ctx, types.NamespacedName{Namespace: run.Namespace, Name: template}, &confirmedTemplate); err != nil ||
-			!confirmedTemplate.DeletionTimestamp.IsZero() || confirmedTemplate.UID != currentTemplate.UID {
+			!confirmedTemplate.DeletionTimestamp.IsZero() || !warmPoolMemberCurrent(env, &confirmedTemplate) {
 			if releaseErr := r.releaseClaim(ctx, run, env); releaseErr != nil {
 				return nil, fmt.Errorf("release warm environment %q after template changed: %w", env.Name, releaseErr)
 			}
@@ -870,7 +869,7 @@ func (r *RunReconciler) currentUnpromotedWarmClaim(ctx context.Context, env *pla
 	if !template.DeletionTimestamp.IsZero() {
 		return false, nil
 	}
-	return exactControllerOwner(env, platformv1alpha1.GroupVersion.String(), "EnvironmentTemplate", template.Name, template.UID), nil
+	return warmPoolMemberCurrent(env, &template), nil
 }
 
 func environmentFenced(env *platformv1alpha1.Environment) bool {

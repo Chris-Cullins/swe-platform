@@ -543,6 +543,22 @@ uses `Recreate` operator upgrades during this transition. Readiness clears both 
 fields are scheduled for removal after that compatibility rollout; clients must use
 `status.recovery` now.
 
+Before creating infrastructure, the operator publishes `Environment.status.provisioning`: the
+exact Template name/UID/generation, effective backend, image, size, resolved CPU/memory,
+RuntimeClass name and disk size, plus the bound Project name/UID/generation and repository when
+present. Monotonic Template and Project verification flags record a separate uncached
+post-publication source check; no provisioning child or warm capacity is created or counted
+until the required checks complete. That snapshot is reused for Pod replacement and pause/resume. Template image, size,
+disk, RuntimeClass and backend edits, and Project repository edits therefore affect future
+Environments, not existing ones. Template `idleTimeout` and `warmPool.min`, and Project egress
+policy, remain live policy. Workspace PVC expansion is unsupported: create a new Environment to
+request a different disk size.
+
+`templateRef` and an explicit backend (including whether it was specified) are immutable.
+`projectRef` can only be added once to a Project-less warm Environment and then cannot change or
+be cleared. Deleting and recreating the selected Template or Project under the same name does
+not retarget an Environment: UID checks fail closed and fence its execution.
+
 Transient operational reconciliation errors withdraw readiness with an `OperationalError`
 reason and use controller-runtime's rate-limited retry; they do not put the Environment in the
 terminal `Failed` phase. Missing or blank references, invalid specifications, and deterministic
@@ -567,6 +583,9 @@ stable across operator restarts. Replacement surge is bounded to the configured 
 most twice the minimum exact, unclaimed members remain while an entire replacement set is also
 quarantined. Cleanup requires exact Template ownership and UID/resourceVersion preconditions, so
 concurrent claims and promotions win without being deleted.
+Provisioning edits make old warm members stale and unclaimable; the pool creates current
+replacements and quarantines stale members under the same bounded surge and cleanup rules.
+Changes only to `idleTimeout` or `warmPool.min` do not stale otherwise-current members.
 
 Only the `pod` environment backend is currently supported. An explicit
 `Environment.spec.backend` takes precedence over its template's backend; unsupported

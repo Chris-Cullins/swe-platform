@@ -109,6 +109,9 @@ func (c Connector) ExecutionCurrent(ctx context.Context, fence lifecycle.Executi
 		!platformv1alpha1.IsEnvironmentReady(env) || env.Status.PodName != execution.podName || env.Status.Endpoints.Sandboxd == "" {
 		return false, nil
 	}
+	if err := c.validateProvisioningSources(ctx, env); err != nil {
+		return false, nil
+	}
 	var pod corev1.Pod
 	if err := c.Reader.Get(ctx, types.NamespacedName{Namespace: env.Namespace, Name: execution.podName}, &pod); apierrors.IsNotFound(err) {
 		return false, nil
@@ -265,11 +268,10 @@ func (c Connector) resolvePodForEnvironment(ctx context.Context, env *platformv1
 	if !processEnvironmentReachable(env) {
 		return nil, nil, fmt.Errorf("environment is not the current reachable incarnation")
 	}
-	var template platformv1alpha1.EnvironmentTemplate
-	if err := c.Reader.Get(ctx, types.NamespacedName{Namespace: env.Namespace, Name: env.Spec.TemplateRef}, &template); err != nil {
-		return nil, nil, fmt.Errorf("get environment template: %w", err)
+	if err := c.validateProvisioningSources(ctx, env); err != nil {
+		return nil, nil, err
 	}
-	if backend := platformv1alpha1.EffectiveEnvironmentBackend(env, &template); backend != platformv1alpha1.EnvironmentBackendPod {
+	if backend := env.Status.Provisioning.Backend; backend != platformv1alpha1.EnvironmentBackendPod {
 		return nil, nil, fmt.Errorf("environment backend %q is not supported", backend)
 	}
 	var pod corev1.Pod
@@ -291,6 +293,30 @@ func (c Connector) resolvePodForEnvironment(ctx context.Context, env *platformv1
 		return nil, nil, fmt.Errorf("environment pod does not identify the current execution generation")
 	}
 	return &pod, &template, nil
+}
+
+func (c Connector) validateProvisioningSources(ctx context.Context, env *platformv1alpha1.Environment) error {
+	if err := platformv1alpha1.ValidateEnvironmentProvisioningSnapshot(env, env.Status.Provisioning); err != nil {
+		return err
+	}
+	snapshot := env.Status.Provisioning
+	var template platformv1alpha1.EnvironmentTemplate
+	if err := c.Reader.Get(ctx, types.NamespacedName{Namespace: env.Namespace, Name: snapshot.Template.Name}, &template); err != nil {
+		return fmt.Errorf("get snapshotted environment template: %w", err)
+	}
+	if template.UID != snapshot.Template.UID || !template.DeletionTimestamp.IsZero() {
+		return fmt.Errorf("snapshotted environment template is not the current live incarnation")
+	}
+	if snapshot.Project != nil {
+		var project platformv1alpha1.Project
+		if err := c.Reader.Get(ctx, types.NamespacedName{Namespace: env.Namespace, Name: snapshot.Project.Name}, &project); err != nil {
+			return fmt.Errorf("get snapshotted project: %w", err)
+		}
+		if project.UID != snapshot.Project.UID || !project.DeletionTimestamp.IsZero() {
+			return fmt.Errorf("snapshotted project is not the current live incarnation")
+		}
+	}
+	return nil
 }
 
 func parseExecutionGeneration(pod *corev1.Pod) (int64, bool) {

@@ -37,6 +37,43 @@ import (
 	sandboxdauth "github.com/Chris-Cullins/swe-platform/sandboxd/auth"
 )
 
+// setTestProvisioningSnapshot gives fixtures that represent an already
+// provisioned Environment the same immutable inputs the controller publishes.
+func setTestProvisioningSnapshot(env *platformv1alpha1.Environment, tmpl *platformv1alpha1.EnvironmentTemplate, project *platformv1alpha1.Project) {
+	if env.UID == "" {
+		env.UID = "environment-uid"
+	}
+	if tmpl.Name == "" {
+		tmpl.Name = env.Spec.TemplateRef
+	}
+	if tmpl.Namespace == "" {
+		tmpl.Namespace = env.Namespace
+	}
+	if tmpl.UID == "" {
+		tmpl.UID = types.UID(tmpl.Name + "-uid")
+	}
+	if tmpl.Generation < 1 {
+		tmpl.Generation = 1
+	}
+	if tmpl.Spec.Image == "" {
+		tmpl.Spec.Image = "example/environment:test"
+	}
+	if tmpl.Spec.Size == "" {
+		tmpl.Spec.Size = "small"
+	}
+	if project != nil {
+		if project.UID == "" {
+			project.UID = types.UID(project.Name + "-uid")
+		}
+		if project.Generation < 1 {
+			project.Generation = 1
+		}
+	}
+	env.Status.Provisioning = platformv1alpha1.ResolveEnvironmentProvisioning(env, tmpl, project)
+	env.Status.Provisioning.TemplateVerified = true
+	env.Status.Provisioning.ProjectVerified = project != nil
+}
+
 func TestEnsurePodUsesOnlyNonSecretProjectValues(t *testing.T) {
 	scheme := runtime.NewScheme()
 	if err := corev1.AddToScheme(scheme); err != nil {
@@ -125,6 +162,9 @@ func TestEnsurePodRejectsInvalidProjectRepositoryCounts(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			scheme := runtime.NewScheme()
 			if err := corev1.AddToScheme(scheme); err != nil {
+				t.Fatal(err)
+			}
+			if err := networkingv1.AddToScheme(scheme); err != nil {
 				t.Fatal(err)
 			}
 			if err := platformv1alpha1.AddToScheme(scheme); err != nil {
@@ -1002,6 +1042,7 @@ func TestTerminatingFailedPodPersistsRecoveryBeforeReplacement(t *testing.T) {
 		},
 	}
 	template := &platformv1alpha1.EnvironmentTemplate{ObjectMeta: metav1.ObjectMeta{Name: "small", Namespace: env.Namespace}}
+	setTestProvisioningSnapshot(env, template, nil)
 	pvc := &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: envPVCName(env), Namespace: env.Namespace, UID: "workspace-pvc"}}
 	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
 		Name: envPodName(env), Namespace: env.Namespace, UID: "dead-pod", DeletionTimestamp: &deletedAt, Finalizers: []string{"test/hold"},
@@ -1150,6 +1191,7 @@ func TestReconcileHonorsRecoveryWhenTerminalPodIsMissing(t *testing.T) {
 				env.Status.Recovery.NextAttemptAt = &next
 			}
 			template := &platformv1alpha1.EnvironmentTemplate{ObjectMeta: metav1.ObjectMeta{Name: "small", Namespace: env.Namespace}}
+			setTestProvisioningSnapshot(env, template, nil)
 			pvc := &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: envPVCName(env), Namespace: env.Namespace, UID: "workspace-pvc"}}
 			if err := controllerutil.SetControllerReference(env, pvc, scheme); err != nil {
 				t.Fatal(err)
@@ -1719,9 +1761,11 @@ func TestReconcileUsesUncachedEnvironmentWithLiveExecution(t *testing.T) {
 			stale := current.DeepCopy()
 			test.mutate(stale)
 			template := &platformv1alpha1.EnvironmentTemplate{
-				ObjectMeta: metav1.ObjectMeta{Name: "small", Namespace: current.Namespace},
+				ObjectMeta: metav1.ObjectMeta{Name: "small", Namespace: current.Namespace, UID: "template-uid", Generation: 1},
 				Spec:       platformv1alpha1.EnvironmentTemplateSpec{Image: "example/environment:latest", Size: "small"},
 			}
+			setTestProvisioningSnapshot(current, template, nil)
+			stale.Status.Provisioning = current.Status.Provisioning.DeepCopy()
 			pod := &corev1.Pod{
 				ObjectMeta: metav1.ObjectMeta{
 					Name: envPodName(current), Namespace: current.Namespace, UID: "pod-uid",
@@ -1904,6 +1948,7 @@ func TestReconcileReportsStableChildOwnershipCondition(t *testing.T) {
 		Spec:       platformv1alpha1.EnvironmentSpec{TemplateRef: "small"},
 	}
 	template := &platformv1alpha1.EnvironmentTemplate{ObjectMeta: metav1.ObjectMeta{Name: "small", Namespace: "default"}}
+	setTestProvisioningSnapshot(env, template, nil)
 	foreignPVC := &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: envPVCName(env), Namespace: env.Namespace}}
 	reconciler := &EnvironmentReconciler{
 		Client: fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(env).WithObjects(env, template, foreignPVC).Build(), Scheme: scheme,
@@ -1944,8 +1989,10 @@ func TestOperationalFailureRetriesAndRecoversReadiness(t *testing.T) {
 	env := &platformv1alpha1.Environment{
 		ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default", UID: "environment-uid", Generation: 2, Finalizers: []string{environmentFinalizer}},
 		Spec:       platformv1alpha1.EnvironmentSpec{TemplateRef: "small"},
+		Status:     platformv1alpha1.EnvironmentStatus{ExecutionGeneration: 1},
 	}
 	template := &platformv1alpha1.EnvironmentTemplate{ObjectMeta: metav1.ObjectMeta{Name: "small", Namespace: "default"}}
+	setTestProvisioningSnapshot(env, template, nil)
 	baseClient := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(env).WithObjects(env, template).Build()
 	transient := apierrors.NewServiceUnavailable("temporary template API failure")
 	failTemplateGet := true
@@ -2042,7 +2089,7 @@ func TestNamedRuntimeClassMustExistBeforeProvisioningAndRecovers(t *testing.T) {
 		Spec:       platformv1alpha1.EnvironmentSpec{TemplateRef: "isolated"},
 	}
 	template := &platformv1alpha1.EnvironmentTemplate{
-		ObjectMeta: metav1.ObjectMeta{Name: "isolated", Namespace: env.Namespace},
+		ObjectMeta: metav1.ObjectMeta{Name: "isolated", Namespace: env.Namespace, UID: "template-uid", Generation: 1},
 		Spec:       platformv1alpha1.EnvironmentTemplateSpec{Image: "example/environment:dev", Size: "small", RuntimeClass: "gvisor"},
 	}
 	baseClient := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(env).WithObjects(env, template).Build()
@@ -2050,6 +2097,9 @@ func TestNamedRuntimeClassMustExistBeforeProvisioningAndRecovers(t *testing.T) {
 	request := ctrl.Request{NamespacedName: client.ObjectKeyFromObject(env)}
 
 	result, err := reconciler.Reconcile(context.Background(), request)
+	for i := 0; i < 2 && err == nil && result.Requeue; i++ {
+		result, err = reconciler.Reconcile(context.Background(), request)
+	}
 	if err != nil || result != (ctrl.Result{}) {
 		t.Fatalf("missing RuntimeClass Reconcile() = (%#v, %v), want terminal success", result, err)
 	}
@@ -2115,6 +2165,7 @@ func TestRuntimeClassReplacementFencesOwnedExecutionInOrder(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{Name: "isolated", Namespace: env.Namespace},
 		Spec:       platformv1alpha1.EnvironmentTemplateSpec{Image: "example/environment:dev", Size: "small", RuntimeClass: "gvisor"},
 	}
+	setTestProvisioningSnapshot(env, template, nil)
 	runtimeClass := &nodev1.RuntimeClass{ObjectMeta: metav1.ObjectMeta{Name: "gvisor", UID: "runtime-new"}, Handler: "runsc"}
 	controller := true
 	owner := metav1.OwnerReference{APIVersion: platformv1alpha1.GroupVersion.String(), Kind: "Environment", Name: env.Name, UID: env.UID, Controller: &controller}
@@ -2163,7 +2214,7 @@ func TestRuntimeClassReplacementFencesOwnedExecutionInOrder(t *testing.T) {
 	}
 }
 
-func TestMissingTemplateFencesOwnedExecutionInOrderAndRecovers(t *testing.T) {
+func TestSameNameTemplateReplacementFencesOwnedExecutionAndFailsClosed(t *testing.T) {
 	scheme := runtime.NewScheme()
 	if err := corev1.AddToScheme(scheme); err != nil {
 		t.Fatal(err)
@@ -2183,6 +2234,12 @@ func TestMissingTemplateFencesOwnedExecutionInOrderAndRecovers(t *testing.T) {
 			Conditions: []metav1.Condition{{Type: platformv1alpha1.EnvironmentConditionReady, Status: metav1.ConditionTrue, ObservedGeneration: 2, Reason: "SandboxdReady"}},
 		},
 	}
+	originalTemplate := &platformv1alpha1.EnvironmentTemplate{
+		ObjectMeta: metav1.ObjectMeta{Name: "missing", Namespace: env.Namespace, UID: "original-template-uid", Generation: 1},
+		Spec:       platformv1alpha1.EnvironmentTemplateSpec{Image: "example/environment:old", Size: "small"},
+	}
+	setTestProvisioningSnapshot(env, originalTemplate, nil)
+	originalSnapshot := env.Status.Provisioning.DeepCopy()
 	controller := true
 	owner := metav1.OwnerReference{APIVersion: platformv1alpha1.GroupVersion.String(), Kind: "Environment", Name: env.Name, UID: env.UID, Controller: &controller}
 	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: envPodName(env), Namespace: env.Namespace, UID: "pod-uid", OwnerReferences: []metav1.OwnerReference{owner}}}
@@ -2254,8 +2311,15 @@ func TestMissingTemplateFencesOwnedExecutionInOrderAndRecovers(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if !restored {
-		t.Fatal("Template recreation did not restore provisioning")
+	if restored {
+		t.Fatal("same-name Template replacement restored provisioning")
+	}
+	var retained platformv1alpha1.Environment
+	if err := baseClient.Get(context.Background(), client.ObjectKeyFromObject(env), &retained); err != nil {
+		t.Fatal(err)
+	}
+	if !platformv1alpha1.ProvisioningSnapshotsEqual(retained.Status.Provisioning, originalSnapshot) {
+		t.Fatalf("immutable provisioning snapshot changed: %#v", retained.Status.Provisioning)
 	}
 	if err := baseClient.Get(context.Background(), client.ObjectKeyFromObject(pvc), &corev1.PersistentVolumeClaim{}); err != nil {
 		t.Fatal("recovery replaced or removed the retained workspace PVC")
@@ -2370,12 +2434,18 @@ func TestBlankTemplateRefIsTerminalAndCorrectedSpecRecovers(t *testing.T) {
 	if err := baseClient.Update(context.Background(), &failed); err != nil {
 		t.Fatal(err)
 	}
-	template := &platformv1alpha1.EnvironmentTemplate{ObjectMeta: metav1.ObjectMeta{Name: "small", Namespace: "default"}, Spec: platformv1alpha1.EnvironmentTemplateSpec{Image: "example/environment:dev"}}
+	template := &platformv1alpha1.EnvironmentTemplate{ObjectMeta: metav1.ObjectMeta{Name: "small", Namespace: "default", UID: "template-uid", Generation: 1}, Spec: platformv1alpha1.EnvironmentTemplateSpec{Image: "example/environment:dev"}}
 	if err := baseClient.Create(context.Background(), template); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := reconciler.Reconcile(context.Background(), request); err != nil {
 		t.Fatalf("corrected spec did not recover: %v", err)
+	}
+	if _, err := reconciler.Reconcile(context.Background(), request); err != nil {
+		t.Fatalf("corrected spec did not provision after snapshot: %v", err)
+	}
+	if _, err := reconciler.Reconcile(context.Background(), request); err != nil {
+		t.Fatalf("corrected spec did not provision after verification: %v", err)
 	}
 	var recovering platformv1alpha1.Environment
 	if err := baseClient.Get(context.Background(), client.ObjectKeyFromObject(env), &recovering); err != nil {
@@ -2413,10 +2483,11 @@ func TestReferenceWatchMappersWakeTerminalEnvironments(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{Name: "isolated", Namespace: runtimeEnv.Namespace},
 		Spec:       platformv1alpha1.EnvironmentTemplateSpec{RuntimeClass: "gvisor"},
 	}
+	setTestProvisioningSnapshot(runtimeEnv, runtimeTemplate, nil)
 	baseClient := fake.NewClientBuilder().WithScheme(scheme).
 		WithIndex(&platformv1alpha1.Environment{}, templateRefField, environmentTemplateRefIndex).
 		WithIndex(&platformv1alpha1.Environment{}, projectRefField, environmentProjectRefIndex).
-		WithIndex(&platformv1alpha1.EnvironmentTemplate{}, runtimeClassField, templateRuntimeClassIndex).
+		WithIndex(&platformv1alpha1.Environment{}, provisioningRuntimeClassField, environmentRuntimeClassIndex).
 		WithObjects(templateEnv, projectEnv, runtimeEnv, runtimeTemplate).Build()
 	reconciler := &EnvironmentReconciler{Client: baseClient}
 
@@ -2450,6 +2521,9 @@ func TestInvalidChildCreationIsTerminalValidationFailure(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			scheme := runtime.NewScheme()
 			if err := corev1.AddToScheme(scheme); err != nil {
+				t.Fatal(err)
+			}
+			if err := networkingv1.AddToScheme(scheme); err != nil {
 				t.Fatal(err)
 			}
 			if err := platformv1alpha1.AddToScheme(scheme); err != nil {
@@ -2528,7 +2602,7 @@ func TestReconcileRejectsUnsupportedEgressAllowlistBeforeCreatingChildren(t *tes
 		t.Fatal(err)
 	}
 	project := &platformv1alpha1.Project{
-		ObjectMeta: metav1.ObjectMeta{Name: "project", Namespace: "default"},
+		ObjectMeta: metav1.ObjectMeta{Name: "project", Namespace: "default", UID: "project-uid", Generation: 1},
 		Spec: platformv1alpha1.ProjectSpec{
 			Repositories:    []string{"https://github.com/example/repo"},
 			EgressAllowlist: []string{"github.com"},
@@ -2582,7 +2656,7 @@ func TestUnsupportedEgressAllowlistFencesExactOwnedExecutionAndRetainsWorkspace(
 		t.Fatal(err)
 	}
 	project := &platformv1alpha1.Project{
-		ObjectMeta: metav1.ObjectMeta{Name: "project", Namespace: "default"},
+		ObjectMeta: metav1.ObjectMeta{Name: "project", Namespace: "default", UID: "project-uid", Generation: 1},
 		Spec:       platformv1alpha1.ProjectSpec{Repositories: []string{"https://github.com/example/repo"}, EgressAllowlist: []string{"github.com"}},
 	}
 	env := &platformv1alpha1.Environment{
@@ -2770,14 +2844,14 @@ func TestUnsupportedEgressAllowlistRecoversAfterProjectIsCleared(t *testing.T) {
 		t.Fatal(err)
 	}
 	project := &platformv1alpha1.Project{
-		ObjectMeta: metav1.ObjectMeta{Name: "project", Namespace: "default"},
+		ObjectMeta: metav1.ObjectMeta{Name: "project", Namespace: "default", UID: "project-uid", Generation: 1},
 		Spec:       platformv1alpha1.ProjectSpec{Repositories: []string{"https://github.com/example/repo"}, EgressAllowlist: []string{"github.com"}},
 	}
 	env := &platformv1alpha1.Environment{
 		ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default", UID: "environment-uid", Generation: 1, Finalizers: []string{environmentFinalizer}},
 		Spec:       platformv1alpha1.EnvironmentSpec{TemplateRef: "small", ProjectRef: project.Name},
 	}
-	template := &platformv1alpha1.EnvironmentTemplate{ObjectMeta: metav1.ObjectMeta{Name: "small", Namespace: "default"}, Spec: platformv1alpha1.EnvironmentTemplateSpec{Image: "example/environment:dev", Size: "small"}}
+	template := &platformv1alpha1.EnvironmentTemplate{ObjectMeta: metav1.ObjectMeta{Name: "small", Namespace: "default", UID: "template-uid", Generation: 1}, Spec: platformv1alpha1.EnvironmentTemplateSpec{Image: "example/environment:dev", Size: "small"}}
 	reconciler := &EnvironmentReconciler{
 		Client: fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(env).WithObjects(env, project, template).Build(), Scheme: scheme,
 	}
@@ -2795,6 +2869,21 @@ func TestUnsupportedEgressAllowlistRecoversAfterProjectIsCleared(t *testing.T) {
 	}
 	if _, err := reconciler.Reconcile(context.Background(), request); err != nil {
 		t.Fatalf("Reconcile() after clearing allowlist: %v", err)
+	}
+	for range 8 {
+		var created corev1.Pod
+		if err := reconciler.Get(context.Background(), types.NamespacedName{Namespace: env.Namespace, Name: envPodName(env)}, &created); err == nil && created.UID == "" {
+			created.UID = "pod-uid"
+			if err := reconciler.Update(context.Background(), &created); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if _, err := reconciler.Reconcile(context.Background(), request); err != nil {
+			t.Fatalf("Reconcile() while provisioning after clearing allowlist: %v", err)
+		}
+		if err := reconciler.Get(context.Background(), types.NamespacedName{Namespace: env.Namespace, Name: envPodName(env)}, &created); err == nil {
+			break
+		}
 	}
 	var pod corev1.Pod
 	if err := reconciler.Get(context.Background(), types.NamespacedName{Namespace: env.Namespace, Name: envPodName(env)}, &pod); err != nil {
@@ -2873,6 +2962,9 @@ func TestReconcileRejectsUnsupportedEffectiveBackendBeforeCreatingChildren(t *te
 			if err := corev1.AddToScheme(scheme); err != nil {
 				t.Fatal(err)
 			}
+			if err := networkingv1.AddToScheme(scheme); err != nil {
+				t.Fatal(err)
+			}
 			if err := platformv1alpha1.AddToScheme(scheme); err != nil {
 				t.Fatal(err)
 			}
@@ -2881,13 +2973,28 @@ func TestReconcileRejectsUnsupportedEffectiveBackendBeforeCreatingChildren(t *te
 				Spec:       platformv1alpha1.EnvironmentSpec{TemplateRef: "small", Backend: test.environment},
 			}
 			template := &platformv1alpha1.EnvironmentTemplate{
-				ObjectMeta: metav1.ObjectMeta{Name: "small", Namespace: "default"},
-				Spec:       platformv1alpha1.EnvironmentTemplateSpec{Backend: test.template},
+				ObjectMeta: metav1.ObjectMeta{Name: "small", Namespace: "default", UID: "template-uid", Generation: 1},
+				Spec:       platformv1alpha1.EnvironmentTemplateSpec{Backend: test.template, Image: "example/environment:test", Size: "small"},
 			}
 			reconciler := &EnvironmentReconciler{Client: fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(env).WithObjects(env, template).Build(), Scheme: scheme}
-			result, err := reconciler.Reconcile(context.Background(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(env)})
+			var result ctrl.Result
+			var err error
+			for range 10 {
+				result, err = reconciler.Reconcile(context.Background(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(env)})
+				if err != nil {
+					break
+				}
+				var terminal platformv1alpha1.Environment
+				if getErr := reconciler.Get(context.Background(), client.ObjectKeyFromObject(env), &terminal); getErr != nil {
+					t.Fatal(getErr)
+				}
+				if terminal.Status.Phase == platformv1alpha1.EnvironmentPhaseFailed {
+					result = ctrl.Result{}
+					break
+				}
+			}
 			if err != nil || result.Requeue || result.RequeueAfter != 0 {
-				t.Fatalf("Reconcile() = (%#v, %v), want terminal success", result, err)
+				t.Fatalf("Reconcile() = (%#v, %v), want terminal success after snapshot publication", result, err)
 			}
 			var updated platformv1alpha1.Environment
 			if err := reconciler.Get(context.Background(), client.ObjectKeyFromObject(env), &updated); err != nil {

@@ -252,6 +252,155 @@ func TestGuardedClientLeaseBindsCompleteClaim(t *testing.T) {
 	}
 }
 
+func TestEnvironmentStaleProjectFenceLeaseIsNarrowAndRevocable(t *testing.T) {
+	i, namespace, project := fixture(LifecycleActive)
+	env := &platformv1alpha1.Environment{ObjectMeta: metav1.ObjectMeta{Name: "work", Namespace: "team", UID: "e-1"}}
+	controller := true
+	owner := metav1.OwnerReference{APIVersion: platformv1alpha1.GroupVersion.String(), Kind: "Environment", Name: env.Name, UID: env.UID, Controller: &controller}
+	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "work", Namespace: "team", UID: "pod-1", OwnerReferences: []metav1.OwnerReference{owner}}}
+	secret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "work-credentials", Namespace: "team", UID: "secret-1", OwnerReferences: []metav1.OwnerReference{owner}}}
+	c := fake.NewClientBuilder().WithScheme(tenancyScheme(t)).WithStatusSubresource(env).WithObjects(i, namespace, project, env, pod, secret).Build()
+	v := Verifier{Reader: c, Installation: InstallationIdentity{Key: types.NamespacedName{Namespace: "system", Name: "main"}, UID: "i-1"}, Mode: ModeScoped}
+	if err := c.Delete(context.Background(), project); err != nil {
+		t.Fatal(err)
+	}
+	leased, _, err := (&ReconcileScope{Verifier: &v}).BeginEnvironmentStaleProjectFence(context.Background(), "team", env.Name, env.UID, LifecycleActive)
+	if err != nil {
+		t.Fatal(err)
+	}
+	g := GuardedClient{Client: c, Verifier: &v}
+	env.Status.Phase = platformv1alpha1.EnvironmentPhaseFailed
+	if err := g.Status().Update(leased, env); err != nil {
+		t.Fatalf("exact Environment status: %v", err)
+	}
+	for name, operation := range map[string]func() error{
+		"create": func() error {
+			return g.Create(leased, &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: "new", Namespace: "team"}})
+		},
+		"base update": func() error { return g.Update(leased, env) },
+		"foreign owner": func() error {
+			foreign := pod.DeepCopy()
+			foreign.Name = "foreign"
+			foreign.OwnerReferences[0].UID = "other"
+			return g.Delete(leased, foreign)
+		},
+		"PVC delete": func() error {
+			return g.Delete(leased, &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: "disk", Namespace: "team", OwnerReferences: []metav1.OwnerReference{owner}}})
+		},
+		"other subresource": func() error { return g.SubResource("scale").Update(leased, env) },
+		"wrong Environment": func() error { other := env.DeepCopy(); other.UID = "e-2"; return g.Status().Update(leased, other) },
+	} {
+		t.Run(name, func(t *testing.T) {
+			if err := operation(); err == nil {
+				t.Fatal("fence-only operation was accepted")
+			}
+		})
+	}
+	if err := g.Delete(leased, pod); err != nil {
+		t.Fatalf("exact Pod delete: %v", err)
+	}
+	if err := g.Delete(leased, secret); err != nil {
+		t.Fatalf("exact Secret delete: %v", err)
+	}
+
+	// Every mutation revalidates the namespace-side authority independently of
+	// the absent Project object.
+	var current corev1.Namespace
+	if err := c.Get(context.Background(), client.ObjectKey{Name: "team"}, &current); err != nil {
+		t.Fatal(err)
+	}
+	current.Annotations[ProjectUIDAnnotation] = "changed"
+	if err := c.Update(context.Background(), &current); err != nil {
+		t.Fatal(err)
+	}
+	if err := g.Status().Update(leased, env); !errors.Is(err, ErrOutOfScope) {
+		t.Fatalf("changed annotated claim did not revoke lease: %v", err)
+	}
+}
+
+type projectListErrorReader struct {
+	client.Reader
+	err error
+}
+
+func (r projectListErrorReader) List(ctx context.Context, list client.ObjectList, opts ...client.ListOption) error {
+	if _, ok := list.(*platformv1alpha1.ProjectList); ok {
+		return r.err
+	}
+	return r.Reader.List(ctx, list, opts...)
+}
+
+func TestEnvironmentStaleProjectFenceRejectsValidClaimAndListErrors(t *testing.T) {
+	i, namespace, project := fixture(LifecycleActive)
+	v, c := verifier(t, i, namespace, project)
+	scope := ReconcileScope{Verifier: &v}
+	if _, _, err := scope.BeginEnvironmentStaleProjectFence(context.Background(), "team", "work", "e-1", LifecycleActive); !errors.Is(err, ErrOutOfScope) {
+		t.Fatalf("valid claim granted fallback: %v", err)
+	}
+	if err := c.Delete(context.Background(), project); err != nil {
+		t.Fatal(err)
+	}
+	v.Reader = projectListErrorReader{Reader: c, err: errors.New("temporary list failure")}
+	if _, _, err := scope.BeginEnvironmentStaleProjectFence(context.Background(), "team", "work", "e-1", LifecycleActive); err == nil || errors.Is(err, ErrOutOfScope) {
+		t.Fatalf("transient list failure granted/masqueraded as fallback: %v", err)
+	}
+}
+
+func TestEnvironmentStaleProjectFenceLeaseRevocation(t *testing.T) {
+	mutations := map[string]func(client.Client, *platformv1alpha1.Installation, *corev1.Namespace){
+		"Installation UID": func(c client.Client, installation *platformv1alpha1.Installation, _ *corev1.Namespace) {
+			installation.UID = "i-2"
+			if err := c.Update(context.Background(), installation); err != nil {
+				t.Fatal(err)
+			}
+		},
+		"installation annotation": func(c client.Client, _ *platformv1alpha1.Installation, namespace *corev1.Namespace) {
+			namespace.Annotations[InstallationUIDAnnotation] = "i-2"
+			if err := c.Update(context.Background(), namespace); err != nil {
+				t.Fatal(err)
+			}
+		},
+		"Namespace UID": func(c client.Client, _ *platformv1alpha1.Installation, namespace *corev1.Namespace) {
+			namespace.UID = "n-2"
+			if err := c.Update(context.Background(), namespace); err != nil {
+				t.Fatal(err)
+			}
+		},
+		"lifecycle": func(c client.Client, _ *platformv1alpha1.Installation, namespace *corev1.Namespace) {
+			namespace.Annotations[LifecycleAnnotation] = string(LifecycleFenced)
+			if err := c.Update(context.Background(), namespace); err != nil {
+				t.Fatal(err)
+			}
+		},
+		"Project claim": func(c client.Client, _ *platformv1alpha1.Installation, namespace *corev1.Namespace) {
+			namespace.Annotations[ProjectNameAnnotation] = "other"
+			if err := c.Update(context.Background(), namespace); err != nil {
+				t.Fatal(err)
+			}
+		},
+	}
+	for name, mutate := range mutations {
+		t.Run(name, func(t *testing.T) {
+			installation, namespace, project := fixture(LifecycleActive)
+			env := &platformv1alpha1.Environment{ObjectMeta: metav1.ObjectMeta{Name: "work", Namespace: "team", UID: "e-1"}}
+			c := fake.NewClientBuilder().WithScheme(tenancyScheme(t)).WithStatusSubresource(env).WithObjects(installation, namespace, project, env).Build()
+			v := Verifier{Reader: c, Installation: InstallationIdentity{Key: types.NamespacedName{Namespace: "system", Name: "main"}, UID: "i-1"}, Mode: ModeScoped}
+			if err := c.Delete(context.Background(), project); err != nil {
+				t.Fatal(err)
+			}
+			leased, _, err := (&ReconcileScope{Verifier: &v}).BeginEnvironmentStaleProjectFence(context.Background(), "team", env.Name, env.UID, LifecycleActive)
+			if err != nil {
+				t.Fatal(err)
+			}
+			mutate(c, installation, namespace)
+			err = (GuardedClient{Client: c, Verifier: &v}).Status().Update(leased, env)
+			if !errors.Is(err, ErrOutOfScope) {
+				t.Fatalf("authority change did not revoke fence lease: %v", err)
+			}
+		})
+	}
+}
+
 func TestValidateManagedTemplateExactOwnership(t *testing.T) {
 	identity := InstallationIdentity{Key: types.NamespacedName{Namespace: "system", Name: "main"}, UID: "i-1"}
 	claim := Claim{NamespaceUID: "n-1", ProjectName: "app", ProjectUID: "p-1", Lifecycle: LifecycleActive}

@@ -37,8 +37,12 @@ FAKE_ENV_CONTEXT=""
 E2E_KUBECONFIG=""
 SESSION_KEYRING_FILE=""
 E2E_SESSION_FIXTURE=""
+SELECTOR_ENV_NAME=""
 
 cleanup() {
+	if [[ -n "$SELECTOR_ENV_NAME" ]]; then
+		kubectl -n "$PROJECT_NAMESPACE" delete environment "$SELECTOR_ENV_NAME" --wait=false >/dev/null 2>&1 || true
+	fi
 	if [[ -n "$STREAM_PID" ]]; then
 		kill "$STREAM_PID" >/dev/null 2>&1 || true
 		wait "$STREAM_PID" >/dev/null 2>&1 || true
@@ -1866,6 +1870,53 @@ if ! kubectl exec "$POD_NAME" -- sh -c 'test "$(cat /workspace/setup-result)" = 
 	exit 1
 fi
 
+echo "==> verifying Environment selector admission and mutable services contract"
+SELECTOR_ENV_NAME="selector-admission-$RANDOM"
+cat <<EOF | kubectl create -f - >/dev/null
+apiVersion: swe.dev/v1alpha1
+kind: Environment
+metadata:
+  name: ${SELECTOR_ENV_NAME}
+spec:
+  templateRef: small
+  lifecycle:
+    hold:
+      enabled: true
+      revision: 1
+EOF
+if kubectl patch environment "$SELECTOR_ENV_NAME" --type=merge -p '{"spec":{"templateRef":"unavailable"}}' >/dev/null 2>&1; then
+	echo "FAIL: admission accepted an Environment templateRef change"
+	exit 1
+fi
+if kubectl patch environment "$SELECTOR_ENV_NAME" --type=merge -p '{"spec":{"backend":"pod"}}' >/dev/null 2>&1; then
+	echo "FAIL: admission accepted an Environment backend presence transition"
+	exit 1
+fi
+kubectl patch environment "$SELECTOR_ENV_NAME" --type=merge -p "{\"spec\":{\"projectRef\":\"${PROJECT_NAME}\"}}" >/dev/null
+if kubectl patch environment "$SELECTOR_ENV_NAME" --type=merge -p '{"spec":{"projectRef":"replacement"}}' >/dev/null 2>&1; then
+	echo "FAIL: admission accepted an Environment projectRef change after promotion"
+	exit 1
+fi
+if kubectl patch environment "$SELECTOR_ENV_NAME" --type=json -p '[{"op":"remove","path":"/spec/projectRef"}]' >/dev/null 2>&1; then
+	echo "FAIL: admission accepted clearing a promoted Environment projectRef"
+	exit 1
+fi
+kubectl patch environment "$SELECTOR_ENV_NAME" --type=merge -p '{"spec":{"services":[{"name":"admission","revision":1,"protocol":"HTTP","targetPort":3000,"visibility":"Project","readiness":"TCPConnect"}]}}' >/dev/null
+kubectl delete environment "$SELECTOR_ENV_NAME" --wait=false >/dev/null
+SELECTOR_ENV_NAME=""
+
+PROVISIONING_SNAPSHOT=$(kubectl get environment "$ENV_NAME" -o json | jq -cS '.status.provisioning')
+LIVE_PROJECT_UID=$(kubectl get project "$PROJECT_NAME" -o jsonpath='{.metadata.uid}')
+if [[ "$PROVISIONING_SNAPSHOT" == "null" ]] || ! jq -e \
+	--arg templateUID "$LOCAL_TEMPLATE_UID" --arg projectUID "$LIVE_PROJECT_UID" \
+	'.template.name == "small" and .template.uid == $templateUID and (.template.generation > 0) and
+	 .project.name == "e2e" and .project.uid == $projectUID and (.project.generation > 0) and
+	 (.image | length > 0) and (.project.repository | length > 0)' <<<"$PROVISIONING_SNAPSHOT" >/dev/null; then
+	echo "FAIL: active Environment has no complete provisioning snapshot"
+	kubectl get environment "$ENV_NAME" -o yaml >&2
+	exit 1
+fi
+
 echo "==> verifying setup runs only once when the pod is recreated"
 kubectl delete pod "$POD_NAME" --wait=true >/dev/null
 for _ in $(seq 1 30); do
@@ -1875,6 +1926,23 @@ for _ in $(seq 1 30); do
 	sleep 1
 done
 kubectl wait --for=condition=Ready pod/"$POD_NAME" --timeout=2m
+if [[ "$(kubectl get environment "$ENV_NAME" -o json | jq -cS '.status.provisioning')" != "$PROVISIONING_SNAPSHOT" ]]; then
+	echo "FAIL: active Pod recreation changed the provisioning snapshot"
+	exit 1
+fi
+RECREATED_POD=$(kubectl get pod "$POD_NAME" -o json)
+if ! jq -e --argjson snapshot "$PROVISIONING_SNAPSHOT" '
+	([.spec.containers[] | select(.name == "environment")] | length == 1 and
+	 .[0].image == $snapshot.image and .[0].resources.requests == $snapshot.resources and
+	 .[0].resources.limits == $snapshot.resources) and
+	([.spec.initContainers[] | select(.name == "project-setup")] | length == 1 and
+	 .[0].image == $snapshot.image and .[0].resources.requests == $snapshot.resources and
+	 .[0].resources.limits == $snapshot.resources and
+	 ([.[0].env[] | select(.name == "SWE_REPOSITORY") | .value] | first) == $snapshot.project.repository)' <<<"$RECREATED_POD" >/dev/null ||
+	[[ "$(jq -r '.spec.runtimeClassName // ""' <<<"$RECREATED_POD")" != "$(jq -r '.runtimeClassName' <<<"$PROVISIONING_SNAPSHOT")" ]]; then
+	echo "FAIL: recreated Pod does not match the provisioning image/runtime/resources/repository"
+	exit 1
+fi
 if ! kubectl exec "$POD_NAME" -- sh -c 'test "$(wc -l < /workspace/setup-result)" -eq 1'; then
 	echo "FAIL: .agents/setup ran again for an initialized workspace"
 	exit 1
@@ -2106,6 +2174,14 @@ if [[ "$(curl --silent --output /dev/null --write-out '%{http_code}' -H "Host: $
 	echo "FAIL: explicit hold did not fence the repository service portal"
 	exit 1
 fi
+if [[ "$(kubectl get environment "$ENV_NAME" -o json | jq -cS '.status.provisioning')" != "$PROVISIONING_SNAPSHOT" ]]; then
+	echo "FAIL: pause changed the provisioning snapshot"
+	exit 1
+fi
+if [[ "$(kubectl get pvc "$PVC_NAME" -o json | jq -r '.spec.resources.requests.storage')" != "$(jq -r '.diskSize' <<<"$PROVISIONING_SNAPSHOT")" ]]; then
+	echo "FAIL: retained PVC requested storage does not match the provisioning diskSize"
+	exit 1
+fi
 HOLD_REVISION=$(kubectl get environment "$ENV_NAME" -o jsonpath='{.spec.lifecycle.hold.revision}')
 if [[ "$(kubectl get environment "$ENV_NAME" -o jsonpath='{.spec.lifecycle.hold.enabled}')" != "true" || -z "$HOLD_REVISION" ]]; then
 	echo "FAIL: swe environment hold did not publish enabled revisioned policy"
@@ -2244,6 +2320,10 @@ done
 if ! kubectl get environment "$ENV_NAME" -o json | jq -e --argjson generation "$UPDATED_ROUTE_GENERATION" \
 	'any(.status.portalRoutes[]?; .generation == $generation and .active == false)' >/dev/null 2>&1; then
 	echo "FAIL: gateway did not persist a denial tombstone for the removed repository route"
+	exit 1
+fi
+if [[ "$(kubectl get environment "$ENV_NAME" -o json | jq -cS '.status.provisioning')" != "$PROVISIONING_SNAPSHOT" ]]; then
+	echo "FAIL: Ready resume changed the provisioning snapshot"
 	exit 1
 fi
 RESUMED_IMAGE_ID=$(kubectl get environment "$ENV_NAME" -o jsonpath='{.status.imageID}')

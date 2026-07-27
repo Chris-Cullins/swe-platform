@@ -1102,6 +1102,7 @@ func TestWakeAndHoldReleaseWaitForBackendFence(t *testing.T) {
 					},
 				},
 			}
+			setTestProvisioningSnapshot(environment, template, project)
 			pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
 				Name: envPodName(environment), Namespace: environment.Namespace, UID: "pod-uid",
 				Annotations: map[string]string{sandboxdauth.IdentityAnnotation: oldIdentity},
@@ -1192,6 +1193,14 @@ func TestWakeAndHoldReleaseWaitForBackendFence(t *testing.T) {
 			}
 			if err := reconciler.Get(context.Background(), key, &fencing); err != nil {
 				t.Fatal(err)
+			}
+			if fencing.Status.Phase == platformv1alpha1.EnvironmentPhasePaused {
+				if _, err := reconciler.Reconcile(context.Background(), ctrl.Request{NamespacedName: key}); err != nil {
+					t.Fatal(err)
+				}
+				if err := reconciler.Get(context.Background(), key, &fencing); err != nil {
+					t.Fatal(err)
+				}
 			}
 			if fencing.Status.Phase != platformv1alpha1.EnvironmentPhaseResuming || fencing.Status.Endpoints.Sandboxd != "" {
 				t.Fatalf("released Environment skipped fenced resume: %#v", fencing.Status)
