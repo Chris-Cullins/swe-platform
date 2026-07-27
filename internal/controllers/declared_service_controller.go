@@ -45,6 +45,11 @@ type DeclaredServiceReconciler struct {
 	Routes    PortalRouteResolver
 }
 
+// The repository-service controller uses its rotating projected service-account
+// token only for the control plane's authenticated, proof-bearing portal discovery.
+// +kubebuilder:rbac:groups=swe.dev,resources=environments/portal,verbs=get
+// +kubebuilder:rbac:groups=swe.dev,resources=environmentservices/portal,verbs=get
+
 func (r *DeclaredServiceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	var env platformv1alpha1.Environment
 	if err := r.reader().Get(ctx, req.NamespacedName, &env); err != nil {

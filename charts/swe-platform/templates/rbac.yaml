@@ -35,6 +35,12 @@ rules:
   - apiGroups: ["swe.dev"]
     resources: ["agentcredentialprofiles", "projects"]
     verbs: ["get", "list", "watch"]
+  {{- if .Values.controlPlane.portal.enabled }}
+  # Repository services discover an exact gateway-owned, proof-bearing URL.
+  - apiGroups: ["swe.dev"]
+    resources: ["environments/portal", "environmentservices/portal"]
+    verbs: ["get"]
+  {{- end }}
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole

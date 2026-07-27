@@ -298,6 +298,48 @@ claim authorizes it. Removal tombstones the old route; re-adding the same name r
 route generation and locator and can never resurrect an old URL. Declarations intentionally
 contain no route, locator, or URL input.
 
+Repository-owned declarations come from `.swe/services.yaml`. Its strict version-1 schema is a
+`services` mapping keyed by a DNS-1123 name of at most 32 bytes; each value has a required
+non-empty direct argv string array `command` and optional canonical integer `port`. The parser
+accepts at most 32 services, 64 KiB of UTF-8 input, 64 arguments per command, 4096 bytes per
+argument, and 16 KiB aggregate argv. It rejects unknown and duplicate fields or names, aliases,
+anchors, merge keys, multiple documents, non-string arguments, and ports outside 1–65535 or
+equal to 50051. For example:
+
+```yaml
+version: 1
+services:
+  web:
+    command: ["npm", "run", "dev"]
+    port: 3000
+  docs:
+    command: ["python", "-m", "http.server"]
+```
+
+The declaration controller converges this into canonical `Environment.spec.services` with
+`Source=Repository` and `Launch.argv`, while preserving `Source=API` entries. A repository/API
+same-name collision fails closed, and the CLI refuses mutation of repository-owned entries.
+Omitted ports are allocated deterministically from 49152–65535 using Environment UID and name,
+then retained durably. Distinct repository processes may not share a port; API declarations may
+remain port aliases. Malformed input, exhaustion, and collisions preserve the last canonical set
+and do not launch ambiguous intent.
+
+The gateway remains sole URL and route owner. For each repository process the operator uses its
+rotating projected service-account token to call existing authenticated portal discovery; RBAC
+grants only `get` on `environments/portal` and `environmentservices/portal`. It consumes the
+exact proof-bearing URL and never constructs one. Processes receive only `PORT` and `PUBLIC_URL`,
+never that token or a portal credential. Disabled or unavailable discovery preserves declarations
+but launch fails closed.
+
+The file read uses a distinct filesystem-only sandboxd capability and process reconciliation uses
+the separate process capability; neither raw token is mounted or injected. Before and after calls
+the connector proves the full Environment UID/execution, backend, Pod, endpoint, TLS identity,
+Secret, and exact capability. The desired process set is Environment UID plus monotonic
+Environment generation. sandboxd restarts crashes and successful exits with bounded backoff,
+starts a new daemon epoch after resume, and stops removals while suppressing restart. Pause,
+removal, and Environment or Pod replacement fence old processes and URLs. Observations remain
+advisory; gateway route state remains authority.
+
 ### Adapters, processes, and transcripts
 
 The agent layer is adapters. `internal/agent` is the exact adapter contract boundary, including
@@ -488,8 +530,8 @@ Only capabilities explicitly described as future work remain unimplemented.
 The maintainer approved the [three-owner service model in #16](https://github.com/Chris-Cullins/swe-platform/issues/16#issuecomment-5078805652):
 
 - the Environment owns the durable desired Service records described above;
-- future `.swe/services.yaml` ingestion (#70) may join the implemented CLI declaration path; listening
-  alone never grants visibility;
+- implemented `.swe/services.yaml` ingestion joins the CLI/API declaration path with explicit
+  ownership; listening alone never grants visibility;
 - sandboxd and the implemented observation controller report backend-portable listener state
   fenced to the exact current execution; and
 - the control-plane/gateway owns Project-only URLs, authentication, authorization, routing,
@@ -530,8 +572,8 @@ path forcing ship together after Project namespace claims.
 
 ## Remaining decisions and open work
 
-The remaining service work is `.swe/services.yaml` ingestion and process URL injection (#70),
-neither of which is implemented. Other unimplemented areas include inbox and child-run semantics, changes
+Repository service ingestion and process URL injection from authenticated discovery are
+implemented. Portal UI work (#95) remains unimplemented. Other unimplemented areas include inbox and child-run semantics, changes
 publication, transcript garbage collection, additional credential forms, ConPTY, non-Pod
 backends, and control-plane HA. Their detailed contracts remain issue work unless and until a
 maintainer decision is recorded. In particular, schema placeholders or portable interfaces do

@@ -77,6 +77,13 @@ rules:
 - apiGroups:
   - swe.dev
   resources:
+  - environments/portal
+  - environmentservices/portal
+  verbs:
+  - get
+- apiGroups:
+  - swe.dev
+  resources:
   - environments/status
   - environmenttemplates/status
   - runs/status

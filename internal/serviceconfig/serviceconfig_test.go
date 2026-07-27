@@ -64,6 +64,7 @@ func TestParseRejectsInvalidSchema(t *testing.T) {
 		"scalar command":        serviceFile("web", "command: run"),
 		"empty command":         serviceFile("web", "command: []"),
 		"empty executable":      serviceFile("web", "command: ['', x]"),
+		"empty argument":        serviceFile("web", "command: [run, '']"),
 		"typed argument":        serviceFile("web", "command: [run, 1]"),
 		"boolean argument":      serviceFile("web", "command: [true]"),
 		"NUL argument":          serviceFile("web", `command: ["run\0bad"]`),
@@ -141,6 +142,13 @@ func TestParseBounds(t *testing.T) {
 	assertRejected(t, serviceFile("web", "command: ["+strings.Join(aggregate, ",")+"]"))
 
 	assertRejected(t, string(make([]byte, MaxInputBytes+1)))
+
+	var tooMany strings.Builder
+	tooMany.WriteString("version: 1\nservices:\n")
+	for i := 0; i < 33; i++ {
+		fmt.Fprintf(&tooMany, "  service-%d: {command: [run]}\n", i)
+	}
+	assertRejected(t, tooMany.String())
 }
 
 func serviceFile(name, body string) string {
