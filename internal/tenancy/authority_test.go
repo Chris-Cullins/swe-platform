@@ -346,6 +346,36 @@ func TestEnvironmentStaleProjectFenceRejectsValidClaimAndListErrors(t *testing.T
 	}
 }
 
+func TestEnvironmentStaleProjectFenceLeaseRevokedWhenClaimRecovers(t *testing.T) {
+	i, namespace, project := fixture(LifecycleActive)
+	extra := &platformv1alpha1.Project{ObjectMeta: metav1.ObjectMeta{Name: "other", Namespace: namespace.Name, UID: "p-2"}}
+	env := &platformv1alpha1.Environment{ObjectMeta: metav1.ObjectMeta{Name: "work", Namespace: namespace.Name, UID: "e-1"}}
+	c := fake.NewClientBuilder().WithScheme(tenancyScheme(t)).WithStatusSubresource(env).WithObjects(i, namespace, project, extra, env).Build()
+	v := Verifier{Reader: c, Installation: InstallationIdentity{Key: types.NamespacedName{Namespace: "system", Name: "main"}, UID: "i-1"}, Mode: ModeScoped}
+	leased, _, err := (&ReconcileScope{Verifier: &v}).BeginEnvironmentStaleProjectFence(context.Background(), namespace.Name, env.Name, env.UID, LifecycleActive)
+	if err != nil {
+		t.Fatal(err)
+	}
+	g := GuardedClient{Client: c, Verifier: &v}
+	env.Status.Phase = platformv1alpha1.EnvironmentPhaseFailed
+	if err := g.Status().Update(leased, env); err != nil {
+		t.Fatalf("persistent non-sole claim rejected exact status fence: %v", err)
+	}
+
+	transient := errors.New("temporary Project list failure")
+	v.Reader = projectListErrorReader{Reader: c, err: transient}
+	if err := g.Status().Update(leased, env); !errors.Is(err, transient) {
+		t.Fatalf("transient claim revalidation error = %v, want propagated list error", err)
+	}
+	v.Reader = c
+	if err := c.Delete(context.Background(), extra); err != nil {
+		t.Fatal(err)
+	}
+	if err := g.Status().Update(leased, env); !errors.Is(err, ErrOutOfScope) {
+		t.Fatalf("recovered sole claim did not revoke stale-Project fence: %v", err)
+	}
+}
+
 func TestEnvironmentStaleProjectFenceLeaseRevocation(t *testing.T) {
 	mutations := map[string]func(client.Client, *platformv1alpha1.Installation, *corev1.Namespace){
 		"Installation UID": func(c client.Client, installation *platformv1alpha1.Installation, _ *corev1.Namespace) {
