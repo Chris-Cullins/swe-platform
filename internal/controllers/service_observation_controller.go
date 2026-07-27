@@ -206,5 +206,5 @@ func (r *ServiceObservationReconciler) SetupWithManager(mgr ctrl.Manager) error 
 		new, ok2 := e.ObjectNew.(*platformv1alpha1.Environment)
 		return !ok1 || !ok2 || observationRelevantEnvironmentUpdate(old, new)
 	}})
-	return ctrl.NewControllerManagedBy(mgr).For(&platformv1alpha1.Environment{}, p).WithOptions(controller.Options{MaxConcurrentReconciles: 4}).Complete(r)
+	return ctrl.NewControllerManagedBy(mgr).Named("service-observation").For(&platformv1alpha1.Environment{}, p).WithOptions(controller.Options{MaxConcurrentReconciles: 4}).Complete(r)
 }
