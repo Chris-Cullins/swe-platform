@@ -996,6 +996,10 @@ func TestTerminalHeartbeatRevokesConnectionWhenBoundExecutionChanges(t *testing.
 			case <-time.After(time.Second):
 				t.Fatal("bound execution change did not revoke terminal")
 			}
+			deadline := time.Now().Add(time.Second)
+			for testutil.ToFloat64(metrics.terminalRevocations.WithLabelValues("execution_changed")) != 1 && time.Now().Before(deadline) {
+				time.Sleep(time.Millisecond)
+			}
 			if got := testutil.ToFloat64(metrics.terminalRevocations.WithLabelValues("execution_changed")); got != 1 {
 				t.Fatalf("execution-change revocations = %v, want 1", got)
 			}
