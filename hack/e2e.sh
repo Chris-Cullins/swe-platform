@@ -2155,6 +2155,7 @@ if ! jq -e --arg url "$UPDATED_REPOSITORY_URL" '.marker == "v2" and .publicURL =
 	echo "FAIL: changed repository process did not start with the new gateway-owned URL"
 	exit 1
 fi
+UPDATED_ROUTE_GENERATION=$(kubectl get environment "$ENV_NAME" -o json | jq -r '.status.portalRoutes[] | select(.name == "repository-web" and .active == true and .declarationRevision == 2) | .generation')
 manage_observation_listener service-state "$POD_NAME" "$OBSERVATION_OWNER" repository-web running
 
 echo "==> verifying repository removal stops process and tombstones URL"
@@ -2183,6 +2184,18 @@ if ! manage_observation_listener service-state "$POD_NAME" "$OBSERVATION_OWNER" 
 fi
 if [[ "$(curl --silent --output /dev/null --write-out '%{http_code}' -H "Host: $UPDATED_REPOSITORY_HOST" -H "Authorization: Bearer $CONSOLE_TOKEN" http://127.0.0.1:18080/)" != "404" ]]; then
 	echo "FAIL: repository removal retained its last portal URL"
+	exit 1
+fi
+for _ in $(seq 1 30); do
+	if kubectl get environment "$ENV_NAME" -o json | jq -e --argjson generation "$UPDATED_ROUTE_GENERATION" \
+		'any(.status.portalRoutes[]?; .generation == $generation and .active == false)' >/dev/null 2>&1; then
+		break
+	fi
+	sleep 1
+done
+if ! kubectl get environment "$ENV_NAME" -o json | jq -e --argjson generation "$UPDATED_ROUTE_GENERATION" \
+	'any(.status.portalRoutes[]?; .generation == $generation and .active == false)' >/dev/null 2>&1; then
+	echo "FAIL: gateway did not persist a denial tombstone for the removed repository route"
 	exit 1
 fi
 RESUMED_IMAGE_ID=$(kubectl get environment "$ENV_NAME" -o jsonpath='{.status.imageID}')

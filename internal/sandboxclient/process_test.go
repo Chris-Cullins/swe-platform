@@ -7,6 +7,7 @@ import (
 	"crypto/rand"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/json"
 	"encoding/pem"
 	"math/big"
 	"strings"
@@ -124,10 +125,14 @@ func TestDialProcessValidatesCurrentEnvironmentPodAndCredentialIncarnation(t *te
 	}, OwnerReferences: []metav1.OwnerReference{{APIVersion: platformv1alpha1.GroupVersion.String(), Kind: "Environment", Name: env.Name, UID: env.UID, Controller: processTestPtr(true)}}}, Status: corev1.PodStatus{
 		PodIP: "10.0.0.1", Conditions: []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}},
 	}, Spec: corev1.PodSpec{RestartPolicy: corev1.RestartPolicyNever}}
+	capabilities, err := json.Marshal(sandboxdauth.Config{Grants: []sandboxdauth.Grant{{TokenHash: sandboxdauth.TokenVerifier("process-token"), Capabilities: []sandboxdauth.Capability{sandboxdauth.CapabilityProcess}}}})
+	if err != nil {
+		t.Fatal(err)
+	}
 	secret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "env-environment-sandboxd", Namespace: env.Namespace, UID: "secret-uid", Annotations: map[string]string{
 		sandboxdauth.IdentityAnnotation: identity, sandboxdauth.PodUIDAnnotation: string(pod.UID),
 	}, OwnerReferences: []metav1.OwnerReference{{APIVersion: platformv1alpha1.GroupVersion.String(), Kind: "Environment", Name: env.Name, UID: env.UID, Controller: processTestPtr(true)}}}, Data: map[string][]byte{
-		sandboxdauth.TLSCertKey: certificate, sandboxdauth.ProcessTokenKey: []byte("process-token"),
+		sandboxdauth.TLSCertKey: certificate, sandboxdauth.CapabilitiesKey: capabilities, sandboxdauth.ProcessTokenKey: []byte("process-token"),
 	}}
 
 	newClient := func(objects ...client.Object) client.Client {
@@ -147,6 +152,22 @@ func TestDialProcessValidatesCurrentEnvironmentPodAndCredentialIncarnation(t *te
 	}
 	if err := closeConnection(); err != nil {
 		t.Fatal(err)
+	}
+	for name, grants := range map[string][]sandboxdauth.Grant{
+		"broadened": {{TokenHash: sandboxdauth.TokenVerifier("process-token"), Capabilities: []sandboxdauth.Capability{sandboxdauth.CapabilityProcess, sandboxdauth.CapabilityFilesystem}}},
+		"duplicate": {
+			{TokenHash: sandboxdauth.TokenVerifier("process-token"), Capabilities: []sandboxdauth.Capability{sandboxdauth.CapabilityProcess}},
+			{TokenHash: sandboxdauth.TokenVerifier("process-token"), Capabilities: []sandboxdauth.Capability{sandboxdauth.CapabilityProcess}},
+		},
+		"wrong": {{TokenHash: sandboxdauth.TokenVerifier("process-token"), Capabilities: []sandboxdauth.Capability{sandboxdauth.CapabilityFilesystem}}},
+	} {
+		t.Run("process capability "+name, func(t *testing.T) {
+			malformed := secret.DeepCopy()
+			malformed.Data[sandboxdauth.CapabilitiesKey], _ = json.Marshal(sandboxdauth.Config{Grants: grants})
+			if _, _, err := (Connector{Reader: newClient(env.DeepCopy(), pod.DeepCopy(), malformed)}).DialProcess(context.Background(), lifecycle.CaptureExecutionFence(env)); err == nil || !strings.Contains(err.Error(), "exact process capability") {
+				t.Fatalf("malformed process grant error = %v", err)
+			}
+		})
 	}
 	freshEpoch := env.DeepCopy()
 	freshEpoch.Status.Lifecycle.Epoch = 1

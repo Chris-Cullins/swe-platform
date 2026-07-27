@@ -1253,8 +1253,12 @@ type ReconcileManagedServicesRequest struct {
 	OwnerId        string                 `protobuf:"bytes,1,opt,name=owner_id,json=ownerId,proto3" json:"owner_id,omitempty"`
 	IntentRevision uint64                 `protobuf:"varint,2,opt,name=intent_revision,json=intentRevision,proto3" json:"intent_revision,omitempty"`
 	Services       []*ManagedServiceSpec  `protobuf:"bytes,3,rep,name=services,proto3" json:"services,omitempty"`
-	unknownFields  protoimpl.UnknownFields
-	sizeCache      protoimpl.SizeCache
+	// route_revision is the gateway-owned monotonic route generation used by
+	// the complete service set. The pair (intent_revision, route_revision) is
+	// ordered lexicographically.
+	RouteRevision uint64 `protobuf:"varint,4,opt,name=route_revision,json=routeRevision,proto3" json:"route_revision,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *ReconcileManagedServicesRequest) Reset() {
@@ -1306,6 +1310,13 @@ func (x *ReconcileManagedServicesRequest) GetServices() []*ManagedServiceSpec {
 		return x.Services
 	}
 	return nil
+}
+
+func (x *ReconcileManagedServicesRequest) GetRouteRevision() uint64 {
+	if x != nil {
+		return x.RouteRevision
+	}
+	return 0
 }
 
 type ManagedServiceStatus struct {
@@ -1365,6 +1376,7 @@ type ReconcileManagedServicesResponse struct {
 	OwnerId        string                  `protobuf:"bytes,1,opt,name=owner_id,json=ownerId,proto3" json:"owner_id,omitempty"`
 	IntentRevision uint64                  `protobuf:"varint,2,opt,name=intent_revision,json=intentRevision,proto3" json:"intent_revision,omitempty"`
 	Services       []*ManagedServiceStatus `protobuf:"bytes,3,rep,name=services,proto3" json:"services,omitempty"`
+	RouteRevision  uint64                  `protobuf:"varint,4,opt,name=route_revision,json=routeRevision,proto3" json:"route_revision,omitempty"`
 	unknownFields  protoimpl.UnknownFields
 	sizeCache      protoimpl.SizeCache
 }
@@ -1418,6 +1430,13 @@ func (x *ReconcileManagedServicesResponse) GetServices() []*ManagedServiceStatus
 		return x.Services
 	}
 	return nil
+}
+
+func (x *ReconcileManagedServicesResponse) GetRouteRevision() uint64 {
+	if x != nil {
+		return x.RouteRevision
+	}
+	return 0
 }
 
 type StartProcessRequest struct {
@@ -3163,18 +3182,20 @@ const file_proto_sandboxd_v1_sandboxd_proto_rawDesc = "" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"V\n" +
 	"\x12ManagedServiceSpec\x12\x12\n" +
 	"\x04role\x18\x01 \x01(\tR\x04role\x12,\n" +
-	"\x04spec\x18\x02 \x01(\v2\x18.sandboxd.v1.ProcessSpecR\x04spec\"\xa2\x01\n" +
+	"\x04spec\x18\x02 \x01(\v2\x18.sandboxd.v1.ProcessSpecR\x04spec\"\xc9\x01\n" +
 	"\x1fReconcileManagedServicesRequest\x12\x19\n" +
 	"\bowner_id\x18\x01 \x01(\tR\aownerId\x12'\n" +
 	"\x0fintent_revision\x18\x02 \x01(\x04R\x0eintentRevision\x12;\n" +
-	"\bservices\x18\x03 \x03(\v2\x1f.sandboxd.v1.ManagedServiceSpecR\bservices\"Z\n" +
+	"\bservices\x18\x03 \x03(\v2\x1f.sandboxd.v1.ManagedServiceSpecR\bservices\x12%\n" +
+	"\x0eroute_revision\x18\x04 \x01(\x04R\rrouteRevision\"Z\n" +
 	"\x14ManagedServiceStatus\x12\x12\n" +
 	"\x04role\x18\x01 \x01(\tR\x04role\x12.\n" +
-	"\aprocess\x18\x02 \x01(\v2\x14.sandboxd.v1.ProcessR\aprocess\"\xa5\x01\n" +
+	"\aprocess\x18\x02 \x01(\v2\x14.sandboxd.v1.ProcessR\aprocess\"\xcc\x01\n" +
 	" ReconcileManagedServicesResponse\x12\x19\n" +
 	"\bowner_id\x18\x01 \x01(\tR\aownerId\x12'\n" +
 	"\x0fintent_revision\x18\x02 \x01(\x04R\x0eintentRevision\x12=\n" +
-	"\bservices\x18\x03 \x03(\v2!.sandboxd.v1.ManagedServiceStatusR\bservices\"n\n" +
+	"\bservices\x18\x03 \x03(\v2!.sandboxd.v1.ManagedServiceStatusR\bservices\x12%\n" +
+	"\x0eroute_revision\x18\x04 \x01(\x04R\rrouteRevision\"n\n" +
 	"\x13StartProcessRequest\x12)\n" +
 	"\x03key\x18\x01 \x01(\v2\x17.sandboxd.v1.ProcessKeyR\x03key\x12,\n" +
 	"\x04spec\x18\x02 \x01(\v2\x18.sandboxd.v1.ProcessSpecR\x04spec\"\x99\x01\n" +

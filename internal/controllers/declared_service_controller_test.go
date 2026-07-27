@@ -28,18 +28,22 @@ type declaredConnectorFake struct {
 }
 
 type declaredReconcileCall struct {
-	fence  lifecycle.ExecutionFence
-	decls  []platformv1alpha1.EnvironmentServiceDeclaration
-	intent uint64
-	specs  []*sandboxdv1.ManagedServiceSpec
+	fence                 lifecycle.ExecutionFence
+	decls                 []platformv1alpha1.EnvironmentServiceDeclaration
+	routes                []platformv1alpha1.EnvironmentPortalRoute
+	intent, routeRevision uint64
+	specs                 []*sandboxdv1.ManagedServiceSpec
 }
 
 func (f *declaredConnectorFake) ReadWorkspaceServices(_ context.Context, fence lifecycle.ExecutionFence) (sandboxclient.WorkspaceServicesFile, error) {
 	f.reads = append(f.reads, fence)
 	return f.file, f.readErr
 }
-func (f *declaredConnectorFake) ReconcileRepositoryServices(_ context.Context, fence lifecycle.ExecutionFence, d []platformv1alpha1.EnvironmentServiceDeclaration, intent uint64, specs []*sandboxdv1.ManagedServiceSpec) error {
-	f.reconciles = append(f.reconciles, declaredReconcileCall{fence, append([]platformv1alpha1.EnvironmentServiceDeclaration(nil), d...), intent, specs})
+func (f *declaredConnectorFake) ReconcileRepositoryServices(_ context.Context, fence lifecycle.ExecutionFence, d []platformv1alpha1.EnvironmentServiceDeclaration, routes []platformv1alpha1.EnvironmentPortalRoute, intent, routeRevision uint64, specs []*sandboxdv1.ManagedServiceSpec) error {
+	f.reconciles = append(f.reconciles, declaredReconcileCall{
+		fence: fence, decls: append([]platformv1alpha1.EnvironmentServiceDeclaration(nil), d...),
+		routes: append([]platformv1alpha1.EnvironmentPortalRoute(nil), routes...), intent: intent, routeRevision: routeRevision, specs: specs,
+	})
 	return nil
 }
 
@@ -121,12 +125,35 @@ func TestDeclaredServiceReconcilerConvergesThenLaunchesFreshGeneration(t *testin
 		t.Fatalf("reconcile calls = %d", len(connector.reconciles))
 	}
 	call := connector.reconciles[0]
-	if call.intent != uint64(current.Generation) || call.fence.EnvironmentUID() != current.UID || len(call.specs) != 1 {
+	if call.intent != uint64(current.Generation) || call.routeRevision != 9 || call.fence.EnvironmentUID() != current.UID || len(call.specs) != 1 || len(call.routes) != 1 {
 		t.Fatalf("call = %#v", call)
 	}
 	spec := call.specs[0]
 	if !reflect.DeepEqual(spec.Spec.Argv, []string{"server", "--direct"}) || !reflect.DeepEqual(spec.Spec.Env, map[string]string{"PORT": "8080", "PUBLIC_URL": "https://web.example"}) || spec.Spec.EnvMode != sandboxdv1.EnvironmentMode_ENVIRONMENT_MODE_INHERIT {
 		t.Fatalf("managed spec = %#v", spec)
+	}
+}
+
+func TestDeclaredServiceReconcilerPublishesEmptySetForDisabledPortalAuthority(t *testing.T) {
+	env := declaredEnvironment()
+	declaration := platformv1alpha1.EnvironmentServiceDeclaration{
+		Name: "web", Source: platformv1alpha1.EnvironmentServiceSourceRepository, InstanceID: "abcdefghijklmnopqrst", Revision: 1,
+		Protocol: platformv1alpha1.EnvironmentServiceProtocolHTTP, Visibility: platformv1alpha1.EnvironmentServiceVisibilityProject, Readiness: platformv1alpha1.EnvironmentServiceReadinessTCPConnect, TargetPort: 8080,
+		Launch: &platformv1alpha1.EnvironmentServiceLaunch{Argv: []platformv1alpha1.EnvironmentServiceLaunchArgument{"server"}},
+	}
+	env.Spec.Services = []platformv1alpha1.EnvironmentServiceDeclaration{declaration}
+	env.Status.NextPortalRouteGeneration = 10
+	env.Status.PortalRoutes = []platformv1alpha1.EnvironmentPortalRoute{{Name: declaration.Name, Active: false, DeclarationInstanceID: declaration.InstanceID, DeclarationRevision: declaration.Revision, Generation: 10}}
+	c := declaredClient(t, env)
+	connector := &declaredConnectorFake{file: sandboxclient.WorkspaceServicesFile{Data: []byte("version: 1\nservices:\n  web:\n    command: [server]\n    port: 8080\n")}}
+	routes := &declaredRoutesFake{route: controlplaneclient.PortalRoute{Disabled: true, EnvironmentUID: string(env.UID), Service: declaration.Name, DeclarationInstanceID: declaration.InstanceID, Revision: declaration.Revision, RouteGeneration: 10}}
+	runDeclared(t, c, connector, routes)
+	if len(connector.reconciles) != 1 {
+		t.Fatalf("reconcile calls = %d", len(connector.reconciles))
+	}
+	call := connector.reconciles[0]
+	if len(call.specs) != 0 || len(call.routes) != 1 || call.routes[0].Active || call.routeRevision != 10 {
+		t.Fatalf("disabled route reconcile = %#v", call)
 	}
 }
 
@@ -240,5 +267,23 @@ func TestConvergeRepositoryDeclarationsPreservesAPIAndRejectsCollisions(t *testi
 	result, collision, _ := convergeRepositoryDeclarations(env, []serviceconfig.Declaration{{Name: "repo", Argv: []string{"x"}, Port: &p}})
 	if collision != "" || len(result) != 2 || !reflect.DeepEqual(result[0], api) {
 		t.Fatalf("API preservation result=%#v collision=%q", result, collision)
+	}
+}
+
+func TestConvergeRepositoryDeclarationsRejectsRetainedAndExplicitPortCollision(t *testing.T) {
+	port := int32(50000)
+	existing := platformv1alpha1.EnvironmentServiceDeclaration{
+		Name: "retained", InstanceID: "abcdefghijklmnopqrst", Revision: 1,
+		Source:     platformv1alpha1.EnvironmentServiceSourceRepository,
+		Launch:     &platformv1alpha1.EnvironmentServiceLaunch{Argv: []platformv1alpha1.EnvironmentServiceLaunchArgument{"serve"}},
+		TargetPort: port,
+	}
+	env := &platformv1alpha1.Environment{ObjectMeta: metav1.ObjectMeta{UID: "uid"}, Spec: platformv1alpha1.EnvironmentSpec{Services: []platformv1alpha1.EnvironmentServiceDeclaration{existing}}}
+	_, collision, err := convergeRepositoryDeclarations(env, []serviceconfig.Declaration{
+		{Name: "explicit", Argv: []string{"serve"}, Port: &port},
+		{Name: "retained", Argv: []string{"serve"}},
+	})
+	if err != nil || collision == "" {
+		t.Fatalf("collision=%q err=%v, want retained/explicit collision", collision, err)
 	}
 }

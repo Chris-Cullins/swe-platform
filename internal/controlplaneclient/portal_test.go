@@ -25,3 +25,15 @@ func TestGetPortalRouteEscapesPathAndAuthenticates(t *testing.T) {
 		t.Fatalf("route=%#v err=%v", route, err)
 	}
 }
+
+func TestGetPortalRouteAcceptsGatewayDisabledDenial(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		fmt.Fprint(w, `{"disabled":true,"environmentUID":"uid","service":"web","revision":2,"declarationInstanceID":"abcdefghijklmnopqrstuvwx","routeGeneration":4}`)
+	}))
+	defer server.Close()
+	client, _ := New(server.URL, "token", server.Client())
+	route, err := client.GetPortalRoute(context.Background(), "ns", "env", "web")
+	if err != nil || !route.Disabled || route.URL != "" || route.RouteGeneration != 4 {
+		t.Fatalf("route=%#v err=%v", route, err)
+	}
+}

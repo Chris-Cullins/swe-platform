@@ -16,10 +16,11 @@ making a retry unsafe. Epoch close fences every execution tree before replacemen
 ## Managed service sets
 
 `ReconcileManagedServices` is the Environment-owned, complete-set primitive for
-long-lived services. `owner_id` is the exact Environment UID, `intent_revision` is
-positive and monotonically increasing, and each unique role has an ordinary public
-`ProcessSpec`. An exact duplicate is idempotent. A lower revision, or a byte-different
-normalized set at the current revision, fails without mutation. A greater revision
+long-lived services. `owner_id` is the exact Environment UID; positive
+`intent_revision` and gateway-owned `route_revision` form a lexicographically ordered
+monotonic pair; and each unique role has an ordinary public `ProcessSpec`. An exact
+duplicate is idempotent. A lower pair, or a byte-different normalized set at the
+current pair, fails without mutation. A greater pair
 atomically replaces desired intent: removed roles are stopped, changed roles are
 stopped before replacement, and new roles are started. Responses report each desired
 logical role's current `Process` state and opaque execution ID, never an OS identity.
@@ -28,8 +29,9 @@ Every unrequested exit, including exit zero and start failure, is restarted with
 bounded exponential backoff. Backoff is capped and resets after stable operation. A
 restart reuses the owner/role record and receives fresh execution identity and output
 buffers. Complete-set removal, replacement, explicit `Stop`, and daemon/Supervisor
-close suppress the old execution's restart. Revision/generation fencing applies to
-delayed restart work, so stale reconciliation cannot resurrect a removed service or
+close suppress the old execution's restart. Restart admission is serialized with set
+reconciliation and explicit Stop. Revision/generation fencing applies to delayed restart work,
+so stale reconciliation cannot resurrect a removed service or
 overwrite newer intent. Managed services use only `ProcessSpec.env`; launch material
 is deliberately unsupported.
 

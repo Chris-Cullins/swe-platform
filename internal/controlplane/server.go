@@ -156,7 +156,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc(namespacedPathPrefix, s.handleNamespacedAPI)
 	base := http.Handler(mux)
 	if s.consoleAssets == nil {
-		if s.portal == nil {
+		if !s.portal.enabled() {
 			return base
 		}
 		return s.portal.wrap(base)
@@ -169,7 +169,7 @@ func (s *Server) Handler() http.Handler {
 		}
 		console.ServeHTTP(w, r)
 	})
-	if s.portal != nil {
+	if s.portal.enabled() {
 		return s.portal.wrap(base)
 	}
 	return base

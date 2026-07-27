@@ -31,7 +31,7 @@ const declaredServiceInterval = 20 * time.Second
 
 type RepositoryServiceConnector interface {
 	ReadWorkspaceServices(context.Context, lifecycle.ExecutionFence) (sandboxclient.WorkspaceServicesFile, error)
-	ReconcileRepositoryServices(context.Context, lifecycle.ExecutionFence, []platformv1alpha1.EnvironmentServiceDeclaration, uint64, []*sandboxdv1.ManagedServiceSpec) error
+	ReconcileRepositoryServices(context.Context, lifecycle.ExecutionFence, []platformv1alpha1.EnvironmentServiceDeclaration, []platformv1alpha1.EnvironmentPortalRoute, uint64, uint64, []*sandboxdv1.ManagedServiceSpec) error
 }
 type PortalRouteResolver interface {
 	GetPortalRoute(context.Context, string, string, string) (controlplaneclient.PortalRoute, error)
@@ -98,6 +98,8 @@ func (r *DeclaredServiceReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 	}
 
 	specs := make([]*sandboxdv1.ManagedServiceSpec, 0)
+	routeProofs := make([]platformv1alpha1.EnvironmentPortalRoute, 0)
+	routeRevision := uint64(env.Status.NextPortalRouteGeneration)
 	for _, declaration := range env.Spec.Services {
 		if declaration.Source != platformv1alpha1.EnvironmentServiceSourceRepository {
 			continue
@@ -113,7 +115,21 @@ func (r *DeclaredServiceReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		if err := r.reader().Get(ctx, req.NamespacedName, &current); err != nil {
 			return ctrl.Result{}, client.IgnoreNotFound(err)
 		}
-		if err := fence.Validate(&current); err != nil || !reflect.DeepEqual(current.Spec.Services, env.Spec.Services) || !exactActiveRoute(&current, declaration, route.RouteGeneration) {
+		routeProof, routeCurrent := exactRoute(&current, declaration, route.RouteGeneration, !route.Disabled)
+		if err := fence.Validate(&current); err != nil || !reflect.DeepEqual(current.Spec.Services, env.Spec.Services) || !routeCurrent {
+			return ctrl.Result{RequeueAfter: declaredServiceInterval}, nil
+		}
+		routeProofs = append(routeProofs, routeProof)
+		if uint64(routeProof.Generation) > routeRevision {
+			routeRevision = uint64(routeProof.Generation)
+		}
+		if route.Disabled {
+			if hasActiveRepositoryRoute(&current) || env.Generation < 1 {
+				return ctrl.Result{RequeueAfter: declaredServiceInterval}, nil
+			}
+			if err := r.Connector.ReconcileRepositoryServices(ctx, fence, append([]platformv1alpha1.EnvironmentServiceDeclaration(nil), env.Spec.Services...), routeProofs, uint64(env.Generation), routeRevision, nil); err != nil {
+				return ctrl.Result{RequeueAfter: declaredServiceInterval}, nil
+			}
 			return ctrl.Result{RequeueAfter: declaredServiceInterval}, nil
 		}
 		if declaration.Launch == nil || len(declaration.Launch.Argv) == 0 {
@@ -128,7 +144,7 @@ func (r *DeclaredServiceReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 	if env.Generation < 1 {
 		return ctrl.Result{RequeueAfter: declaredServiceInterval}, nil
 	}
-	if err := r.Connector.ReconcileRepositoryServices(ctx, fence, append([]platformv1alpha1.EnvironmentServiceDeclaration(nil), env.Spec.Services...), uint64(env.Generation), specs); err != nil {
+	if err := r.Connector.ReconcileRepositoryServices(ctx, fence, append([]platformv1alpha1.EnvironmentServiceDeclaration(nil), env.Spec.Services...), routeProofs, uint64(env.Generation), routeRevision, specs); err != nil {
 		return ctrl.Result{RequeueAfter: declaredServiceInterval}, nil
 	}
 	return ctrl.Result{RequeueAfter: declaredServiceInterval}, nil
@@ -153,14 +169,33 @@ func serviceEnvironmentActive(env *platformv1alpha1.Environment) bool {
 	return platformv1alpha1.IsEnvironmentReady(env) && !env.Spec.Paused && !env.Status.Lifecycle.Suspended && (env.Spec.Lifecycle.Hold == nil || !env.Spec.Lifecycle.Hold.Enabled)
 }
 
-func exactActiveRoute(env *platformv1alpha1.Environment, d platformv1alpha1.EnvironmentServiceDeclaration, generation int64) bool {
+func exactRoute(env *platformv1alpha1.Environment, d platformv1alpha1.EnvironmentServiceDeclaration, generation int64, active bool) (platformv1alpha1.EnvironmentPortalRoute, bool) {
+	var found platformv1alpha1.EnvironmentPortalRoute
 	count := 0
 	for _, route := range env.Status.PortalRoutes {
-		if route.Name == d.Name && route.Active && route.DeclarationInstanceID == d.InstanceID && route.DeclarationRevision == d.Revision && route.Generation == generation {
+		if route.Name == d.Name && route.Active == active && route.DeclarationInstanceID == d.InstanceID && route.DeclarationRevision == d.Revision && route.Generation == generation {
+			found = route
 			count++
 		}
 	}
-	return count == 1
+	return found, count == 1
+}
+
+func hasActiveRepositoryRoute(env *platformv1alpha1.Environment) bool {
+	repository := make(map[string]struct{})
+	for _, declaration := range env.Spec.Services {
+		if declaration.Source == platformv1alpha1.EnvironmentServiceSourceRepository {
+			repository[declaration.Name] = struct{}{}
+		}
+	}
+	for _, route := range env.Status.PortalRoutes {
+		if route.Active {
+			if _, ok := repository[route.Name]; ok {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func convergeRepositoryDeclarations(env *platformv1alpha1.Environment, desired []serviceconfig.Declaration) ([]platformv1alpha1.EnvironmentServiceDeclaration, string, error) {
@@ -191,6 +226,7 @@ func convergeRepositoryDeclarations(env *platformv1alpha1.Environment, desired [
 	for _, d := range api {
 		result = append(result, d)
 	}
+	repositoryPorts := make(map[int32]string, len(desired))
 	for _, wanted := range desired {
 		port := int32(0)
 		old, found := existing[wanted.Name]
@@ -201,6 +237,10 @@ func convergeRepositoryDeclarations(env *platformv1alpha1.Environment, desired [
 		} else {
 			port = allocateServicePort(env.UID, wanted.Name, occupied)
 		}
+		if other, duplicate := repositoryPorts[port]; duplicate {
+			return env.Spec.Services, fmt.Sprintf("%s/%s", other, wanted.Name), nil
+		}
+		repositoryPorts[port] = wanted.Name
 		occupied[port] = true
 		argv := make([]platformv1alpha1.EnvironmentServiceLaunchArgument, len(wanted.Argv))
 		for i := range argv {

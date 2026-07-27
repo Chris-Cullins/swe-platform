@@ -196,7 +196,8 @@ func newPortalWebSocketFixture(t *testing.T, leasePoll time.Duration) portalWebS
 	if err := platformv1alpha1.AddToScheme(scheme); err != nil {
 		t.Fatal(err)
 	}
-	route := platformv1alpha1.EnvironmentPortalRoute{Name: "web", DeclarationInstanceID: "aaaaaaaaaaaaaaaaaaaa", DeclarationRevision: 1, Locator: "bbbbbbbbbbbbbbbbbbbb", Generation: 1, Active: true}
+	presentationID := (&portalGateway{scheme: "http", suffix: "portal.example"}).presentationID()
+	route := platformv1alpha1.EnvironmentPortalRoute{Name: "web", PresentationID: presentationID, DeclarationInstanceID: "aaaaaaaaaaaaaaaaaaaa", DeclarationRevision: 1, Locator: "bbbbbbbbbbbbbbbbbbbb", Generation: 1, Active: true}
 	environment := &platformv1alpha1.Environment{
 		ObjectMeta: metav1.ObjectMeta{Name: "env", Namespace: "ns", UID: "env-uid", Generation: 1},
 		Spec: platformv1alpha1.EnvironmentSpec{ProjectRef: "project", TemplateRef: "template", Services: []platformv1alpha1.EnvironmentServiceDeclaration{{
@@ -302,15 +303,16 @@ func TestBoundedPortalBody(t *testing.T) {
 }
 
 func TestReconcilePortalRoutesStableRevisionAndRemoval(t *testing.T) {
+	const presentation = "0123456789abcdef"
 	env := &platformv1alpha1.Environment{ObjectMeta: metav1.ObjectMeta{Name: "env"}, Spec: platformv1alpha1.EnvironmentSpec{Services: []platformv1alpha1.EnvironmentServiceDeclaration{{Name: "web", InstanceID: "aaaaaaaaaaaaaaaaaaaa", Revision: 1, Protocol: platformv1alpha1.EnvironmentServiceProtocolHTTP, Visibility: platformv1alpha1.EnvironmentServiceVisibilityProject}}}}
-	changed, first, err := reconcilePortalRoutes(env, "web", "aaaaaaaaaaaaaaaaaaaa", 1)
+	changed, first, err := reconcilePortalRoutes(env, "web", "aaaaaaaaaaaaaaaaaaaa", 1, presentation)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !changed || !first.Active || first.Generation != 1 {
 		t.Fatalf("first route = %#v", first)
 	}
-	changed, stable, err := reconcilePortalRoutes(env, "web", "aaaaaaaaaaaaaaaaaaaa", 1)
+	changed, stable, err := reconcilePortalRoutes(env, "web", "aaaaaaaaaaaaaaaaaaaa", 1, presentation)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -318,7 +320,7 @@ func TestReconcilePortalRoutesStableRevisionAndRemoval(t *testing.T) {
 		t.Fatalf("route not stable: %#v", stable)
 	}
 	env.Spec.Services[0].Revision = 2
-	changed, second, err := reconcilePortalRoutes(env, "web", "aaaaaaaaaaaaaaaaaaaa", 2)
+	changed, second, err := reconcilePortalRoutes(env, "web", "aaaaaaaaaaaaaaaaaaaa", 2, presentation)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -326,7 +328,7 @@ func TestReconcilePortalRoutesStableRevisionAndRemoval(t *testing.T) {
 		t.Fatalf("revision route = %#v status=%#v", second, env.Status)
 	}
 	env.Spec.Services = nil
-	changed, _, err = reconcilePortalRoutes(env, "", "", 0)
+	changed, _, err = reconcilePortalRoutes(env, "", "", 0, presentation)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -334,7 +336,7 @@ func TestReconcilePortalRoutesStableRevisionAndRemoval(t *testing.T) {
 		t.Fatal("removed route was not tombstoned")
 	}
 	env.Spec.Services = []platformv1alpha1.EnvironmentServiceDeclaration{{Name: "web", InstanceID: "bbbbbbbbbbbbbbbbbbbb", Revision: 2, Protocol: platformv1alpha1.EnvironmentServiceProtocolHTTP, Visibility: platformv1alpha1.EnvironmentServiceVisibilityProject}}
-	_, third, err := reconcilePortalRoutes(env, "web", "bbbbbbbbbbbbbbbbbbbb", 2)
+	_, third, err := reconcilePortalRoutes(env, "web", "bbbbbbbbbbbbbbbbbbbb", 2, presentation)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -353,6 +355,70 @@ func TestExactPortalDeclarationRejectsLegacyMissingInstanceID(t *testing.T) {
 	environment.Spec.Services[0].InstanceID = "invalid-with-hyphens"
 	if _, ok := exactPortalDeclaration(environment, "web"); ok {
 		t.Fatal("invalid instanceID received portal eligibility")
+	}
+}
+
+func TestReconcilePortalRoutesRotatesChangedPresentation(t *testing.T) {
+	env := &platformv1alpha1.Environment{Spec: platformv1alpha1.EnvironmentSpec{Services: []platformv1alpha1.EnvironmentServiceDeclaration{{Name: "web", InstanceID: "aaaaaaaaaaaaaaaaaaaa", Revision: 1, Protocol: platformv1alpha1.EnvironmentServiceProtocolHTTP, Visibility: platformv1alpha1.EnvironmentServiceVisibilityProject}}}}
+	_, first, err := reconcilePortalRoutes(env, "web", "aaaaaaaaaaaaaaaaaaaa", 1, "0123456789abcdef")
+	if err != nil {
+		t.Fatal(err)
+	}
+	changed, second, err := reconcilePortalRoutes(env, "web", "aaaaaaaaaaaaaaaaaaaa", 1, "fedcba9876543210")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !changed || first.Locator == second.Locator || first.Generation >= second.Generation || env.Status.PortalRoutes[0].Active || second.PresentationID != "fedcba9876543210" {
+		t.Fatalf("presentation rotation first=%#v second=%#v status=%#v", first, second, env.Status.PortalRoutes)
+	}
+}
+
+func TestReconcileDisabledPortalRouteTombstonesAndStabilizesDenial(t *testing.T) {
+	env := &platformv1alpha1.Environment{Status: platformv1alpha1.EnvironmentStatus{NextPortalRouteGeneration: 4, PortalRoutes: []platformv1alpha1.EnvironmentPortalRoute{
+		{Name: "web", PresentationID: "0123456789abcdef", DeclarationInstanceID: "aaaaaaaaaaaaaaaaaaaa", DeclarationRevision: 1, Locator: "aaaaaaaaaaaaaaaaaaaa", Generation: 3, Active: true},
+		{Name: "other", PresentationID: "0123456789abcdef", DeclarationInstanceID: "bbbbbbbbbbbbbbbbbbbb", DeclarationRevision: 1, Locator: "bbbbbbbbbbbbbbbbbbbb", Generation: 4, Active: true},
+	}}}
+	changed, denial, err := reconcileDisabledPortalRoute(env, "web", "aaaaaaaaaaaaaaaaaaaa", 1, "fedcba9876543210")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !changed || denial.Active || denial.Generation != 5 || env.Status.PortalRoutes[0].Active || env.Status.PortalRoutes[1].Active {
+		t.Fatalf("disabled denial=%#v status=%#v", denial, env.Status)
+	}
+	changed, stable, err := reconcileDisabledPortalRoute(env, "web", "aaaaaaaaaaaaaaaaaaaa", 1, "fedcba9876543210")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if changed || stable.Generation != denial.Generation || stable.Locator != denial.Locator {
+		t.Fatalf("disabled denial was not stable: %#v", stable)
+	}
+	env.Status.NextPortalRouteGeneration++
+	env.Status.PortalRoutes = append(env.Status.PortalRoutes, platformv1alpha1.EnvironmentPortalRoute{Name: "web", PresentationID: "0123456789abcdef", DeclarationInstanceID: "aaaaaaaaaaaaaaaaaaaa", DeclarationRevision: 1, Locator: "cccccccccccccccccccc", Generation: env.Status.NextPortalRouteGeneration, Active: true})
+	changed, secondDenial, err := reconcileDisabledPortalRoute(env, "web", "aaaaaaaaaaaaaaaaaaaa", 1, "fedcba9876543210")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !changed || secondDenial.Generation <= env.Status.PortalRoutes[len(env.Status.PortalRoutes)-2].Generation || secondDenial.Generation <= denial.Generation {
+		t.Fatalf("re-disabled route reused stale denial: first=%#v second=%#v status=%#v", denial, secondDenial, env.Status)
+	}
+}
+
+func TestTombstoneStaleRoutePersistsGatewayDenial(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := platformv1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	route := platformv1alpha1.EnvironmentPortalRoute{Name: "web", Locator: "aaaaaaaaaaaaaaaaaaaa", Generation: 3, Active: true}
+	env := &platformv1alpha1.Environment{ObjectMeta: metav1.ObjectMeta{Name: "env", Namespace: "ns", UID: "uid"}, Status: platformv1alpha1.EnvironmentStatus{PortalRoutes: []platformv1alpha1.EnvironmentPortalRoute{route}}}
+	resolver := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(env).WithObjects(env).Build()
+	gateway := &portalGateway{resolver: resolver}
+	gateway.tombstoneStaleRoute(context.Background(), client.ObjectKeyFromObject(env), env.UID, route)
+	var got platformv1alpha1.Environment
+	if err := resolver.Get(context.Background(), client.ObjectKeyFromObject(env), &got); err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Status.PortalRoutes) != 1 || got.Status.PortalRoutes[0].Active {
+		t.Fatalf("stale route was not tombstoned: %#v", got.Status.PortalRoutes)
 	}
 }
 

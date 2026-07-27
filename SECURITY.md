@@ -166,8 +166,10 @@ Service plus exact Host exercises gateway hairpin but does not provide in-Enviro
 DNS. Repository services receive `PORT` and the exact gateway-discovered `PUBLIC_URL`, but no
 portal credential or projected service-account token. The operator uses a rotating projected
 token and only exact `get` authority on the two virtual portal resources for authenticated
-discovery; it never constructs a URL. Disabled or unavailable discovery preserves declarations
-but prevents launch. Process reconciliation is fenced by Environment UID and monotonic revision;
+discovery; it never constructs a URL. Disabled discovery returns a gateway-owned durable denial
+generation that tombstones routes and stops the complete managed set; unavailable discovery
+preserves declarations but prevents launch. Process reconciliation is fenced by Environment UID and the monotonic
+Environment-intent/gateway-route revision pair;
 pause/resume creates a new daemon epoch, and pause, removal, or replacement revokes the old
 process and URL. Portal UI work (#95) remains out of scope.
 

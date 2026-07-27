@@ -3,6 +3,7 @@ package controlplane
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/base32"
 	"errors"
 	"fmt"
@@ -58,6 +59,7 @@ type portalGateway struct {
 
 type PortalRoute struct {
 	URL                   string `json:"url"`
+	Disabled              bool   `json:"disabled,omitempty"`
 	EnvironmentUID        string `json:"environmentUID"`
 	Service               string `json:"service"`
 	Revision              int64  `json:"revision"`
@@ -68,7 +70,13 @@ type PortalRoute struct {
 func newPortalGateway(s *Server, o ServerOptions) *portalGateway {
 	suffix := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(o.PortalSuffix)), ".")
 	scheme := strings.ToLower(strings.TrimSpace(o.PortalScheme))
-	if suffix == "" || o.PortalResolver == nil || o.PortalDialer == nil {
+	if o.PortalResolver == nil {
+		return nil
+	}
+	if suffix == "" {
+		return &portalGateway{server: s, resolver: o.PortalResolver, suffix: suffix, scheme: scheme, requests: make(chan struct{}, 64)}
+	}
+	if o.PortalDialer == nil {
 		return nil
 	}
 	if scheme != "https" && scheme != "http" {
@@ -82,6 +90,8 @@ func newPortalGateway(s *Server, o ServerOptions) *portalGateway {
 	}
 	return &portalGateway{server: s, resolver: o.PortalResolver, enumerator: o.PortalEnvironmentEnumerator, dialer: o.PortalDialer, suffix: suffix, scheme: scheme, requests: make(chan struct{}, 64)}
 }
+
+func (g *portalGateway) enabled() bool { return g != nil && g.suffix != "" }
 
 // ValidatePortalConfiguration rejects partially configured or malformed
 // production gateway settings. Empty settings intentionally disable portals.
@@ -225,7 +235,25 @@ func (g *portalGateway) discover(w http.ResponseWriter, r *http.Request, ns, nam
 			http.NotFound(w, r)
 			return
 		}
-		changed, route, err := reconcilePortalRoutes(&env, service, decl.InstanceID, decl.Revision)
+		if !g.enabled() {
+			changed, route, err := reconcileDisabledPortalRoute(&env, service, decl.InstanceID, decl.Revision, g.presentationID())
+			if err != nil {
+				g.server.writeResourceError(w, "disable portal route", ns, name, err)
+				return
+			}
+			if changed {
+				if err := g.resolver.Status().Update(r.Context(), &env); err != nil {
+					if apierrors.IsConflict(err) {
+						continue
+					}
+					g.server.writeResourceError(w, "disable portal route", ns, name, err)
+					return
+				}
+			}
+			writeJSON(w, http.StatusOK, PortalRoute{Disabled: true, EnvironmentUID: string(env.UID), Service: service, Revision: decl.Revision, DeclarationInstanceID: decl.InstanceID, RouteGeneration: route.Generation})
+			return
+		}
+		changed, route, err := reconcilePortalRoutes(&env, service, decl.InstanceID, decl.Revision, g.presentationID())
 		if err != nil {
 			g.server.writeResourceError(w, "generate portal route", ns, name, err)
 			return
@@ -243,6 +271,57 @@ func (g *portalGateway) discover(w http.ResponseWriter, r *http.Request, ns, nam
 		return
 	}
 	writeProblem(w, 409, "conflict", "Conflict", "portal route changed concurrently")
+}
+
+func reconcileDisabledPortalRoute(env *platformv1alpha1.Environment, want, instanceID string, revision int64, presentationID string) (bool, platformv1alpha1.EnvironmentPortalRoute, error) {
+	changed := false
+	for i := range env.Status.PortalRoutes {
+		route := &env.Status.PortalRoutes[i]
+		if route.Active {
+			route.Active = false
+			changed = true
+		}
+	}
+	if !changed {
+		var denial platformv1alpha1.EnvironmentPortalRoute
+		latestGeneration := int64(0)
+		for i := range env.Status.PortalRoutes {
+			route := &env.Status.PortalRoutes[i]
+			if route.Name != want {
+				continue
+			}
+			if route.Generation > latestGeneration {
+				latestGeneration = route.Generation
+			}
+			if !route.Active && route.PresentationID == presentationID && route.DeclarationInstanceID == instanceID && route.DeclarationRevision == revision && route.Generation > denial.Generation {
+				denial = *route
+			}
+		}
+		if denial.Generation > 0 && denial.Generation >= latestGeneration {
+			return false, denial, nil
+		}
+	}
+	locator, err := randomLocator()
+	if err != nil {
+		return false, platformv1alpha1.EnvironmentPortalRoute{}, err
+	}
+	env.Status.NextPortalRouteGeneration++
+	route := platformv1alpha1.EnvironmentPortalRoute{Name: want, PresentationID: presentationID, DeclarationInstanceID: instanceID, DeclarationRevision: revision, Locator: locator, Generation: env.Status.NextPortalRouteGeneration, Active: false}
+	env.Status.PortalRoutes = append(env.Status.PortalRoutes, route)
+	for len(env.Status.PortalRoutes) > 64 {
+		idx := -1
+		for i := range env.Status.PortalRoutes[:len(env.Status.PortalRoutes)-1] {
+			if !env.Status.PortalRoutes[i].Active {
+				idx = i
+				break
+			}
+		}
+		if idx < 0 {
+			break
+		}
+		env.Status.PortalRoutes = append(env.Status.PortalRoutes[:idx], env.Status.PortalRoutes[idx+1:]...)
+	}
+	return true, route, nil
 }
 
 func exactPortalDeclaration(env *platformv1alpha1.Environment, name string) (platformv1alpha1.EnvironmentServiceDeclaration, bool) {
@@ -263,7 +342,7 @@ func exactPortalDeclaration(env *platformv1alpha1.Environment, name string) (pla
 	return *d, true
 }
 
-func reconcilePortalRoutes(env *platformv1alpha1.Environment, want, instanceID string, revision int64) (bool, platformv1alpha1.EnvironmentPortalRoute, error) {
+func reconcilePortalRoutes(env *platformv1alpha1.Environment, want, instanceID string, revision int64, presentationID string) (bool, platformv1alpha1.EnvironmentPortalRoute, error) {
 	changed := false
 	declarations := map[string]platformv1alpha1.EnvironmentServiceDeclaration{}
 	for _, d := range env.Spec.Services {
@@ -274,7 +353,7 @@ func reconcilePortalRoutes(env *platformv1alpha1.Environment, want, instanceID s
 	for i := range env.Status.PortalRoutes {
 		r := &env.Status.PortalRoutes[i]
 		d, exists := declarations[r.Name]
-		if r.Active && (!exists || d.InstanceID != r.DeclarationInstanceID || d.Revision != r.DeclarationRevision) {
+		if r.Active && (!exists || d.InstanceID != r.DeclarationInstanceID || d.Revision != r.DeclarationRevision || r.PresentationID != presentationID) {
 			r.Active = false
 			changed = true
 		}
@@ -290,7 +369,7 @@ func reconcilePortalRoutes(env *platformv1alpha1.Environment, want, instanceID s
 		return false, platformv1alpha1.EnvironmentPortalRoute{}, err
 	}
 	env.Status.NextPortalRouteGeneration++
-	route := platformv1alpha1.EnvironmentPortalRoute{Name: want, DeclarationInstanceID: instanceID, DeclarationRevision: revision, Locator: loc, Generation: env.Status.NextPortalRouteGeneration, Active: true}
+	route := platformv1alpha1.EnvironmentPortalRoute{Name: want, PresentationID: presentationID, DeclarationInstanceID: instanceID, DeclarationRevision: revision, Locator: loc, Generation: env.Status.NextPortalRouteGeneration, Active: true}
 	env.Status.PortalRoutes = append(env.Status.PortalRoutes, route)
 	changed = true
 	for len(env.Status.PortalRoutes) > 64 {
@@ -307,6 +386,10 @@ func reconcilePortalRoutes(env *platformv1alpha1.Environment, want, instanceID s
 		env.Status.PortalRoutes = append(env.Status.PortalRoutes[:idx], env.Status.PortalRoutes[idx+1:]...)
 	}
 	return changed, route, nil
+}
+func (g *portalGateway) presentationID() string {
+	sum := sha256.Sum256([]byte(g.scheme + "\x00" + g.suffix))
+	return fmt.Sprintf("%x", sum[:8])
 }
 func randomLocator() (string, error) {
 	b := make([]byte, 20)
@@ -428,7 +511,12 @@ func (g *portalGateway) serveLocator(w http.ResponseWriter, r *http.Request, loc
 		return
 	}
 	decl, ok := exactPortalDeclaration(&env, route.Name)
-	if !ok || decl.InstanceID != route.DeclarationInstanceID || decl.Revision != route.DeclarationRevision || g.authorize(authRequest, env.Namespace, env.Name, route.Name, &env) != nil || portalPolicyError(&env) != nil {
+	if !ok || decl.InstanceID != route.DeclarationInstanceID || decl.Revision != route.DeclarationRevision || route.PresentationID != g.presentationID() {
+		g.tombstoneStaleRoute(ctx, client.ObjectKeyFromObject(&env), env.UID, route)
+		portal404(w)
+		return
+	}
+	if g.authorize(authRequest, env.Namespace, env.Name, route.Name, &env) != nil || portalPolicyError(&env) != nil {
 		portal404(w)
 		return
 	}
@@ -549,6 +637,34 @@ func (g *portalGateway) serveLocator(w http.ResponseWriter, r *http.Request, loc
 	proxyRequest := r.Clone(lifetimeCtx)
 	go g.revalidatePortalLease(leaseCtx, leaseRequest, conn, client.ObjectKeyFromObject(&post), fence, snapshot, route)
 	g.proxy(w, proxyRequest, conn)
+}
+
+// tombstoneStaleRoute performs gateway-owned denial cleanup after a locator
+// resolves to a declaration that no longer exists or no longer matches. The
+// request remains a uniform 404 regardless of cleanup success.
+func (g *portalGateway) tombstoneStaleRoute(ctx context.Context, key types.NamespacedName, uid types.UID, stale platformv1alpha1.EnvironmentPortalRoute) {
+	for attempt := 0; attempt < 5; attempt++ {
+		var current platformv1alpha1.Environment
+		if g.resolver.Get(ctx, key, &current) != nil || current.UID != uid {
+			return
+		}
+		found := false
+		for i := range current.Status.PortalRoutes {
+			route := &current.Status.PortalRoutes[i]
+			if route.Active && route.Generation == stale.Generation && route.Locator == stale.Locator {
+				route.Active = false
+				found = true
+				break
+			}
+		}
+		if !found {
+			return
+		}
+		if err := g.resolver.Status().Update(ctx, &current); apierrors.IsConflict(err) {
+			continue
+		}
+		return
+	}
 }
 
 func (g *portalGateway) recordAdmissionActivity(ctx context.Context, env *platformv1alpha1.Environment, next *time.Time, previousFence *lifecycle.ExecutionFence) error {

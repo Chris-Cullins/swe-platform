@@ -290,7 +290,9 @@ template, backend, endpoint, TLS identity, and private observation capability. T
 state is reader-freshness-qualified and never route authority. The implemented control-plane
 gateway separately owns bounded durable
 `status.portalRoutes` records containing opaque locators, declaration identity/revision,
-monotonic route generations, and active/tombstone state. These records are routing state, not
+an opaque presentation identity for the gateway's scheme/suffix, monotonic route generations,
+and active/tombstone state. A changed gateway presentation rotates the route rather than leaving
+a process pinned to a stale URL. These records are routing state, not
 service-observation state: observations remain advisory and every connection still proves the
 current declaration, execution, and private sandboxd backend. A Project-less Environment may
 retain declarations but cannot receive a route until an exact current Project and Installation
@@ -328,14 +330,17 @@ The gateway remains sole URL and route owner. For each repository process the op
 rotating projected service-account token to call existing authenticated portal discovery; RBAC
 grants only `get` on `environments/portal` and `environmentservices/portal`. It consumes the
 exact proof-bearing URL and never constructs one. Processes receive only `PORT` and `PUBLIC_URL`,
-never that token or a portal credential. Disabled or unavailable discovery preserves declarations
+never that token or a portal credential. When portals are disabled, the same authenticated
+gateway authority tombstones active routes and returns a durable denial generation; the operator
+publishes an empty managed set at that generation. Unavailable discovery preserves declarations
 but launch fails closed.
 
 The file read uses a distinct filesystem-only sandboxd capability and process reconciliation uses
 the separate process capability; neither raw token is mounted or injected. Before and after calls
 the connector proves the full Environment UID/execution, backend, Pod, endpoint, TLS identity,
-Secret, and exact capability. The desired process set is Environment UID plus monotonic
-Environment generation. sandboxd restarts crashes and successful exits with bounded backoff,
+Secret, and exact capability. The desired process set is Environment UID plus the
+lexicographically monotonic Environment generation/gateway route generation pair. sandboxd
+restarts crashes and successful exits with bounded backoff,
 starts a new daemon epoch after resume, and stops removals while suppressing restart. Pause,
 removal, and Environment or Pod replacement fence old processes and URLs. Observations remain
 advisory; gateway route state remains authority.

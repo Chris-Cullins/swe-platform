@@ -134,6 +134,10 @@ message ReconcileManagedServicesRequest {
   string owner_id = 1;
   uint64 intent_revision = 2;
   repeated ManagedServiceSpec services = 3;
+  // route_revision is the gateway-owned monotonic route generation used by
+  // the complete service set. The pair (intent_revision, route_revision) is
+  // ordered lexicographically.
+  uint64 route_revision = 4;
 }
 
 message ManagedServiceStatus {
@@ -145,6 +149,7 @@ message ReconcileManagedServicesResponse {
   string owner_id = 1;
   uint64 intent_revision = 2;
   repeated ManagedServiceStatus services = 3;
+  uint64 route_revision = 4;
 }
 
 message StartProcessRequest {

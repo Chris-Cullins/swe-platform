@@ -90,25 +90,27 @@ type managedProcess struct {
 
 type ProcessServer struct {
 	sandboxdv1.UnimplementedProcessServiceServer
-	Workspace      string
-	mu             sync.Mutex
-	processes      map[processKey]*managedProcess
-	closed         bool
-	OutputCapacity int
-	MaxRecords     int
-	supervisor     *Supervisor
-	reconcileMu    sync.Mutex
-	managedOwners  map[string]*managedOwner
-	restartInitial time.Duration
-	restartMax     time.Duration
-	restartStable  time.Duration
+	Workspace          string
+	mu                 sync.Mutex
+	processes          map[processKey]*managedProcess
+	closed             bool
+	OutputCapacity     int
+	MaxRecords         int
+	supervisor         *Supervisor
+	reconcileMu        sync.Mutex
+	managedOwners      map[string]*managedOwner
+	restartInitial     time.Duration
+	restartMax         time.Duration
+	restartStable      time.Duration
+	beforeManagedStart func()
 }
 
 type managedOwner struct {
-	revision uint64
-	wire     []byte
-	desired  map[string]*sandboxdv1.ProcessSpec
-	gen      uint64
+	revision      uint64
+	routeRevision uint64
+	wire          []byte
+	desired       map[string]*sandboxdv1.ProcessSpec
+	gen           uint64
 }
 
 func NewProcessServer(workspace string, supervisors ...*Supervisor) *ProcessServer {
@@ -216,6 +218,11 @@ func (s *ProcessServer) Start(_ context.Context, req *sandboxdv1.StartProcessReq
 	if req == nil {
 		return nil, status.Error(codes.InvalidArgument, "request must not be nil")
 	}
+	s.reconcileMu.Lock()
+	defer s.reconcileMu.Unlock()
+	if err := s.rejectManagedKey(req.Key); err != nil {
+		return nil, err
+	}
 	return s.start(req.Key, req.Spec, nil, false)
 }
 
@@ -225,7 +232,25 @@ func (s *ProcessServer) StartWithLaunchMaterial(_ context.Context, req *sandboxd
 	}
 	secretEnv := req.GetLaunchMaterial().GetSecretEnv()
 	defer clearSecretEnv(secretEnv)
+	s.reconcileMu.Lock()
+	defer s.reconcileMu.Unlock()
+	if err := s.rejectManagedKey(req.Key); err != nil {
+		return nil, err
+	}
 	return s.start(req.Key, req.Spec, secretEnv, true)
+}
+
+func (s *ProcessServer) rejectManagedKey(keyRequest *sandboxdv1.ProcessKey) error {
+	key, err := requestKey(keyRequest)
+	if err != nil {
+		return err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if owner := s.managedOwners[key.ownerID]; owner != nil && owner.desired[key.role] != nil {
+		return status.Error(codes.FailedPrecondition, "process key is owned by managed service intent")
+	}
+	return nil
 }
 
 // ReconcileManagedServices accepts a complete desired service set. Reconcile
@@ -252,7 +277,7 @@ func (s *ProcessServer) ReconcileManagedServices(_ context.Context, req *sandbox
 		roles = append(roles, service.Role)
 	}
 	sort.Strings(roles)
-	canonical := &sandboxdv1.ReconcileManagedServicesRequest{OwnerId: req.OwnerId, IntentRevision: req.IntentRevision}
+	canonical := &sandboxdv1.ReconcileManagedServicesRequest{OwnerId: req.OwnerId, IntentRevision: req.IntentRevision, RouteRevision: req.RouteRevision}
 	for _, role := range roles {
 		canonical.Services = append(canonical.Services, &sandboxdv1.ManagedServiceSpec{Role: role, Spec: desired[role]})
 	}
@@ -270,11 +295,11 @@ func (s *ProcessServer) ReconcileManagedServices(_ context.Context, req *sandbox
 	}
 	owner := s.managedOwners[req.OwnerId]
 	if owner != nil {
-		if req.IntentRevision < owner.revision {
+		if req.IntentRevision < owner.revision || req.IntentRevision == owner.revision && req.RouteRevision < owner.routeRevision {
 			s.mu.Unlock()
-			return nil, status.Error(codes.FailedPrecondition, "intent_revision is stale")
+			return nil, status.Error(codes.FailedPrecondition, "managed service revision is stale")
 		}
-		if req.IntentRevision == owner.revision {
+		if req.IntentRevision == owner.revision && req.RouteRevision == owner.routeRevision {
 			if !bytes.Equal(wire, owner.wire) {
 				s.mu.Unlock()
 				return nil, status.Error(codes.FailedPrecondition, "intent_revision has a different desired set")
@@ -288,7 +313,7 @@ func (s *ProcessServer) ReconcileManagedServices(_ context.Context, req *sandbox
 	if owner != nil {
 		gen = owner.gen + 1
 	}
-	owner = &managedOwner{revision: req.IntentRevision, wire: wire, desired: desired, gen: gen}
+	owner = &managedOwner{revision: req.IntentRevision, routeRevision: req.RouteRevision, wire: wire, desired: desired, gen: gen}
 	s.managedOwners[req.OwnerId] = owner
 	var stop []*managedProcess
 	toStart := make(map[string]struct{}, len(desired))
@@ -296,11 +321,11 @@ func (s *ProcessServer) ReconcileManagedServices(_ context.Context, req *sandbox
 		toStart[role] = struct{}{}
 	}
 	for key, p := range s.processes {
-		if key.ownerID != req.OwnerId || !p.managed {
+		if key.ownerID != req.OwnerId {
 			continue
 		}
 		spec, wanted := desired[key.role]
-		if !wanted || !reflect.DeepEqual(spec, p.spec) {
+		if !p.managed || !wanted || !reflect.DeepEqual(spec, p.spec) {
 			p.managed = false
 			p.managedSuppressed = false
 			if p.state == sandboxdv1.ProcessState_PROCESS_STATE_RUNNING {
@@ -318,7 +343,7 @@ func (s *ProcessServer) ReconcileManagedServices(_ context.Context, req *sandbox
 	// Changed slots are launched by the old execution's completion; brand-new
 	// slots can be admitted immediately.
 	for role := range toStart {
-		s.ensureManaged(req.OwnerId, role, gen, 0)
+		s.ensureManagedUnderReconcile(req.OwnerId, role, gen, 0)
 	}
 	s.mu.Lock()
 	resp := s.managedResponseLocked(req.OwnerId, owner)
@@ -327,7 +352,7 @@ func (s *ProcessServer) ReconcileManagedServices(_ context.Context, req *sandbox
 }
 
 func (s *ProcessServer) managedResponseLocked(ownerID string, owner *managedOwner) *sandboxdv1.ReconcileManagedServicesResponse {
-	resp := &sandboxdv1.ReconcileManagedServicesResponse{OwnerId: ownerID, IntentRevision: owner.revision}
+	resp := &sandboxdv1.ReconcileManagedServicesResponse{OwnerId: ownerID, IntentRevision: owner.revision, RouteRevision: owner.routeRevision}
 	roles := make([]string, 0, len(owner.desired))
 	for role := range owner.desired {
 		roles = append(roles, role)
@@ -344,6 +369,15 @@ func (s *ProcessServer) managedResponseLocked(ownerID string, owner *managedOwne
 }
 
 func (s *ProcessServer) ensureManaged(ownerID, role string, gen uint64, attempt uint) {
+	s.reconcileMu.Lock()
+	defer s.reconcileMu.Unlock()
+	s.ensureManagedUnderReconcile(ownerID, role, gen, attempt)
+}
+
+// ensureManagedUnderReconcile is called only while reconcileMu is held. The
+// admission gap around start therefore cannot overlap a newer desired set or
+// an explicit Stop and resurrect an obsolete execution.
+func (s *ProcessServer) ensureManagedUnderReconcile(ownerID, role string, gen uint64, attempt uint) {
 	s.mu.Lock()
 	owner := s.managedOwners[ownerID]
 	if s.closed || owner == nil || owner.gen != gen || owner.desired[role] == nil {
@@ -351,15 +385,31 @@ func (s *ProcessServer) ensureManaged(ownerID, role string, gen uint64, attempt 
 		return
 	}
 	key := processKey{ownerID, role}
-	if old := s.processes[key]; old != nil && old.state != sandboxdv1.ProcessState_PROCESS_STATE_EXITED && old.state != sandboxdv1.ProcessState_PROCESS_STATE_FAILED {
-		s.mu.Unlock()
-		return
+	if old := s.processes[key]; old != nil {
+		if old.managedSuppressed && old.managedGeneration == gen {
+			s.mu.Unlock()
+			return
+		}
+		if old.state != sandboxdv1.ProcessState_PROCESS_STATE_EXITED && old.state != sandboxdv1.ProcessState_PROCESS_STATE_FAILED {
+			s.mu.Unlock()
+			return
+		}
 	}
 	delete(s.processes, key)
 	spec := owner.desired[role]
 	s.mu.Unlock()
-	_, _ = s.start(&sandboxdv1.ProcessKey{OwnerId: ownerID, Role: role}, spec, nil, false)
+	if s.beforeManagedStart != nil {
+		s.beforeManagedStart()
+	}
+	_, startErr := s.start(&sandboxdv1.ProcessKey{OwnerId: ownerID, Role: role}, spec, nil, false)
 	s.mu.Lock()
+	if startErr != nil {
+		if owner == s.managedOwners[ownerID] && owner.gen == gen && owner.desired[role] != nil && !s.closed {
+			time.AfterFunc(s.restartInitial, func() { s.ensureManaged(ownerID, role, gen, attempt+1) })
+		}
+		s.mu.Unlock()
+		return
+	}
 	if p := s.processes[key]; p != nil && owner == s.managedOwners[ownerID] && owner.gen == gen && reflect.DeepEqual(p.spec, spec) {
 		p.managed, p.managedGeneration, p.restartAttempt, p.startedAt = true, gen, attempt, time.Now()
 		if p.state == sandboxdv1.ProcessState_PROCESS_STATE_EXITED || p.state == sandboxdv1.ProcessState_PROCESS_STATE_FAILED {
@@ -754,6 +804,8 @@ func (s *ProcessServer) Get(_ context.Context, req *sandboxdv1.GetProcessRequest
 	return processResponse(p), nil
 }
 func (s *ProcessServer) Stop(_ context.Context, req *sandboxdv1.StopProcessRequest) (*sandboxdv1.Process, error) {
+	s.reconcileMu.Lock()
+	defer s.reconcileMu.Unlock()
 	if req == nil {
 		return nil, status.Error(codes.InvalidArgument, "request must not be nil")
 	}
@@ -780,13 +832,14 @@ func (s *ProcessServer) Stop(_ context.Context, req *sandboxdv1.StopProcessReque
 		s.mu.Unlock()
 		return &sandboxdv1.Process{Key: req.Key, State: sandboxdv1.ProcessState_PROCESS_STATE_EXITED}, nil
 	}
-	if !p.started {
-		s.mu.Unlock()
-		return processResponse(p), nil
-	}
 	if p.managed {
 		p.managed = false
 		p.managedSuppressed = true
+	}
+	if !p.started {
+		response := processResponse(p)
+		s.mu.Unlock()
+		return response, nil
 	}
 	if p.state == sandboxdv1.ProcessState_PROCESS_STATE_EXITED || p.state == sandboxdv1.ProcessState_PROCESS_STATE_FAILED {
 		response := processResponse(p)

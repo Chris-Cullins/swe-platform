@@ -823,9 +823,9 @@ status routes, and has Secret `get` (but not list/watch) in onboarded namespaces
 requests only the exact credential named by the current pod. Environment NetworkPolicy is
 unchanged: only installation-labeled operator/control-plane pods reach sandboxd port 50051, and
 Ingress never targets an Environment pod. The operator additionally receives exact `get` on
-`environments/portal` and `environmentservices/portal` only while portals are enabled. It uses a
-rotating projected service-account token to discover each repository service's exact
-proof-bearing URL; it never constructs one.
+`environments/portal` and `environmentservices/portal`. It uses a rotating projected
+service-account token to discover each repository service's exact proof-bearing URL—or the
+gateway's durable denial generation when portals are disabled; it never constructs either.
 
 Repositories can declare up to 32 processes in strict version-1 `.swe/services.yaml`:
 
@@ -843,8 +843,9 @@ anchors, merge keys, multiple documents, oversized input/argv, and invalid ports
 entries converge into `Environment.spec.services` without replacing API entries; same-name and
 repository process port collisions fail closed, while API port aliases remain supported. The CLI
 refuses to mutate repository-owned entries. Services receive only `PORT` and discovered
-`PUBLIC_URL`, not a portal credential or projected token. If portals are disabled or unavailable,
-declarations remain durable but launch fails closed. Portal UI (#95) is not implemented.
+`PUBLIC_URL`, not a portal credential or projected token. If portals are disabled, the gateway
+tombstones active routes and the operator stops the complete managed service set; if discovery is
+unavailable, declarations remain durable but launch fails closed. Portal UI (#95) is not implemented.
 
 ## Operations console
 
