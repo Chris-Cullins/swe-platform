@@ -1293,6 +1293,8 @@ func runRelevantEnvironmentUpdate(oldEnvironment, newEnvironment *platformv1alph
 	newStatus.LastActiveAt = nil
 	oldStatus.Lifecycle.ActivityReceipts = nil
 	newStatus.Lifecycle.ActivityReceipts = nil
+	oldStatus.ServiceObservations = nil
+	newStatus.ServiceObservations = nil
 	return oldEnvironment.Generation != newEnvironment.Generation && !reflect.DeepEqual(*oldSpec, *newSpec) ||
 		oldEnvironment.UID != newEnvironment.UID ||
 		!reflect.DeepEqual(oldEnvironment.DeletionTimestamp, newEnvironment.DeletionTimestamp) ||

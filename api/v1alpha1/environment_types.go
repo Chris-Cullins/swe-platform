@@ -325,6 +325,66 @@ type EnvironmentEndpoints struct {
 	Terminal string `json:"terminal,omitempty"`
 }
 
+// EnvironmentServiceObservationState is the advisory result of one bounded
+// point-in-time observation of a declaration.
+// +kubebuilder:validation:Enum=Healthy;Unhealthy;Unknown;Pending;Unavailable
+type EnvironmentServiceObservationState string
+
+const (
+	EnvironmentServiceObservationHealthy     EnvironmentServiceObservationState = "Healthy"
+	EnvironmentServiceObservationUnhealthy   EnvironmentServiceObservationState = "Unhealthy"
+	EnvironmentServiceObservationUnknown     EnvironmentServiceObservationState = "Unknown"
+	EnvironmentServiceObservationPending     EnvironmentServiceObservationState = "Pending"
+	EnvironmentServiceObservationUnavailable EnvironmentServiceObservationState = "Unavailable"
+)
+
+// EnvironmentServiceObservationReason is a fixed, non-sensitive explanation.
+// +kubebuilder:validation:Enum=ConnectionAccepted;ConnectionFailed;ProbeTimedOut;ObservationFailed;EnvironmentNotReady;EnvironmentSuspended
+type EnvironmentServiceObservationReason string
+
+const (
+	EnvironmentServiceReasonConnectionAccepted   EnvironmentServiceObservationReason = "ConnectionAccepted"
+	EnvironmentServiceReasonConnectionFailed     EnvironmentServiceObservationReason = "ConnectionFailed"
+	EnvironmentServiceReasonProbeTimedOut        EnvironmentServiceObservationReason = "ProbeTimedOut"
+	EnvironmentServiceReasonObservationFailed    EnvironmentServiceObservationReason = "ObservationFailed"
+	EnvironmentServiceReasonEnvironmentNotReady  EnvironmentServiceObservationReason = "EnvironmentNotReady"
+	EnvironmentServiceReasonEnvironmentSuspended EnvironmentServiceObservationReason = "EnvironmentSuspended"
+)
+
+// +kubebuilder:validation:XValidation:rule="(self.state == 'Healthy' && self.reason == 'ConnectionAccepted') || (self.state == 'Unhealthy' && self.reason == 'ConnectionFailed') || (self.state == 'Unknown' && (self.reason == 'ProbeTimedOut' || self.reason == 'ObservationFailed')) || (self.state == 'Pending' && self.reason == 'EnvironmentNotReady') || (self.state == 'Unavailable' && self.reason == 'EnvironmentSuspended')",message="state and reason must be a supported pair"
+type EnvironmentServiceObservation struct {
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=63
+	// +kubebuilder:validation:Pattern=`^[a-z0-9]([-a-z0-9]*[a-z0-9])?$`
+	Name string `json:"name"`
+	// +kubebuilder:validation:Minimum=1
+	DeclarationRevision int64                               `json:"declarationRevision"`
+	State               EnvironmentServiceObservationState  `json:"state"`
+	Reason              EnvironmentServiceObservationReason `json:"reason"`
+}
+
+// EnvironmentServiceObservations is one atomic, declaration-correlated and
+// reader-freshness-qualified advisory envelope. It is never route authority.
+// +kubebuilder:validation:XValidation:rule="has(self.executionGeneration) ? self.records.all(r, r.state in ['Healthy', 'Unhealthy', 'Unknown']) : (self.records.all(r, r.state == 'Pending') || self.records.all(r, r.state == 'Unavailable'))",message="execution generation is required exactly for probe-derived records"
+type EnvironmentServiceObservations struct {
+	// +kubebuilder:validation:Minimum=1
+	ObservedGeneration int64 `json:"observedGeneration"`
+	// ExecutionGeneration is present only for post-call-proven probe outcomes.
+	// +kubebuilder:validation:Minimum=1
+	// +optional
+	ExecutionGeneration *int64 `json:"executionGeneration,omitempty"`
+	// +kubebuilder:validation:Minimum=0
+	LifecycleEpoch int64 `json:"lifecycleEpoch"`
+	// +kubebuilder:validation:Minimum=0
+	HoldRevision int64       `json:"holdRevision"`
+	ObservedAt   metav1.Time `json:"observedAt"`
+	// +listType=map
+	// +listMapKey=name
+	// +kubebuilder:validation:MinItems=1
+	// +kubebuilder:validation:MaxItems=32
+	Records []EnvironmentServiceObservation `json:"records"`
+}
+
 // EnvironmentStatus defines the observed state of Environment.
 // +kubebuilder:validation:XValidation:rule="!has(oldSelf.executionGeneration) || (has(self.executionGeneration) && self.executionGeneration >= oldSelf.executionGeneration)",message="executionGeneration cannot decrease or be removed"
 type EnvironmentStatus struct {
@@ -355,6 +415,12 @@ type EnvironmentStatus struct {
 
 	// +optional
 	Endpoints EnvironmentEndpoints `json:"endpoints,omitempty"`
+
+	// ServiceObservations is advisory point-in-time service state owned solely
+	// by the service-observation controller. Readers determine freshness from
+	// the correlated generations, lifecycle fence, declarations, and time.
+	// +optional
+	ServiceObservations *EnvironmentServiceObservations `json:"serviceObservations,omitempty"`
 
 	// PodName is the name of the backing pod, when one exists.
 	// +optional

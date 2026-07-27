@@ -188,6 +188,59 @@ check_sandboxd_process() {
 	rm -f /tmp/swe-platform-sandboxd-cert-"$$" /tmp/swe-platform-sandboxd-token-"$$"
 }
 
+manage_observation_listener() {
+	local action="$1"
+	local pod_name="$2"
+	local owner="$3"
+	local role="$4"
+	local port="${5:-}"
+	local secret_name identity
+	secret_name=$(kubectl -n "$PROJECT_NAMESPACE" get pod "$pod_name" -o jsonpath='{.metadata.annotations.swe\.dev/sandboxd-secret-name}')
+	identity=$(kubectl -n "$PROJECT_NAMESPACE" get pod "$pod_name" -o jsonpath='{.metadata.annotations.swe\.dev/sandboxd-identity}')
+	kubectl -n "$PROJECT_NAMESPACE" get secret "$secret_name" -o jsonpath='{.data.tls\.crt}' | base64 --decode > /tmp/swe-platform-observation-cert-"$$"
+	kubectl -n "$PROJECT_NAMESPACE" get secret "$secret_name" -o jsonpath='{.data.process-token}' | base64 --decode > /tmp/swe-platform-observation-process-token-"$$"
+	kubectl -n "$PROJECT_NAMESPACE" port-forward pod/"$pod_name" 15052:50051 >/tmp/swe-platform-observation-port-forward.log 2>&1 &
+	SANDBOXD_PORT_FORWARD_PID=$!
+	for _ in $(seq 1 30); do
+		if grep -q 'Forwarding from' /tmp/swe-platform-observation-port-forward.log; then
+			break
+		fi
+		sleep 1
+	done
+	if [[ "$action" == "service-start" ]]; then
+		go run ./hack/e2e-process-check "$action" 127.0.0.1:15052 "$identity" /tmp/swe-platform-observation-cert-"$$" /tmp/swe-platform-observation-process-token-"$$" "$owner" "$role" "$port"
+	else
+		go run ./hack/e2e-process-check "$action" 127.0.0.1:15052 "$identity" /tmp/swe-platform-observation-cert-"$$" /tmp/swe-platform-observation-process-token-"$$" "$owner" "$role"
+	fi
+	kill "$SANDBOXD_PORT_FORWARD_PID" >/dev/null 2>&1 || true
+	wait "$SANDBOXD_PORT_FORWARD_PID" >/dev/null 2>&1 || true
+	SANDBOXD_PORT_FORWARD_PID=""
+	rm -f /tmp/swe-platform-observation-cert-"$$" /tmp/swe-platform-observation-process-token-"$$"
+}
+
+wait_service_observation() {
+	local environment="$1"
+	local service="$2"
+	local revision="$3"
+	local state="$4"
+	local execution_mode="${5:-present}"
+	for _ in $(seq 1 60); do
+		if kubectl -n "$PROJECT_NAMESPACE" get environment "$environment" -o json | jq -e \
+			--arg service "$service" --argjson revision "$revision" --arg state "$state" --arg execution_mode "$execution_mode" '
+			.status.serviceObservations as $envelope |
+			$envelope.observedGeneration == .metadata.generation and
+			any($envelope.records[]?; .name == $service and .declarationRevision == $revision and .state == $state) and
+			(if $execution_mode == "absent" then ($envelope.executionGeneration == null)
+			 else ($envelope.executionGeneration == .status.executionGeneration) end)' >/dev/null 2>&1; then
+			return 0
+		fi
+		sleep 1
+	done
+	echo "FAIL: service $service revision $revision did not reach $state ($execution_mode execution)" >&2
+	kubectl -n "$PROJECT_NAMESPACE" get environment "$environment" -o yaml >&2 || true
+	return 1
+}
+
 cd "$(dirname "$0")/.."
 
 echo "==> building binaries"
@@ -1541,6 +1594,28 @@ if ! grep -Fq $'web\t1\tHTTP\t3000\tProject\tTCPConnect' <<<"$SERVICE_LIST" ||
 	echo "FAIL: service list did not report durable declarations and duplicate-port aliases"
 	exit 1
 fi
+if grep -Eiq 'https?://|portal|url' <<<"$SERVICE_LIST"; then
+	echo "FAIL: service list exposed or implied a portal URL"
+	exit 1
+fi
+echo "==> verifying real stateless service observations and duplicate-port correlation"
+OBSERVATION_OWNER=$(kubectl get environment "$ENV_NAME" -o jsonpath='{.metadata.uid}')
+OBSERVATION_SECRET=$(kubectl get pod "$POD_NAME" -o jsonpath='{.metadata.annotations.swe\.dev/sandboxd-secret-name}')
+OBSERVATION_TOKEN=$(kubectl get secret "$OBSERVATION_SECRET" -o jsonpath='{.data.service-observation-token}' | base64 --decode)
+if [[ -z "$OBSERVATION_TOKEN" ]] || kubectl get pod "$POD_NAME" -o json | grep -Fq "$OBSERVATION_TOKEN" ||
+	kubectl exec "$POD_NAME" -- test -e /var/run/swe-platform/sandboxd/service-observation-token; then
+	echo "FAIL: observation token was absent from its Secret or exposed to the Environment pod"
+	exit 1
+fi
+manage_observation_listener service-start "$POD_NAME" "$OBSERVATION_OWNER" observation-listener-a 3000
+wait_service_observation "$ENV_NAME" web 1 Healthy
+wait_service_observation "$ENV_NAME" web-alias 1 Healthy
+manage_observation_listener service-stop "$POD_NAME" "$OBSERVATION_OWNER" observation-listener-a
+wait_service_observation "$ENV_NAME" web 1 Unhealthy
+wait_service_observation "$ENV_NAME" web-alias 1 Unhealthy
+manage_observation_listener service-start "$POD_NAME" "$OBSERVATION_OWNER" observation-listener-b 3000
+wait_service_observation "$ENV_NAME" web 1 Healthy
+wait_service_observation "$ENV_NAME" web-alias 1 Healthy
 bin/swe --namespace "$PROJECT_NAMESPACE" environment services declare "$ENV_NAME" web --target-port 3000
 if [[ "$(kubectl get environment "$ENV_NAME" -o jsonpath='{.spec.services[?(@.name=="web")].revision}')" != "1" ]]; then
 	echo "FAIL: exact service declare retry was not idempotent"
@@ -1571,16 +1646,20 @@ if [[ -n "$(kubectl get environment "$ENV_NAME" -o jsonpath='{.spec.services[?(@
 	echo "FAIL: service removal did not durably remove desired state"
 	exit 1
 fi
+manage_observation_listener service-stop "$POD_NAME" "$OBSERVATION_OWNER" observation-listener-b
 bin/swe --namespace "$PROJECT_NAMESPACE" environment services remove "$ENV_NAME" web
 bin/swe --namespace "$PROJECT_NAMESPACE" environment services declare "$ENV_NAME" web --target-port 3002
 if [[ "$(kubectl get environment "$ENV_NAME" -o jsonpath='{.spec.services[?(@.name=="web")].revision}')" != "1" ]]; then
 	echo "FAIL: same-name service re-add did not create a fresh declaration"
 	exit 1
 fi
-bin/swe --namespace "$PROJECT_NAMESPACE" environment services remove "$ENV_NAME" web
+manage_observation_listener service-start "$POD_NAME" "$OBSERVATION_OWNER" observation-listener-c 3002
+wait_service_observation "$ENV_NAME" web 1 Healthy
+PRE_PAUSE_OBSERVATION_EXECUTION=$(kubectl get environment "$ENV_NAME" -o jsonpath='{.status.serviceObservations.executionGeneration}')
 
 echo "==> verifying pause retains the workspace and resume runs its hook"
 bin/swe --namespace "$PROJECT_NAMESPACE" environment hold "$ENV_NAME"
+wait_service_observation "$ENV_NAME" web 1 Unavailable absent
 for _ in $(seq 1 60); do
 	PHASE=$(kubectl get environment "$ENV_NAME" -o jsonpath='{.status.phase}')
 	if [[ "$PHASE" == "Paused" ]] && ! kubectl get pod "$POD_NAME" >/dev/null 2>&1; then
@@ -1613,6 +1692,25 @@ if [[ "$(kubectl get environment "$ENV_NAME" -o jsonpath='{.spec.lifecycle.hold.
 fi
 kubectl wait --for=jsonpath='{.status.phase}'=Ready environment/"$ENV_NAME" --timeout=2m
 kubectl wait --for=condition=Ready pod/"$POD_NAME" --timeout=2m
+wait_service_observation "$ENV_NAME" web 1 Unhealthy
+POST_RESUME_OBSERVATION_EXECUTION=$(kubectl get environment "$ENV_NAME" -o jsonpath='{.status.serviceObservations.executionGeneration}')
+if [[ -z "$POST_RESUME_OBSERVATION_EXECUTION" || "$POST_RESUME_OBSERVATION_EXECUTION" -le "$PRE_PAUSE_OBSERVATION_EXECUTION" ]]; then
+	echo "FAIL: resumed service observation did not require a fresh execution"
+	exit 1
+fi
+manage_observation_listener service-start "$POD_NAME" "$OBSERVATION_OWNER" observation-listener-d 3002
+wait_service_observation "$ENV_NAME" web 1 Healthy
+bin/swe --namespace "$PROJECT_NAMESPACE" environment services remove "$ENV_NAME" web
+for _ in $(seq 1 30); do
+	if [[ -z "$(kubectl get environment "$ENV_NAME" -o jsonpath='{.status.serviceObservations}' 2>/dev/null || true)" ]]; then
+		break
+	fi
+	sleep 1
+done
+if [[ -n "$(kubectl get environment "$ENV_NAME" -o jsonpath='{.status.serviceObservations}' 2>/dev/null || true)" ]]; then
+	echo "FAIL: removed service retained an observation record"
+	exit 1
+fi
 RESUMED_IMAGE_ID=$(kubectl get environment "$ENV_NAME" -o jsonpath='{.status.imageID}')
 RESUMED_POD_IMAGE_ID=$(kubectl get pod "$POD_NAME" -o jsonpath='{.status.containerStatuses[?(@.name=="environment")].imageID}')
 if [[ -z "$RESUMED_IMAGE_ID" || "$RESUMED_IMAGE_ID" != "$RESUMED_POD_IMAGE_ID" ]]; then

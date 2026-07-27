@@ -47,8 +47,9 @@ CLI / TUI / local MCP / browser console
 - **`sandboxd`.** A small daemon in each Environment provides authenticated gRPC services for
   connection-bound exec, keyed managed processes, workspace-confined filesystem access, one
   shared terminal, health, and bounded stateless TCP-connect observations from its logical
-  loopback. The observation primitive retains no declarations or results, and no operator token
-  or connector currently invokes it.
+  loopback. The observation primitive retains no declarations or results; an operator-only
+  connector invokes it with an observation-only credential and a dedicated controller owns the
+  fenced advisory status envelope.
 
 Portal proxying, inbox delivery and child-run spawning, branch/PR publication, and non-Pod
 Environment backends are not implemented.
@@ -67,7 +68,7 @@ All current CRDs are namespaced:
 | `Installation` | Empty-spec identity object in the system namespace. Its immutable Kubernetes UID is the stable installation identity used by namespace claims, catalog sources, managed Template copies, and baseline resources. |
 | `Project` | One repository URL (represented as a one-item list), a same-namespace default Template reference, changes-workflow metadata, and a reserved egress allowlist. A non-empty allowlist is rejected when an Environment uses the Project. |
 | `EnvironmentTemplate` | Pod image, size/resources, disk, runtime class, idle timeout, warm-pool minimum, and backend. Admission currently permits only the `pod` backend. Chart-owned system-namespace objects are inert catalog sources; execution accepts only installation-managed same-namespace copies bound to exact Installation, source, and Project identities. |
-| `Environment` | Template/Project selection, explicit hold policy, bounded wake/suspend/activity intents, and up to 32 durable desired service declarations; status owns readiness, lifecycle suspension and epoch, backend-neutral execution generation, exact Run claim, backend observations, activity, and recovery state. |
+| `Environment` | Template/Project selection, explicit hold policy, bounded wake/suspend/activity intents, and up to 32 durable desired service declarations; status owns readiness, lifecycle suspension and epoch, backend-neutral execution generation, exact Run claim, backend observations, activity, recovery state, and the service-observation controller's atomic advisory observation envelope. |
 | `Run` | Immutable agent task and Environment/Project/Template/credential selection plus monotonic cancellation; status records normalized lifecycle, exact Environment name/UID and ownership, exact credential profile identity, accepted lifecycle epoch, and accepted execution generation. `notify` and `parentRef` are schema placeholders without an implemented inbox. |
 | `AgentCredentialProfile` | Immutable adapter and `APIKey` type metadata. Key bytes live in an owner-linked Secret whose name is derived from the profile UID. |
 
@@ -251,8 +252,15 @@ same-intent retry, `update` increments revision only for a real change, and `rem
 idempotent durable desired-state removal. A name change is remove plus declare.
 
 Declarations survive process restart, pause/resume, and Project-less warm-pool states because
-they are Environment spec, but nothing observes them or exposes a route today. A Project-less
-Environment may retain declarations but cannot receive a future route until an exact current
+they are Environment spec. A dedicated controller observes ready executions through sandboxd
+and is the sole writer of one atomic `status.serviceObservations` envelope. The bounded,
+name-keyed records correlate full declaration revisions, metadata and execution generations,
+lifecycle epoch, hold revision, and observation time. Pending and suspended results deliberately
+carry no execution generation; probe and transport outcomes are publishable only after an
+uncached post-call proof of the full `lifecycle.ExecutionFence`, declaration snapshot, Pod,
+template, backend, endpoint, TLS identity, and private observation capability. This advisory
+state is reader-freshness-qualified and never route authority. Nothing exposes a route today.
+A Project-less Environment may retain declarations but cannot receive a future route until an exact current
 Project and Installation claim authorizes it. Removal permanently revokes any future old route
 generation; re-adding the same name must receive a new route generation and can never resurrect
 an old route or URL. Route generations are gateway state and deliberately are not represented
@@ -414,15 +422,15 @@ environment base for amd64/arm64.
 These decisions constrain the future portions of the contracts. They do not imply that the
 listed controllers, proxies, or gateways already exist.
 
-### Service observation and gateway ownership
+### Gateway ownership
 
 The maintainer approved the [three-owner service model in #16](https://github.com/Chris-Cullins/swe-platform/issues/16#issuecomment-5078805652):
 
 - the Environment owns the durable desired Service records described above;
 - future `.swe/services.yaml` ingestion joins the implemented CLI declaration path; listening
   alone never grants visibility;
-- sandboxd reports backend-portable listener/health observations fenced to the exact current
-  execution; and
+- sandboxd and the implemented observation controller report backend-portable listener state
+  fenced to the exact current execution; and
 - the control-plane/gateway owns Project-only URLs, authentication, authorization, routing,
   route generation, and revocation.
 
@@ -460,11 +468,9 @@ path forcing ship together after Project namespace claims.
 
 ## Remaining decisions and open work
 
-The remaining approved service contract still requires observation connector/controller work
-and gateway implementation. sandboxd has a stateless internal loopback observation primitive
-and Environments have durable declarations, but no connector invokes the primitive and no
-controller-owned health status exists. The execution-generation contract is implemented above;
-future declaration observations, portal routes, and egress identity must capture and revalidate
+The remaining approved service contract requires gateway implementation (#69) and optional
+`.swe/services.yaml` ingestion (#70). The observation connector and controller are implemented.
+Future portal routes and egress identity must capture and revalidate
 the mandatory `lifecycle.ExecutionFence` without exposing backend-specific identity or selecting
 individual fence components.
 
