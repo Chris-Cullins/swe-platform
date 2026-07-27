@@ -246,6 +246,31 @@ type EnvironmentServiceReadiness string
 
 const EnvironmentServiceReadinessTCPConnect EnvironmentServiceReadiness = "TCPConnect"
 
+// EnvironmentServiceSource identifies who owns a service declaration's
+// launch lifecycle.
+// +kubebuilder:validation:Enum=API;Repository
+type EnvironmentServiceSource string
+
+const (
+	EnvironmentServiceSourceAPI        EnvironmentServiceSource = "API"
+	EnvironmentServiceSourceRepository EnvironmentServiceSource = "Repository"
+)
+
+// EnvironmentServiceLaunchArgument is one bounded argv element.
+// +kubebuilder:validation:MinLength=1
+// +kubebuilder:validation:MaxLength=4096
+type EnvironmentServiceLaunchArgument string
+
+// EnvironmentServiceLaunch describes how a repository-supervised service is
+// launched. Arguments are passed directly without shell interpretation.
+// +kubebuilder:validation:XValidation:rule="self.argv.join(\"\").size() <= 16384",message="argv must not exceed 16384 aggregate characters"
+type EnvironmentServiceLaunch struct {
+	// Argv is the non-empty executable and argument vector.
+	// +kubebuilder:validation:MinItems=1
+	// +kubebuilder:validation:MaxItems=64
+	Argv []EnvironmentServiceLaunchArgument `json:"argv"`
+}
+
 // EnvironmentServiceDeclaration is durable desired service exposure owned by
 // one Environment. Its logical identity is the Environment UID and Name. The
 // target is always that Environment's logical loopback; callers cannot supply
@@ -253,6 +278,8 @@ const EnvironmentServiceReadinessTCPConnect EnvironmentServiceReadiness = "TCPCo
 //
 // +kubebuilder:validation:XValidation:rule="self == oldSelf || self.revision > oldSelf.revision",message="revision must increase when an existing service declaration changes"
 // +kubebuilder:validation:XValidation:rule="!oldSelf.hasValue() ? has(self.instanceID) : (has(oldSelf.value().instanceID) ? (has(self.instanceID) && self.instanceID == oldSelf.value().instanceID) : (self == oldSelf.value() || (has(self.instanceID) && self.revision > oldSelf.value().revision)))",message="new services require instanceID; a legacy missing instanceID may be added only with a higher revision and is then immutable",optionalOldSelf=true
+// +kubebuilder:validation:XValidation:rule="self.source == oldSelf.source",message="source is immutable for a service declaration incarnation; remove and re-add the declaration to change ownership"
+// +kubebuilder:validation:XValidation:rule="(self.source == 'Repository') == has(self.launch)",message="launch must be present exactly when source is Repository"
 type EnvironmentServiceDeclaration struct {
 	// Name is the stable service name within this Environment.
 	// +kubebuilder:validation:MinLength=1
@@ -272,6 +299,13 @@ type EnvironmentServiceDeclaration struct {
 	// declaration's configuration changes. An exact no-op is idempotent.
 	// +kubebuilder:validation:Minimum=1
 	Revision int64 `json:"revision"`
+
+	// Source identifies the owner responsible for launching the service.
+	Source EnvironmentServiceSource `json:"source"`
+
+	// Launch is required only for repository-supervised services.
+	// +optional
+	Launch *EnvironmentServiceLaunch `json:"launch,omitempty"`
 
 	Protocol EnvironmentServiceProtocol `json:"protocol"`
 

@@ -212,6 +212,7 @@ func desiredEnvironmentService(name string, targetPort int32, revision int64, in
 		Name:       name,
 		InstanceID: id,
 		Revision:   revision,
+		Source:     platformv1alpha1.EnvironmentServiceSourceAPI,
 		Protocol:   platformv1alpha1.EnvironmentServiceProtocolHTTP,
 		TargetPort: targetPort,
 		Visibility: platformv1alpha1.EnvironmentServiceVisibilityProject,
@@ -252,6 +253,9 @@ func writeEnvironmentService(ctx context.Context, kube client.Client, key types.
 			environment.Spec.Services = append(environment.Spec.Services, result)
 		} else {
 			existing := environment.Spec.Services[index]
+			if existing.Source == platformv1alpha1.EnvironmentServiceSourceRepository {
+				return fmt.Errorf("service %q is Repository-owned and cannot be mutated by the services CLI", name)
+			}
 			instanceID := existing.InstanceID
 			if update && instanceID == "" {
 				var err error
@@ -321,6 +325,9 @@ func removeEnvironmentService(ctx context.Context, kube client.Client, key types
 		if index < 0 {
 			return nil
 		}
+		if environment.Spec.Services[index].Source == platformv1alpha1.EnvironmentServiceSourceRepository {
+			return fmt.Errorf("service %q is Repository-owned and cannot be mutated by the services CLI", name)
+		}
 		before := environment.DeepCopy()
 		environment.Spec.Services = append(environment.Spec.Services[:index], environment.Spec.Services[index+1:]...)
 		return kube.Patch(ctx, &environment, client.MergeFromWithOptions(before, client.MergeFromWithOptimisticLock{}))
@@ -354,7 +361,7 @@ func listEnvironmentServicesAt(ctx context.Context, kube client.Reader, key type
 	}
 	services := append([]platformv1alpha1.EnvironmentServiceDeclaration(nil), environment.Spec.Services...)
 	sort.Slice(services, func(i, j int) bool { return services[i].Name < services[j].Name })
-	fmt.Fprintln(out, "NAME\tREVISION\tPROTOCOL\tTARGET-PORT\tVISIBILITY\tREADINESS\tSTATE\tREASON\tOBSERVED-AT\tFRESHNESS")
+	fmt.Fprintln(out, "NAME\tSOURCE\tREVISION\tPROTOCOL\tTARGET-PORT\tVISIBILITY\tREADINESS\tSTATE\tREASON\tOBSERVED-AT\tFRESHNESS")
 	for _, service := range services {
 		state, reason, observedAt, freshness := "-", "-", "-", "NO-OBSERVATION"
 		observations := environment.Status.ServiceObservations
@@ -381,7 +388,7 @@ func listEnvironmentServicesAt(ctx context.Context, kube client.Reader, key type
 				}
 			}
 		}
-		fmt.Fprintf(out, "%s\t%d\t%s\t%d\t%s\t%s\t%s\t%s\t%s\t%s\n", service.Name, service.Revision, service.Protocol, service.TargetPort, service.Visibility, service.Readiness, state, reason, observedAt, freshness)
+		fmt.Fprintf(out, "%s\t%s\t%d\t%s\t%d\t%s\t%s\t%s\t%s\t%s\t%s\n", service.Name, service.Source, service.Revision, service.Protocol, service.TargetPort, service.Visibility, service.Readiness, state, reason, observedAt, freshness)
 	}
 	return nil
 }
