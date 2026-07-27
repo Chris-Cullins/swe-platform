@@ -123,11 +123,12 @@ var ExecService_ServiceDesc = grpc.ServiceDesc{
 }
 
 const (
-	ProcessService_Start_FullMethodName                   = "/sandboxd.v1.ProcessService/Start"
-	ProcessService_StartWithLaunchMaterial_FullMethodName = "/sandboxd.v1.ProcessService/StartWithLaunchMaterial"
-	ProcessService_Get_FullMethodName                     = "/sandboxd.v1.ProcessService/Get"
-	ProcessService_Stop_FullMethodName                    = "/sandboxd.v1.ProcessService/Stop"
-	ProcessService_ReadOutput_FullMethodName              = "/sandboxd.v1.ProcessService/ReadOutput"
+	ProcessService_Start_FullMethodName                    = "/sandboxd.v1.ProcessService/Start"
+	ProcessService_StartWithLaunchMaterial_FullMethodName  = "/sandboxd.v1.ProcessService/StartWithLaunchMaterial"
+	ProcessService_Get_FullMethodName                      = "/sandboxd.v1.ProcessService/Get"
+	ProcessService_Stop_FullMethodName                     = "/sandboxd.v1.ProcessService/Stop"
+	ProcessService_ReadOutput_FullMethodName               = "/sandboxd.v1.ProcessService/ReadOutput"
+	ProcessService_ReconcileManagedServices_FullMethodName = "/sandboxd.v1.ProcessService/ReconcileManagedServices"
 )
 
 // ProcessServiceClient is the client API for ProcessService service.
@@ -149,6 +150,9 @@ type ProcessServiceClient interface {
 	// Stop is idempotent, including when the key is absent or already terminal.
 	Stop(ctx context.Context, in *StopProcessRequest, opts ...grpc.CallOption) (*Process, error)
 	ReadOutput(ctx context.Context, in *ReadOutputRequest, opts ...grpc.CallOption) (*ReadOutputResponse, error)
+	// ReconcileManagedServices atomically accepts a complete, revisioned desired
+	// set of restartable services for one owner.
+	ReconcileManagedServices(ctx context.Context, in *ReconcileManagedServicesRequest, opts ...grpc.CallOption) (*ReconcileManagedServicesResponse, error)
 }
 
 type processServiceClient struct {
@@ -209,6 +213,16 @@ func (c *processServiceClient) ReadOutput(ctx context.Context, in *ReadOutputReq
 	return out, nil
 }
 
+func (c *processServiceClient) ReconcileManagedServices(ctx context.Context, in *ReconcileManagedServicesRequest, opts ...grpc.CallOption) (*ReconcileManagedServicesResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ReconcileManagedServicesResponse)
+	err := c.cc.Invoke(ctx, ProcessService_ReconcileManagedServices_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // ProcessServiceServer is the server API for ProcessService service.
 // All implementations must embed UnimplementedProcessServiceServer
 // for forward compatibility.
@@ -228,6 +242,9 @@ type ProcessServiceServer interface {
 	// Stop is idempotent, including when the key is absent or already terminal.
 	Stop(context.Context, *StopProcessRequest) (*Process, error)
 	ReadOutput(context.Context, *ReadOutputRequest) (*ReadOutputResponse, error)
+	// ReconcileManagedServices atomically accepts a complete, revisioned desired
+	// set of restartable services for one owner.
+	ReconcileManagedServices(context.Context, *ReconcileManagedServicesRequest) (*ReconcileManagedServicesResponse, error)
 	mustEmbedUnimplementedProcessServiceServer()
 }
 
@@ -252,6 +269,9 @@ func (UnimplementedProcessServiceServer) Stop(context.Context, *StopProcessReque
 }
 func (UnimplementedProcessServiceServer) ReadOutput(context.Context, *ReadOutputRequest) (*ReadOutputResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method ReadOutput not implemented")
+}
+func (UnimplementedProcessServiceServer) ReconcileManagedServices(context.Context, *ReconcileManagedServicesRequest) (*ReconcileManagedServicesResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ReconcileManagedServices not implemented")
 }
 func (UnimplementedProcessServiceServer) mustEmbedUnimplementedProcessServiceServer() {}
 func (UnimplementedProcessServiceServer) testEmbeddedByValue()                        {}
@@ -364,6 +384,24 @@ func _ProcessService_ReadOutput_Handler(srv interface{}, ctx context.Context, de
 	return interceptor(ctx, in, info, handler)
 }
 
+func _ProcessService_ReconcileManagedServices_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ReconcileManagedServicesRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ProcessServiceServer).ReconcileManagedServices(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: ProcessService_ReconcileManagedServices_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ProcessServiceServer).ReconcileManagedServices(ctx, req.(*ReconcileManagedServicesRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // ProcessService_ServiceDesc is the grpc.ServiceDesc for ProcessService service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -390,6 +428,10 @@ var ProcessService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "ReadOutput",
 			Handler:    _ProcessService_ReadOutput_Handler,
+		},
+		{
+			MethodName: "ReconcileManagedServices",
+			Handler:    _ProcessService_ReconcileManagedServices_Handler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},

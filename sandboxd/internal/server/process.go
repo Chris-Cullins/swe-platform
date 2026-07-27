@@ -17,6 +17,8 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"google.golang.org/protobuf/proto"
+
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
@@ -79,6 +81,11 @@ type managedProcess struct {
 	timer             *time.Timer
 	graceTimer        *time.Timer
 	doneOnce          sync.Once
+	managed           bool
+	managedGeneration uint64
+	restartAttempt    uint
+	startedAt         time.Time
+	managedSuppressed bool
 }
 
 type ProcessServer struct {
@@ -90,6 +97,18 @@ type ProcessServer struct {
 	OutputCapacity int
 	MaxRecords     int
 	supervisor     *Supervisor
+	reconcileMu    sync.Mutex
+	managedOwners  map[string]*managedOwner
+	restartInitial time.Duration
+	restartMax     time.Duration
+	restartStable  time.Duration
+}
+
+type managedOwner struct {
+	revision uint64
+	wire     []byte
+	desired  map[string]*sandboxdv1.ProcessSpec
+	gen      uint64
 }
 
 func NewProcessServer(workspace string, supervisors ...*Supervisor) *ProcessServer {
@@ -97,7 +116,7 @@ func NewProcessServer(workspace string, supervisors ...*Supervisor) *ProcessServ
 	if len(supervisors) != 0 && supervisors[0] != nil {
 		sup = supervisors[0]
 	}
-	return &ProcessServer{Workspace: workspace, processes: make(map[processKey]*managedProcess), OutputCapacity: defaultOutputCapacity, MaxRecords: defaultMaxRecords, supervisor: sup}
+	return &ProcessServer{Workspace: workspace, processes: make(map[processKey]*managedProcess), managedOwners: make(map[string]*managedOwner), OutputCapacity: defaultOutputCapacity, MaxRecords: defaultMaxRecords, supervisor: sup, restartInitial: 25 * time.Millisecond, restartMax: 5 * time.Second, restartStable: 30 * time.Second}
 }
 
 func validTimeout(ms uint64) bool { return ms <= uint64((time.Duration(1<<63-1))/time.Millisecond) }
@@ -207,6 +226,170 @@ func (s *ProcessServer) StartWithLaunchMaterial(_ context.Context, req *sandboxd
 	secretEnv := req.GetLaunchMaterial().GetSecretEnv()
 	defer clearSecretEnv(secretEnv)
 	return s.start(req.Key, req.Spec, secretEnv, true)
+}
+
+// ReconcileManagedServices accepts a complete desired service set. Reconcile
+// calls are serialized so an older call can never perform launches after a
+// newer revision has been accepted.
+func (s *ProcessServer) ReconcileManagedServices(_ context.Context, req *sandboxdv1.ReconcileManagedServicesRequest) (*sandboxdv1.ReconcileManagedServicesResponse, error) {
+	if req == nil || req.OwnerId == "" || req.IntentRevision == 0 {
+		return nil, status.Error(codes.InvalidArgument, "owner_id and positive intent_revision are required")
+	}
+	desired := make(map[string]*sandboxdv1.ProcessSpec, len(req.Services))
+	roles := make([]string, 0, len(req.Services))
+	for _, service := range req.Services {
+		if service == nil || service.Role == "" {
+			return nil, status.Error(codes.InvalidArgument, "service role must not be empty")
+		}
+		if _, exists := desired[service.Role]; exists {
+			return nil, status.Error(codes.InvalidArgument, "service roles must be unique")
+		}
+		spec, err := s.normalizeSpec(service.Spec)
+		if err != nil {
+			return nil, err
+		}
+		desired[service.Role] = spec
+		roles = append(roles, service.Role)
+	}
+	sort.Strings(roles)
+	canonical := &sandboxdv1.ReconcileManagedServicesRequest{OwnerId: req.OwnerId, IntentRevision: req.IntentRevision}
+	for _, role := range roles {
+		canonical.Services = append(canonical.Services, &sandboxdv1.ManagedServiceSpec{Role: role, Spec: desired[role]})
+	}
+	wire, err := proto.MarshalOptions{Deterministic: true}.Marshal(canonical)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "encode desired services: %v", err)
+	}
+
+	s.reconcileMu.Lock()
+	defer s.reconcileMu.Unlock()
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return nil, status.Error(codes.Unavailable, "process supervisor epoch is closed")
+	}
+	owner := s.managedOwners[req.OwnerId]
+	if owner != nil {
+		if req.IntentRevision < owner.revision {
+			s.mu.Unlock()
+			return nil, status.Error(codes.FailedPrecondition, "intent_revision is stale")
+		}
+		if req.IntentRevision == owner.revision {
+			if !bytes.Equal(wire, owner.wire) {
+				s.mu.Unlock()
+				return nil, status.Error(codes.FailedPrecondition, "intent_revision has a different desired set")
+			}
+			resp := s.managedResponseLocked(req.OwnerId, owner)
+			s.mu.Unlock()
+			return resp, nil
+		}
+	}
+	gen := uint64(1)
+	if owner != nil {
+		gen = owner.gen + 1
+	}
+	owner = &managedOwner{revision: req.IntentRevision, wire: wire, desired: desired, gen: gen}
+	s.managedOwners[req.OwnerId] = owner
+	var stop []*managedProcess
+	toStart := make(map[string]struct{}, len(desired))
+	for role := range desired {
+		toStart[role] = struct{}{}
+	}
+	for key, p := range s.processes {
+		if key.ownerID != req.OwnerId || !p.managed {
+			continue
+		}
+		spec, wanted := desired[key.role]
+		if !wanted || !reflect.DeepEqual(spec, p.spec) {
+			p.managed = false
+			p.managedSuppressed = false
+			if p.state == sandboxdv1.ProcessState_PROCESS_STATE_RUNNING {
+				stop = append(stop, p)
+			}
+		} else {
+			p.managedGeneration = gen
+			delete(toStart, key.role)
+		}
+	}
+	s.mu.Unlock()
+	for _, p := range stop {
+		s.requestTermination(processKey{p.key.OwnerId, p.key.Role}, p, sandboxdv1.TerminationReason_TERMINATION_REASON_TERMINATED, true)
+	}
+	// Changed slots are launched by the old execution's completion; brand-new
+	// slots can be admitted immediately.
+	for role := range toStart {
+		s.ensureManaged(req.OwnerId, role, gen, 0)
+	}
+	s.mu.Lock()
+	resp := s.managedResponseLocked(req.OwnerId, owner)
+	s.mu.Unlock()
+	return resp, nil
+}
+
+func (s *ProcessServer) managedResponseLocked(ownerID string, owner *managedOwner) *sandboxdv1.ReconcileManagedServicesResponse {
+	resp := &sandboxdv1.ReconcileManagedServicesResponse{OwnerId: ownerID, IntentRevision: owner.revision}
+	roles := make([]string, 0, len(owner.desired))
+	for role := range owner.desired {
+		roles = append(roles, role)
+	}
+	sort.Strings(roles)
+	for _, role := range roles {
+		var process *sandboxdv1.Process
+		if p := s.processes[processKey{ownerID, role}]; p != nil {
+			process = processResponse(p)
+		}
+		resp.Services = append(resp.Services, &sandboxdv1.ManagedServiceStatus{Role: role, Process: process})
+	}
+	return resp
+}
+
+func (s *ProcessServer) ensureManaged(ownerID, role string, gen uint64, attempt uint) {
+	s.mu.Lock()
+	owner := s.managedOwners[ownerID]
+	if s.closed || owner == nil || owner.gen != gen || owner.desired[role] == nil {
+		s.mu.Unlock()
+		return
+	}
+	key := processKey{ownerID, role}
+	if old := s.processes[key]; old != nil && old.state != sandboxdv1.ProcessState_PROCESS_STATE_EXITED && old.state != sandboxdv1.ProcessState_PROCESS_STATE_FAILED {
+		s.mu.Unlock()
+		return
+	}
+	delete(s.processes, key)
+	spec := owner.desired[role]
+	s.mu.Unlock()
+	_, _ = s.start(&sandboxdv1.ProcessKey{OwnerId: ownerID, Role: role}, spec, nil, false)
+	s.mu.Lock()
+	if p := s.processes[key]; p != nil && owner == s.managedOwners[ownerID] && owner.gen == gen && reflect.DeepEqual(p.spec, spec) {
+		p.managed, p.managedGeneration, p.restartAttempt, p.startedAt = true, gen, attempt, time.Now()
+		if p.state == sandboxdv1.ProcessState_PROCESS_STATE_EXITED || p.state == sandboxdv1.ProcessState_PROCESS_STATE_FAILED {
+			s.scheduleManagedRestartLocked(key, p)
+		}
+	}
+	s.mu.Unlock()
+}
+
+func (s *ProcessServer) scheduleManagedRestartLocked(key processKey, p *managedProcess) {
+	if !p.managed || s.closed {
+		return
+	}
+	owner := s.managedOwners[key.ownerID]
+	if owner == nil || owner.gen != p.managedGeneration || !reflect.DeepEqual(owner.desired[key.role], p.spec) {
+		return
+	}
+	attempt := p.restartAttempt + 1
+	if time.Since(p.startedAt) >= s.restartStable {
+		attempt = 0
+	}
+	delay := s.restartInitial
+	for i := uint(0); i < attempt && delay < s.restartMax; i++ {
+		delay *= 2
+		if delay > s.restartMax {
+			delay = s.restartMax
+		}
+	}
+	gen := owner.gen
+	time.AfterFunc(delay, func() { s.ensureManaged(key.ownerID, key.role, gen, attempt) })
 }
 
 func clearSecretEnv(env map[string][]byte) {
@@ -523,6 +706,13 @@ func (s *ProcessServer) finishLocked(p *managedProcess) {
 		if p.graceTimer != nil {
 			p.graceTimer.Stop()
 		}
+		key := processKey{p.key.OwnerId, p.key.Role}
+		if p.managed {
+			s.scheduleManagedRestartLocked(key, p)
+		} else if owner := s.managedOwners[key.ownerID]; owner != nil && owner.desired[key.role] != nil && !p.managedSuppressed && !s.closed {
+			gen := owner.gen
+			time.AfterFunc(0, func() { s.ensureManaged(key.ownerID, key.role, gen, 0) })
+		}
 	}
 }
 func (s *ProcessServer) requestTermination(key processKey, p *managedProcess, reason sandboxdv1.TerminationReason, force bool) {
@@ -593,6 +783,10 @@ func (s *ProcessServer) Stop(_ context.Context, req *sandboxdv1.StopProcessReque
 	if !p.started {
 		s.mu.Unlock()
 		return processResponse(p), nil
+	}
+	if p.managed {
+		p.managed = false
+		p.managedSuppressed = true
 	}
 	if p.state == sandboxdv1.ProcessState_PROCESS_STATE_EXITED || p.state == sandboxdv1.ProcessState_PROCESS_STATE_FAILED {
 		response := processResponse(p)

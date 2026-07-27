@@ -106,6 +106,9 @@ service ProcessService {
   // Stop is idempotent, including when the key is absent or already terminal.
   rpc Stop(StopProcessRequest) returns (Process);
   rpc ReadOutput(ReadOutputRequest) returns (ReadOutputResponse);
+  // ReconcileManagedServices atomically accepts a complete, revisioned desired
+  // set of restartable services for one owner.
+  rpc ReconcileManagedServices(ReconcileManagedServicesRequest) returns (ReconcileManagedServicesResponse);
 }
 
 message ProcessKey {
@@ -120,6 +123,28 @@ message ProcessSpec {
   map<string, string> env = 3;
   EnvironmentMode env_mode = 4;
   uint64 timeout_ms = 5;
+}
+
+message ManagedServiceSpec {
+  string role = 1;
+  ProcessSpec spec = 2;
+}
+
+message ReconcileManagedServicesRequest {
+  string owner_id = 1;
+  uint64 intent_revision = 2;
+  repeated ManagedServiceSpec services = 3;
+}
+
+message ManagedServiceStatus {
+  string role = 1;
+  Process process = 2;
+}
+
+message ReconcileManagedServicesResponse {
+  string owner_id = 1;
+  uint64 intent_revision = 2;
+  repeated ManagedServiceStatus services = 3;
 }
 
 message StartProcessRequest {
