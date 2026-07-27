@@ -259,6 +259,13 @@ type EnvironmentServiceDeclaration struct {
 	// +kubebuilder:validation:Pattern=`^[a-z0-9]([-a-z0-9]*[a-z0-9])?$`
 	Name string `json:"name"`
 
+	// InstanceID is a cryptographically random identity for this declaration
+	// incarnation. It is retained by updates and replaced after remove/re-add.
+	// +kubebuilder:validation:MinLength=20
+	// +kubebuilder:validation:MaxLength=63
+	// +kubebuilder:validation:Pattern=`^[a-z0-9]{20,63}$`
+	InstanceID string `json:"instanceID"`
+
 	// Revision starts at one and strictly increases when this same-name
 	// declaration's configuration changes. An exact no-op is idempotent.
 	// +kubebuilder:validation:Minimum=1
@@ -305,6 +312,7 @@ type EnvironmentSpec struct {
 	// +listType=map
 	// +listMapKey=name
 	// +kubebuilder:validation:MaxItems=32
+	// +kubebuilder:validation:XValidation:rule="self.all(s, !oldSelf.exists(o, o.name == s.name) || oldSelf.exists(o, o.name == s.name && o.instanceID == s.instanceID))",message="instanceID is immutable for an existing same-name service declaration"
 	Services []EnvironmentServiceDeclaration `json:"services,omitempty"`
 
 	// Paused is a deprecated compatibility input. The lifecycle controller
@@ -385,8 +393,26 @@ type EnvironmentServiceObservations struct {
 	Records []EnvironmentServiceObservation `json:"records"`
 }
 
+// EnvironmentPortalRoute is gateway-owned durable route state. Locators are
+// opaque and never reused; inactive records are denial tombstones.
+type EnvironmentPortalRoute struct {
+	Name string `json:"name"`
+	// +kubebuilder:validation:MinLength=20
+	// +kubebuilder:validation:MaxLength=63
+	// +kubebuilder:validation:Pattern=`^[a-z0-9]{20,63}$`
+	DeclarationInstanceID string `json:"declarationInstanceID"`
+	// +kubebuilder:validation:Minimum=1
+	DeclarationRevision int64 `json:"declarationRevision"`
+	// +kubebuilder:validation:Pattern=`^[a-z0-9]{20,63}$`
+	Locator string `json:"locator"`
+	// +kubebuilder:validation:Minimum=1
+	Generation int64 `json:"generation"`
+	Active     bool  `json:"active"`
+}
+
 // EnvironmentStatus defines the observed state of Environment.
 // +kubebuilder:validation:XValidation:rule="!has(oldSelf.executionGeneration) || (has(self.executionGeneration) && self.executionGeneration >= oldSelf.executionGeneration)",message="executionGeneration cannot decrease or be removed"
+// +kubebuilder:validation:XValidation:rule="!has(oldSelf.nextPortalRouteGeneration) || (has(self.nextPortalRouteGeneration) && self.nextPortalRouteGeneration >= oldSelf.nextPortalRouteGeneration)",message="nextPortalRouteGeneration cannot decrease or be removed"
 type EnvironmentStatus struct {
 	// ObservedGeneration is the Environment generation reflected by this status.
 	// +optional
@@ -421,6 +447,15 @@ type EnvironmentStatus struct {
 	// the correlated generations, lifecycle fence, declarations, and time.
 	// +optional
 	ServiceObservations *EnvironmentServiceObservations `json:"serviceObservations,omitempty"`
+
+	// PortalRoutes is bounded gateway-owned state. Other status writers must
+	// preserve it. NextPortalRouteGeneration is monotonic.
+	// +optional
+	// +kubebuilder:validation:MaxItems=64
+	PortalRoutes []EnvironmentPortalRoute `json:"portalRoutes,omitempty"`
+	// +kubebuilder:validation:Minimum=0
+	// +optional
+	NextPortalRouteGeneration int64 `json:"nextPortalRouteGeneration,omitempty"`
 
 	// PodName is the name of the backing pod, when one exists.
 	// +optional

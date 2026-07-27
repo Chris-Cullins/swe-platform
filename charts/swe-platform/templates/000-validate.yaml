@@ -30,3 +30,26 @@
 {{- if or (lt $metricsPort 1) (gt $metricsPort 65535) (eq $metricsPort 80) (eq $metricsPort 8080) -}}
 {{- fail "controlPlane.metrics.port must be from 1 through 65535 and must not be 80 or 8080" -}}
 {{- end -}}
+{{- $portal := .Values.controlPlane.portal -}}
+{{- if $portal.enabled -}}
+  {{- if not (regexMatch "^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$" $portal.suffix) -}}
+    {{- fail "controlPlane.portal.enabled requires a canonical DNS suffix without wildcard or trailing dot" -}}
+  {{- end -}}
+  {{- if not (has $portal.scheme (list "http" "https")) -}}
+    {{- fail "controlPlane.portal.scheme must be http or https" -}}
+  {{- end -}}
+  {{- if and (eq $portal.scheme "http") (or $portal.ingress.enabled (not .Values.controlPlane.auth.allowInsecureSessions)) -}}
+    {{- fail "HTTP portals are allowed only for explicit insecure development with portal ingress disabled" -}}
+  {{- end -}}
+  {{- if and $portal.ingress.enabled (ne $portal.scheme "https") -}}
+    {{- fail "controlPlane.portal.ingress.enabled requires controlPlane.portal.scheme=https" -}}
+  {{- end -}}
+  {{- if and $portal.ingress.enabled (not .Values.controlPlane.auth.trustProxyHeaders) -}}
+    {{- fail "controlPlane.portal.ingress.enabled requires controlPlane.auth.trustProxyHeaders=true and an ingress that overwrites X-Forwarded-Host/Proto" -}}
+  {{- end -}}
+  {{- if and $portal.ingress.enabled (not $portal.ingress.tls.secretName) -}}
+    {{- fail "controlPlane.portal.ingress.enabled requires an administrator-owned portal TLS Secret name" -}}
+  {{- end -}}
+{{- else if or $portal.suffix $portal.ingress.enabled -}}
+  {{- fail "controlPlane.portal suffix/ingress requires controlPlane.portal.enabled=true" -}}
+{{- end -}}

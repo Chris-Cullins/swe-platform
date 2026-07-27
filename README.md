@@ -17,7 +17,7 @@ to ~$0. Reviewable diff, branch, and PR publication remain planned work.
 > pools keep unclaimed environments ready for `swe run` to claim. The `claude-code` (default),
 > `amp`, `codex`, and `pi` adapters run through sandboxd's managed-process API. Environments
 > accept bounded durable desired service declarations and publish fenced advisory TCP-connect
-> observations; portal proxying is not built yet.
+> observations and exposes declared HTTP services through authenticated, fenced portal URLs.
 > The Helm chart installs the
 > operator, control plane, CRDs, a stable Installation identity, and inert Template catalog
 > sources in a system namespace. `swe project onboard` creates a dedicated claimed namespace,
@@ -47,7 +47,7 @@ to ~$0. Reviewable diff, branch, and PR publication remain planned work.
 | **Project** | One git repo today (list-shaped for future multi-repo support) + config |
 | **Template** | Environment class: image, size, runtime, warm pool |
 | **Inbox** | Planned addressable message queue per Run |
-| **Portal** | Planned authenticated URL exposing a dev server inside an Environment |
+| **Portal** | Authenticated, revocable URL for a declared Environment HTTP service |
 
 ## Architecture (short version)
 
@@ -60,13 +60,13 @@ implemented today, approved next contracts, and remaining open work.
   connector; the control plane never touches a pod except through sandboxd.
 - **Operator + CRDs** — `Installation`, `Environment`, `EnvironmentTemplate`, `Run`, `Project`, with
   controllers for lifecycle, warm pools (pre-booted environments), and idle reaping.
-- **Control plane** — API, auth, transcripts, resource watches, and a web terminal sharing
-  the Environment's tmux session; terminal requests can wake Idle suspension.
+- **Control plane** — API, auth, transcripts, resource watches, a web terminal, and the
+  authenticated portal host gateway; terminal and portal requests can wake Idle suspension.
 - **Desired services** — `Environment.spec.services` and the CLI hold bounded durable HTTP
   loopback target declarations. A dedicated controller publishes fenced advisory TCP-connect
   state without URLs; `services list` marks it CURRENT only while both exact execution/intent
-  correlation and a short wall-clock age bound hold. It remains advisory. Authenticated portal
-  URLs and reverse proxying remain gateway work.
+  correlation and a short wall-clock age bound hold. It remains advisory and is never route
+  authority; the portal gateway revalidates declaration, lifecycle, authorization, and execution.
 - **Planned Run actors** — inboxes, child spawning, messaging, and wake-on-message are not
   implemented.
 
@@ -183,7 +183,23 @@ swe --namespace my-project environment services declare my-environment web --tar
 swe --namespace my-project environment services list my-environment
 swe --namespace my-project environment services update my-environment web --target-port 8080
 swe --namespace my-project environment services remove my-environment web
+# Requires an explicit control-plane bearer credential and configured portal suffix:
+SWE_CONTROL_PLANE_TOKEN="$(kubectl create token portal-user -n my-project --audience=swe-platform)" \
+  swe --namespace my-project portal my-environment web
 ```
+
+The printed stable URL is a host locator, not a credential. Open it with the same explicit
+bearer token, or exchange that token at the portal host's own `/api/v1/session` endpoint and
+then use its host-local session cookie. Cookies are deliberately host-only, never `Domain`
+cookies. In local kind/port-forward development, wildcard DNS is not implied: send the exact
+printed Host to the forwarded control-plane address (for example with `curl --resolve` or an
+explicit `Host` header). In-Environment access uses the same authenticated gateway route, but
+wildcard DNS and an internal path to the gateway are cluster-operator prerequisites; the
+platform does not weaken authorization or grant arbitrary egress to manufacture a hairpin.
+
+Issue [#70](https://github.com/Chris-Cullins/swe-platform/issues/70) is a separate boundary:
+the platform does not ingest `.swe/services.yaml` and does not inject `$PUBLIC_URL` (or any
+portal URL) into managed processes. Services must be declared explicitly through the CLI/API.
 
 Service names are DNS-1123 labels. `declare` is idempotent only for the exact existing intent;
 use `update` for a real configuration change, which strictly increases its revision. `remove`

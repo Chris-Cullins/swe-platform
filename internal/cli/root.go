@@ -40,6 +40,7 @@ runs in them, and streams their output back to your terminal.`,
 		newCancelCommand(),
 		newLogsCommand(),
 		newAttachCommand(),
+		newPortalCommand(),
 		newProjectCommand(),
 	)
 	return root

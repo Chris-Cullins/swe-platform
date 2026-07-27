@@ -21,7 +21,7 @@ import (
 
 const ordinaryMarker = "ordinary-process-credential-absent"
 
-const listenerScript = `require("net").createServer((socket) => socket.end()).listen(Number(process.argv[1]), "127.0.0.1")`
+const listenerScript = `const http=require("http"),crypto=require("crypto"); const server=http.createServer((request,response)=>{response.setHeader("Content-Type","application/json");response.end(JSON.stringify({marker:"portal-listener",authorization:request.headers.authorization||"",cookie:request.headers.cookie||"",connection:request.headers.connection||"",portalHeader:request.headers["x-portal-check"]||""}))}); server.on("upgrade",(request,socket)=>{const key=request.headers["sec-websocket-key"];if(!key){socket.destroy();return}const accept=crypto.createHash("sha1").update(key+"258EAFA5-E914-47DA-95CA-C5AB0DC85B11").digest("base64");socket.write("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: "+accept+"\r\n\r\n")});server.listen(Number(process.argv[1]),"127.0.0.1")`
 
 func main() {
 	if err := run(); err != nil {

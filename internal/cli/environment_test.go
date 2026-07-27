@@ -218,7 +218,7 @@ func TestEnvironmentServiceDeclarationsAreRevisionedAndIdempotent(t *testing.T) 
 	key := client.ObjectKeyFromObject(environment)
 
 	web, err := writeEnvironmentService(context.Background(), kube, key, "web", 3000, false)
-	if err != nil || web != desiredEnvironmentService("web", 3000, 1) {
+	if err != nil || !validServiceInstanceID(web.InstanceID) || web != desiredEnvironmentService("web", 3000, 1, web.InstanceID) {
 		t.Fatalf("declare web = %#v, %v", web, err)
 	}
 	web, err = writeEnvironmentService(context.Background(), kube, key, "web", 3000, false)
@@ -231,8 +231,9 @@ func TestEnvironmentServiceDeclarationsAreRevisionedAndIdempotent(t *testing.T) 
 	if _, err := writeEnvironmentService(context.Background(), kube, key, "alias", 3000, false); err != nil {
 		t.Fatalf("declare duplicate-port alias: %v", err)
 	}
+	instanceID := web.InstanceID
 	web, err = writeEnvironmentService(context.Background(), kube, key, "web", 3001, true)
-	if err != nil || web != desiredEnvironmentService("web", 3001, 2) {
+	if err != nil || web != desiredEnvironmentService("web", 3001, 2, instanceID) {
 		t.Fatalf("update web = %#v, %v", web, err)
 	}
 	web, err = writeEnvironmentService(context.Background(), kube, key, "web", 3001, true)
