@@ -1374,6 +1374,119 @@ func (w *transientTerminalStatusWriter) Update(ctx context.Context, object clien
 	return w.SubResourceWriter.Update(ctx, object, options...)
 }
 
+func TestKubernetesTerminalDialerCountsOnlyAttachedLeaseAsGranted(t *testing.T) {
+	newFixture := func(t *testing.T) (client.Client, *platformv1alpha1.Run, *platformv1alpha1.Environment) {
+		t.Helper()
+		scheme := runtime.NewScheme()
+		if err := corev1.AddToScheme(scheme); err != nil {
+			t.Fatal(err)
+		}
+		if err := platformv1alpha1.AddToScheme(scheme); err != nil {
+			t.Fatal(err)
+		}
+		run := &platformv1alpha1.Run{
+			ObjectMeta: metav1.ObjectMeta{Name: "run-1", Namespace: "project-1", UID: "run-uid"},
+			Status: platformv1alpha1.RunStatus{EnvironmentRef: &platformv1alpha1.RunEnvironmentReference{
+				Name: "env-1", UID: "env-uid", Ownership: platformv1alpha1.EnvironmentOwnershipClaimed,
+			}},
+		}
+		environment := &platformv1alpha1.Environment{
+			ObjectMeta: metav1.ObjectMeta{Name: "env-1", Namespace: "project-1", UID: "env-uid", Generation: 1},
+			Spec:       platformv1alpha1.EnvironmentSpec{TemplateRef: "default"},
+			Status:     platformv1alpha1.EnvironmentStatus{ClaimedBy: &platformv1alpha1.RunReference{Name: run.Name, UID: run.UID}},
+		}
+		applyReadyTerminalStatus(environment, "env-pod")
+		template := &platformv1alpha1.EnvironmentTemplate{ObjectMeta: metav1.ObjectMeta{Name: "default", Namespace: environment.Namespace}}
+		pod := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "env-pod", Namespace: environment.Namespace, UID: "pod-uid",
+				Annotations: map[string]string{
+					"swe.dev/execution-generation":  "1",
+					sandboxdauth.IdentityAnnotation: "env-pod.sandboxd.swe.dev",
+					sandboxdauth.TrustAnnotation:    testCertificatePEM(t, "env-pod.sandboxd.swe.dev"),
+					sandboxdauth.TokenAnnotation:    "terminal-token",
+				},
+			},
+			Spec:   corev1.PodSpec{RestartPolicy: corev1.RestartPolicyNever},
+			Status: corev1.PodStatus{PodIP: "192.0.2.10", Conditions: []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}}},
+		}
+		if err := controllerutil.SetControllerReference(environment, pod, scheme); err != nil {
+			t.Fatal(err)
+		}
+		kubeClient := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(environment, run).WithObjects(run, environment, template, pod).Build()
+		return kubeClient, run, environment
+	}
+	assertFailedOnly := func(t *testing.T, metrics *Metrics) {
+		t.Helper()
+		if got := testutil.ToFloat64(metrics.terminalLeaseGrants.WithLabelValues("failed")); got != 1 {
+			t.Fatalf("failed terminal leases = %v, want 1", got)
+		}
+		if got := testutil.ToFloat64(metrics.terminalLeaseGrants.WithLabelValues("granted")); got != 0 {
+			t.Fatalf("granted terminal leases = %v, want 0", got)
+		}
+		for _, reason := range []string{"run_association_changed", "environment_changed", "execution_changed", "hold_policy_changed"} {
+			if got := testutil.ToFloat64(metrics.terminalRevocations.WithLabelValues(reason)); got != 0 {
+				t.Fatalf("%s revocations for never-attached lease = %v, want 0", reason, got)
+			}
+		}
+	}
+
+	t.Run("post-dial association failure", func(t *testing.T) {
+		baseClient, run, environment := newFixture(t)
+		metrics := NewMetrics(prometheus.NewRegistry())
+		kubeClient := &postDialAssociationFailureClient{Client: baseClient}
+		dialer := KubernetesTerminalDialer{Client: kubeClient, Metrics: metrics}
+		association := RunTerminalAssociation{
+			RunName: run.Name, RunUID: string(run.UID), EnvironmentName: environment.Name,
+			EnvironmentUID: string(environment.UID), EnvironmentOwnership: string(platformv1alpha1.EnvironmentOwnershipClaimed),
+		}
+		if _, _, _, err := dialer.DialRunTerminal(context.Background(), environment.Namespace, association); !errors.Is(err, errRunTerminalAssociation) {
+			t.Fatalf("DialRunTerminal() error = %v, want association failure", err)
+		}
+		assertFailedOnly(t, metrics)
+	})
+
+	t.Run("pre-attachment revocation", func(t *testing.T) {
+		kubeClient, _, environment := newFixture(t)
+		metrics := NewMetrics(prometheus.NewRegistry())
+		dialer := KubernetesTerminalDialer{
+			Client: kubeClient, Metrics: metrics,
+			beforeLeaseAttach: func(lease *terminalConnectionLease) {
+				if revoked, err := lease.revoke(); err != nil || revoked {
+					t.Fatalf("pre-attachment revoke = %v, %v; want false, nil", revoked, err)
+				}
+			},
+		}
+		if _, _, _, err := dialer.DialTerminal(context.Background(), environment.Namespace, environment.Name, string(environment.UID)); err == nil {
+			t.Fatal("DialTerminal() succeeded after pre-attachment revocation")
+		}
+		assertFailedOnly(t, metrics)
+	})
+}
+
+type postDialAssociationFailureClient struct {
+	client.Client
+	mu      sync.Mutex
+	runGets int
+}
+
+func (c *postDialAssociationFailureClient) Get(ctx context.Context, key client.ObjectKey, object client.Object, options ...client.GetOption) error {
+	if err := c.Client.Get(ctx, key, object, options...); err != nil {
+		return err
+	}
+	run, ok := object.(*platformv1alpha1.Run)
+	if !ok {
+		return nil
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.runGets++
+	if c.runGets == 3 {
+		run.Status.EnvironmentRef = nil
+	}
+	return nil
+}
+
 func TestKubernetesTerminalDialerActivityPreservesReadyGeneration(t *testing.T) {
 	metrics := NewMetrics(prometheus.NewRegistry())
 	scheme := runtime.NewScheme()
