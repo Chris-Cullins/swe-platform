@@ -426,7 +426,15 @@ func (r *RunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.R
 	executionFence := lifecycle.CaptureExecutionFence(env)
 	started := time.Now()
 	observation, message, err := adapter.Observe(ctx, adapterTask(&run), r.adapterSandbox(&run, env, executionFence, fenceRejections))
-	r.Metrics.observeAdapter(run.Spec.Agent, adapterOperationObserve, started, err)
+	metricErr := err
+	if metricErr == nil {
+		switch observation {
+		case AdapterObservationAccepted, AdapterObservationRunning, AdapterObservationNeedsInput, AdapterObservationSucceeded, AdapterObservationFailed:
+		default:
+			metricErr = fmt.Errorf("adapter %q returned unknown observation %q", run.Spec.Agent, observation)
+		}
+	}
+	r.Metrics.observeAdapter(run.Spec.Agent, adapterOperationObserve, started, metricErr)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
@@ -449,7 +457,7 @@ func (r *RunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.R
 	case AdapterObservationFailed:
 		state = platformv1alpha1.RunStateFailed
 	default:
-		return ctrl.Result{}, fmt.Errorf("adapter %q returned unknown observation %q", run.Spec.Agent, observation)
+		return ctrl.Result{}, metricErr
 	}
 	err = r.setRunState(ctx, &run, state, string(observation), message, true)
 	if err != nil || terminalRunState(state) {

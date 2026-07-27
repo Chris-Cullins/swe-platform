@@ -35,7 +35,7 @@ spec:
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           args:
             - --metrics-bind-address=:{{ int .Values.operator.metrics.port }}
-            - --health-probe-bind-address={{ .Values.healthProbeBindAddress }}
+            - --health-probe-bind-address=:{{ int .Values.operator.health.port }}
             - --leader-elect={{ .Values.leaderElection }}
             - --control-plane-namespace=$(POD_NAMESPACE)
             - --control-plane-name={{ include "swe-platform.name" . }}
@@ -59,7 +59,7 @@ spec:
             - name: metrics
               containerPort: {{ int .Values.operator.metrics.port }}
             - name: health
-              containerPort: 8081
+              containerPort: {{ int .Values.operator.health.port }}
           livenessProbe:
             httpGet: {path: /healthz, port: health}
           readinessProbe:

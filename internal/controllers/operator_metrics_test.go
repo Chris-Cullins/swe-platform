@@ -111,6 +111,9 @@ func TestOperatorMetricsObserveAdapterOutcomesOnCalls(t *testing.T) {
 		{name: "observe error", state: platformv1alpha1.RunStateRunning, operation: adapterOperationObserve, outcome: adapterOutcomeError, configure: func(_ *platformv1alpha1.Run, adapter *scriptedAdapter) {
 			adapter.observeErr = errors.New("rpc unavailable")
 		}},
+		{name: "invalid observation", state: platformv1alpha1.RunStateRunning, operation: adapterOperationObserve, outcome: adapterOutcomeError, configure: func(_ *platformv1alpha1.Run, adapter *scriptedAdapter) {
+			adapter.observations = []AdapterObservation{"Unknown"}
+		}},
 		{name: "cancel pending", state: platformv1alpha1.RunStateRunning, operation: adapterOperationCancel, outcome: adapterOutcomePending, configure: func(run *platformv1alpha1.Run, adapter *scriptedAdapter) {
 			run.Spec.Cancel = true
 			adapter.cancelErr = ErrAdapterCancellationPending
