@@ -17,6 +17,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	platformv1alpha1 "github.com/Chris-Cullins/swe-platform/api/v1alpha1"
+	"github.com/Chris-Cullins/swe-platform/internal/lifecycle"
 	sandboxdauth "github.com/Chris-Cullins/swe-platform/sandboxd/auth"
 	sandboxdv1 "github.com/Chris-Cullins/swe-platform/sandboxd/gen/proto/sandboxd/v1"
 )
@@ -49,8 +50,8 @@ type TerminalExecution = Execution
 
 // DialTerminal resolves the current ready Environment incarnation and returns
 // terminal and health clients sharing one authenticated, pod-pinned connection.
-func (c Connector) DialTerminal(ctx context.Context, namespace, environment string, environmentUID types.UID) (sandboxdv1.TerminalServiceClient, sandboxdv1.HealthServiceClient, TerminalExecution, func() error, error) {
-	env, pod, err := c.resolvePod(ctx, namespace, environment, environmentUID, nil, nil)
+func (c Connector) DialTerminal(ctx context.Context, fence lifecycle.ExecutionFence) (sandboxdv1.TerminalServiceClient, sandboxdv1.HealthServiceClient, TerminalExecution, func() error, error) {
+	env, pod, err := c.resolvePod(ctx, fence)
 	if err != nil {
 		return nil, nil, TerminalExecution{}, nil, err
 	}
@@ -66,7 +67,7 @@ func (c Connector) DialTerminal(ctx context.Context, namespace, environment stri
 	// Re-read after pinning the endpoint and credentials. A lifecycle transition
 	// or same-name Pod replacement racing the dial must not produce an attachment
 	// whose independent activity heartbeat can outlive that execution.
-	currentEnvironment, currentPod, err := c.resolvePod(ctx, namespace, environment, environmentUID, &execution.executionGeneration, &execution.lifecycleEpoch)
+	currentEnvironment, currentPod, err := c.resolvePod(ctx, fence)
 	if err != nil || executionForPod(currentEnvironment, currentPod) != execution {
 		_ = conn.Close()
 		if err != nil {
@@ -79,8 +80,8 @@ func (c Connector) DialTerminal(ctx context.Context, namespace, environment stri
 
 // ResolveExecution non-dialingly proves that an Environment generation maps to
 // one exact live backend execution and returns its opaque connector identity.
-func (c Connector) ResolveExecution(ctx context.Context, namespace, environment string, environmentUID types.UID, executionGeneration, lifecycleEpoch int64) (Execution, error) {
-	env, pod, err := c.resolvePod(ctx, namespace, environment, environmentUID, &executionGeneration, &lifecycleEpoch)
+func (c Connector) ResolveExecution(ctx context.Context, fence lifecycle.ExecutionFence) (Execution, error) {
+	env, pod, err := c.resolvePod(ctx, fence)
 	if err != nil {
 		return Execution{}, err
 	}
@@ -88,28 +89,30 @@ func (c Connector) ResolveExecution(ctx context.Context, namespace, environment 
 }
 
 // ExecutionCurrent reports whether execution is still the exact active live
-// backend execution. NotFound is a stale result rather than an operational
-// error; all other API read failures remain retryable by callers.
-func (c Connector) ExecutionCurrent(ctx context.Context, namespace, environment string, execution Execution) (bool, error) {
-	var env platformv1alpha1.Environment
-	if err := c.Reader.Get(ctx, types.NamespacedName{Namespace: namespace, Name: environment}, &env); apierrors.IsNotFound(err) {
+// backend execution. NotFound is a stale result; a changed fence is returned
+// as lifecycle.ErrExecutionFenceChanged so each consumer can either discard a
+// delayed result or distinguish a retryable hold-policy transition. Other API
+// read failures remain retryable by callers.
+func (c Connector) ExecutionCurrent(ctx context.Context, fence lifecycle.ExecutionFence, execution Execution) (bool, error) {
+	env, err := fence.Revalidate(ctx, c.Reader)
+	if apierrors.IsNotFound(err) {
 		return false, nil
 	} else if err != nil {
 		return false, err
 	}
 	if env.UID != execution.environmentUID || env.Status.ExecutionGeneration != execution.executionGeneration ||
 		env.Status.Lifecycle.Epoch != execution.lifecycleEpoch || env.Spec.Paused || env.Status.Lifecycle.Suspended ||
-		!platformv1alpha1.IsEnvironmentReady(&env) || env.Status.PodName != execution.podName || env.Status.Endpoints.Sandboxd == "" {
+		!platformv1alpha1.IsEnvironmentReady(env) || env.Status.PodName != execution.podName || env.Status.Endpoints.Sandboxd == "" {
 		return false, nil
 	}
 	var pod corev1.Pod
-	if err := c.Reader.Get(ctx, types.NamespacedName{Namespace: namespace, Name: execution.podName}, &pod); apierrors.IsNotFound(err) {
+	if err := c.Reader.Get(ctx, types.NamespacedName{Namespace: env.Namespace, Name: execution.podName}, &pod); apierrors.IsNotFound(err) {
 		return false, nil
 	} else if err != nil {
 		return false, err
 	}
 	podGeneration, generationValid := parseExecutionGeneration(&pod)
-	return exactEnvironmentOwner(&pod, &env) && pod.UID == execution.podUID && pod.DeletionTimestamp.IsZero() &&
+	return exactEnvironmentOwner(&pod, env) && pod.UID == execution.podUID && pod.DeletionTimestamp.IsZero() &&
 		pod.Spec.RestartPolicy == corev1.RestartPolicyNever && processPodReady(&pod) && pod.Status.PodIP != "" &&
 		env.Status.Endpoints.Sandboxd == net.JoinHostPort(pod.Status.PodIP, sandboxdPort) && generationValid &&
 		podGeneration == execution.executionGeneration, nil
@@ -122,26 +125,10 @@ func executionForPod(env *platformv1alpha1.Environment, pod *corev1.Pod) Executi
 	}
 }
 
-// DialProcess resolves the exact Environment UID immediately before dialing
-// and returns a process-only sandboxd client.
-func (c Connector) DialProcess(ctx context.Context, namespace, environment string, environmentUID types.UID) (sandboxdv1.ProcessServiceClient, func() error, error) {
-	return c.dialProcess(ctx, namespace, environment, environmentUID, nil, nil)
-}
-
-// DialProcessForEpoch resolves a process client only when the current
-// Environment lifecycle epoch matches the caller's accepted execution epoch.
-func (c Connector) DialProcessForEpoch(ctx context.Context, namespace, environment string, environmentUID types.UID, expectedEpoch int64) (sandboxdv1.ProcessServiceClient, func() error, error) {
-	return c.dialProcess(ctx, namespace, environment, environmentUID, nil, &expectedEpoch)
-}
-
-// DialProcessForExecution resolves a process client only for the exact accepted
-// backend execution and lifecycle epoch.
-func (c Connector) DialProcessForExecution(ctx context.Context, namespace, environment string, environmentUID types.UID, expectedExecutionGeneration, expectedEpoch int64) (sandboxdv1.ProcessServiceClient, func() error, error) {
-	return c.dialProcess(ctx, namespace, environment, environmentUID, &expectedExecutionGeneration, &expectedEpoch)
-}
-
-func (c Connector) dialProcess(ctx context.Context, namespace, environment string, environmentUID types.UID, expectedExecutionGeneration, expectedEpoch *int64) (sandboxdv1.ProcessServiceClient, func() error, error) {
-	env, pod, err := c.resolvePod(ctx, namespace, environment, environmentUID, expectedExecutionGeneration, expectedEpoch)
+// DialProcess resolves only the complete captured execution fence and returns
+// a process-only sandboxd client.
+func (c Connector) DialProcess(ctx context.Context, fence lifecycle.ExecutionFence) (sandboxdv1.ProcessServiceClient, func() error, error) {
+	env, pod, err := c.resolvePod(ctx, fence)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -151,7 +138,7 @@ func (c Connector) dialProcess(ctx context.Context, namespace, environment strin
 		return nil, nil, fmt.Errorf("sandboxd endpoint does not identify its credential")
 	}
 	var secret corev1.Secret
-	if err := c.Reader.Get(ctx, types.NamespacedName{Namespace: namespace, Name: secretName}, &secret); err != nil {
+	if err := c.Reader.Get(ctx, types.NamespacedName{Namespace: env.Namespace, Name: secretName}, &secret); err != nil {
 		return nil, nil, err
 	}
 	identity := pod.Annotations[sandboxdauth.IdentityAnnotation]
@@ -172,54 +159,43 @@ func (c Connector) dialProcess(ctx context.Context, namespace, environment strin
 	if err != nil {
 		return nil, nil, err
 	}
-	if expectedExecutionGeneration != nil || expectedEpoch != nil {
-		// Re-read after pinning the endpoint, TLS identity, and token. If an
-		// epoch transition raced resolution, reject this client; if transition
-		// starts after this check, the old credentials cannot authenticate to
-		// the replacement pod.
-		var current platformv1alpha1.Environment
-		if err := c.Reader.Get(ctx, types.NamespacedName{Namespace: namespace, Name: environment}, &current); err != nil {
-			_ = conn.Close()
-			return nil, nil, err
+	// Re-read after pinning the endpoint, TLS identity, and token. If an
+	// execution-fence transition raced resolution, reject this client; if a
+	// transition starts after this check, the old credentials cannot
+	// authenticate to the replacement backend execution.
+	current, err := fence.Revalidate(ctx, c.Reader)
+	if err != nil || current.Spec.Paused || current.Status.Lifecycle.Suspended || !platformv1alpha1.IsEnvironmentReady(current) ||
+		current.Status.PodName != env.Status.PodName || current.Status.Endpoints.Sandboxd != env.Status.Endpoints.Sandboxd {
+		_ = conn.Close()
+		if err != nil {
+			return nil, nil, fmt.Errorf("environment execution changed while resolving process endpoint: %w", err)
 		}
-		if current.UID != environmentUID || expectedExecutionGeneration != nil && current.Status.ExecutionGeneration != *expectedExecutionGeneration ||
-			expectedEpoch != nil && current.Status.Lifecycle.Epoch != *expectedEpoch ||
-			current.Spec.Paused || current.Status.Lifecycle.Suspended || !platformv1alpha1.IsEnvironmentReady(&current) ||
-			current.Status.PodName != env.Status.PodName || current.Status.Endpoints.Sandboxd != env.Status.Endpoints.Sandboxd {
-			_ = conn.Close()
-			return nil, nil, fmt.Errorf("environment execution changed while resolving process endpoint")
-		}
+		return nil, nil, fmt.Errorf("environment execution changed while resolving process endpoint")
 	}
 	return sandboxdv1.NewProcessServiceClient(conn), conn.Close, nil
 }
 
-func (c Connector) resolvePod(ctx context.Context, namespace, environment string, environmentUID types.UID, expectedExecutionGeneration, expectedEpoch *int64) (*platformv1alpha1.Environment, *corev1.Pod, error) {
-	var env platformv1alpha1.Environment
-	if err := c.Reader.Get(ctx, types.NamespacedName{Namespace: namespace, Name: environment}, &env); err != nil {
+func (c Connector) resolvePod(ctx context.Context, fence lifecycle.ExecutionFence) (*platformv1alpha1.Environment, *corev1.Pod, error) {
+	env, err := fence.Revalidate(ctx, c.Reader)
+	if err != nil {
 		return nil, nil, err
 	}
-	if environmentUID != "" && env.UID != environmentUID || env.Status.ExecutionGeneration < 1 || env.Spec.Paused || env.Status.Lifecycle.Suspended || !platformv1alpha1.IsEnvironmentReady(&env) || env.Status.PodName == "" || env.Status.Endpoints.Sandboxd == "" {
+	if env.Spec.Paused || env.Status.Lifecycle.Suspended || !platformv1alpha1.IsEnvironmentReady(env) || env.Status.PodName == "" || env.Status.Endpoints.Sandboxd == "" {
 		return nil, nil, fmt.Errorf("environment is not the current reachable incarnation")
 	}
-	if expectedExecutionGeneration != nil && env.Status.ExecutionGeneration != *expectedExecutionGeneration {
-		return nil, nil, fmt.Errorf("environment execution generation changed: expected %d, got %d", *expectedExecutionGeneration, env.Status.ExecutionGeneration)
-	}
-	if expectedEpoch != nil && env.Status.Lifecycle.Epoch != *expectedEpoch {
-		return nil, nil, fmt.Errorf("environment lifecycle epoch changed: expected %d, got %d", *expectedEpoch, env.Status.Lifecycle.Epoch)
-	}
 	var template platformv1alpha1.EnvironmentTemplate
-	if err := c.Reader.Get(ctx, types.NamespacedName{Namespace: namespace, Name: env.Spec.TemplateRef}, &template); err != nil {
+	if err := c.Reader.Get(ctx, types.NamespacedName{Namespace: env.Namespace, Name: env.Spec.TemplateRef}, &template); err != nil {
 		return nil, nil, fmt.Errorf("get environment template: %w", err)
 	}
-	if backend := platformv1alpha1.EffectiveEnvironmentBackend(&env, &template); backend != platformv1alpha1.EnvironmentBackendPod {
+	if backend := platformv1alpha1.EffectiveEnvironmentBackend(env, &template); backend != platformv1alpha1.EnvironmentBackendPod {
 		return nil, nil, fmt.Errorf("environment backend %q is not supported", backend)
 	}
 	var pod corev1.Pod
-	if err := c.Reader.Get(ctx, types.NamespacedName{Namespace: namespace, Name: env.Status.PodName}, &pod); err != nil {
+	if err := c.Reader.Get(ctx, types.NamespacedName{Namespace: env.Namespace, Name: env.Status.PodName}, &pod); err != nil {
 		return nil, nil, err
 	}
 	wantEndpoint := net.JoinHostPort(pod.Status.PodIP, sandboxdPort)
-	if !exactEnvironmentOwner(&pod, &env) {
+	if !exactEnvironmentOwner(&pod, env) {
 		return nil, nil, fmt.Errorf("environment pod is not owned by the current environment")
 	}
 	if pod.UID == "" || !pod.DeletionTimestamp.IsZero() || !processPodReady(&pod) || pod.Status.PodIP == "" || env.Status.Endpoints.Sandboxd != wantEndpoint {
@@ -232,7 +208,7 @@ func (c Connector) resolvePod(ctx context.Context, namespace, environment string
 	if !generationValid || podGeneration != env.Status.ExecutionGeneration {
 		return nil, nil, fmt.Errorf("environment pod does not identify the current execution generation")
 	}
-	return &env, &pod, nil
+	return env, &pod, nil
 }
 
 func parseExecutionGeneration(pod *corev1.Pod) (int64, bool) {
