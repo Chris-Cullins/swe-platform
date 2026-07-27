@@ -157,6 +157,12 @@ func main() {
 		setupLog.Error(err, "unable to create controller", "controller", "Environment")
 		os.Exit(1)
 	}
+	if !(mode == tenancy.ModeScoped && len(tenancyNamespaces) == 0) {
+		if err := (&controllers.ServiceObservationReconciler{Client: guardedClient, APIReader: mgr.GetAPIReader(), Scope: scope}).SetupWithManager(mgr); err != nil {
+			setupLog.Error(err, "unable to create controller", "controller", "ServiceObservation")
+			os.Exit(1)
+		}
+	}
 	var eventSink controllers.AdapterEventSink
 	if transcriptURL != "" {
 		if transcriptTokenFile == "" {

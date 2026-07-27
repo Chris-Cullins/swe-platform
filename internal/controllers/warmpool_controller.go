@@ -11,9 +11,12 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
+	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	platformv1alpha1 "github.com/Chris-Cullins/swe-platform/api/v1alpha1"
@@ -303,6 +306,14 @@ func (r *WarmPoolReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		// objects on updates, so identity changes replenish both pools.
 		Watches(&platformv1alpha1.Environment{}, handler.EnqueueRequestsFromMapFunc(func(_ context.Context, object client.Object) []reconcile.Request {
 			return warmPoolTemplateRequests(object)
-		})).
+		}), builder.WithPredicates(predicate.Funcs{UpdateFunc: func(e event.UpdateEvent) bool {
+			old, ok1 := e.ObjectOld.(*platformv1alpha1.Environment)
+			new, ok2 := e.ObjectNew.(*platformv1alpha1.Environment)
+			return !ok1 || !ok2 || warmPoolRelevantEnvironmentUpdate(old, new)
+		}})).
 		Complete(r)
+}
+
+func warmPoolRelevantEnvironmentUpdate(oldEnv, newEnv *platformv1alpha1.Environment) bool {
+	return observationRelevantEnvironmentUpdate(oldEnv, newEnv)
 }

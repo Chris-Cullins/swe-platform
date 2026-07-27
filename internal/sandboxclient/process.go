@@ -43,6 +43,7 @@ type Execution struct {
 	lifecycleEpoch      int64
 	podName             string
 	podUID              types.UID
+	endpoint            string
 }
 
 // TerminalExecution is retained as the terminal feature's opaque handle.
@@ -122,6 +123,7 @@ func executionForPod(env *platformv1alpha1.Environment, pod *corev1.Pod) Executi
 	return Execution{
 		environmentUID: env.UID, executionGeneration: env.Status.ExecutionGeneration,
 		lifecycleEpoch: env.Status.Lifecycle.Epoch, podName: pod.Name, podUID: pod.UID,
+		endpoint: env.Status.Endpoints.Sandboxd,
 	}
 }
 
