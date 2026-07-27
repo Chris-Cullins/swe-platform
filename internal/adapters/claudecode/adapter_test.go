@@ -35,6 +35,10 @@ type fakeProcessClient struct {
 	launchErr     error
 }
 
+func (f *fakeProcessClient) ReconcileManagedServices(context.Context, *sandboxdv1.ReconcileManagedServicesRequest, ...grpc.CallOption) (*sandboxdv1.ReconcileManagedServicesResponse, error) {
+	return nil, errors.New("unexpected ReconcileManagedServices call")
+}
+
 func (f *fakeProcessClient) StartWithLaunchMaterial(_ context.Context, request *sandboxdv1.StartProcessWithLaunchMaterialRequest, _ ...grpc.CallOption) (*sandboxdv1.Process, error) {
 	f.launchCalls++
 	f.launchRequest = request

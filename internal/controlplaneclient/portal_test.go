@@ -16,7 +16,7 @@ func TestGetPortalRouteEscapesPathAndAuthenticates(t *testing.T) {
 		if r.Header.Get("Authorization") != "Bearer token" {
 			t.Errorf("authorization %q", r.Header.Get("Authorization"))
 		}
-		fmt.Fprint(w, `{"url":"https://locator.portal.example","environmentUID":"uid","service":"web/ui","revision":2}`)
+		fmt.Fprint(w, `{"url":"https://locator.portal.example","environmentUID":"uid","service":"web/ui","revision":2,"declarationInstanceID":"abcdefghijklmnopqrstuvwx","routeGeneration":3}`)
 	}))
 	defer s.Close()
 	c, _ := New(s.URL, "token", s.Client())

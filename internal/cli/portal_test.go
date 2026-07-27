@@ -13,7 +13,7 @@ func TestPortalCommandPrintsOnlyAuthenticatedStableURL(t *testing.T) {
 		if r.URL.EscapedPath() != "/api/v1/namespaces/team-a/environments/env-a/portal/web" || r.Header.Get("Authorization") != "Bearer portal-token" {
 			t.Fatalf("request path/auth = %q/%q", r.URL.EscapedPath(), r.Header.Get("Authorization"))
 		}
-		fmt.Fprint(w, `{"url":"https://abcdefghijklmnopqrst.portal.example","environmentUID":"env-uid","service":"web","revision":1}`)
+		fmt.Fprint(w, `{"url":"https://abcdefghijklmnopqrst.portal.example","environmentUID":"env-uid","service":"web","revision":1,"declarationInstanceID":"abcdefghijklmnopqrst","routeGeneration":1}`)
 	}))
 	defer server.Close()
 

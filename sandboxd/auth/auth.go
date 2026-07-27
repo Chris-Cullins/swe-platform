@@ -39,6 +39,7 @@ const (
 	CapabilitiesKey            = "capabilities.json"
 	HealthTokenKey             = "health-token"
 	ProcessTokenKey            = "process-token"
+	FilesystemTokenKey         = "filesystem-token"
 	ServiceObservationTokenKey = "service-observation-token"
 	PortalTokenKey             = "portal-token"
 	IdentityAnnotation         = "swe.dev/sandboxd-identity"

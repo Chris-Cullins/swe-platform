@@ -30,6 +30,7 @@ import (
 	"github.com/Chris-Cullins/swe-platform/internal/adapters/pi"
 	"github.com/Chris-Cullins/swe-platform/internal/agent"
 	"github.com/Chris-Cullins/swe-platform/internal/controllers"
+	"github.com/Chris-Cullins/swe-platform/internal/controlplaneclient"
 	"github.com/Chris-Cullins/swe-platform/internal/sandboxclient"
 	"github.com/Chris-Cullins/swe-platform/internal/tenancy"
 	"github.com/Chris-Cullins/swe-platform/internal/transcriptclient"
@@ -173,6 +174,13 @@ func main() {
 	if !(mode == tenancy.ModeScoped && len(tenancyNamespaces) == 0) {
 		if err := (&controllers.ServiceObservationReconciler{Client: guardedClient, APIReader: mgr.GetAPIReader(), Scope: scope, Observer: connector}).SetupWithManager(mgr); err != nil {
 			setupLog.Error(err, "unable to create controller", "controller", "ServiceObservation")
+			os.Exit(1)
+		}
+		if err := (&controllers.DeclaredServiceReconciler{
+			Client: guardedClient, APIReader: mgr.GetAPIReader(), Scope: scope, Connector: connector,
+			Routes: controlplaneclient.RotatingPortalResolver{BaseURL: transcriptURL, TokenFile: transcriptTokenFile, HTTP: &http.Client{Timeout: 15 * time.Second}},
+		}).SetupWithManager(mgr); err != nil {
+			setupLog.Error(err, "unable to create controller", "controller", "DeclaredService")
 			os.Exit(1)
 		}
 	}

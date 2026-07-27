@@ -38,6 +38,10 @@ type fakeClient struct {
 	readRequests    []*sandboxdv1.ReadOutputRequest
 }
 
+func (f *fakeClient) ReconcileManagedServices(context.Context, *sandboxdv1.ReconcileManagedServicesRequest, ...grpc.CallOption) (*sandboxdv1.ReconcileManagedServicesResponse, error) {
+	return nil, errors.New("unexpected ReconcileManagedServices call")
+}
+
 func (f *fakeClient) Start(_ context.Context, request *sandboxdv1.StartProcessRequest, _ ...grpc.CallOption) (*sandboxdv1.Process, error) {
 	f.starts++
 	if f.startedKey == nil {

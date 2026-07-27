@@ -29,10 +29,12 @@ const (
 
 // PortalRoute is the stable authenticated route allocated for a declared service.
 type PortalRoute struct {
-	URL            string `json:"url"`
-	EnvironmentUID string `json:"environmentUID"`
-	Service        string `json:"service"`
-	Revision       int64  `json:"revision"`
+	URL                   string `json:"url"`
+	EnvironmentUID        string `json:"environmentUID"`
+	Service               string `json:"service"`
+	Revision              int64  `json:"revision"`
+	DeclarationInstanceID string `json:"declarationInstanceID"`
+	RouteGeneration       int64  `json:"routeGeneration"`
 }
 
 // GetPortalRoute discovers (and lazily allocates) an Environment service route.
@@ -42,7 +44,7 @@ func (c *Client) GetPortalRoute(ctx context.Context, namespace, environment, ser
 	if err := c.getJSONLimit(ctx, endpoint, &route, 64<<10); err != nil {
 		return PortalRoute{}, err
 	}
-	if route.URL == "" || route.EnvironmentUID == "" || route.Service != service || route.Revision < 1 {
+	if route.URL == "" || route.EnvironmentUID == "" || route.Service != service || route.Revision < 1 || route.DeclarationInstanceID == "" || route.RouteGeneration < 1 {
 		return PortalRoute{}, fmt.Errorf("control plane returned an invalid portal route")
 	}
 	return route, nil
