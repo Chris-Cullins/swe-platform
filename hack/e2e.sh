@@ -1930,6 +1930,7 @@ if grep -Eiq 'https?://|portal|url' <<<"$SERVICE_LIST"; then
 fi
 echo "==> verifying real stateless service observations and duplicate-port correlation"
 OBSERVATION_OWNER=$(kubectl get environment "$ENV_NAME" -o jsonpath='{.metadata.uid}')
+REPOSITORY_PROCESS_OWNER="repository-services/$OBSERVATION_OWNER"
 OBSERVATION_SECRET=$(kubectl get pod "$POD_NAME" -o jsonpath='{.metadata.annotations.swe\.dev/sandboxd-secret-name}')
 OBSERVATION_TOKEN=$(kubectl get secret "$OBSERVATION_SECRET" -o jsonpath='{.data.service-observation-token}' | base64 --decode)
 OBSERVATION_POD_JSON=$(kubectl get pod "$POD_NAME" -o json)
@@ -2157,7 +2158,7 @@ if ! jq -e --arg url "$UPDATED_REPOSITORY_URL" '.marker == "v2" and .publicURL =
 	exit 1
 fi
 UPDATED_ROUTE_GENERATION=$(kubectl get environment "$ENV_NAME" -o json | jq -r '.status.portalRoutes[] | select(.name == "repository-web" and .active == true and .declarationRevision == 2) | .generation')
-manage_observation_listener service-state "$POD_NAME" "$OBSERVATION_OWNER" repository-web running
+manage_observation_listener service-state "$POD_NAME" "$REPOSITORY_PROCESS_OWNER" repository-web running
 
 echo "==> verifying repository removal stops process and tombstones URL"
 printf '%s' $'version: 1\nservices: {}\n' |
@@ -2174,12 +2175,12 @@ if [[ -n "$(kubectl get environment "$ENV_NAME" -o jsonpath='{.spec.services[?(@
 	exit 1
 fi
 for _ in $(seq 1 60); do
-	if manage_observation_listener service-state "$POD_NAME" "$OBSERVATION_OWNER" repository-web stopped >/dev/null 2>&1; then
+	if manage_observation_listener service-state "$POD_NAME" "$REPOSITORY_PROCESS_OWNER" repository-web stopped >/dev/null 2>&1; then
 		break
 	fi
 	sleep 1
 done
-if ! manage_observation_listener service-state "$POD_NAME" "$OBSERVATION_OWNER" repository-web stopped; then
+if ! manage_observation_listener service-state "$POD_NAME" "$REPOSITORY_PROCESS_OWNER" repository-web stopped; then
 	echo "FAIL: repository removal did not stop its managed process"
 	exit 1
 fi
