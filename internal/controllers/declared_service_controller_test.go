@@ -236,6 +236,11 @@ func TestConvergeRepositoryDeclarationsLifecycle(t *testing.T) {
 	if err != nil || collision != "" || len(first) != 1 || first[0].Revision != 1 || first[0].TargetPort < 49152 || len(first[0].InstanceID) < 20 {
 		t.Fatalf("first = %#v, collision=%q err=%v", first, collision, err)
 	}
+	for _, c := range first[0].InstanceID {
+		if (c < 'a' || c > 'z') && (c < '0' || c > '9') {
+			t.Fatalf("instance ID %q is not CRD-valid lowercase alphanumeric", first[0].InstanceID)
+		}
+	}
 	env.Spec.Services = first
 	second, _, _ := convergeRepositoryDeclarations(env, want)
 	if !reflect.DeepEqual(first, second) {
