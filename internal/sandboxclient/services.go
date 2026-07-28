@@ -145,11 +145,14 @@ func (c Connector) ReconcileRepositoryServices(ctx context.Context, fence lifecy
 		return err
 	}
 	defer release()
-	response, err := client.ReconcileManagedServices(ctx, &sandboxdv1.ReconcileManagedServicesRequest{OwnerId: string(fence.EnvironmentUID()), IntentRevision: intentRevision, RouteRevision: routeRevision, Services: services})
+	// A complete managed set owns only this key namespace. Environment-scoped
+	// setup, agent, and API-observation processes retain their existing owner.
+	ownerID := "repository-services/" + string(fence.EnvironmentUID())
+	response, err := client.ReconcileManagedServices(ctx, &sandboxdv1.ReconcileManagedServicesRequest{OwnerId: ownerID, IntentRevision: intentRevision, RouteRevision: routeRevision, Services: services})
 	if err != nil {
 		return fmt.Errorf("reconcile repository services: %w", err)
 	}
-	if response.OwnerId != string(fence.EnvironmentUID()) || response.IntentRevision != intentRevision || response.RouteRevision != routeRevision {
+	if response.OwnerId != ownerID || response.IntentRevision != intentRevision || response.RouteRevision != routeRevision {
 		return errors.New("sandboxd returned mismatched managed service intent")
 	}
 	env, _, currentProof, err := c.resolveProcessTarget(ctx, fence)
