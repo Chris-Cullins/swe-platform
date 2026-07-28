@@ -2,6 +2,8 @@ package controllers
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/base32"
 	"errors"
 	"fmt"
 	"hash/fnv"
@@ -9,6 +11,7 @@ import (
 	"reflect"
 	"sort"
 	"strconv"
+	"strings"
 	"time"
 
 	"k8s.io/apimachinery/pkg/types"
@@ -266,7 +269,7 @@ func convergeRepositoryDeclarations(env *platformv1alpha1.Environment, desired [
 				d.Revision++
 			}
 		} else {
-			id, err := randomCredential(24)
+			id, err := randomServiceDeclarationInstanceID()
 			if err != nil {
 				return nil, "", err
 			}
@@ -276,6 +279,14 @@ func convergeRepositoryDeclarations(env *platformv1alpha1.Environment, desired [
 	}
 	sort.Slice(result, func(i, j int) bool { return result[i].Name < result[j].Name })
 	return result, "", nil
+}
+
+func randomServiceDeclarationInstanceID() (string, error) {
+	b := make([]byte, 20)
+	if _, err := rand.Read(b); err != nil {
+		return "", fmt.Errorf("generate repository service declaration instance ID: %w", err)
+	}
+	return strings.ToLower(base32.StdEncoding.WithPadding(base32.NoPadding).EncodeToString(b)), nil
 }
 
 func allocateServicePort(uid types.UID, name string, occupied map[int32]bool) int32 {
