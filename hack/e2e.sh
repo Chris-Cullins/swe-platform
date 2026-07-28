@@ -1193,7 +1193,7 @@ rules:
     verbs: ["get"]
   - apiGroups: ["swe.dev"]
     resources: ["environmentservices/portal"]
-    resourceNames: ["${ENV_NAME}.web"]
+    resourceNames: ["${ENV_NAME}.web", "${ENV_NAME}.repository-web"]
     verbs: ["get"]
   - apiGroups: ["swe.dev"]
     resources: ["projects"]
