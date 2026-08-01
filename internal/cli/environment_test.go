@@ -264,6 +264,29 @@ func TestEnvironmentServiceDeclarationsAreRevisionedAndIdempotent(t *testing.T) 
 	}
 }
 
+func TestEnvironmentServiceUpdateBackfillsLegacyInstanceID(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := platformv1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	environment := &platformv1alpha1.Environment{ObjectMeta: metav1.ObjectMeta{Name: "shared", Namespace: "ns", UID: "env-uid"}, Spec: platformv1alpha1.EnvironmentSpec{
+		Services: []platformv1alpha1.EnvironmentServiceDeclaration{desiredEnvironmentService("web", 3000, 4)},
+	}}
+	kube := fake.NewClientBuilder().WithScheme(scheme).WithObjects(environment).Build()
+	service, err := writeEnvironmentService(context.Background(), kube, client.ObjectKeyFromObject(environment), "web", 3000, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if service.Revision != 5 || !validServiceInstanceID(service.InstanceID) || service.TargetPort != 3000 {
+		t.Fatalf("legacy backfill = %#v", service)
+	}
+	stableID := service.InstanceID
+	service, err = writeEnvironmentService(context.Background(), kube, client.ObjectKeyFromObject(environment), "web", 3000, true)
+	if err != nil || service.Revision != 5 || service.InstanceID != stableID {
+		t.Fatalf("idempotent migrated update = %#v, %v", service, err)
+	}
+}
+
 func TestServiceListCurrentRequiresExecutionAndWallClockFreshness(t *testing.T) {
 	now := time.Unix(1000, 0)
 	execution := int64(4)

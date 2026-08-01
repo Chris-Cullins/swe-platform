@@ -255,7 +255,7 @@ func exactPortalDeclaration(env *platformv1alpha1.Environment, name string) (pla
 		}
 	}
 	returnValue := platformv1alpha1.EnvironmentServiceDeclaration{}
-	if d == nil || d.Protocol != platformv1alpha1.EnvironmentServiceProtocolHTTP || d.Visibility != platformv1alpha1.EnvironmentServiceVisibilityProject {
+	if d == nil || !validLocator(d.InstanceID) || d.Protocol != platformv1alpha1.EnvironmentServiceProtocolHTTP || d.Visibility != platformv1alpha1.EnvironmentServiceVisibilityProject {
 		return returnValue, false
 	}
 	return *d, true
@@ -390,6 +390,8 @@ func (g *portalGateway) serveLocator(w http.ResponseWriter, r *http.Request, loc
 		portal404(w)
 		return
 	}
+	r, cancelStream := g.server.withStreamLifecycle(r)
+	defer cancelStream()
 	ctx, cancel := context.WithTimeout(r.Context(), portalAdmissionTimeout)
 	defer cancel()
 	lifetimeCtx := r.Context()
@@ -538,10 +540,13 @@ func (g *portalGateway) serveLocator(w http.ResponseWriter, r *http.Request, loc
 		portal404(w)
 		return
 	}
+	defer conn.Close()
 	leaseCtx, cancelLease := context.WithCancel(lifetimeCtx)
 	defer cancelLease()
-	go g.revalidatePortalLease(leaseCtx, r, conn, client.ObjectKeyFromObject(&post), fence, snapshot, route)
-	g.proxy(w, r.WithContext(lifetimeCtx), conn)
+	leaseRequest := r.Clone(lifetimeCtx)
+	proxyRequest := r.Clone(lifetimeCtx)
+	go g.revalidatePortalLease(leaseCtx, leaseRequest, conn, client.ObjectKeyFromObject(&post), fence, snapshot, route)
+	g.proxy(w, proxyRequest, conn)
 }
 
 func (g *portalGateway) recordAdmissionActivity(ctx context.Context, env *platformv1alpha1.Environment, next *time.Time, previousFence *lifecycle.ExecutionFence) error {

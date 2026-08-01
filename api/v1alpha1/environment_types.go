@@ -264,7 +264,8 @@ type EnvironmentServiceDeclaration struct {
 	// +kubebuilder:validation:MinLength=20
 	// +kubebuilder:validation:MaxLength=63
 	// +kubebuilder:validation:Pattern=`^[a-z0-9]{20,63}$`
-	InstanceID string `json:"instanceID"`
+	// +optional
+	InstanceID string `json:"instanceID,omitempty"`
 
 	// Revision starts at one and strictly increases when this same-name
 	// declaration's configuration changes. An exact no-op is idempotent.
@@ -312,7 +313,7 @@ type EnvironmentSpec struct {
 	// +listType=map
 	// +listMapKey=name
 	// +kubebuilder:validation:MaxItems=32
-	// +kubebuilder:validation:XValidation:rule="self.all(s, !oldSelf.exists(o, o.name == s.name) || oldSelf.exists(o, o.name == s.name && o.instanceID == s.instanceID))",message="instanceID is immutable for an existing same-name service declaration"
+	// +kubebuilder:validation:XValidation:rule="!oldSelf.hasValue() ? self.all(s, has(s.instanceID)) : self.all(s, !oldSelf.value().exists(o, o.name == s.name) ? has(s.instanceID) : oldSelf.value().exists(o, o.name == s.name && (has(o.instanceID) ? (has(s.instanceID) && o.instanceID == s.instanceID) : (s == o || (has(s.instanceID) && s.revision > o.revision)))))",message="new services require instanceID; a legacy missing instanceID may be added only with a higher revision and is then immutable",optionalOldSelf=true
 	Services []EnvironmentServiceDeclaration `json:"services,omitempty"`
 
 	// Paused is a deprecated compatibility input. The lifecycle controller

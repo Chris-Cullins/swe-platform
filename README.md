@@ -205,7 +205,10 @@ Service names are DNS-1123 labels. `declare` is idempotent only for the exact ex
 use `update` for a real configuration change, which strictly increases its revision. `remove`
 is idempotent durable desired-state removal, and renaming is remove plus declare. Logical
 identity is the Environment UID and service name, so conflict retries never mutate a same-name
-Environment replacement. A Project-less Environment retains declarations but receives no
+Environment replacement. Declarations retained from a pre-portal CRD upgrade may temporarily
+lack an `instanceID`; they receive no route until `services update` assigns one while increasing
+the revision. New declarations always include an ID, which is immutable until remove/re-add. A
+Project-less Environment retains declarations but receives no
 route. The control-plane gateway tombstones an old route generation on removal and assigns a
 new generation and locator on same-name re-add; declaration intent and advisory observations
 remain separate from gateway-owned `status.portalRoutes`, and declarations contain no route or
@@ -232,6 +235,8 @@ allowed to overlap the new one.
   hibernation tier, hosted offering
 
 ## Local development
+
+Installation requires Kubernetes 1.33 or newer.
 
 Development targets a local [kind](https://kind.sigs.k8s.io/) cluster. Run `make kind-up`
 to create a cluster with the `gvisor` RuntimeClass and the snapshot-capable CSI hostpath
