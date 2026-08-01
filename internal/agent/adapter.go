@@ -65,11 +65,15 @@ type AdapterEventSink interface {
 	Append(context.Context, string, string, string, AdapterEvent) error
 }
 
+// EnvironmentUID is the immutable platform Environment identity. Its string
+// representation keeps the adapter contract independent of any backend API.
+type EnvironmentUID string
+
 // AdapterSandbox is the backend-neutral handle exposed to adapters. Adapters
 // use sandboxd and never inspect pods, containers, VMs, PIDs, or OS signals.
 type AdapterSandbox struct {
 	EnvironmentName string
-	EnvironmentUID  string
+	EnvironmentUID  EnvironmentUID
 	DialProcess     func(context.Context) (sandboxdv1.ProcessServiceClient, func() error, error)
 	EmitEvent       func(context.Context, AdapterEvent) error
 }

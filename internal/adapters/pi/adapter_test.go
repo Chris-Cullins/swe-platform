@@ -33,7 +33,7 @@ func (c *startClient) StartWithLaunchMaterial(context.Context, *sandboxdv1.Start
 }
 
 func acceptanceSandbox(client sandboxdv1.ProcessServiceClient, dials *int) agent.AdapterSandbox {
-	return agent.AdapterSandbox{EnvironmentUID: "epoch", DialProcess: func(context.Context) (sandboxdv1.ProcessServiceClient, func() error, error) {
+	return agent.AdapterSandbox{EnvironmentUID: agent.EnvironmentUID("epoch"), DialProcess: func(context.Context) (sandboxdv1.ProcessServiceClient, func() error, error) {
 		*dials++
 		return client, func() error { return nil }, nil
 	}}
@@ -162,7 +162,7 @@ func (c *processClient) ReadOutput(_ context.Context, r *sandboxdv1.ReadOutputRe
 	return &sandboxdv1.ReadOutputResponse{Data: append([]byte(nil), data[start:end]...), Offset: offset, NextOffset: retained + uint64(end), GapBytes: gap, RetainedStart: retained, ProducedEnd: produced, Eof: end == len(data)}, nil
 }
 
-func processSandbox(client sandboxdv1.ProcessServiceClient, epoch string) agent.AdapterSandbox {
+func processSandbox(client sandboxdv1.ProcessServiceClient, epoch agent.EnvironmentUID) agent.AdapterSandbox {
 	return agent.AdapterSandbox{EnvironmentUID: epoch, DialProcess: func(context.Context) (sandboxdv1.ProcessServiceClient, func() error, error) {
 		return client, func() error { return nil }, nil
 	}}

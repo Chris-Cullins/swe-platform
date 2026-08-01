@@ -100,7 +100,7 @@ func (f *fakeProcessClient) ReadOutput(_ context.Context, request *sandboxdv1.Re
 func sandboxFor(client sandboxdv1.ProcessServiceClient) agent.AdapterSandbox {
 	return agent.AdapterSandbox{
 		EnvironmentName: "environment",
-		EnvironmentUID:  "environment-uid",
+		EnvironmentUID:  agent.EnvironmentUID("environment-uid"),
 		DialProcess: func(context.Context) (sandboxdv1.ProcessServiceClient, func() error, error) {
 			return client, func() error { return nil }, nil
 		},

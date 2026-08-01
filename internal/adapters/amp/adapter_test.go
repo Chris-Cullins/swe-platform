@@ -122,7 +122,7 @@ func TestOutputIncludesGapMetadata(t *testing.T) {
 }
 
 func testSandbox(client sandboxdv1.ProcessServiceClient) agent.AdapterSandbox {
-	return agent.AdapterSandbox{EnvironmentUID: "epoch", DialProcess: func(context.Context) (sandboxdv1.ProcessServiceClient, func() error, error) {
+	return agent.AdapterSandbox{EnvironmentUID: agent.EnvironmentUID("epoch"), DialProcess: func(context.Context) (sandboxdv1.ProcessServiceClient, func() error, error) {
 		return client, func() error { return nil }, nil
 	}}
 }

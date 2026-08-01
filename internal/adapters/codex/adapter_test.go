@@ -48,7 +48,7 @@ func (f *launchClient) StartWithLaunchMaterial(_ context.Context, r *sandboxdv1.
 }
 
 func sandboxFor(c sandboxdv1.ProcessServiceClient, dials *int) agent.AdapterSandbox {
-	return agent.AdapterSandbox{EnvironmentUID: "epoch", DialProcess: func(context.Context) (sandboxdv1.ProcessServiceClient, func() error, error) {
+	return agent.AdapterSandbox{EnvironmentUID: agent.EnvironmentUID("epoch"), DialProcess: func(context.Context) (sandboxdv1.ProcessServiceClient, func() error, error) {
 		*dials++
 		return c, func() error { return nil }, nil
 	}}
@@ -210,7 +210,7 @@ func (f *fakeProcessClient) ReadOutput(_ context.Context, request *sandboxdv1.Re
 	}, nil
 }
 
-func processSandbox(client sandboxdv1.ProcessServiceClient, epoch string) agent.AdapterSandbox {
+func processSandbox(client sandboxdv1.ProcessServiceClient, epoch agent.EnvironmentUID) agent.AdapterSandbox {
 	return agent.AdapterSandbox{
 		EnvironmentUID: epoch,
 		DialProcess: func(context.Context) (sandboxdv1.ProcessServiceClient, func() error, error) {
