@@ -551,8 +551,54 @@ kubectl -n "$PROJECT_NAMESPACE" get environments legacy-recovery-existing legacy
   (.items[] | select(.metadata.name=="legacy-recovery-existing") | .status | .podRecoveryAttempts==1 and .podRecoveryUID==$uid and .podRecoveryNextAttemptAt==$deadline) and
   (.items[] | select(.metadata.name=="legacy-recovery-missing") | .status | .podRecoveryAttempts==2 and .podRecoveryUID=="missing-pod-uid" and .podRecoveryNextAttemptAt==$deadline) and
   (.items[] | select(.metadata.name=="legacy-recovery-exhausted") | .status | .podRecoveryAttempts==3 and .podRecoveryExhausted==true)' >/dev/null
+
+# Exercise the immediate pre-service-source schema with a durable API-owned
+# declaration. Defaulting and the one-way legacy migration must preserve its
+# identity and intent through both status and ordinary spec writes.
+PRE_SERVICE_SOURCE_SHA=28c9d396a9960ebbbd1b4feea3626de7c258a383
+git fetch --depth=1 origin "$PRE_SERVICE_SOURCE_SHA"
+git show "$PRE_SERVICE_SOURCE_SHA:config/crd/bases/swe.dev_environments.yaml" | kubectl apply --server-side --force-conflicts -f -
+cat <<'EOF' | kubectl create -f -
+apiVersion: swe.dev/v1alpha1
+kind: Environment
+metadata:
+  name: legacy-service-source-migration
+spec:
+  templateRef: small
+  services:
+  - name: legacy-api
+    instanceID: legacyapiabcdefghijkl
+    revision: 3
+    protocol: HTTP
+    targetPort: 4321
+    visibility: Project
+    readiness: TCPConnect
+EOF
+kubectl apply --server-side --force-conflicts -f charts/swe-platform/crds
+kubectl get environment legacy-service-source-migration -o json | jq -e \
+	'.spec.services == [{"instanceID":"legacyapiabcdefghijkl","name":"legacy-api","protocol":"HTTP","readiness":"TCPConnect","revision":3,"source":"API","targetPort":4321,"visibility":"Project"}]' >/dev/null
+kubectl patch environment legacy-service-source-migration --subresource=status --type=merge -p '{"status":{"phase":"Creating"}}'
+kubectl patch environment legacy-service-source-migration --type=merge -p \
+	'{"spec":{"lifecycle":{"hold":{"enabled":false,"revision":1}}}}'
+kubectl get environment legacy-service-source-migration -o json | jq -e \
+	'.status.phase == "Creating" and .spec.lifecycle.hold == {"enabled":false,"revision":1} and .spec.services == [{"instanceID":"legacyapiabcdefghijkl","name":"legacy-api","protocol":"HTTP","readiness":"TCPConnect","revision":3,"source":"API","targetPort":4321,"visibility":"Project"}]' >/dev/null
+LEGACY_SOURCE_ERROR=/tmp/swe-platform-legacy-service-source-error
+if kubectl patch environment legacy-service-source-migration --type=merge -p \
+	'{"spec":{"services":[{"name":"legacy-api","instanceID":"legacyapiabcdefghijkl","revision":4,"source":"Repository","launch":{"argv":["serve"]},"protocol":"HTTP","targetPort":4321,"visibility":"Project","readiness":"TCPConnect"}]}}' \
+	>/dev/null 2>"$LEGACY_SOURCE_ERROR"; then
+	echo "FAIL: admission allowed a legacy API service to become Repository-owned"
+	exit 1
+fi
+if ! grep -Fq 'only legacy declarations may adopt API ownership' "$LEGACY_SOURCE_ERROR"; then
+	echo "FAIL: legacy source takeover was not rejected by the source-immutability rule"
+	cat "$LEGACY_SOURCE_ERROR"
+	exit 1
+fi
+kubectl get environment legacy-service-source-migration -o json | jq -e \
+	'.spec.services[0].source == "API" and .spec.services[0].revision == 3 and (.spec.services[0] | has("launch") | not)' >/dev/null
 kubectl delete environment legacy-execution-generation-migration --wait=false
 kubectl delete environment legacy-service-instance-id-migration --wait=false
+kubectl delete environment legacy-service-source-migration --wait=false
 
 echo "==> verifying trusted-admin preset and release-scoped cluster RBAC names"
 TRUSTED_RENDER=$(helm template swe-platform charts/swe-platform --namespace preset-check --values charts/swe-platform/values-kind.yaml)

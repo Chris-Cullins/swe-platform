@@ -83,6 +83,55 @@ func TestManagedServicesRestartSuccessFailureAndEnvironmentIsolation(t *testing.
 	}
 }
 
+func TestManagedRestartDelayProgressionAndCap(t *testing.T) {
+	s := NewProcessServer(t.TempDir())
+	s.restartInitial = 10 * time.Millisecond
+	s.restartMax = 40 * time.Millisecond
+	for attempt, want := range []time.Duration{10 * time.Millisecond, 20 * time.Millisecond, 40 * time.Millisecond, 40 * time.Millisecond, 40 * time.Millisecond} {
+		if got := s.managedRestartDelay(uint(attempt)); got != want {
+			t.Fatalf("attempt %d delay = %s, want %s", attempt, got, want)
+		}
+	}
+	if got := s.managedRestartDelay(^uint(0)); got != 40*time.Millisecond {
+		t.Fatalf("overflow-scale attempt delay = %s, want cap", got)
+	}
+}
+
+func TestManagedStartRecordExhaustionUsesExponentialBackoff(t *testing.T) {
+	s := NewProcessServer(t.TempDir())
+	s.MaxRecords = 1
+	s.restartInitial = 40 * time.Millisecond
+	s.restartMax = 160 * time.Millisecond
+	marker := filepath.Join(t.TempDir(), "occupied")
+	occupied := managedRequest("other", 1, "slot", marker, "occupied", map[string]string{"WAIT": "1"})
+	if _, err := s.Start(context.Background(), &sandboxdv1.StartProcessRequest{Key: &sandboxdv1.ProcessKey{OwnerId: "other", Role: "slot"}, Spec: occupied.Services[0].Spec}); err != nil {
+		t.Fatal(err)
+	}
+	waitLines(t, marker, 1)
+
+	attempted := make(chan time.Time, 4)
+	s.beforeManagedStart = func() { attempted <- time.Now() }
+	request := &sandboxdv1.ReconcileManagedServicesRequest{OwnerId: "uid", IntentRevision: 1, Services: []*sandboxdv1.ManagedServiceSpec{{Role: "svc", Spec: &sandboxdv1.ProcessSpec{Argv: []string{"never-admitted"}}}}}
+	if _, err := s.ReconcileManagedServices(context.Background(), request); err != nil {
+		t.Fatal(err)
+	}
+	times := make([]time.Time, 3)
+	for i := range times {
+		select {
+		case times[i] = <-attempted:
+		case <-time.After(time.Second):
+			t.Fatalf("timed out waiting for exhausted-record attempt %d", i)
+		}
+	}
+	if first := times[1].Sub(times[0]); first < 30*time.Millisecond {
+		t.Fatalf("first exhausted-record retry delay = %s, want about 40ms", first)
+	}
+	if second := times[2].Sub(times[1]); second < 65*time.Millisecond {
+		t.Fatalf("second exhausted-record retry delay = %s, want about 80ms", second)
+	}
+	s.Close()
+}
+
 func TestManagedServicesRevisionReplaceRemoveReaddAndClose(t *testing.T) {
 	s := NewProcessServer(t.TempDir())
 	s.restartInitial = 5 * time.Millisecond

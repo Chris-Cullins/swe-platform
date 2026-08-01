@@ -79,7 +79,7 @@ All current CRDs are namespaced:
 | `Installation` | Empty-spec identity object in the system namespace. Its immutable Kubernetes UID is the stable installation identity used by namespace claims, catalog sources, managed Template copies, and baseline resources. |
 | `Project` | One repository URL (represented as a one-item list), a same-namespace default Template reference, changes-workflow metadata, and a reserved egress allowlist. A non-empty allowlist is rejected when an Environment uses the Project. |
 | `EnvironmentTemplate` | Pod image, size/resources, disk, runtime class, idle timeout, warm-pool minimum, and backend. Admission currently permits only the `pod` backend. Chart-owned system-namespace objects are inert catalog sources; execution accepts only installation-managed same-namespace copies bound to exact Installation, source, and Project identities. |
-| `Environment` | Template/Project selection, explicit hold policy, bounded wake/suspend/activity intents, and up to 32 service declarations. New declarations have an immutable-per-incarnation random `instanceID`; upgrade-retained legacy declarations may omit it, receive no portal route, and can add it only with a higher revision. Status owns lifecycle/execution, claim, observation, activity, and nested backend-neutral recovery state; recovery records attempts, exhaustion, the exact failed execution generation being accounted, and the next allowed attempt time, while generation zero means no recovery identity. The gateway owns bounded `portalRoutes` and monotonic `nextPortalRouteGeneration`; inactive routes are denial tombstones preserved by other status writers. |
+| `Environment` | Template/Project selection, explicit hold policy, bounded wake/suspend/activity intents, and up to 32 API- or Repository-owned service declarations. New declarations have an immutable-per-incarnation random `instanceID`; upgrade-retained legacy declarations may omit it, receive no portal route, and can add it only with a higher revision. Omitted legacy service ownership defaults only to `API` and is immutable thereafter. Status owns lifecycle/execution, claim, observation, activity, and nested backend-neutral recovery state; recovery records attempts, exhaustion, the exact failed execution generation being accounted, and the next allowed attempt time, while generation zero means no recovery identity. The gateway owns bounded `portalRoutes` and monotonic `nextPortalRouteGeneration`; inactive routes are denial tombstones preserved by other status writers. |
 | `Run` | Immutable agent task and Environment/Project/Template/credential selection plus monotonic cancellation; status records normalized lifecycle, exact Environment name/UID and ownership, exact credential profile identity, accepted lifecycle epoch, and accepted execution generation. `notify` and `parentRef` are schema placeholders without an implemented inbox. |
 | `AgentCredentialProfile` | Immutable adapter and `APIKey` type metadata. Key bytes live in an owner-linked Secret whose name is derived from the profile UID. |
 
@@ -270,10 +270,13 @@ visibility intent, and `TCPConnect` readiness intent. There is intentionally no 
 address, allocated port, route, or URL input. Duplicate target ports are valid aliases.
 These defaults follow the [maintainer's implementation decision in #16](https://github.com/Chris-Cullins/swe-platform/issues/16#issuecomment-5084221807).
 
-Admission permits an exact same-name no-op and requires a strictly greater revision for every
-same-name configuration change. A legacy declaration persisted before `instanceID` existed stays
-schema-valid but cannot receive a portal route; its next CLI `update` assigns an ID and advances
-the revision, after which that ID is immutable. New names always require an ID. The CLI supplies `list`, `declare`, `update`, and `remove`;
+Admission defaults an omitted `source` to `API`, including declarations persisted before source
+ownership existed; that one legacy adoption cannot become `Repository`, and ownership is
+immutable thereafter. Admission permits an exact same-name no-op and requires a strictly greater
+revision for every same-name configuration change. A legacy declaration persisted before
+`instanceID` existed stays schema-valid but cannot receive a portal route; its next CLI `update`
+assigns an ID and advances the revision, after which that ID is immutable. New names always
+require an ID. The CLI supplies `list`, `declare`, `update`, and `remove`;
 mutations pin the Environment UID on their first read, use optimistic conflict retries, and
 refuse to mutate a same-name replacement. `declare` starts at revision 1 and recovers an exact
 same-intent retry, `update` increments revision only for a real change, and `remove` is an
