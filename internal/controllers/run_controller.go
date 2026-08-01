@@ -1151,7 +1151,7 @@ func adapterTask(run *platformv1alpha1.Run) agent.AdapterTask {
 }
 
 func (r *RunReconciler) adapterSandbox(run *platformv1alpha1.Run, env *platformv1alpha1.Environment, fence lifecycle.ExecutionFence, fenceRejections *fenceRejectionRecorder) agent.AdapterSandbox {
-	sandbox := agent.AdapterSandbox{EnvironmentName: env.Name, EnvironmentUID: string(env.UID),
+	sandbox := agent.AdapterSandbox{EnvironmentName: env.Name, EnvironmentUID: agent.EnvironmentUID(env.UID),
 		DialProcess: func(ctx context.Context) (sandboxdv1.ProcessServiceClient, func() error, error) {
 			reader := r.apiReader()
 			// Mandatory uncached pre-call association proof: a still-current
