@@ -77,13 +77,13 @@ func RequestSuspend(ctx context.Context, kube client.Client, key types.Namespace
 // RecordActivity publishes one source's latest activity intent. Activity uses
 // fixed metadata slots so heartbeats are durable without advancing generation;
 // only execution-contract changes make Environment status stale.
-func RecordActivity(ctx context.Context, kube client.Client, key types.NamespacedName, expectedUID types.UID, executionGeneration, policyRevision int64, source platformv1alpha1.EnvironmentActivitySource, requestID string) error {
+func RecordActivity(ctx context.Context, kube client.Client, fence ExecutionFence, source platformv1alpha1.EnvironmentActivitySource, requestID string) error {
 	request := platformv1alpha1.EnvironmentActivityRequest{
 		Source: source,
 		EnvironmentLifecycleRequest: platformv1alpha1.EnvironmentLifecycleRequest{
-			ID: requestID, EnvironmentUID: expectedUID, HoldPolicyRevision: policyRevision,
+			ID: requestID, EnvironmentUID: fence.EnvironmentUID(), HoldPolicyRevision: fence.HoldPolicyRevision(),
 		},
-		ExecutionGeneration: executionGeneration,
+		ExecutionGeneration: fence.ExecutionGeneration(),
 	}
 	if err := validateActivityRequest(request); err != nil {
 		return err
@@ -92,7 +92,7 @@ func RecordActivity(ctx context.Context, kube client.Client, key types.Namespace
 	if err != nil {
 		return fmt.Errorf("encode activity request: %w", err)
 	}
-	return patchActivityIntent(ctx, kube, key, expectedUID, executionGeneration, policyRevision, func(environment *platformv1alpha1.Environment) {
+	return patchActivityIntent(ctx, kube, fence, func(environment *platformv1alpha1.Environment) {
 		if environment.Annotations == nil {
 			environment.Annotations = make(map[string]string)
 		}
@@ -193,20 +193,14 @@ func patchIntent(ctx context.Context, kube client.Client, key types.NamespacedNa
 	})
 }
 
-func patchActivityIntent(ctx context.Context, kube client.Client, key types.NamespacedName, expectedUID types.UID, expectedExecutionGeneration, expectedPolicyRevision int64, mutate func(*platformv1alpha1.Environment)) error {
+func patchActivityIntent(ctx context.Context, kube client.Client, fence ExecutionFence, mutate func(*platformv1alpha1.Environment)) error {
 	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		var environment platformv1alpha1.Environment
-		if err := kube.Get(ctx, key, &environment); err != nil {
+		if err := kube.Get(ctx, fence.key, &environment); err != nil {
 			return err
 		}
-		if environment.UID != expectedUID {
-			return ErrEnvironmentIncarnationChanged
-		}
-		if expectedExecutionGeneration < 1 || environment.Status.ExecutionGeneration != expectedExecutionGeneration {
-			return ErrExecutionGenerationChanged
-		}
-		if HoldPolicyRevision(&environment) != expectedPolicyRevision {
-			return ErrHoldPolicyChanged
+		if err := fence.Validate(&environment); err != nil {
+			return err
 		}
 		before := environment.DeepCopy()
 		mutate(&environment)

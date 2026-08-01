@@ -21,6 +21,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	platformv1alpha1 "github.com/Chris-Cullins/swe-platform/api/v1alpha1"
+	"github.com/Chris-Cullins/swe-platform/internal/lifecycle"
 	sandboxdauth "github.com/Chris-Cullins/swe-platform/sandboxd/auth"
 )
 
@@ -73,7 +74,7 @@ func TestDialTerminalBindsExactExecutionAfterFinalRead(t *testing.T) {
 		return fake.NewClientBuilder().WithScheme(scheme).WithObjects(environment.DeepCopy(), template.DeepCopy(), pod.DeepCopy()).Build()
 	}
 
-	terminal, health, execution, closeConnection, err := (Connector{Reader: newClient()}).DialTerminal(context.Background(), environment.Namespace, environment.Name, environment.UID)
+	terminal, health, execution, closeConnection, err := (Connector{Reader: newClient()}).DialTerminal(context.Background(), lifecycle.CaptureExecutionFence(environment))
 	if err != nil || terminal == nil || health == nil || closeConnection == nil {
 		t.Fatalf("valid terminal dial: terminal nil=%t, health nil=%t, close nil=%t, error=%v", terminal == nil, health == nil, closeConnection == nil, err)
 	}
@@ -88,14 +89,14 @@ func TestDialTerminalBindsExactExecutionAfterFinalRead(t *testing.T) {
 		current.Status.Lifecycle.Epoch++
 		current.Status.Lifecycle.Suspended = true
 	}}
-	terminal, health, execution, closeConnection, err = (Connector{Reader: epochRace}).DialTerminal(context.Background(), environment.Namespace, environment.Name, environment.UID)
+	terminal, health, execution, closeConnection, err = (Connector{Reader: epochRace}).DialTerminal(context.Background(), lifecycle.CaptureExecutionFence(environment))
 	if err == nil || !strings.Contains(err.Error(), "execution changed while resolving terminal endpoint") || epochRace.environmentGets != 2 || terminal != nil || health != nil || closeConnection != nil || execution != (TerminalExecution{}) {
 		t.Fatalf("post-dial lifecycle race: terminal nil=%t, health nil=%t, execution=%#v, close nil=%t, error=%v, Environment reads=%d", terminal == nil, health == nil, execution, closeConnection == nil, err, epochRace.environmentGets)
 	}
 	executionRace := &environmentChangingReader{Reader: newClient(), mutate: func(current *platformv1alpha1.Environment) {
 		current.Status.ExecutionGeneration++
 	}}
-	terminal, health, execution, closeConnection, err = (Connector{Reader: executionRace}).DialTerminal(context.Background(), environment.Namespace, environment.Name, environment.UID)
+	terminal, health, execution, closeConnection, err = (Connector{Reader: executionRace}).DialTerminal(context.Background(), lifecycle.CaptureExecutionFence(environment))
 	if err == nil || !strings.Contains(err.Error(), "execution changed while resolving terminal endpoint") || executionRace.environmentGets != 2 || terminal != nil || health != nil || closeConnection != nil || execution != (TerminalExecution{}) {
 		t.Fatalf("post-dial execution-generation race: terminal nil=%t, health nil=%t, execution=%#v, close nil=%t, error=%v, Environment reads=%d", terminal == nil, health == nil, execution, closeConnection == nil, err, executionRace.environmentGets)
 	}
@@ -103,7 +104,7 @@ func TestDialTerminalBindsExactExecutionAfterFinalRead(t *testing.T) {
 	podRace := &podChangingReader{Reader: newClient(), mutate: func(current *corev1.Pod) {
 		current.UID = "pod-uid-2"
 	}}
-	terminal, health, execution, closeConnection, err = (Connector{Reader: podRace}).DialTerminal(context.Background(), environment.Namespace, environment.Name, environment.UID)
+	terminal, health, execution, closeConnection, err = (Connector{Reader: podRace}).DialTerminal(context.Background(), lifecycle.CaptureExecutionFence(environment))
 	if err == nil || !strings.Contains(err.Error(), "execution changed while resolving terminal endpoint") || podRace.podGets != 2 || terminal != nil || health != nil || closeConnection != nil || execution != (TerminalExecution{}) {
 		t.Fatalf("post-dial same-name Pod race: terminal nil=%t, health nil=%t, execution=%#v, close nil=%t, error=%v, Pod reads=%d", terminal == nil, health == nil, execution, closeConnection == nil, err, podRace.podGets)
 	}
@@ -140,7 +141,7 @@ func TestDialProcessValidatesCurrentEnvironmentPodAndCredentialIncarnation(t *te
 		return fake.NewClientBuilder().WithScheme(scheme).WithObjects(append(objects, template.DeepCopy())...).Build()
 	}
 
-	process, closeConnection, err := (Connector{Reader: newClient(env.DeepCopy(), pod.DeepCopy(), secret.DeepCopy())}).DialProcess(context.Background(), env.Namespace, env.Name, env.UID)
+	process, closeConnection, err := (Connector{Reader: newClient(env.DeepCopy(), pod.DeepCopy(), secret.DeepCopy())}).DialProcess(context.Background(), lifecycle.CaptureExecutionFence(env))
 	if err != nil || process == nil || closeConnection == nil {
 		t.Fatalf("valid process dial handle: process nil=%t, close nil=%t, error=%v", process == nil, closeConnection == nil, err)
 	}
@@ -149,35 +150,37 @@ func TestDialProcessValidatesCurrentEnvironmentPodAndCredentialIncarnation(t *te
 	}
 	freshEpoch := env.DeepCopy()
 	freshEpoch.Status.Lifecycle.Epoch = 1
-	if _, _, err := (Connector{Reader: newClient(freshEpoch, pod.DeepCopy(), secret.DeepCopy())}).DialProcessForEpoch(context.Background(), env.Namespace, env.Name, env.UID, 0); err == nil || !strings.Contains(err.Error(), "lifecycle epoch changed") {
+	if _, _, err := (Connector{Reader: newClient(freshEpoch, pod.DeepCopy(), secret.DeepCopy())}).DialProcess(context.Background(), lifecycle.CaptureExecutionFence(env)); err == nil || !strings.Contains(err.Error(), "lifecycle epoch changed") {
 		t.Fatalf("stale lifecycle epoch error = %v", err)
 	}
-	if _, _, err := (Connector{Reader: newClient(env.DeepCopy(), pod.DeepCopy(), secret.DeepCopy())}).DialProcessForExecution(context.Background(), env.Namespace, env.Name, env.UID, 2, 0); err == nil || !strings.Contains(err.Error(), "execution generation changed") {
+	staleGeneration := env.DeepCopy()
+	staleGeneration.Status.ExecutionGeneration = 2
+	if _, _, err := (Connector{Reader: newClient(env.DeepCopy(), pod.DeepCopy(), secret.DeepCopy())}).DialProcess(context.Background(), lifecycle.CaptureExecutionFence(staleGeneration)); err == nil || !strings.Contains(err.Error(), "execution generation changed") {
 		t.Fatalf("stale execution generation error = %v", err)
 	}
 	for _, policy := range []corev1.RestartPolicy{corev1.RestartPolicyAlways, corev1.RestartPolicyOnFailure, ""} {
 		restartable := pod.DeepCopy()
 		restartable.Spec.RestartPolicy = policy
-		if _, _, err := (Connector{Reader: newClient(env.DeepCopy(), restartable, secret.DeepCopy())}).DialProcess(context.Background(), env.Namespace, env.Name, env.UID); err == nil || !strings.Contains(err.Error(), "restart policy") {
+		if _, _, err := (Connector{Reader: newClient(env.DeepCopy(), restartable, secret.DeepCopy())}).DialProcess(context.Background(), lifecycle.CaptureExecutionFence(env)); err == nil || !strings.Contains(err.Error(), "restart policy") {
 			t.Fatalf("restart policy %q error = %v", policy, err)
 		}
 	}
 	for _, annotation := range []string{"", "0", "01", "malformed", "2"} {
 		malformed := pod.DeepCopy()
 		malformed.Annotations[executionGenerationAnnotation] = annotation
-		if _, _, err := (Connector{Reader: newClient(env.DeepCopy(), malformed, secret.DeepCopy())}).DialProcess(context.Background(), env.Namespace, env.Name, env.UID); err == nil || !strings.Contains(err.Error(), "execution generation") {
+		if _, _, err := (Connector{Reader: newClient(env.DeepCopy(), malformed, secret.DeepCopy())}).DialProcess(context.Background(), lifecycle.CaptureExecutionFence(env)); err == nil || !strings.Contains(err.Error(), "execution generation") {
 			t.Fatalf("execution annotation %q error = %v", annotation, err)
 		}
 	}
 	legacy := env.DeepCopy()
 	legacy.Status.ExecutionGeneration = 0
-	if _, _, err := (Connector{Reader: newClient(legacy, pod.DeepCopy(), secret.DeepCopy())}).DialProcess(context.Background(), env.Namespace, env.Name, env.UID); err == nil || !strings.Contains(err.Error(), "current reachable incarnation") {
+	if _, _, err := (Connector{Reader: newClient(legacy, pod.DeepCopy(), secret.DeepCopy())}).DialProcess(context.Background(), lifecycle.CaptureExecutionFence(legacy)); err == nil || !strings.Contains(err.Error(), "execution generation changed") {
 		t.Fatalf("legacy generation zero error = %v", err)
 	}
 	activityReader := &environmentChangingReader{Reader: newClient(env.DeepCopy(), pod.DeepCopy(), secret.DeepCopy()), mutate: func(environment *platformv1alpha1.Environment) {
 		environment.Annotations = map[string]string{"lifecycle.swe.dev/activity-terminal": `{"id":"activity"}`}
 	}}
-	_, closeActivity, err := (Connector{Reader: activityReader}).DialProcessForEpoch(context.Background(), env.Namespace, env.Name, env.UID, 0)
+	_, closeActivity, err := (Connector{Reader: activityReader}).DialProcess(context.Background(), lifecycle.CaptureExecutionFence(env))
 	if err != nil || closeActivity == nil || activityReader.environmentGets != 2 {
 		t.Fatalf("metadata-only activity dial: close nil=%t, error=%v, Environment reads=%d", closeActivity == nil, err, activityReader.environmentGets)
 	}
@@ -203,7 +206,7 @@ func TestDialProcessValidatesCurrentEnvironmentPodAndCredentialIncarnation(t *te
 	} {
 		t.Run("final read "+test.name, func(t *testing.T) {
 			reader := &environmentChangingReader{Reader: newClient(env.DeepCopy(), pod.DeepCopy(), secret.DeepCopy()), mutate: test.mutate}
-			if _, _, err := (Connector{Reader: reader}).DialProcessForEpoch(context.Background(), env.Namespace, env.Name, env.UID, 0); err == nil || !strings.Contains(err.Error(), "execution changed while resolving") || reader.environmentGets != 2 {
+			if _, _, err := (Connector{Reader: reader}).DialProcess(context.Background(), lifecycle.CaptureExecutionFence(env)); err == nil || !strings.Contains(err.Error(), "execution changed while resolving") || reader.environmentGets != 2 {
 				t.Fatalf("racing execution error = %v, Environment reads = %d", err, reader.environmentGets)
 			}
 		})
@@ -211,7 +214,7 @@ func TestDialProcessValidatesCurrentEnvironmentPodAndCredentialIncarnation(t *te
 	suspended := env.DeepCopy()
 	suspended.Status.Lifecycle.Suspended = true
 	suspended.Status.Lifecycle.SuspensionReason = platformv1alpha1.EnvironmentSuspensionReasonIdle
-	if _, _, err := (Connector{Reader: newClient(suspended, pod.DeepCopy(), secret.DeepCopy())}).DialProcess(context.Background(), env.Namespace, env.Name, env.UID); err == nil || !strings.Contains(err.Error(), "current reachable incarnation") {
+	if _, _, err := (Connector{Reader: newClient(suspended, pod.DeepCopy(), secret.DeepCopy())}).DialProcess(context.Background(), lifecycle.CaptureExecutionFence(suspended)); err == nil || !strings.Contains(err.Error(), "current reachable incarnation") {
 		t.Fatalf("suspended environment error = %v", err)
 	}
 	longNameEnv := env.DeepCopy()
@@ -222,7 +225,7 @@ func TestDialProcessValidatesCurrentEnvironmentPodAndCredentialIncarnation(t *te
 	longNameSecret := secret.DeepCopy()
 	longNameSecret.Name = "bounded-credential-name"
 	longNameSecret.OwnerReferences[0].Name = longNameEnv.Name
-	_, closeLongName, err := (Connector{Reader: newClient(longNameEnv, longNamePod, longNameSecret)}).DialProcess(context.Background(), longNameEnv.Namespace, longNameEnv.Name, longNameEnv.UID)
+	_, closeLongName, err := (Connector{Reader: newClient(longNameEnv, longNamePod, longNameSecret)}).DialProcess(context.Background(), lifecycle.CaptureExecutionFence(longNameEnv))
 	if err != nil {
 		t.Fatalf("long-name Environment credential lookup: %v", err)
 	}
@@ -232,27 +235,29 @@ func TestDialProcessValidatesCurrentEnvironmentPodAndCredentialIncarnation(t *te
 
 	wrongOwner := pod.DeepCopy()
 	wrongOwner.OwnerReferences[0].Name = "other-environment"
-	if _, _, err := (Connector{Reader: newClient(env.DeepCopy(), wrongOwner, secret.DeepCopy())}).DialProcess(context.Background(), env.Namespace, env.Name, env.UID); err == nil || !strings.Contains(err.Error(), "not owned") {
+	if _, _, err := (Connector{Reader: newClient(env.DeepCopy(), wrongOwner, secret.DeepCopy())}).DialProcess(context.Background(), lifecycle.CaptureExecutionFence(env)); err == nil || !strings.Contains(err.Error(), "not owned") {
 		t.Fatalf("wrong pod owner error = %v", err)
 	}
 
 	staleCredential := secret.DeepCopy()
 	staleCredential.Annotations[sandboxdauth.PodUIDAnnotation] = "replaced-pod"
-	if _, _, err := (Connector{Reader: newClient(env.DeepCopy(), pod.DeepCopy(), staleCredential)}).DialProcess(context.Background(), env.Namespace, env.Name, env.UID); err == nil || !strings.Contains(err.Error(), "current environment pod") {
+	if _, _, err := (Connector{Reader: newClient(env.DeepCopy(), pod.DeepCopy(), staleCredential)}).DialProcess(context.Background(), lifecycle.CaptureExecutionFence(env)); err == nil || !strings.Contains(err.Error(), "current environment pod") {
 		t.Fatalf("stale credential error = %v", err)
 	}
 	replacementSecret := secret.DeepCopy()
 	replacementSecret.UID = "replacement-secret-uid"
-	if _, _, err := (Connector{Reader: newClient(env.DeepCopy(), pod.DeepCopy(), replacementSecret)}).DialProcess(context.Background(), env.Namespace, env.Name, env.UID); err == nil || !strings.Contains(err.Error(), "current environment pod") {
+	if _, _, err := (Connector{Reader: newClient(env.DeepCopy(), pod.DeepCopy(), replacementSecret)}).DialProcess(context.Background(), lifecycle.CaptureExecutionFence(env)); err == nil || !strings.Contains(err.Error(), "current environment pod") {
 		t.Fatalf("replacement Secret error = %v", err)
 	}
 	wrongSecretOwner := secret.DeepCopy()
 	wrongSecretOwner.OwnerReferences[0].Kind = "Run"
-	if _, _, err := (Connector{Reader: newClient(env.DeepCopy(), pod.DeepCopy(), wrongSecretOwner)}).DialProcess(context.Background(), env.Namespace, env.Name, env.UID); err == nil || !strings.Contains(err.Error(), "current environment pod") {
+	if _, _, err := (Connector{Reader: newClient(env.DeepCopy(), pod.DeepCopy(), wrongSecretOwner)}).DialProcess(context.Background(), lifecycle.CaptureExecutionFence(env)); err == nil || !strings.Contains(err.Error(), "current environment pod") {
 		t.Fatalf("wrong Secret owner kind error = %v", err)
 	}
 
-	if _, _, err := (Connector{Reader: newClient(env.DeepCopy())}).DialProcess(context.Background(), env.Namespace, env.Name, types.UID("replaced-environment")); err == nil || !strings.Contains(err.Error(), "current reachable incarnation") {
+	replacedEnvironment := env.DeepCopy()
+	replacedEnvironment.UID = types.UID("replaced-environment")
+	if _, _, err := (Connector{Reader: newClient(env.DeepCopy())}).DialProcess(context.Background(), lifecycle.CaptureExecutionFence(replacedEnvironment)); err == nil || !strings.Contains(err.Error(), "incarnation changed") {
 		t.Fatalf("stale environment UID error = %v", err)
 	}
 }

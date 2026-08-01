@@ -215,14 +215,15 @@ Pause is disk plus transcript, not process checkpointing:
 5. resume creates a fresh pod/credential epoch, runs the repository resume hook, and repeats
    idempotent adapter acceptance with the same Run UID.
 
-Terminal attachment captures Environment UID, execution generation, lifecycle epoch, and hold
-revision before publishing activity, then atomically rejects stale activity. Its connector-owned
-opaque handle also revalidates the exact live backend execution throughout the lease. Run adapter
-acceptance, observation, and cancellation similarly capture the allocated Environment UID,
-execution generation, epoch, and an opaque non-dialing connector execution handle. After each
-adapter call, the controller uncached-reads the exact allocation and asks the connector to prove
-that the same live backend execution remains current before publishing Run state, releasing a
-claim, or removing a finalizer. Delayed results from disappeared or same-name replacement Pods
+`lifecycle.ExecutionFence` is the mandatory backend-neutral capture/revalidation mechanism for
+execution-scoped work. Its opaque value always carries the Environment UID, execution generation,
+lifecycle epoch, and hold-policy revision; callers cannot construct a partial fence. Terminal
+attachment captures one before publishing activity, then atomically rejects stale activity. Its
+connector-owned opaque handle also revalidates the exact live backend execution throughout the
+lease. Run adapter acceptance, observation, and cancellation use the same complete fence. After
+each adapter call, the controller uncached-reads the exact allocation and asks the connector to
+prove that the same live backend execution remains current before publishing Run state, releasing
+a claim, or removing a finalizer. Delayed results from disappeared or same-name replacement Pods
 are therefore discarded even if Environment status has not yet advanced.
 
 Only the Pod backend performs execution today. Project-backed initialization clones the
@@ -465,8 +466,9 @@ The remaining approved service contract still requires observation connector/con
 and gateway implementation. sandboxd has a stateless internal loopback observation primitive
 and Environments have durable declarations, but no connector invokes the primitive and no
 controller-owned health status exists. The execution-generation contract is implemented above;
-future declaration observations, portal routes, and egress identity must consume the same
-backend-neutral fence without exposing backend-specific identity.
+future declaration observations, portal routes, and egress identity must capture and revalidate
+the mandatory `lifecycle.ExecutionFence` without exposing backend-specific identity or selecting
+individual fence components.
 
 Other unimplemented areas include portal transport, inbox and child-run semantics, changes
 publication, transcript garbage collection, additional credential forms, ConPTY, non-Pod
