@@ -241,13 +241,6 @@ func (p processConnectionProof) matches(other processConnectionProof) bool {
 		p.secretPodUID == other.secretPodUID && p.certificateHash == other.certificateHash && p.tokenHash == other.tokenHash
 }
 
-func (p processConnectionProof) matchesEnvironment(env *platformv1alpha1.Environment) bool {
-	return processEnvironmentReachable(env) && env.UID == p.execution.environmentUID &&
-		env.Status.ExecutionGeneration == p.execution.executionGeneration && env.Status.Lifecycle.Epoch == p.execution.lifecycleEpoch &&
-		lifecycle.HoldPolicyRevision(env) == p.holdPolicyRevision &&
-		env.Status.PodName == p.execution.podName && env.Status.Endpoints.Sandboxd == p.execution.endpoint
-}
-
 func processEnvironmentReachable(env *platformv1alpha1.Environment) bool {
 	return !env.Spec.Paused && !env.Status.Lifecycle.Suspended &&
 		(env.Spec.Lifecycle.Hold == nil || !env.Spec.Lifecycle.Hold.Enabled) && platformv1alpha1.IsEnvironmentReady(env) &&
