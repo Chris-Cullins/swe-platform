@@ -551,6 +551,26 @@ spec:
               podName:
                 description: PodName is the name of the backing pod, when one exists.
                 type: string
+              podRecoveryAttempts:
+                description: |-
+                  PodRecoveryAttempts is deprecated compatibility state retained for one
+                  rollout. New writers use Recovery.
+                format: int32
+                type: integer
+              podRecoveryExhausted:
+                description: PodRecoveryExhausted is deprecated compatibility state
+                  retained for one rollout.
+                type: boolean
+              podRecoveryNextAttemptAt:
+                description: PodRecoveryNextAttemptAt is deprecated compatibility
+                  state retained for one rollout.
+                format: date-time
+                type: string
+              podRecoveryUID:
+                description: |-
+                  PodRecoveryUID is deprecated Pod-identity compatibility state. It must not
+                  be interpreted as an execution generation without observing that exact Pod.
+                type: string
               portalRoutes:
                 description: |-
                   PortalRoutes is bounded gateway-owned state. Other status writers must

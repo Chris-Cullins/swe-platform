@@ -13,16 +13,64 @@ import (
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 )
 
-// reconcilePendingPodRecovery advances persisted recovery before ensurePod can
-// create a replacement. This keeps backoff and exhaustion effective even when
-// a terminal Pod disappears without the controller deleting it.
+// reconcilePodRecoveryMigration losslessly moves deprecated flat recovery state
+// into its nested representation, or clears stale flat state when nested state
+// is already authoritative.
+func (r *EnvironmentReconciler) reconcilePodRecoveryMigration(ctx context.Context, env *platformv1alpha1.Environment) (ctrl.Result, bool, error) {
+	if legacyRecoveryMeaningful(&env.Status) {
+		executionGeneration := int64(0)
+		if !nestedRecoveryMeaningful(env.Status.Recovery) {
+			var pod corev1.Pod
+			err := r.apiReader().Get(ctx, client.ObjectKey{Namespace: env.Namespace, Name: envPodName(env)}, &pod)
+			if err == nil {
+				podGeneration, valid := podExecutionGeneration(&pod)
+				if pod.UID == env.Status.PodRecoveryUID &&
+					exactControllerOwner(&pod, platformv1alpha1.GroupVersion.String(), "Environment", env.Name, env.UID) &&
+					valid && podGeneration == env.Status.ExecutionGeneration {
+					executionGeneration = podGeneration
+				}
+			} else if !errors.IsNotFound(err) {
+				return ctrl.Result{}, true, err
+			}
+		}
+		if err := r.updatePodRecoveryStatus(ctx, env, func(current *platformv1alpha1.Environment) {
+			if !nestedRecoveryMeaningful(current.Status.Recovery) {
+				current.Status.Recovery = platformv1alpha1.EnvironmentRecoveryStatus{
+					Attempts: current.Status.PodRecoveryAttempts, Exhausted: current.Status.PodRecoveryExhausted,
+					ExecutionGeneration: executionGeneration, NextAttemptAt: current.Status.PodRecoveryNextAttemptAt,
+				}
+			}
+			current.Status.PodRecoveryAttempts = 0
+			current.Status.PodRecoveryExhausted = false
+			current.Status.PodRecoveryUID = ""
+			current.Status.PodRecoveryNextAttemptAt = nil
+		}); err != nil {
+			if stderrors.Is(err, errPodRecoveryChanged) {
+				return ctrl.Result{Requeue: true}, true, nil
+			}
+			return ctrl.Result{}, true, err
+		}
+		// Always observe the nested representation on a separate reconcile before
+		// enforcing its deadline or exhaustion latch. Migration is not a recovery
+		// transition and therefore emits no attempt/exhausted metric.
+		return ctrl.Result{Requeue: true}, true, nil
+	}
+	return ctrl.Result{}, false, nil
+}
+
+// reconcilePendingPodRecovery advances persisted nested recovery before
+// ensurePod can create a replacement. This keeps backoff and exhaustion
+// effective even when a terminal Pod disappears without the controller
+// deleting it. Flat recovery state is migrated by an earlier reconcile phase.
 func (r *EnvironmentReconciler) reconcilePendingPodRecovery(ctx context.Context, env *platformv1alpha1.Environment) (ctrl.Result, bool, error) {
+	recovery, _ := effectivePodRecovery(&env.Status)
 	ready := apimeta.FindStatusCondition(env.Status.Conditions, platformv1alpha1.EnvironmentConditionReady)
-	if env.Status.Recovery.Exhausted {
-		message := fmt.Sprintf("automatic recovery is exhausted after %d terminal pod replacements", env.Status.Recovery.Attempts)
+	if recovery.Exhausted {
+		message := fmt.Sprintf("automatic recovery is exhausted after %d terminal pod replacements", recovery.Attempts)
 		if ready == nil || ready.ObservedGeneration != env.Generation || ready.Status != metav1.ConditionFalse || ready.Reason != "PodRecoveryExhausted" {
 			if err := r.setEnvironmentStatus(ctx, env, platformv1alpha1.EnvironmentPhaseFailed, env.Status.PodName, "", "PodRecoveryExhausted", message); err != nil {
 				return ctrl.Result{}, true, err
@@ -30,14 +78,14 @@ func (r *EnvironmentReconciler) reconcilePendingPodRecovery(ctx context.Context,
 		}
 		return ctrl.Result{}, true, nil
 	}
-	nextAttemptAt := env.Status.Recovery.NextAttemptAt
+	nextAttemptAt := recovery.NextAttemptAt
 	if nextAttemptAt == nil {
 		return ctrl.Result{}, false, nil
 	}
 	now := r.now()
 	if now.Before(nextAttemptAt.Time) {
 		if ready == nil || ready.ObservedGeneration != env.Generation || ready.Status != metav1.ConditionFalse || ready.Reason != "PodRecoveryPending" {
-			message := fmt.Sprintf("terminal pod recovery attempt %d of %d is scheduled for %s", env.Status.Recovery.Attempts+1, podRecoveryLimit, nextAttemptAt.Time.UTC().Format(time.RFC3339))
+			message := fmt.Sprintf("terminal pod recovery attempt %d of %d is scheduled for %s", recovery.Attempts+1, podRecoveryLimit, nextAttemptAt.Time.UTC().Format(time.RFC3339))
 			if err := r.setEnvironmentStatus(ctx, env, platformv1alpha1.EnvironmentPhaseCreating, "", "", "PodRecoveryPending", message); err != nil {
 				return ctrl.Result{}, true, err
 			}
@@ -45,12 +93,12 @@ func (r *EnvironmentReconciler) reconcilePendingPodRecovery(ctx context.Context,
 		return ctrl.Result{RequeueAfter: nextAttemptAt.Sub(now)}, true, nil
 	}
 
-	attempts := env.Status.Recovery.Attempts + 1
+	attempts := recovery.Attempts + 1
 	message := fmt.Sprintf("replacing terminal environment pod (recovery attempt %d of %d)", attempts, podRecoveryLimit)
 	if err := r.updatePodRecoveryStatus(ctx, env, func(current *platformv1alpha1.Environment) {
 		applyEnvironmentStatus(current, platformv1alpha1.EnvironmentPhaseCreating, "", "", "PodRecovering", message, env.Status.LastActiveAt)
 		current.Status.Recovery.Attempts = attempts
-		current.Status.Recovery.ExecutionGeneration = env.Status.Recovery.ExecutionGeneration
+		current.Status.Recovery.ExecutionGeneration = recovery.ExecutionGeneration
 		current.Status.Recovery.NextAttemptAt = nil
 		clearChildOwnershipCollision(current)
 	}); err != nil {
@@ -78,9 +126,10 @@ func (r *EnvironmentReconciler) reconcileTerminalPod(ctx context.Context, env *p
 		return ctrl.Result{Requeue: true}, nil
 	}
 	now := r.now()
-	attempts := env.Status.Recovery.Attempts
-	recoveryGeneration := env.Status.Recovery.ExecutionGeneration
-	nextAttemptAt := env.Status.Recovery.NextAttemptAt
+	recovery, _ := effectivePodRecovery(&env.Status)
+	attempts := recovery.Attempts
+	recoveryGeneration := recovery.ExecutionGeneration
+	nextAttemptAt := recovery.NextAttemptAt
 
 	if recoveryGeneration != executionGeneration {
 		if attempts >= podRecoveryLimit {
@@ -134,6 +183,26 @@ func (r *EnvironmentReconciler) reconcileTerminalPod(ctx context.Context, env *p
 
 func podRecoveryBackoff(attempts int32) time.Duration {
 	return podRecoveryDelay * time.Duration(1<<attempts)
+}
+
+func nestedRecoveryMeaningful(recovery platformv1alpha1.EnvironmentRecoveryStatus) bool {
+	return recovery.Attempts != 0 || recovery.Exhausted || recovery.ExecutionGeneration != 0 || recovery.NextAttemptAt != nil
+}
+
+func legacyRecoveryMeaningful(status *platformv1alpha1.EnvironmentStatus) bool {
+	return status.PodRecoveryAttempts != 0 || status.PodRecoveryExhausted || status.PodRecoveryUID != "" || status.PodRecoveryNextAttemptAt != nil
+}
+
+// effectivePodRecovery defines coexistence deterministically: any meaningful
+// nested state is authoritative; legacy state is consulted only otherwise.
+func effectivePodRecovery(status *platformv1alpha1.EnvironmentStatus) (platformv1alpha1.EnvironmentRecoveryStatus, bool) {
+	if nestedRecoveryMeaningful(status.Recovery) || !legacyRecoveryMeaningful(status) {
+		return status.Recovery, false
+	}
+	return platformv1alpha1.EnvironmentRecoveryStatus{
+		Attempts: status.PodRecoveryAttempts, Exhausted: status.PodRecoveryExhausted,
+		NextAttemptAt: status.PodRecoveryNextAttemptAt,
+	}, true
 }
 
 func (r *EnvironmentReconciler) now() time.Time {

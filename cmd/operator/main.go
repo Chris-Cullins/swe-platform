@@ -158,6 +158,7 @@ func main() {
 		setupLog.Info("scoped installation has no configured Project namespaces; catalog is ready for onboarding and workload controllers are disabled")
 	} else if err := (&controllers.EnvironmentReconciler{
 		Client:                        guardedClient,
+		APIReader:                     mgr.GetAPIReader(),
 		Scheme:                        mgr.GetScheme(),
 		Scope:                         scope,
 		Metrics:                       operatorMetrics,
