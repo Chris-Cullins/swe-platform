@@ -292,6 +292,7 @@ spec:
                       minimum: 1
                       type: integer
                     source:
+                      default: API
                       description: Source identifies the owner responsible for launching
                         the service.
                       enum:
@@ -337,8 +338,9 @@ spec:
                       : (self == oldSelf.value() || (has(self.instanceID) && self.revision
                       > oldSelf.value().revision)))'
                   - message: source is immutable for a service declaration incarnation;
-                      remove and re-add the declaration to change ownership
-                    rule: self.source == oldSelf.source
+                      only legacy declarations may adopt API ownership
+                    rule: 'has(oldSelf.source) ? self.source == oldSelf.source : self.source
+                      == ''API'''
                   - message: launch must be present exactly when source is Repository
                     rule: (self.source == 'Repository') == has(self.launch)
                 maxItems: 32

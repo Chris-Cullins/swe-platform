@@ -99,6 +99,18 @@ func (r *DeclaredServiceReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		if err := fence.Validate(&current); err != nil || !reflect.DeepEqual(current.Spec.Services, env.Spec.Services) {
 			return ctrl.Result{Requeue: true}, nil
 		}
+		if current.Generation == math.MaxInt64 {
+			ctrl.LoggerFrom(ctx).Error(errors.New("environment generation is exhausted"), "fence previous repository service processes")
+			return ctrl.Result{RequeueAfter: declaredServiceInterval}, nil
+		}
+		// Stop the complete old set before publishing changed durable intent. The
+		// patch advances metadata.generation to this future intent revision; a
+		// later launch at a positive route revision is therefore strictly newer,
+		// while retries of an uncertain empty-set call remain idempotent.
+		if err := r.Connector.ReconcileRepositoryServices(ctx, fence, append([]platformv1alpha1.EnvironmentServiceDeclaration(nil), current.Spec.Services...), nil, uint64(current.Generation+1), 0, nil); err != nil {
+			ctrl.LoggerFrom(ctx).Error(err, "fence previous repository service processes")
+			return ctrl.Result{RequeueAfter: declaredServiceInterval}, nil
+		}
 		base := current.DeepCopy()
 		current.Spec.Services = converged
 		if err := r.Patch(ctx, &current, client.MergeFromWithOptions(base, client.MergeFromWithOptimisticLock{})); err != nil {
@@ -216,7 +228,7 @@ func convergeRepositoryDeclarations(env *platformv1alpha1.Environment, desired [
 	occupied := make(map[int32]bool)
 	for _, d := range env.Spec.Services {
 		occupied[d.TargetPort] = true
-		if d.Source == platformv1alpha1.EnvironmentServiceSourceAPI {
+		if d.Source == "" || d.Source == platformv1alpha1.EnvironmentServiceSourceAPI {
 			api[d.Name] = d
 		} else {
 			existing[d.Name] = d

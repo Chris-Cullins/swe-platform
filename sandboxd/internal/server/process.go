@@ -407,7 +407,8 @@ func (s *ProcessServer) ensureManagedUnderReconcile(ownerID, role string, gen ui
 	s.mu.Lock()
 	if startErr != nil {
 		if owner == s.managedOwners[ownerID] && owner.gen == gen && owner.desired[role] != nil && !s.closed {
-			time.AfterFunc(s.restartInitial, func() { s.ensureManaged(ownerID, role, gen, attempt+1) })
+			delay := s.managedRestartDelay(attempt)
+			time.AfterFunc(delay, func() { s.ensureManaged(ownerID, role, gen, attempt+1) })
 		}
 		s.mu.Unlock()
 		return
@@ -429,19 +430,27 @@ func (s *ProcessServer) scheduleManagedRestartLocked(key processKey, p *managedP
 	if owner == nil || owner.gen != p.managedGeneration || !reflect.DeepEqual(owner.desired[key.role], p.spec) {
 		return
 	}
-	attempt := p.restartAttempt + 1
+	attempt := p.restartAttempt
 	if time.Since(p.startedAt) >= s.restartStable {
 		attempt = 0
 	}
-	delay := s.restartInitial
-	for i := uint(0); i < attempt && delay < s.restartMax; i++ {
-		delay *= 2
-		if delay > s.restartMax {
-			delay = s.restartMax
-		}
-	}
+	delay := s.managedRestartDelay(attempt)
 	gen := owner.gen
-	time.AfterFunc(delay, func() { s.ensureManaged(key.ownerID, key.role, gen, attempt) })
+	time.AfterFunc(delay, func() { s.ensureManaged(key.ownerID, key.role, gen, attempt+1) })
+}
+
+func (s *ProcessServer) managedRestartDelay(attempt uint) time.Duration {
+	delay := s.restartInitial
+	if delay >= s.restartMax {
+		return s.restartMax
+	}
+	for i := uint(0); i < attempt; i++ {
+		if delay >= s.restartMax-delay {
+			return s.restartMax
+		}
+		delay *= 2
+	}
+	return delay
 }
 
 func clearSecretEnv(env map[string][]byte) {

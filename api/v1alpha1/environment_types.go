@@ -278,7 +278,7 @@ type EnvironmentServiceLaunch struct {
 //
 // +kubebuilder:validation:XValidation:rule="self == oldSelf || self.revision > oldSelf.revision",message="revision must increase when an existing service declaration changes"
 // +kubebuilder:validation:XValidation:rule="!oldSelf.hasValue() ? has(self.instanceID) : (has(oldSelf.value().instanceID) ? (has(self.instanceID) && self.instanceID == oldSelf.value().instanceID) : (self == oldSelf.value() || (has(self.instanceID) && self.revision > oldSelf.value().revision)))",message="new services require instanceID; a legacy missing instanceID may be added only with a higher revision and is then immutable",optionalOldSelf=true
-// +kubebuilder:validation:XValidation:rule="self.source == oldSelf.source",message="source is immutable for a service declaration incarnation; remove and re-add the declaration to change ownership"
+// +kubebuilder:validation:XValidation:rule="has(oldSelf.source) ? self.source == oldSelf.source : self.source == 'API'",message="source is immutable for a service declaration incarnation; only legacy declarations may adopt API ownership"
 // +kubebuilder:validation:XValidation:rule="(self.source == 'Repository') == has(self.launch)",message="launch must be present exactly when source is Repository"
 type EnvironmentServiceDeclaration struct {
 	// Name is the stable service name within this Environment.
@@ -301,6 +301,7 @@ type EnvironmentServiceDeclaration struct {
 	Revision int64 `json:"revision"`
 
 	// Source identifies the owner responsible for launching the service.
+	// +kubebuilder:default=API
 	Source EnvironmentServiceSource `json:"source"`
 
 	// Launch is required only for repository-supervised services.
