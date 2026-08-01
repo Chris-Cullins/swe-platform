@@ -112,7 +112,7 @@ func (c Connector) ExecutionCurrent(ctx context.Context, fence lifecycle.Executi
 		!platformv1alpha1.IsEnvironmentReady(env) || env.Status.PodName != execution.podName || env.Status.Endpoints.Sandboxd == "" {
 		return false, nil
 	}
-	if err := c.validateProvisioningSources(ctx, env); err != nil {
+	if _, err := c.validateProvisioningSources(ctx, env); err != nil {
 		if errors.Is(err, errProvisioningSourcesChanged) {
 			return false, nil
 		}
@@ -274,7 +274,8 @@ func (c Connector) resolvePodForEnvironment(ctx context.Context, env *platformv1
 	if !processEnvironmentReachable(env) {
 		return nil, nil, fmt.Errorf("environment is not the current reachable incarnation")
 	}
-	if err := c.validateProvisioningSources(ctx, env); err != nil {
+	template, err := c.validateProvisioningSources(ctx, env)
+	if err != nil {
 		return nil, nil, err
 	}
 	if backend := env.Status.Provisioning.Backend; backend != platformv1alpha1.EnvironmentBackendPod {
@@ -301,34 +302,34 @@ func (c Connector) resolvePodForEnvironment(ctx context.Context, env *platformv1
 	return &pod, &template, nil
 }
 
-func (c Connector) validateProvisioningSources(ctx context.Context, env *platformv1alpha1.Environment) error {
+func (c Connector) validateProvisioningSources(ctx context.Context, env *platformv1alpha1.Environment) (platformv1alpha1.EnvironmentTemplate, error) {
 	if err := platformv1alpha1.ValidateEnvironmentProvisioningSnapshot(env, env.Status.Provisioning); err != nil {
-		return fmt.Errorf("%w: %v", errProvisioningSourcesChanged, err)
+		return platformv1alpha1.EnvironmentTemplate{}, fmt.Errorf("%w: %v", errProvisioningSourcesChanged, err)
 	}
 	snapshot := env.Status.Provisioning
 	var template platformv1alpha1.EnvironmentTemplate
 	if err := c.Reader.Get(ctx, types.NamespacedName{Namespace: env.Namespace, Name: snapshot.Template.Name}, &template); err != nil {
 		if apierrors.IsNotFound(err) {
-			return fmt.Errorf("%w: snapshotted environment template no longer exists", errProvisioningSourcesChanged)
+			return platformv1alpha1.EnvironmentTemplate{}, fmt.Errorf("%w: snapshotted environment template no longer exists", errProvisioningSourcesChanged)
 		}
-		return fmt.Errorf("get snapshotted environment template: %w", err)
+		return platformv1alpha1.EnvironmentTemplate{}, fmt.Errorf("get snapshotted environment template: %w", err)
 	}
 	if template.UID != snapshot.Template.UID || !template.DeletionTimestamp.IsZero() {
-		return fmt.Errorf("%w: snapshotted environment template is not the current live incarnation", errProvisioningSourcesChanged)
+		return platformv1alpha1.EnvironmentTemplate{}, fmt.Errorf("%w: snapshotted environment template is not the current live incarnation", errProvisioningSourcesChanged)
 	}
 	if snapshot.Project != nil {
 		var project platformv1alpha1.Project
 		if err := c.Reader.Get(ctx, types.NamespacedName{Namespace: env.Namespace, Name: snapshot.Project.Name}, &project); err != nil {
 			if apierrors.IsNotFound(err) {
-				return fmt.Errorf("%w: snapshotted project no longer exists", errProvisioningSourcesChanged)
+				return platformv1alpha1.EnvironmentTemplate{}, fmt.Errorf("%w: snapshotted project no longer exists", errProvisioningSourcesChanged)
 			}
-			return fmt.Errorf("get snapshotted project: %w", err)
+			return platformv1alpha1.EnvironmentTemplate{}, fmt.Errorf("get snapshotted project: %w", err)
 		}
 		if project.UID != snapshot.Project.UID || !project.DeletionTimestamp.IsZero() {
-			return fmt.Errorf("%w: snapshotted project is not the current live incarnation", errProvisioningSourcesChanged)
+			return platformv1alpha1.EnvironmentTemplate{}, fmt.Errorf("%w: snapshotted project is not the current live incarnation", errProvisioningSourcesChanged)
 		}
 	}
-	return nil
+	return template, nil
 }
 
 func parseExecutionGeneration(pod *corev1.Pod) (int64, bool) {

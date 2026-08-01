@@ -11,6 +11,7 @@ func TestEnvironmentReconcilePhaseOrderingContract(t *testing.T) {
 		"deletion",
 		"recovery-migration",
 		"lifecycle",
+		"legacy-provisioning-migration",
 		"provisioning-fence",
 		"project-resolution",
 		"suspension",
@@ -30,7 +31,7 @@ func TestEnvironmentReconcilePhaseOrderingContract(t *testing.T) {
 	}
 
 	// Teardown and execution fencing must never wait for dependency resolution.
-	for _, gate := range []string{"tenancy-fencing", "deletion", "recovery-migration", "lifecycle", "provisioning-fence"} {
+	for _, gate := range []string{"tenancy-fencing", "deletion", "recovery-migration", "lifecycle", "legacy-provisioning-migration", "provisioning-fence"} {
 		for _, dependency := range []string{"project-resolution", "project-validation", "template", "recovery", "backend-runtime", "provisioning"} {
 			if slices.Index(got, gate) >= slices.Index(got, dependency) {
 				t.Errorf("gate %q must run before dependency phase %q", gate, dependency)

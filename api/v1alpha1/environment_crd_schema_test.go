@@ -79,11 +79,14 @@ func TestGeneratedEnvironmentSelectorTransitions(t *testing.T) {
 		name        string
 		oldChanges  map[string]interface{}
 		newChanges  map[string]interface{}
+		create      bool
 		wantAllowed bool
 	}{
 		{name: "all selectors unchanged", oldChanges: map[string]interface{}{"projectRef": "project", "backend": "pod"}, newChanges: map[string]interface{}{"projectRef": "project", "backend": "pod"}, wantAllowed: true},
 		{name: "omitted project stays omitted", wantAllowed: true},
 		{name: "omitted to nonempty project", newChanges: map[string]interface{}{"projectRef": "project"}, wantAllowed: true},
+		{name: "omitted to explicit empty project rejected", newChanges: map[string]interface{}{"projectRef": ""}},
+		{name: "explicit empty stays explicit empty", oldChanges: map[string]interface{}{"projectRef": ""}, newChanges: map[string]interface{}{"projectRef": ""}, wantAllowed: true},
 		{name: "explicit empty to nonempty project", oldChanges: map[string]interface{}{"projectRef": ""}, newChanges: map[string]interface{}{"projectRef": "project"}, wantAllowed: true},
 		{name: "explicit empty to omitted project", oldChanges: map[string]interface{}{"projectRef": ""}, wantAllowed: true},
 		{name: "nonempty project unchanged", oldChanges: map[string]interface{}{"projectRef": "project"}, newChanges: map[string]interface{}{"projectRef": "project"}, wantAllowed: true},
@@ -93,16 +96,21 @@ func TestGeneratedEnvironmentSelectorTransitions(t *testing.T) {
 		{name: "project changed", oldChanges: map[string]interface{}{"projectRef": "one"}, newChanges: map[string]interface{}{"projectRef": "two"}},
 		{name: "project removed", oldChanges: map[string]interface{}{"projectRef": "project"}},
 		{name: "lifecycle independently changes", newChanges: map[string]interface{}{"lifecycle": map[string]interface{}{"hold": map[string]interface{}{"enabled": true, "revision": int64(1)}}}, wantAllowed: true},
-		{name: "services independently change", newChanges: map[string]interface{}{"services": []interface{}{map[string]interface{}{"name": "web", "revision": int64(1), "protocol": "HTTP", "targetPort": int64(8080), "visibility": "Project", "readiness": "TCPConnect"}}}, wantAllowed: true},
+		{name: "services independently change", newChanges: map[string]interface{}{"services": []interface{}{map[string]interface{}{"name": "web", "source": "API", "instanceID": "aaaaaaaaaaaaaaaaaaaa", "revision": int64(1), "protocol": "HTTP", "targetPort": int64(8080), "visibility": "Project", "readiness": "TCPConnect"}}}, wantAllowed: true},
 		{name: "deprecated paused independently changes", newChanges: map[string]interface{}{"paused": true}, wantAllowed: true},
-		{name: "present blank project rejected by OpenAPI", newChanges: map[string]interface{}{"projectRef": ""}},
+		{name: "present blank project rejected on creation by OpenAPI", newChanges: map[string]interface{}{"projectRef": ""}, create: true},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			oldObject := withSpec(base, test.oldChanges)
 			newObject := withSpec(base, test.newChanges)
 			errs := apiservervalidation.ValidateCustomResource(nil, newObject, openAPI)
-			celErrs, _ := celValidator.Validate(context.Background(), nil, structural, newObject, oldObject, 10_000_000)
+			var oldForCEL interface{}
+			if !test.create {
+				errs = apiservervalidation.ValidateCustomResourceUpdate(nil, newObject, oldObject, openAPI, apiservervalidation.WithRatcheting(nil))
+				oldForCEL = oldObject
+			}
+			celErrs, _ := celValidator.Validate(context.Background(), nil, structural, newObject, oldForCEL, 10_000_000)
 			errs = append(errs, celErrs...)
 			if test.wantAllowed && len(errs) != 0 {
 				t.Fatalf("valid transition rejected: %v", errs)
@@ -142,6 +150,22 @@ func TestGeneratedEnvironmentSelectorTransitions(t *testing.T) {
 		}
 	}
 	t.Run("provisioning initial add", func(t *testing.T) { transition(t, nil, provisioning, true) })
+	legacyProvisioning := runtime.DeepCopyJSONValue(provisioning).(map[string]interface{})
+	legacyProvisioning["legacyWorkspacePVCUID"] = "pvc-uid"
+	t.Run("legacy workspace UID initial add", func(t *testing.T) { transition(t, nil, legacyProvisioning, true) })
+	t.Run("legacy workspace UID rejects empty", func(t *testing.T) {
+		next := runtime.DeepCopyJSONValue(provisioning).(map[string]interface{})
+		next["legacyWorkspacePVCUID"] = ""
+		transition(t, nil, next, false)
+	})
+	t.Run("legacy workspace UID remains unchanged", func(t *testing.T) { transition(t, legacyProvisioning, legacyProvisioning, true) })
+	t.Run("legacy workspace UID rejects later addition", func(t *testing.T) { transition(t, provisioning, legacyProvisioning, false) })
+	t.Run("legacy workspace UID rejects removal", func(t *testing.T) { transition(t, legacyProvisioning, provisioning, false) })
+	t.Run("legacy workspace UID rejects change", func(t *testing.T) {
+		next := runtime.DeepCopyJSONValue(legacyProvisioning).(map[string]interface{})
+		next["legacyWorkspacePVCUID"] = "replacement-pvc"
+		transition(t, legacyProvisioning, next, false)
+	})
 	t.Run("provisioning rejects initially template-verified snapshot", func(t *testing.T) {
 		next := runtime.DeepCopyJSONValue(provisioning).(map[string]interface{})
 		next["templateVerified"] = true

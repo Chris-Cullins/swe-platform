@@ -69,7 +69,12 @@ func TestObserveServicesDuplicatePortsRemainNameCorrelatedAndRequestOrdered(t *t
 		t.Fatal(err)
 	}
 	secret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "credential", Namespace: "ns", UID: "secret-uid", OwnerReferences: owner, Annotations: map[string]string{sandboxdauth.IdentityAnnotation: identity, sandboxdauth.PodUIDAnnotation: "pod-uid"}}, Data: map[string][]byte{sandboxdauth.TLSCertKey: pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certificate.Raw}), sandboxdauth.CapabilitiesKey: capabilities, sandboxdauth.ServiceObservationTokenKey: []byte("observation-token")}}
-	template := &platformv1alpha1.EnvironmentTemplate{ObjectMeta: metav1.ObjectMeta{Name: "default", Namespace: "ns", UID: "template-uid", Generation: 1}}
+	template := &platformv1alpha1.EnvironmentTemplate{
+		ObjectMeta: metav1.ObjectMeta{Name: "default", Namespace: "ns", UID: "template-uid", Generation: 1},
+		Spec:       platformv1alpha1.EnvironmentTemplateSpec{Image: "environment:test", Size: "small"},
+	}
+	env.Status.Provisioning = platformv1alpha1.ResolveEnvironmentProvisioning(env, template, nil)
+	env.Status.Provisioning.TemplateVerified = true
 	scheme := runtime.NewScheme()
 	_ = corev1.AddToScheme(scheme)
 	_ = platformv1alpha1.AddToScheme(scheme)

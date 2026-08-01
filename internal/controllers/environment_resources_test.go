@@ -34,6 +34,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
 	platformv1alpha1 "github.com/Chris-Cullins/swe-platform/api/v1alpha1"
+	"github.com/Chris-Cullins/swe-platform/internal/tenancy"
 	sandboxdauth "github.com/Chris-Cullins/swe-platform/sandboxd/auth"
 )
 
@@ -440,7 +441,7 @@ func TestFailedPodCreateLeavesGenerationGap(t *testing.T) {
 	template := &platformv1alpha1.EnvironmentTemplate{Spec: platformv1alpha1.EnvironmentTemplateSpec{Image: "example/environment:latest", Size: "small"}}
 	project := &platformv1alpha1.Project{ObjectMeta: metav1.ObjectMeta{Name: "project", Namespace: env.Namespace}, Spec: platformv1alpha1.ProjectSpec{Repositories: []string{"https://github.com/example/repo"}}}
 
-	if pod, err := reconciler.ensurePodForProject(context.Background(), env, template, project, ""); pod != nil || !stderrors.Is(err, transientErr) {
+	if pod, err := reconciler.ensurePodForProject(context.Background(), env, template, project, "", tenancy.Claim{}); pod != nil || !stderrors.Is(err, transientErr) {
 		t.Fatalf("first create = (%#v, %v), want transient error", pod, err)
 	}
 	var reserved platformv1alpha1.Environment
@@ -453,7 +454,7 @@ func TestFailedPodCreateLeavesGenerationGap(t *testing.T) {
 	if reserved.Status.Phase != platformv1alpha1.EnvironmentPhaseResuming {
 		t.Fatalf("failed create lost resume intent: phase %q", reserved.Status.Phase)
 	}
-	replacement, err := reconciler.ensurePodForProject(context.Background(), &reserved, template, project, "")
+	replacement, err := reconciler.ensurePodForProject(context.Background(), &reserved, template, project, "", tenancy.Claim{})
 	if err != nil {
 		t.Fatal(err)
 	}

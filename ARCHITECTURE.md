@@ -85,6 +85,14 @@ All current CRDs are namespaced:
 
 The current ownership/reference shape is:
 
+Environment status is controller-owned: the operator and its Run controller retain status
+subresource authority. The control plane has no `environments/status` permission unless the
+portal gateway is enabled; that gateway configuration adds update-only status authority for
+its bounded `portalRoutes` and `nextPortalRouteGeneration` ownership. A fail-closed admission
+policy binds that exact gateway ServiceAccount to those fields and rejects changes to all
+controller-owned status, including the provisioning snapshot. The policy is installed even
+when the gateway is disabled so the fence precedes any later RBAC enablement.
+
 ```text
 Installation --UID claim--> Namespace --exact name + UID--> Project
                               |
@@ -121,7 +129,7 @@ cleared. Lifecycle and service intents remain independently mutable under their 
 The Environment controller exclusively owns `status.provisioning`, whose exact schema is
 `template {name, uid, generation}`, `backend`, `image`, `size`, `resources` (resolved CPU and
 memory requests/limits), `runtimeClassName`, `diskSize`, and optional
-`project {name, uid, generation, repository}`, plus monotonic `templateVerified` and
+`project {name, uid, generation, repository}` and migration-only `legacyWorkspacePVCUID`, plus monotonic `templateVerified` and
 `projectVerified` capture-handshake bits. Status admission makes the snapshot immutable except
 for adding that Project object once, initially unverified, during warm-member promotion.
 
@@ -129,12 +137,30 @@ Before creating any Pod, PVC, credential Secret, or NetworkPolicy, the controlle
 the same Environment UID/generation and exact Template and optional Project UID/generation,
 resolves defaults, then atomically publishes the unverified snapshot. A later reconcile
 uncached-revalidates the exact sources and Environment selectors before monotonically marking
-the relevant capture verified; no child or warm capacity is created or counted before then. It never infers a snapshot from
-existing children: a legacy Environment with an owned provisioning child but no snapshot fails
-closed. Every later reconcile validates the complete snapshot and exact live source UIDs before
-consuming it. Deletion and recreation of a selected Template or bound Project under the same
+the relevant capture verified; no child or warm capacity is created or counted before then. It
+never infers a snapshot from existing child specifications. A legacy Environment with no
+snapshot first withdraws readiness,
+deletes its exact-owned Pod, then revokes its exact-owned sandboxd credential while retaining its
+exact-owned PVC and NetworkPolicy. Only after that fence completes does it resolve and freeze the
+current authoritative managed Template and optional exact Project sources through the normal
+unverified/verified handshake. Before deleting any execution child it durably records the exact
+PVC UID in immutable controller-owned migration status, then copies that identity into the
+snapshot. This deterministic migration cannot recover unknowable historical
+Template or Project values; it deliberately adopts the current authoritative sources, reuses the
+retained workspace, freezes that PVC's exact UID in the immutable snapshot, and runs the resume
+path for an active Environment. A missing, deleting, or same-name replacement PVC fails closed
+and is never recreated. A suspended or held
+Environment remains podless while capture completes and returns to `Paused`. Foreign fixed-name
+children are neither adopted nor deleted and cannot authorize capture. Every later reconcile
+validates the complete snapshot and exact live source UIDs before consuming it. Deletion and
+recreation of a selected Template or bound Project under the same
 name therefore fences and removes execution rather than granting the replacement authority;
 the old snapshot is retained and the Environment does not silently recover.
+Immediately before and after every replacement Pod creation, the controller uncached-revalidates
+the exact Environment generation and nonsuspended policy plus the captured Template and optional
+Project incarnations and managed Template authority. Drift prevents creation or UID-precondition
+deletes the just-created Pod before credentials are bound or readiness is published. Source
+generation advances remain legal because resolved provisioning inputs are already immutable.
 
 For one Environment incarnation, Template image, size/resolved CPU and memory, disk size,
 runtime-class name, and effective backend plus the Project repository are frozen provisioning

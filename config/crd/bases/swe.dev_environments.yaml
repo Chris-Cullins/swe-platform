@@ -364,9 +364,10 @@ spec:
               rule: has(self.backend) == has(oldSelf.backend) && (!has(self.backend)
                 || self.backend == oldSelf.backend)
             - message: projectRef may only transition once from empty to non-empty
-              rule: '(!has(oldSelf.projectRef) || oldSelf.projectRef.size() == 0)
-                ? (!has(self.projectRef) || self.projectRef.size() > 0) : (has(self.projectRef)
-                && self.projectRef == oldSelf.projectRef)'
+              rule: '!has(oldSelf.projectRef) ? (!has(self.projectRef) || self.projectRef.size()
+                > 0) : (oldSelf.projectRef.size() == 0 ? (!has(self.projectRef) ||
+                self.projectRef.size() >= 0) : (has(self.projectRef) && self.projectRef
+                == oldSelf.projectRef))'
             - message: hold policy cannot be removed; disable it at a higher revision
               rule: '!has(oldSelf.lifecycle) || !has(oldSelf.lifecycle.hold) || (has(self.lifecycle)
                 && has(self.lifecycle.hold))'
@@ -686,6 +687,11 @@ spec:
                   image:
                     minLength: 1
                     type: string
+                  legacyWorkspacePVCUID:
+                    description: |-
+                      LegacyWorkspacePVCUID binds a migrated pre-snapshot Environment to the
+                      exact retained workspace incarnation. Ordinary snapshots omit it.
+                    type: string
                   project:
                     properties:
                       generation:
@@ -780,7 +786,9 @@ spec:
                     self.resources.all(k, k in oldSelf.resources && quantity(self.resources[k]).compareTo(quantity(oldSelf.resources[k]))
                     == 0) && oldSelf.resources.all(k, k in self.resources) && self.runtimeClassName
                     == oldSelf.runtimeClassName && quantity(self.diskSize).compareTo(quantity(oldSelf.diskSize))
-                    == 0
+                    == 0 && has(self.legacyWorkspacePVCUID) == has(oldSelf.legacyWorkspacePVCUID)
+                    && (!has(self.legacyWorkspacePVCUID) || self.legacyWorkspacePVCUID
+                    == oldSelf.legacyWorkspacePVCUID)
                 - message: project may only be added once and must start unverified
                   rule: 'has(oldSelf.project) ? (has(self.project) && self.project
                     == oldSelf.project) : (!has(self.project) || !self.projectVerified)'
@@ -790,6 +798,14 @@ spec:
                   rule: '!oldSelf.projectVerified || self.projectVerified'
                 - message: project verification requires a project snapshot
                   rule: has(self.project) || !self.projectVerified
+                - message: legacy workspace PVC UID must not be empty
+                  rule: '!has(self.legacyWorkspacePVCUID) || self.legacyWorkspacePVCUID.size()
+                    > 0'
+              provisioningMigrationPVCUID:
+                description: |-
+                  ProvisioningMigrationPVCUID durably fences the exact retained legacy
+                  workspace before migration tears down any execution child.
+                type: string
               recovery:
                 description: Recovery is backend-neutral terminal execution recovery
                   state.
@@ -922,6 +938,12 @@ spec:
                 && self.nextPortalRouteGeneration >= oldSelf.nextPortalRouteGeneration)'
             - message: provisioning snapshot cannot be removed
               rule: '!has(oldSelf.provisioning) || has(self.provisioning)'
+            - message: provisioning migration PVC UID cannot change or be removed
+              rule: '!has(oldSelf.provisioningMigrationPVCUID) || (has(self.provisioningMigrationPVCUID)
+                && self.provisioningMigrationPVCUID == oldSelf.provisioningMigrationPVCUID)'
+            - message: provisioning migration PVC UID must not be empty
+              rule: '!has(self.provisioningMigrationPVCUID) || self.provisioningMigrationPVCUID.size()
+                > 0'
         type: object
         x-kubernetes-validations:
         - message: initial provisioning snapshot must be unverified

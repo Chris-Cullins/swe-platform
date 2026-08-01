@@ -152,7 +152,7 @@ type EnvironmentReconciler struct {
 // +kubebuilder:rbac:groups=swe.dev,resources=runs,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=persistentvolumeclaims,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups="",resources=secrets,verbs=get;create;update;delete
+// +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch;create;update;delete
 // +kubebuilder:rbac:groups=networking.k8s.io,resources=networkpolicies,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=node.k8s.io,resources=runtimeclasses,verbs=get;list;watch
 
@@ -235,6 +235,156 @@ func (r *EnvironmentReconciler) reconcileInvalidProvisioningFence(ctx context.Co
 		return ctrl.Result{}, true, err
 	}
 	return ctrl.Result{}, false, nil
+}
+
+// reconcileLegacyProvisioningMigration fences a pre-snapshot execution before
+// allowing current authoritative Template and Project inputs to be captured.
+// Its progress is durable in a positive execution generation and the presence
+// of the exact-owned retained PVC. Foreign fixed-name children are never
+// adopted or deleted.
+func (r *EnvironmentReconciler) reconcileLegacyProvisioningMigration(ctx context.Context, env *platformv1alpha1.Environment) (bool, ctrl.Result, bool, error) {
+	// Pre-snapshot controllers reserved a positive execution generation before
+	// creating execution resources. Generation zero is an ordinary environment
+	// that has not started, even if a malformed or stale fixed-name child exists.
+	if env.Status.ExecutionGeneration <= 0 {
+		return false, ctrl.Result{}, false, nil
+	}
+	// Suspension owns execution teardown independently of workspace migration
+	// authority. Once a valid PVC identity has been durably captured—or before
+	// reporting that no valid identity exists—fence the Pod and then credential.
+	// A completed teardown may remain Failed without oscillating through Paused.
+	fenceSuspended := func() (ctrl.Result, bool, error) {
+		if !env.Status.Lifecycle.Suspended {
+			return ctrl.Result{}, false, nil
+		}
+		needsFencing := env.Status.PodName != "" || env.Status.Endpoints.Sandboxd != "" || platformv1alpha1.IsEnvironmentReady(env)
+		if !needsFencing {
+			var pod corev1.Pod
+			if err := r.apiReader().Get(ctx, types.NamespacedName{Namespace: env.Namespace, Name: envPodName(env)}, &pod); err == nil {
+				needsFencing = true
+			} else if !errors.IsNotFound(err) {
+				return ctrl.Result{}, true, err
+			}
+		}
+		if !needsFencing {
+			var credentials corev1.Secret
+			if err := r.apiReader().Get(ctx, types.NamespacedName{Namespace: env.Namespace, Name: envCredentialName(env)}, &credentials); err == nil {
+				needsFencing = true
+			} else if !errors.IsNotFound(err) {
+				return ctrl.Result{}, true, err
+			}
+		}
+		if needsFencing || (env.Status.Phase != platformv1alpha1.EnvironmentPhasePaused && env.Status.Phase != platformv1alpha1.EnvironmentPhaseFailed) {
+			result, err := r.reconcilePaused(ctx, env)
+			if err != nil {
+				return ctrl.Result{}, true, r.fail(ctx, env, fmt.Errorf("pause environment before provisioning migration: %w", err))
+			}
+			return result, true, nil
+		}
+		return ctrl.Result{}, false, nil
+	}
+
+	prepare := func() (ctrl.Result, bool, error) {
+		if env.Status.Phase == platformv1alpha1.EnvironmentPhaseResuming &&
+			env.Status.PodName == "" && env.Status.Endpoints.Sandboxd == "" && !platformv1alpha1.IsEnvironmentReady(env) {
+			return ctrl.Result{}, false, nil
+		}
+		if err := r.setEnvironmentStatus(ctx, env, platformv1alpha1.EnvironmentPhaseResuming, "", "", "ProvisioningMigration", "legacy execution is fenced before current provisioning sources are frozen"); err != nil {
+			return ctrl.Result{}, true, err
+		}
+		return ctrl.Result{Requeue: true}, true, nil
+	}
+
+	// Prove migration authority before fencing anything. A durable workspace is
+	// required, and every retained fixed-name child must belong to this exact
+	// Environment incarnation.
+	var workspace corev1.PersistentVolumeClaim
+	if err := r.apiReader().Get(ctx, types.NamespacedName{Namespace: env.Namespace, Name: envPVCName(env)}, &workspace); err == nil {
+		if !exactControllerOwner(&workspace, platformv1alpha1.GroupVersion.String(), "Environment", env.Name, env.UID) {
+			if result, handled, err := fenceSuspended(); handled || err != nil {
+				return true, result, handled, err
+			}
+			return false, ctrl.Result{}, true, r.fail(ctx, env, &childOwnershipCollisionError{kind: "PersistentVolumeClaim", name: workspace.Name})
+		}
+		if !workspace.DeletionTimestamp.IsZero() {
+			if result, handled, err := fenceSuspended(); handled || err != nil {
+				return true, result, handled, err
+			}
+			return false, ctrl.Result{}, true, r.fail(ctx, env, terminalEnvironment(fmt.Errorf("legacy workspace PVC %q is deleting; refusing provisioning migration", workspace.Name)))
+		}
+	} else if errors.IsNotFound(err) {
+		if result, handled, err := fenceSuspended(); handled || err != nil {
+			return true, result, handled, err
+		}
+		return false, ctrl.Result{}, true, r.fail(ctx, env, terminalEnvironment(fmt.Errorf("legacy execution generation %d has no retained workspace PVC; refusing replacement", env.Status.ExecutionGeneration)))
+	} else {
+		return false, ctrl.Result{}, true, err
+	}
+	if env.Status.ProvisioningMigrationPVCUID == "" {
+		before := env.DeepCopy()
+		env.Status.ProvisioningMigrationPVCUID = workspace.UID
+		if err := r.Status().Patch(ctx, env, client.MergeFromWithOptions(before, client.MergeFromWithOptimisticLock{})); err != nil {
+			if errors.IsConflict(err) {
+				return false, ctrl.Result{Requeue: true}, true, nil
+			}
+			return false, ctrl.Result{}, true, err
+		}
+		return false, ctrl.Result{Requeue: true}, true, nil
+	}
+	if workspace.UID != env.Status.ProvisioningMigrationPVCUID {
+		if result, handled, err := fenceSuspended(); handled || err != nil {
+			return true, result, handled, err
+		}
+		return false, ctrl.Result{}, true, r.fail(ctx, env, terminalEnvironment(fmt.Errorf("legacy workspace PVC %q UID %q does not match migration UID %q", workspace.Name, workspace.UID, env.Status.ProvisioningMigrationPVCUID)))
+	}
+	if result, handled, err := fenceSuspended(); handled || err != nil {
+		return true, result, handled, err
+	}
+
+	var policy networkingv1.NetworkPolicy
+	if err := r.apiReader().Get(ctx, types.NamespacedName{Namespace: env.Namespace, Name: envNetworkPolicyName(env)}, &policy); err == nil {
+		if !exactControllerOwner(&policy, platformv1alpha1.GroupVersion.String(), "Environment", env.Name, env.UID) {
+			return false, ctrl.Result{}, true, r.fail(ctx, env, &childOwnershipCollisionError{kind: "NetworkPolicy", name: policy.Name})
+		}
+	} else if !errors.IsNotFound(err) {
+		return false, ctrl.Result{}, true, err
+	}
+	var pod corev1.Pod
+	if err := r.apiReader().Get(ctx, types.NamespacedName{Namespace: env.Namespace, Name: envPodName(env)}, &pod); err == nil {
+		if !exactControllerOwner(&pod, platformv1alpha1.GroupVersion.String(), "Environment", env.Name, env.UID) {
+			return false, ctrl.Result{}, true, r.fail(ctx, env, &childOwnershipCollisionError{kind: "Pod", name: pod.Name})
+		}
+		if result, handled, err := prepare(); handled || err != nil {
+			return false, result, handled, err
+		}
+		if err := r.deleteObservedChild(ctx, &pod); err != nil && !errors.IsNotFound(err) {
+			return false, ctrl.Result{}, true, fmt.Errorf("delete legacy Pod before provisioning migration: %w", err)
+		}
+		return false, ctrl.Result{Requeue: true}, true, nil
+	} else if !errors.IsNotFound(err) {
+		return false, ctrl.Result{}, true, err
+	}
+
+	var credentials corev1.Secret
+	if err := r.apiReader().Get(ctx, types.NamespacedName{Namespace: env.Namespace, Name: envCredentialName(env)}, &credentials); err == nil {
+		if !exactControllerOwner(&credentials, platformv1alpha1.GroupVersion.String(), "Environment", env.Name, env.UID) {
+			return false, ctrl.Result{}, true, r.fail(ctx, env, &childOwnershipCollisionError{kind: "Secret", name: credentials.Name})
+		}
+		if result, handled, err := prepare(); handled || err != nil {
+			return false, result, handled, err
+		}
+		if err := r.deleteObservedChild(ctx, &credentials); err != nil && !errors.IsNotFound(err) {
+			return false, ctrl.Result{}, true, fmt.Errorf("delete legacy credential before provisioning migration: %w", err)
+		}
+		return false, ctrl.Result{Requeue: true}, true, nil
+	} else if !errors.IsNotFound(err) {
+		return false, ctrl.Result{}, true, err
+	}
+
+	if env.Status.Provisioning != nil {
+		return true, ctrl.Result{}, false, nil
+	}
+	return true, ctrl.Result{}, false, nil
 }
 
 // reconcileUnsupportedBackend withdraws the published connection identity
@@ -450,16 +600,29 @@ func (r *EnvironmentReconciler) reconcilePaused(ctx context.Context, env *platfo
 
 func (r *EnvironmentReconciler) ensureWorkspacePVC(ctx context.Context, env *platformv1alpha1.Environment, tmpl *platformv1alpha1.EnvironmentTemplate) (bool, error) {
 	pvcName := envPVCName(env)
+	legacyPVCUID := types.UID("")
+	if env.Status.Provisioning != nil {
+		legacyPVCUID = env.Status.Provisioning.LegacyWorkspacePVCUID
+	}
 	var pvc corev1.PersistentVolumeClaim
-	err := r.Get(ctx, types.NamespacedName{Namespace: env.Namespace, Name: pvcName}, &pvc)
+	err := r.apiReader().Get(ctx, types.NamespacedName{Namespace: env.Namespace, Name: pvcName}, &pvc)
 	if err == nil {
-		if !metav1.IsControlledBy(&pvc, env) {
+		if !exactControllerOwner(&pvc, platformv1alpha1.GroupVersion.String(), "Environment", env.Name, env.UID) {
 			return false, &childOwnershipCollisionError{kind: "PersistentVolumeClaim", name: pvcName}
+		}
+		if !pvc.DeletionTimestamp.IsZero() {
+			return false, terminalEnvironment(fmt.Errorf("workspace PVC %q is deleting", pvcName))
+		}
+		if legacyPVCUID != "" && pvc.UID != legacyPVCUID {
+			return false, terminalEnvironment(fmt.Errorf("legacy workspace PVC %q UID %q does not match frozen UID %q", pvcName, pvc.UID, legacyPVCUID))
 		}
 		return true, nil
 	}
 	if !errors.IsNotFound(err) {
 		return false, err
+	}
+	if legacyPVCUID != "" {
+		return false, terminalEnvironment(fmt.Errorf("legacy workspace PVC %q with frozen UID %q is missing", pvcName, legacyPVCUID))
 	}
 
 	size := resource.MustParse(defaultDiskSize)
@@ -534,7 +697,7 @@ func (r *EnvironmentReconciler) ensurePod(ctx context.Context, env *platformv1al
 		}
 		runtimeClassUID = runtimeClass.UID
 	}
-	return r.ensurePodForProject(ctx, env, tmpl, project, runtimeClassUID)
+	return r.ensurePodForProject(ctx, env, tmpl, project, runtimeClassUID, tenancy.Claim{})
 }
 
 func (r *EnvironmentReconciler) resolveEnvironmentProject(ctx context.Context, env *platformv1alpha1.Environment) (*platformv1alpha1.Project, error) {
@@ -566,7 +729,80 @@ func unsupportedEgressAllowlistMessage(projectName string) string {
 	return fmt.Sprintf("project %q has a non-empty egressAllowlist, which is unsupported until GitHub issue #68 is implemented", projectName)
 }
 
-func (r *EnvironmentReconciler) ensurePodForProject(ctx context.Context, env *platformv1alpha1.Environment, tmpl *platformv1alpha1.EnvironmentTemplate, project *platformv1alpha1.Project, runtimeClassUID types.UID) (*corev1.Pod, error) {
+// backendCreationSourcesCurrent is the final uncached authority fence around a
+// Pod create. Source generations may advance after the immutable provisioning
+// inputs were captured, but source and Environment incarnations may not change.
+func (r *EnvironmentReconciler) backendCreationSourcesCurrent(ctx context.Context, env *platformv1alpha1.Environment, claim tenancy.Claim) (bool, error) {
+	var currentEnv platformv1alpha1.Environment
+	if err := r.apiReader().Get(ctx, client.ObjectKeyFromObject(env), &currentEnv); err != nil {
+		if errors.IsNotFound(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	hold := currentEnv.Spec.Lifecycle.Hold
+	if currentEnv.UID != env.UID || currentEnv.Generation != env.Generation || !currentEnv.DeletionTimestamp.IsZero() ||
+		currentEnv.Spec.Paused || currentEnv.Status.Lifecycle.Suspended || hold != nil && hold.Enabled ||
+		!platformv1alpha1.ProvisioningSnapshotsEqual(currentEnv.Status.Provisioning, env.Status.Provisioning) {
+		return false, nil
+	}
+	// Direct unit-level callers may exercise the lower-level Pod constructor
+	// without the reconcile pipeline's required provisioning snapshot.
+	if env.Status.Provisioning == nil {
+		return true, nil
+	}
+
+	snapshot := env.Status.Provisioning
+	var tmpl platformv1alpha1.EnvironmentTemplate
+	if err := r.apiReader().Get(ctx, types.NamespacedName{Namespace: env.Namespace, Name: snapshot.Template.Name}, &tmpl); err != nil {
+		if errors.IsNotFound(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	if tmpl.UID != snapshot.Template.UID || !tmpl.DeletionTimestamp.IsZero() || tenancy.IsCatalogSource(&tmpl) {
+		return false, nil
+	}
+	if r.Scope != nil && r.Scope.Verifier != nil && tenancy.ValidateManagedTemplate(&tmpl, r.Scope.Verifier.Installation, claim) != nil {
+		return false, nil
+	}
+
+	if snapshot.Project == nil {
+		if currentEnv.Spec.ProjectRef != "" {
+			return false, nil
+		}
+	} else {
+		if currentEnv.Spec.ProjectRef != snapshot.Project.Name {
+			return false, nil
+		}
+		var project platformv1alpha1.Project
+		if err := r.apiReader().Get(ctx, types.NamespacedName{Namespace: env.Namespace, Name: snapshot.Project.Name}, &project); err != nil {
+			if errors.IsNotFound(err) {
+				return false, nil
+			}
+			return false, err
+		}
+		if project.UID != snapshot.Project.UID || !project.DeletionTimestamp.IsZero() {
+			return false, nil
+		}
+	}
+	if snapshot.LegacyWorkspacePVCUID != "" {
+		var pvc corev1.PersistentVolumeClaim
+		if err := r.apiReader().Get(ctx, types.NamespacedName{Namespace: env.Namespace, Name: envPVCName(env)}, &pvc); err != nil {
+			if errors.IsNotFound(err) {
+				return false, nil
+			}
+			return false, err
+		}
+		if pvc.UID != snapshot.LegacyWorkspacePVCUID || !pvc.DeletionTimestamp.IsZero() ||
+			!exactControllerOwner(&pvc, platformv1alpha1.GroupVersion.String(), "Environment", env.Name, env.UID) {
+			return false, nil
+		}
+	}
+	return true, nil
+}
+
+func (r *EnvironmentReconciler) ensurePodForProject(ctx context.Context, env *platformv1alpha1.Environment, tmpl *platformv1alpha1.EnvironmentTemplate, project *platformv1alpha1.Project, runtimeClassUID types.UID, claim tenancy.Claim) (*corev1.Pod, error) {
 	podName := envPodName(env)
 	resuming := env.Status.Phase == platformv1alpha1.EnvironmentPhaseResuming
 	var pod corev1.Pod
@@ -799,8 +1035,26 @@ func (r *EnvironmentReconciler) ensurePodForProject(ctx context.Context, env *pl
 	if err := controllerutil.SetControllerReference(env, &pod, r.Scheme); err != nil {
 		return nil, err
 	}
+	current, err := r.backendCreationSourcesCurrent(ctx, env, claim)
+	if err != nil {
+		return nil, err
+	}
+	if !current {
+		return nil, fmt.Errorf("provisioning authority changed before Pod creation")
+	}
 	if err := r.Create(ctx, &pod); err != nil {
 		return nil, collisionOnAlreadyExists(err, "Pod", podName)
+	}
+	current, err = r.backendCreationSourcesCurrent(ctx, env, claim)
+	if err != nil || !current {
+		deleteErr := r.deleteObservedChild(ctx, &pod)
+		if deleteErr != nil && !errors.IsNotFound(deleteErr) {
+			return nil, fmt.Errorf("delete Pod after provisioning authority changed: %w", deleteErr)
+		}
+		if err != nil {
+			return nil, err
+		}
+		return nil, fmt.Errorf("provisioning authority changed during Pod creation")
 	}
 	// Bind the private adapter credential to the exact execution incarnation.
 	// Real API servers always assign a Pod UID. Fake clients do not, so an empty

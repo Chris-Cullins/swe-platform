@@ -104,6 +104,9 @@ jobs:
       - name: Argo CD port-forward helper regression
         run: ./hack/argocd-port-forward_test.sh
 
+      - name: Rendered Helm RBAC boundaries
+        run: ./hack/helm-rbac_test.sh
+
       - name: Generated code is current
         run: |
           make generate manifests

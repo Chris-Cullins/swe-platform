@@ -89,6 +89,7 @@ func (r *EnvironmentReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		}})).
 		Owns(&corev1.Pod{}).
 		Owns(&corev1.PersistentVolumeClaim{}).
+		Owns(&corev1.Secret{}).
 		Owns(&networkingv1.NetworkPolicy{}).
 		Watches(&platformv1alpha1.Run{}, handler.EnqueueRequestsFromMapFunc(func(_ context.Context, object client.Object) []reconcile.Request {
 			run := object.(*platformv1alpha1.Run)

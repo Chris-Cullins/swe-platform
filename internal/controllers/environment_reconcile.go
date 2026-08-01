@@ -51,6 +51,7 @@ type environmentReconcileState struct {
 	ctx             context.Context
 	env             platformv1alpha1.Environment
 	namespaceClaim  tenancy.Claim
+	legacyMigration bool
 	project         *platformv1alpha1.Project
 	projectErr      error
 	template        platformv1alpha1.EnvironmentTemplate
@@ -79,6 +80,7 @@ var environmentReconcilePhases = []environmentReconcilePhase{
 	{name: "deletion", run: reconcileEnvironmentDeletionGate},
 	{name: "recovery-migration", run: reconcileEnvironmentRecoveryMigrationGate},
 	{name: "lifecycle", run: reconcileEnvironmentLifecycleGate},
+	{name: "legacy-provisioning-migration", run: reconcileEnvironmentLegacyProvisioningMigrationGate},
 	{name: "provisioning-fence", run: reconcileEnvironmentProvisioningFenceGate},
 	{name: "project-resolution", run: reconcileEnvironmentProjectResolutionGate},
 	{name: "suspension", run: reconcileEnvironmentSuspensionGate},
@@ -202,6 +204,31 @@ func reconcileEnvironmentProvisioningFenceGate(r *EnvironmentReconciler, ctx con
 	return phaseContinue()
 }
 
+func reconcileEnvironmentLegacyProvisioningMigrationGate(r *EnvironmentReconciler, ctx context.Context, state *environmentReconcileState) environmentPhaseOutcome {
+	env := &state.env
+	if env.Status.Provisioning != nil && env.Status.Provisioning.TemplateVerified &&
+		(env.Status.Provisioning.Project == nil || env.Status.Provisioning.ProjectVerified) {
+		return phaseContinue()
+	}
+	// Recovery deadlines and exhaustion were persisted by an earlier controller
+	// version and remain authoritative even when this Environment still needs a
+	// provisioning snapshot. Enforce them before migration can fence children
+	// or publish a snapshot, except while suspended: lifecycle teardown and the
+	// held migration path remain authoritative in that state. The normal
+	// recovery phase runs later for already-provisioned Environments.
+	if !env.Status.Lifecycle.Suspended {
+		if result, handled, err := r.reconcilePendingPodRecovery(ctx, env); handled || err != nil {
+			return phaseHandled(result, err)
+		}
+	}
+	retained, result, handled, err := r.reconcileLegacyProvisioningMigration(ctx, env)
+	state.legacyMigration = retained
+	if handled || err != nil {
+		return phaseHandled(result, err)
+	}
+	return phaseContinue()
+}
+
 func reconcileEnvironmentProjectResolutionGate(r *EnvironmentReconciler, ctx context.Context, state *environmentReconcileState) environmentPhaseOutcome {
 	env := &state.env
 	state.project, state.projectErr = r.resolveEnvironmentProject(ctx, env)
@@ -217,7 +244,10 @@ func reconcileEnvironmentSuspensionGate(r *EnvironmentReconciler, ctx context.Co
 	// Fencing must not depend on a still-readable template or successful setup.
 	// Cancellation/finalization can therefore stop an execution domain even after
 	// its template or Project was deleted or provisioning became permanently broken.
-	if env.Status.Lifecycle.Suspended {
+	// A legacy migration that has already removed its Pod and credential may
+	// capture and verify current authoritative sources while held. It still
+	// cannot reach backend provisioning, and the next reconcile restores Paused.
+	if env.Status.Lifecycle.Suspended && (!state.legacyMigration || env.Status.Phase != platformv1alpha1.EnvironmentPhasePaused) {
 		result, err := r.reconcilePaused(ctx, env)
 		if err != nil {
 			return phaseHandled(ctrl.Result{}, r.fail(ctx, env, fmt.Errorf("pause environment: %w", err)))
@@ -272,13 +302,22 @@ func reconcileEnvironmentTemplateGate(r *EnvironmentReconciler, ctx context.Cont
 			return phaseHandled(result, err)
 		}
 	}
-	if handled, err := r.publishProvisioningSnapshot(ctx, env, &state.template, state.project, state.namespaceClaim); handled || err != nil {
+	// A source error after physical fencing is stable in Failed. Resume an active
+	// migration only after all current authoritative inputs validate, immediately
+	// before the one-time snapshot publication.
+	if state.legacyMigration && env.Status.Provisioning == nil && !env.Status.Lifecycle.Suspended && env.Status.Phase != platformv1alpha1.EnvironmentPhaseResuming {
+		if err := r.setEnvironmentStatus(ctx, env, platformv1alpha1.EnvironmentPhaseResuming, "", "", "ProvisioningMigration", "legacy execution is fenced before current provisioning sources are frozen"); err != nil {
+			return phaseHandled(ctrl.Result{}, err)
+		}
+		return phaseHandled(ctrl.Result{Requeue: true}, nil)
+	}
+	if handled, err := r.publishProvisioningSnapshot(ctx, env, &state.template, state.project, state.namespaceClaim, state.legacyMigration); handled || err != nil {
 		return phaseHandled(ctrl.Result{Requeue: err == nil}, err)
 	}
 	return phaseContinue()
 }
 
-func (r *EnvironmentReconciler) publishProvisioningSnapshot(ctx context.Context, env *platformv1alpha1.Environment, tmpl *platformv1alpha1.EnvironmentTemplate, project *platformv1alpha1.Project, claim tenancy.Claim) (bool, error) {
+func (r *EnvironmentReconciler) publishProvisioningSnapshot(ctx context.Context, env *platformv1alpha1.Environment, tmpl *platformv1alpha1.EnvironmentTemplate, project *platformv1alpha1.Project, claim tenancy.Claim, legacyMigration bool) (bool, error) {
 	current := env.Status.Provisioning
 	if current != nil {
 		// A missing Project is the sole valid partial state: a warm environment may
@@ -339,24 +378,44 @@ func (r *EnvironmentReconciler) publishProvisioningSnapshot(ctx context.Context,
 		}
 		return true, nil
 	}
-	// Legacy objects with provisioning children are intentionally not inferred.
+	// Legacy execution is fenced before current authoritative sources are
+	// captured. Exact-owned PVC and NetworkPolicy children are retained and may
+	// participate in that one-time migration; Pod and credential presence still
+	// fails closed here so no snapshot can be published before teardown.
+	legacyWorkspacePVCUID := types.UID("")
 	legacyChildren := []struct {
-		kind   string
-		name   string
-		object client.Object
+		kind     string
+		name     string
+		object   client.Object
+		retained bool
 	}{
 		{kind: "Pod", name: envPodName(env), object: &corev1.Pod{}},
 		{kind: "PersistentVolumeClaim", name: envPVCName(env), object: &corev1.PersistentVolumeClaim{}},
 		{kind: "Secret", name: envCredentialName(env), object: &corev1.Secret{}},
 		{kind: "NetworkPolicy", name: envNetworkPolicyName(env), object: &networkingv1.NetworkPolicy{}},
 	}
+	legacyChildren[1].retained = true
+	legacyChildren[3].retained = true
 	for _, child := range legacyChildren {
 		if err := r.apiReader().Get(ctx, types.NamespacedName{Namespace: env.Namespace, Name: child.name}, child.object); err == nil {
 			if !exactControllerOwner(child.object, platformv1alpha1.GroupVersion.String(), "Environment", env.Name, env.UID) {
 				return true, r.fail(ctx, env, &childOwnershipCollisionError{kind: child.kind, name: child.name})
 			}
-			_, failErr := r.reconcileInvalidProvisioningConfiguration(ctx, env, "legacy environment has provisioning children but no provisioning snapshot")
-			return true, failErr
+			if child.kind == "PersistentVolumeClaim" && !child.object.GetDeletionTimestamp().IsZero() {
+				return true, r.fail(ctx, env, terminalEnvironment(fmt.Errorf("legacy workspace PVC %q is deleting; refusing provisioning migration", child.name)))
+			}
+			if child.kind == "PersistentVolumeClaim" {
+				legacyWorkspacePVCUID = child.object.GetUID()
+				if legacyWorkspacePVCUID != env.Status.ProvisioningMigrationPVCUID {
+					return true, r.fail(ctx, env, terminalEnvironment(fmt.Errorf("legacy workspace PVC %q UID %q does not match migration UID %q", child.name, legacyWorkspacePVCUID, env.Status.ProvisioningMigrationPVCUID)))
+				}
+			}
+			if !legacyMigration || !child.retained {
+				_, failErr := r.reconcileInvalidProvisioningConfiguration(ctx, env, "legacy environment provisioning migration has not completed execution fencing")
+				return true, failErr
+			}
+		} else if errors.IsNotFound(err) && legacyMigration && child.kind == "PersistentVolumeClaim" {
+			return true, r.fail(ctx, env, terminalEnvironment(fmt.Errorf("legacy execution generation %d lost its retained workspace PVC; refusing replacement", env.Status.ExecutionGeneration)))
 		} else if !errors.IsNotFound(err) {
 			return true, err
 		}
@@ -367,6 +426,7 @@ func (r *EnvironmentReconciler) publishProvisioningSnapshot(ctx context.Context,
 	}
 	before := env.DeepCopy()
 	candidate := platformv1alpha1.ResolveEnvironmentProvisioning(env, tmpl, project)
+	candidate.LegacyWorkspacePVCUID = env.Status.ProvisioningMigrationPVCUID
 	if err := platformv1alpha1.ValidateEnvironmentProvisioningTemplateSnapshot(env, candidate); err != nil {
 		_, failErr := r.reconcileInvalidProvisioningConfiguration(ctx, env, err.Error())
 		return true, failErr
@@ -387,6 +447,7 @@ func (r *EnvironmentReconciler) verifyProvisioningSnapshot(ctx context.Context, 
 		return true, err
 	}
 	projection := platformv1alpha1.ResolveEnvironmentProvisioning(env, tmpl, project)
+	projection.LegacyWorkspacePVCUID = env.Status.Provisioning.LegacyWorkspacePVCUID
 	if verifyProject {
 		// Warm snapshots may remain claimable across policy-only Template edits.
 		// Preserve the exact captured generation while comparing the current
@@ -518,7 +579,7 @@ func reconcileEnvironmentProvisioningGate(r *EnvironmentReconciler, ctx context.
 		return phaseHandled(ctrl.Result{Requeue: true}, r.setPhase(ctx, env, platformv1alpha1.EnvironmentPhaseResuming, "", ""))
 	}
 
-	pod, err := r.ensurePodForProject(ctx, env, tmpl, state.project, state.runtimeClassUID)
+	pod, err := r.ensurePodForProject(ctx, env, tmpl, state.project, state.runtimeClassUID, state.namespaceClaim)
 	if stderrors.Is(err, errPodReplacing) {
 		return phaseHandled(ctrl.Result{Requeue: true}, nil)
 	}

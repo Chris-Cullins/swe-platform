@@ -21,6 +21,7 @@ import (
 
 	platformv1alpha1 "github.com/Chris-Cullins/swe-platform/api/v1alpha1"
 	"github.com/Chris-Cullins/swe-platform/internal/tenancy"
+	sandboxdauth "github.com/Chris-Cullins/swe-platform/sandboxd/auth"
 )
 
 func provisioningRequest(env *platformv1alpha1.Environment) ctrl.Request {
@@ -347,5 +348,596 @@ func TestProvisioningSnapshotFreezesReplacementPodAndPVC(t *testing.T) {
 	}
 	if got := pvc.Spec.Resources.Requests[corev1.ResourceStorage]; got.Cmp(disk) != 0 {
 		t.Fatalf("PVC storage = %s, want %s", got.String(), disk.String())
+	}
+}
+
+func TestLegacyProvisioningMigrationOrdersFenceSnapshotAndReplacement(t *testing.T) {
+	for _, held := range []bool{false, true} {
+		name := "active"
+		if held {
+			name = "held"
+		}
+		t.Run(name, func(t *testing.T) {
+			scheme := runtime.NewScheme()
+			for _, add := range []func(*runtime.Scheme) error{corev1.AddToScheme, networkingv1.AddToScheme, platformv1alpha1.AddToScheme} {
+				if err := add(scheme); err != nil {
+					t.Fatal(err)
+				}
+			}
+			disk := resource.MustParse("10Gi")
+			tmpl := &platformv1alpha1.EnvironmentTemplate{ObjectMeta: metav1.ObjectMeta{Name: "small", Namespace: "default", UID: "template-uid", Generation: 2}, Spec: platformv1alpha1.EnvironmentTemplateSpec{Image: "image:frozen", Size: "tiny", DiskSize: &disk}}
+			project := &platformv1alpha1.Project{ObjectMeta: metav1.ObjectMeta{Name: "project", Namespace: "default", UID: "project-uid", Generation: 3}, Spec: platformv1alpha1.ProjectSpec{Repositories: []string{"https://example.test/frozen"}}}
+			env := &platformv1alpha1.Environment{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "default", UID: types.UID("env-" + name), Generation: 1, Finalizers: []string{environmentFinalizer}}, Spec: platformv1alpha1.EnvironmentSpec{TemplateRef: tmpl.Name, ProjectRef: project.Name}, Status: platformv1alpha1.EnvironmentStatus{Phase: platformv1alpha1.EnvironmentPhaseReady, ExecutionGeneration: 1, PodName: "legacy-pod", Endpoints: platformv1alpha1.EnvironmentEndpoints{Sandboxd: "10.0.0.1:50051"}, Conditions: []metav1.Condition{{Type: platformv1alpha1.EnvironmentConditionReady, Status: metav1.ConditionTrue}}}}
+			if held {
+				env.Spec.Lifecycle.Hold = &platformv1alpha1.EnvironmentHoldPolicy{Enabled: true, Revision: 1}
+				env.Status.Lifecycle.Suspended = true
+			}
+			controller := true
+			owner := metav1.OwnerReference{APIVersion: platformv1alpha1.GroupVersion.String(), Kind: "Environment", Name: env.Name, UID: env.UID, Controller: &controller}
+			pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: envPodName(env), Namespace: env.Namespace, UID: "old-pod", OwnerReferences: []metav1.OwnerReference{owner}}}
+			secret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: envCredentialName(env), Namespace: env.Namespace, UID: "old-secret", OwnerReferences: []metav1.OwnerReference{owner}}}
+			pvc := &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: envPVCName(env), Namespace: env.Namespace, UID: "retained-pvc", OwnerReferences: []metav1.OwnerReference{owner}}, Spec: corev1.PersistentVolumeClaimSpec{AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}, Resources: corev1.VolumeResourceRequirements{Requests: corev1.ResourceList{corev1.ResourceStorage: disk}}}}
+			policy := &networkingv1.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{Name: envNetworkPolicyName(env), Namespace: env.Namespace, UID: "retained-policy", OwnerReferences: []metav1.OwnerReference{owner}}}
+			c := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(env).WithObjects(env, tmpl, project, pod, secret, pvc, policy).Build()
+			r := &EnvironmentReconciler{Client: c, APIReader: c, Scheme: scheme}
+
+			sawUnverified := false
+			sourcesEdited := false
+			for step := 0; step < 14; step++ {
+				if _, err := r.Reconcile(context.Background(), provisioningRequest(env)); err != nil {
+					t.Fatalf("step %d: %v", step, err)
+				}
+				var current platformv1alpha1.Environment
+				if err := c.Get(context.Background(), client.ObjectKeyFromObject(env), &current); err != nil {
+					t.Fatal(err)
+				}
+				var observedPod corev1.Pod
+				podErr := c.Get(context.Background(), client.ObjectKeyFromObject(pod), &observedPod)
+				podGone := apierrors.IsNotFound(podErr) || podErr == nil && observedPod.UID != pod.UID
+				if podGone && current.Status.ProvisioningMigrationPVCUID != pvc.UID {
+					t.Fatalf("step %d removed Pod before persisting workspace UID fence: status=%q want=%q", step, current.Status.ProvisioningMigrationPVCUID, pvc.UID)
+				}
+				var observedSecret corev1.Secret
+				secretErr := c.Get(context.Background(), client.ObjectKeyFromObject(secret), &observedSecret)
+				secretGone := apierrors.IsNotFound(secretErr) || secretErr == nil && observedSecret.UID != secret.UID
+				if !podGone && secretGone {
+					t.Fatalf("step %d revoked credential before Pod", step)
+				}
+				if current.Status.Provisioning != nil && (!podGone || !secretGone) {
+					t.Fatalf("step %d published snapshot before execution fence: %#v", step, current.Status.Provisioning)
+				}
+				if current.Status.Provisioning != nil && (!current.Status.Provisioning.TemplateVerified || !current.Status.Provisioning.ProjectVerified) {
+					sawUnverified = true
+				}
+				if !sourcesEdited && current.Status.Provisioning != nil && current.Status.Provisioning.TemplateVerified && current.Status.Provisioning.ProjectVerified {
+					tmpl.Spec.Image = "image:edited-after-verification"
+					tmpl.Generation++
+					if err := c.Update(context.Background(), tmpl); err != nil {
+						t.Fatal(err)
+					}
+					project.Spec.Repositories[0] = "https://example.test/edited-after-verification"
+					project.Generation++
+					if err := c.Update(context.Background(), project); err != nil {
+						t.Fatal(err)
+					}
+					sourcesEdited = true
+				}
+				if !held && podErr == nil && observedPod.UID != pod.UID {
+					break
+				}
+				if held && current.Status.Phase == platformv1alpha1.EnvironmentPhasePaused && current.Status.Provisioning != nil && current.Status.Provisioning.TemplateVerified && current.Status.Provisioning.ProjectVerified {
+					break
+				}
+			}
+			var got platformv1alpha1.Environment
+			if err := c.Get(context.Background(), client.ObjectKeyFromObject(env), &got); err != nil {
+				t.Fatal(err)
+			}
+			if !sawUnverified || got.Status.Provisioning == nil || !got.Status.Provisioning.TemplateVerified || !got.Status.Provisioning.ProjectVerified {
+				t.Fatalf("snapshot was not published unverified then exactly verified: %#v", got.Status.Provisioning)
+			}
+			if got.Status.Provisioning.LegacyWorkspacePVCUID != pvc.UID {
+				t.Fatalf("snapshot workspace UID = %q, want %q", got.Status.Provisioning.LegacyWorkspacePVCUID, pvc.UID)
+			}
+			var retained corev1.PersistentVolumeClaim
+			if err := c.Get(context.Background(), client.ObjectKeyFromObject(pvc), &retained); err != nil || retained.UID != pvc.UID {
+				t.Fatalf("retained PVC changed: %#v, %v", retained.UID, err)
+			}
+			var replacement corev1.Pod
+			err := c.Get(context.Background(), client.ObjectKey{Namespace: env.Namespace, Name: envPodName(env)}, &replacement)
+			if held {
+				if !apierrors.IsNotFound(err) || got.Status.Phase != platformv1alpha1.EnvironmentPhasePaused {
+					t.Fatalf("held migration created Pod or did not pause: pod=%v status=%#v", err, got.Status)
+				}
+			} else if err != nil {
+				t.Fatalf("active replacement Pod missing: %v (status %#v)", err, got.Status)
+			} else if replacement.Spec.Containers[0].Image != "image:frozen" || replacement.Spec.Volumes[0].PersistentVolumeClaim.ClaimName != pvc.Name {
+				t.Fatalf("replacement did not use frozen sources and retained PVC: %#v", replacement.Spec)
+			}
+		})
+	}
+}
+
+func TestVerifiedLegacySnapshotNeverReplacesFrozenWorkspace(t *testing.T) {
+	for _, test := range []struct {
+		name        string
+		replacement bool
+		held        bool
+		deleting    bool
+	}{
+		{name: "deleted after verification"},
+		{name: "same-name UID replacement", replacement: true},
+		{name: "held loss before release", held: true},
+		{name: "deleting after verification", deleting: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			scheme := runtime.NewScheme()
+			for _, add := range []func(*runtime.Scheme) error{corev1.AddToScheme, platformv1alpha1.AddToScheme} {
+				if err := add(scheme); err != nil {
+					t.Fatal(err)
+				}
+			}
+			tmpl := &platformv1alpha1.EnvironmentTemplate{ObjectMeta: metav1.ObjectMeta{Name: "small", Namespace: "default", UID: "template-uid", Generation: 1}, Spec: platformv1alpha1.EnvironmentTemplateSpec{Image: "image", Size: "small"}}
+			env := &platformv1alpha1.Environment{ObjectMeta: metav1.ObjectMeta{Name: "legacy", Namespace: "default", UID: "env-uid", Generation: 1}, Spec: platformv1alpha1.EnvironmentSpec{TemplateRef: tmpl.Name}}
+			env.Status.Provisioning = platformv1alpha1.ResolveEnvironmentProvisioning(env, tmpl, nil)
+			env.Status.Provisioning.TemplateVerified = true
+			env.Status.Provisioning.LegacyWorkspacePVCUID = "retained-pvc-uid"
+			if test.held {
+				env.Spec.Lifecycle.Hold = &platformv1alpha1.EnvironmentHoldPolicy{Enabled: true, Revision: 1}
+				env.Status.Lifecycle.Suspended = true
+				env.Status.Phase = platformv1alpha1.EnvironmentPhasePaused
+			}
+			controller := true
+			owner := metav1.OwnerReference{APIVersion: platformv1alpha1.GroupVersion.String(), Kind: "Environment", Name: env.Name, UID: env.UID, Controller: &controller}
+			objects := []client.Object{env, tmpl}
+			if test.replacement || test.deleting {
+				uid := types.UID("replacement-pvc-uid")
+				metadata := metav1.ObjectMeta{Name: envPVCName(env), Namespace: env.Namespace, UID: uid, OwnerReferences: []metav1.OwnerReference{owner}}
+				if test.deleting {
+					now := metav1.Now()
+					metadata.UID = "retained-pvc-uid"
+					metadata.DeletionTimestamp = &now
+					metadata.Finalizers = []string{"kubernetes.io/pvc-protection"}
+				}
+				objects = append(objects, &corev1.PersistentVolumeClaim{ObjectMeta: metadata})
+			}
+			c := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(env).WithObjects(objects...).Build()
+			r := &EnvironmentReconciler{Client: c, APIReader: c, Scheme: scheme}
+			if ready, err := r.ensureWorkspacePVC(context.Background(), env, tmpl); ready || err == nil {
+				t.Fatalf("frozen workspace check = ready %v, err %v", ready, err)
+			}
+			var pvc corev1.PersistentVolumeClaim
+			err := c.Get(context.Background(), client.ObjectKey{Namespace: env.Namespace, Name: envPVCName(env)}, &pvc)
+			if test.replacement || test.deleting {
+				wantUID := types.UID("replacement-pvc-uid")
+				if test.deleting {
+					wantUID = "retained-pvc-uid"
+				}
+				if err != nil || pvc.UID != wantUID {
+					t.Fatalf("replacement PVC was changed: uid=%q err=%v", pvc.UID, err)
+				}
+			} else if !apierrors.IsNotFound(err) {
+				t.Fatalf("missing frozen PVC was recreated: %v", err)
+			}
+		})
+	}
+}
+
+func TestPodCreationRevalidatesSourceIncarnationsAtBothBoundaries(t *testing.T) {
+	for _, source := range []string{"Template", "Project"} {
+		for _, boundary := range []string{"pre-create", "post-create"} {
+			t.Run(source+"/"+boundary, func(t *testing.T) {
+				scheme := runtime.NewScheme()
+				for _, add := range []func(*runtime.Scheme) error{corev1.AddToScheme, platformv1alpha1.AddToScheme} {
+					if err := add(scheme); err != nil {
+						t.Fatal(err)
+					}
+				}
+				tmpl := &platformv1alpha1.EnvironmentTemplate{ObjectMeta: metav1.ObjectMeta{Name: "small", Namespace: "default", UID: "template-old", Generation: 1}, Spec: platformv1alpha1.EnvironmentTemplateSpec{Image: "image", Size: "small"}}
+				project := &platformv1alpha1.Project{ObjectMeta: metav1.ObjectMeta{Name: "project", Namespace: "default", UID: "project-old", Generation: 1}, Spec: platformv1alpha1.ProjectSpec{Repositories: []string{"https://example.test/repo"}}}
+				env := &platformv1alpha1.Environment{ObjectMeta: metav1.ObjectMeta{Name: "legacy", Namespace: "default", UID: "env-uid", Generation: 1}, Spec: platformv1alpha1.EnvironmentSpec{TemplateRef: tmpl.Name, ProjectRef: project.Name}, Status: platformv1alpha1.EnvironmentStatus{Phase: platformv1alpha1.EnvironmentPhaseResuming}}
+				env.Status.Provisioning = platformv1alpha1.ResolveEnvironmentProvisioning(env, tmpl, project)
+				env.Status.Provisioning.TemplateVerified = true
+				env.Status.Provisioning.ProjectVerified = true
+				base := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(env).WithObjects(env, tmpl, project).Build()
+				clientWithUID := interceptor.NewClient(base, interceptor.Funcs{Create: func(ctx context.Context, delegate client.WithWatch, object client.Object, options ...client.CreateOption) error {
+					if err := delegate.Create(ctx, object, options...); err != nil {
+						return err
+					}
+					if pod, ok := object.(*corev1.Pod); ok {
+						pod.UID = "created-pod-uid"
+						return delegate.Update(ctx, pod)
+					}
+					return nil
+				}})
+				reads := 0
+				reader := interceptor.NewClient(base, interceptor.Funcs{Get: func(ctx context.Context, delegate client.WithWatch, key client.ObjectKey, object client.Object, options ...client.GetOption) error {
+					if err := delegate.Get(ctx, key, object, options...); err != nil {
+						return err
+					}
+					target := source == "Template"
+					if _, ok := object.(*platformv1alpha1.Project); ok {
+						target = source == "Project"
+					} else if _, ok := object.(*platformv1alpha1.EnvironmentTemplate); !ok {
+						target = false
+					}
+					if target {
+						reads++
+						wantRead := 1
+						if boundary == "post-create" {
+							wantRead = 2
+						}
+						if reads == wantRead {
+							object.SetUID(types.UID(source + "-replacement"))
+						}
+					}
+					return nil
+				}})
+				r := &EnvironmentReconciler{Client: clientWithUID, APIReader: reader, Scheme: scheme}
+				if pod, err := r.ensurePodForProject(context.Background(), env, tmpl, project, "", tenancy.Claim{}); pod != nil || err == nil {
+					t.Fatalf("creation across %s %s replacement = pod %#v, err %v", boundary, source, pod, err)
+				}
+				var pod corev1.Pod
+				if err := base.Get(context.Background(), client.ObjectKey{Namespace: env.Namespace, Name: envPodName(env)}, &pod); !apierrors.IsNotFound(err) {
+					t.Fatalf("Pod survived %s %s replacement: uid=%q err=%v", boundary, source, pod.UID, err)
+				}
+				if boundary == "post-create" {
+					var secret corev1.Secret
+					if err := base.Get(context.Background(), client.ObjectKey{Namespace: env.Namespace, Name: envCredentialName(env)}, &secret); err != nil {
+						t.Fatal(err)
+					}
+					if secret.Annotations[sandboxdauth.PodUIDAnnotation] != "" {
+						t.Fatalf("credential was bound before post-create authority validation: %#v", secret.Annotations)
+					}
+				}
+			})
+		}
+	}
+}
+
+func TestLegacyProvisioningMigrationRefusesDeletingWorkspaceBeforeFence(t *testing.T) {
+	scheme := runtime.NewScheme()
+	for _, add := range []func(*runtime.Scheme) error{corev1.AddToScheme, networkingv1.AddToScheme, platformv1alpha1.AddToScheme} {
+		if err := add(scheme); err != nil {
+			t.Fatal(err)
+		}
+	}
+	now := metav1.Now()
+	env := &platformv1alpha1.Environment{
+		ObjectMeta: metav1.ObjectMeta{Name: "legacy", Namespace: "default", UID: "env-uid", Finalizers: []string{environmentFinalizer}},
+		Spec:       platformv1alpha1.EnvironmentSpec{TemplateRef: "small"},
+		Status:     platformv1alpha1.EnvironmentStatus{Phase: platformv1alpha1.EnvironmentPhaseReady, ExecutionGeneration: 1, PodName: "env-legacy"},
+	}
+	controller := true
+	owner := metav1.OwnerReference{APIVersion: platformv1alpha1.GroupVersion.String(), Kind: "Environment", Name: env.Name, UID: env.UID, Controller: &controller}
+	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: envPodName(env), Namespace: env.Namespace, UID: "pod-uid", OwnerReferences: []metav1.OwnerReference{owner}}}
+	secret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: envCredentialName(env), Namespace: env.Namespace, UID: "secret-uid", OwnerReferences: []metav1.OwnerReference{owner}}}
+	pvc := &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: envPVCName(env), Namespace: env.Namespace, UID: "pvc-uid", OwnerReferences: []metav1.OwnerReference{owner}, Finalizers: []string{"kubernetes.io/pvc-protection"}, DeletionTimestamp: &now}}
+	c := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(env).WithObjects(env, pod, secret, pvc).Build()
+	r := &EnvironmentReconciler{Client: c, APIReader: c, Scheme: scheme}
+
+	retained, _, handled, err := r.reconcileLegacyProvisioningMigration(context.Background(), env.DeepCopy())
+	if err != nil || retained || !handled {
+		t.Fatalf("migration result = retained %v, handled %v, err %v", retained, handled, err)
+	}
+	for _, child := range []client.Object{pod, secret, pvc} {
+		observed := child.DeepCopyObject().(client.Object)
+		if err := c.Get(context.Background(), client.ObjectKeyFromObject(child), observed); err != nil || observed.GetUID() != child.GetUID() {
+			t.Fatalf("child %T was changed before deleting-workspace refusal: uid=%q err=%v", child, observed.GetUID(), err)
+		}
+	}
+	var got platformv1alpha1.Environment
+	if err := c.Get(context.Background(), client.ObjectKeyFromObject(env), &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Status.Provisioning != nil || got.Status.Phase != platformv1alpha1.EnvironmentPhaseFailed {
+		t.Fatalf("deleting workspace did not fail closed: %#v", got.Status)
+	}
+}
+
+func TestLegacyProvisioningMigrationWaitsForPendingRecovery(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	if err := platformv1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 8, 2, 12, 0, 0, 0, time.UTC)
+	next := metav1.NewTime(now.Add(5 * time.Minute))
+	env := &platformv1alpha1.Environment{
+		ObjectMeta: metav1.ObjectMeta{Name: "legacy", Namespace: "default", UID: "env-uid", Generation: 2},
+		Spec:       platformv1alpha1.EnvironmentSpec{TemplateRef: "small"},
+		Status: platformv1alpha1.EnvironmentStatus{
+			ExecutionGeneration: 1,
+			Recovery: platformv1alpha1.EnvironmentRecoveryStatus{
+				Attempts: 1, ExecutionGeneration: 1, NextAttemptAt: &next,
+			},
+		},
+	}
+	controller := true
+	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
+		Name: envPodName(env), Namespace: env.Namespace, UID: "legacy-pod-uid",
+		OwnerReferences: []metav1.OwnerReference{{APIVersion: platformv1alpha1.GroupVersion.String(), Kind: "Environment", Name: env.Name, UID: env.UID, Controller: &controller}},
+	}}
+	c := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(env).WithObjects(env, pod).Build()
+	r := &EnvironmentReconciler{Client: c, APIReader: c, Scheme: scheme, Now: func() time.Time { return now }}
+	state := &environmentReconcileState{env: *env.DeepCopy()}
+
+	outcome := reconcileEnvironmentLegacyProvisioningMigrationGate(r, context.Background(), state)
+	if outcome.err != nil || !outcome.handled || outcome.result.RequeueAfter != 5*time.Minute {
+		t.Fatalf("migration gate = %#v, want pending recovery delay", outcome)
+	}
+	var got platformv1alpha1.Environment
+	if err := c.Get(context.Background(), client.ObjectKeyFromObject(env), &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Status.Provisioning != nil || got.Status.Recovery.Attempts != 1 || got.Status.Recovery.NextAttemptAt == nil || !got.Status.Recovery.NextAttemptAt.Equal(&next) {
+		t.Fatalf("pending recovery was changed by provisioning migration gate: %#v", got.Status)
+	}
+	var retained corev1.Pod
+	if err := c.Get(context.Background(), client.ObjectKeyFromObject(pod), &retained); err != nil || retained.UID != pod.UID {
+		t.Fatalf("legacy Pod was fenced before pending recovery elapsed: uid=%q err=%v", retained.UID, err)
+	}
+
+	modern := env.DeepCopy()
+	modern.Status.Provisioning = &platformv1alpha1.EnvironmentProvisioningSnapshot{
+		Template:         platformv1alpha1.EnvironmentProvisioningTemplate{Name: "small", UID: "template-uid", Generation: 1},
+		Backend:          platformv1alpha1.EnvironmentBackendPod,
+		Image:            "image",
+		Size:             "small",
+		Resources:        map[string]resource.Quantity{},
+		DiskSize:         resource.MustParse("1Gi"),
+		TemplateVerified: true,
+	}
+	modernState := &environmentReconcileState{env: *modern}
+	modernOutcome := reconcileEnvironmentLegacyProvisioningMigrationGate(r, context.Background(), modernState)
+	if modernOutcome.handled || modernOutcome.err != nil {
+		t.Fatalf("verified provisioning was preempted by early recovery: %#v", modernOutcome)
+	}
+}
+
+func TestSuspendedLegacyProvisioningMigrationFencesExecutionBeforeMissingPVCFailure(t *testing.T) {
+	scheme := runtime.NewScheme()
+	for _, add := range []func(*runtime.Scheme) error{corev1.AddToScheme, platformv1alpha1.AddToScheme} {
+		if err := add(scheme); err != nil {
+			t.Fatal(err)
+		}
+	}
+	env := &platformv1alpha1.Environment{
+		ObjectMeta: metav1.ObjectMeta{Name: "legacy", Namespace: "default", UID: "env-uid", Generation: 2},
+		Spec:       platformv1alpha1.EnvironmentSpec{TemplateRef: "small"},
+		Status: platformv1alpha1.EnvironmentStatus{
+			ExecutionGeneration: 1, Phase: platformv1alpha1.EnvironmentPhaseReady, PodName: "env-legacy",
+			Endpoints: platformv1alpha1.EnvironmentEndpoints{Sandboxd: "10.0.0.1:50051"},
+			Lifecycle: platformv1alpha1.EnvironmentLifecycleStatus{Suspended: true},
+			Recovery:  platformv1alpha1.EnvironmentRecoveryStatus{Attempts: 3, Exhausted: true, ExecutionGeneration: 1},
+			Conditions: []metav1.Condition{{Type: platformv1alpha1.EnvironmentConditionReady, Status: metav1.ConditionTrue,
+				ObservedGeneration: 2, Reason: "SandboxdReady"}},
+		},
+	}
+	controller := true
+	owner := metav1.OwnerReference{APIVersion: platformv1alpha1.GroupVersion.String(), Kind: "Environment", Name: env.Name, UID: env.UID, Controller: &controller}
+	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: envPodName(env), Namespace: env.Namespace, UID: "pod-uid", OwnerReferences: []metav1.OwnerReference{owner}}}
+	secret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: envCredentialName(env), Namespace: env.Namespace, UID: "secret-uid", OwnerReferences: []metav1.OwnerReference{owner}}}
+	deleted := make([]string, 0, 2)
+	c := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(env).WithObjects(env, pod, secret).
+		WithInterceptorFuncs(interceptor.Funcs{Delete: func(ctx context.Context, client client.WithWatch, obj client.Object, opts ...client.DeleteOption) error {
+			deleted = append(deleted, obj.GetName())
+			return client.Delete(ctx, obj, opts...)
+		}}).Build()
+	r := &EnvironmentReconciler{Client: c, APIReader: c, Scheme: scheme}
+
+	for range 8 {
+		var current platformv1alpha1.Environment
+		if err := c.Get(context.Background(), client.ObjectKeyFromObject(env), &current); err != nil {
+			t.Fatal(err)
+		}
+		state := &environmentReconcileState{env: current}
+		outcome := reconcileEnvironmentLegacyProvisioningMigrationGate(r, context.Background(), state)
+		if outcome.err != nil {
+			t.Fatal(outcome.err)
+		}
+	}
+	if len(deleted) != 2 || deleted[0] != pod.Name || deleted[1] != secret.Name {
+		t.Fatalf("suspended migration deletion order = %v, want Pod then credential", deleted)
+	}
+	var got platformv1alpha1.Environment
+	if err := c.Get(context.Background(), client.ObjectKeyFromObject(env), &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Status.Phase != platformv1alpha1.EnvironmentPhaseFailed || got.Status.Provisioning != nil || got.Status.ProvisioningMigrationPVCUID != "" {
+		t.Fatalf("missing-PVC suspended migration status = %#v", got.Status)
+	}
+	before := got.DeepCopy()
+	state := &environmentReconcileState{env: got}
+	if outcome := reconcileEnvironmentLegacyProvisioningMigrationGate(r, context.Background(), state); outcome.err != nil || !outcome.handled {
+		t.Fatalf("stable failed migration = %#v", outcome)
+	}
+	if err := c.Get(context.Background(), client.ObjectKeyFromObject(env), &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Status.Phase != before.Status.Phase || len(deleted) != 2 {
+		t.Fatalf("failed suspended migration looped status or teardown: before=%#v after=%#v deletes=%v", before.Status, got.Status, deleted)
+	}
+}
+
+func TestLegacyProvisioningMigrationRejectsPVCReplacementAfterUIDFence(t *testing.T) {
+	scheme := runtime.NewScheme()
+	for _, add := range []func(*runtime.Scheme) error{corev1.AddToScheme, networkingv1.AddToScheme, platformv1alpha1.AddToScheme} {
+		if err := add(scheme); err != nil {
+			t.Fatal(err)
+		}
+	}
+	env := &platformv1alpha1.Environment{ObjectMeta: metav1.ObjectMeta{Name: "legacy", Namespace: "default", UID: "env-uid", Generation: 1, Finalizers: []string{environmentFinalizer}}, Spec: platformv1alpha1.EnvironmentSpec{TemplateRef: "small"}, Status: platformv1alpha1.EnvironmentStatus{Phase: platformv1alpha1.EnvironmentPhaseReady, ExecutionGeneration: 1, PodName: "env-legacy"}}
+	tmpl := &platformv1alpha1.EnvironmentTemplate{ObjectMeta: metav1.ObjectMeta{Name: "small", Namespace: env.Namespace, UID: "template-uid", Generation: 1}, Spec: platformv1alpha1.EnvironmentTemplateSpec{Image: "image", Size: "small"}}
+	controller := true
+	owner := metav1.OwnerReference{APIVersion: platformv1alpha1.GroupVersion.String(), Kind: "Environment", Name: env.Name, UID: env.UID, Controller: &controller}
+	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: envPodName(env), Namespace: env.Namespace, UID: "pod-uid", OwnerReferences: []metav1.OwnerReference{owner}}}
+	pvc := &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: envPVCName(env), Namespace: env.Namespace, UID: "original-pvc", OwnerReferences: []metav1.OwnerReference{owner}}}
+	c := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(env).WithObjects(env, tmpl, pod, pvc).Build()
+	r := &EnvironmentReconciler{Client: c, APIReader: c, Scheme: scheme}
+	if _, err := r.Reconcile(context.Background(), provisioningRequest(env)); err != nil {
+		t.Fatal(err)
+	}
+	var fenced platformv1alpha1.Environment
+	if err := c.Get(context.Background(), client.ObjectKeyFromObject(env), &fenced); err != nil {
+		t.Fatal(err)
+	}
+	if fenced.Status.ProvisioningMigrationPVCUID != pvc.UID {
+		t.Fatalf("migration PVC UID fence = %q, want %q", fenced.Status.ProvisioningMigrationPVCUID, pvc.UID)
+	}
+	if err := c.Delete(context.Background(), pvc); err != nil {
+		t.Fatal(err)
+	}
+	replacement := pvc.DeepCopy()
+	replacement.ResourceVersion = ""
+	replacement.UID = "replacement-pvc"
+	if err := c.Create(context.Background(), replacement); err != nil {
+		t.Fatal(err)
+	}
+	for range 3 {
+		if _, err := r.Reconcile(context.Background(), provisioningRequest(env)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var got platformv1alpha1.Environment
+	if err := c.Get(context.Background(), client.ObjectKeyFromObject(env), &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Status.Phase != platformv1alpha1.EnvironmentPhaseFailed || got.Status.Provisioning != nil || got.Status.ProvisioningMigrationPVCUID != "original-pvc" {
+		t.Fatalf("replacement PVC gained migration authority: %#v", got.Status)
+	}
+}
+
+func TestLegacyProvisioningMigrationRejectsForeignFixedNameChildren(t *testing.T) {
+	for _, kind := range []string{"Pod", "PersistentVolumeClaim", "Secret", "NetworkPolicy"} {
+		t.Run(kind, func(t *testing.T) {
+			scheme := runtime.NewScheme()
+			for _, add := range []func(*runtime.Scheme) error{corev1.AddToScheme, networkingv1.AddToScheme, platformv1alpha1.AddToScheme} {
+				if err := add(scheme); err != nil {
+					t.Fatal(err)
+				}
+			}
+			env := &platformv1alpha1.Environment{ObjectMeta: metav1.ObjectMeta{Name: "legacy", Namespace: "default", UID: "env-uid", Generation: 1, Finalizers: []string{environmentFinalizer}}, Spec: platformv1alpha1.EnvironmentSpec{TemplateRef: "small"}, Status: platformv1alpha1.EnvironmentStatus{ExecutionGeneration: 1}}
+			tmpl := &platformv1alpha1.EnvironmentTemplate{ObjectMeta: metav1.ObjectMeta{Name: "small", Namespace: env.Namespace, UID: "template-uid", Generation: 1}, Spec: platformv1alpha1.EnvironmentTemplateSpec{Image: "image", Size: "tiny"}}
+			foreignOwner := true
+			owner := metav1.OwnerReference{APIVersion: platformv1alpha1.GroupVersion.String(), Kind: "Environment", Name: "other", UID: "other-uid", Controller: &foreignOwner}
+			var child client.Object
+			switch kind {
+			case "Pod":
+				child = &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: envPodName(env), Namespace: env.Namespace, UID: "foreign", OwnerReferences: []metav1.OwnerReference{owner}}}
+			case "PersistentVolumeClaim":
+				child = &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: envPVCName(env), Namespace: env.Namespace, UID: "foreign", OwnerReferences: []metav1.OwnerReference{owner}}}
+			case "Secret":
+				child = &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: envCredentialName(env), Namespace: env.Namespace, UID: "foreign", OwnerReferences: []metav1.OwnerReference{owner}}}
+			case "NetworkPolicy":
+				child = &networkingv1.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{Name: envNetworkPolicyName(env), Namespace: env.Namespace, UID: "foreign", OwnerReferences: []metav1.OwnerReference{owner}}}
+			}
+			c := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(env).WithObjects(env, tmpl, child).Build()
+			r := &EnvironmentReconciler{Client: c, APIReader: c, Scheme: scheme}
+			for range 3 {
+				if _, err := r.Reconcile(context.Background(), provisioningRequest(env)); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := c.Get(context.Background(), client.ObjectKeyFromObject(child), child); err != nil || child.GetUID() != "foreign" {
+				t.Fatalf("foreign child was deleted or adopted: uid=%q err=%v", child.GetUID(), err)
+			}
+			var got platformv1alpha1.Environment
+			if err := c.Get(context.Background(), client.ObjectKeyFromObject(env), &got); err != nil {
+				t.Fatal(err)
+			}
+			if got.Status.Provisioning != nil || got.Status.Phase != platformv1alpha1.EnvironmentPhaseFailed {
+				t.Fatalf("foreign child was used for migration: %#v", got.Status)
+			}
+			var pods corev1.PodList
+			if err := c.List(context.Background(), &pods, client.InNamespace(env.Namespace)); err != nil {
+				t.Fatal(err)
+			}
+			for i := range pods.Items {
+				if exactControllerOwner(&pods.Items[i], platformv1alpha1.GroupVersion.String(), "Environment", env.Name, env.UID) {
+					t.Fatalf("owned Pod created despite foreign %s", kind)
+				}
+			}
+		})
+	}
+}
+
+func TestLegacyProvisioningMigrationRejectsSameNameSourceReplacementDuringVerification(t *testing.T) {
+	for _, source := range []string{"Template", "Project"} {
+		t.Run(source, func(t *testing.T) {
+			scheme := runtime.NewScheme()
+			for _, add := range []func(*runtime.Scheme) error{corev1.AddToScheme, networkingv1.AddToScheme, platformv1alpha1.AddToScheme} {
+				if err := add(scheme); err != nil {
+					t.Fatal(err)
+				}
+			}
+			tmpl := &platformv1alpha1.EnvironmentTemplate{ObjectMeta: metav1.ObjectMeta{Name: "small", Namespace: "default", UID: "template-old", Generation: 1}, Spec: platformv1alpha1.EnvironmentTemplateSpec{Image: "image:old", Size: "tiny"}}
+			project := &platformv1alpha1.Project{ObjectMeta: metav1.ObjectMeta{Name: "project", Namespace: "default", UID: "project-old", Generation: 1}, Spec: platformv1alpha1.ProjectSpec{Repositories: []string{"https://example.test/old"}}}
+			env := &platformv1alpha1.Environment{ObjectMeta: metav1.ObjectMeta{Name: "legacy", Namespace: "default", UID: "env-uid", Generation: 1, Finalizers: []string{environmentFinalizer}}, Spec: platformv1alpha1.EnvironmentSpec{TemplateRef: tmpl.Name, ProjectRef: project.Name}, Status: platformv1alpha1.EnvironmentStatus{Phase: platformv1alpha1.EnvironmentPhaseResuming, ExecutionGeneration: 1}}
+			controller := true
+			owner := metav1.OwnerReference{APIVersion: platformv1alpha1.GroupVersion.String(), Kind: "Environment", Name: env.Name, UID: env.UID, Controller: &controller}
+			pvc := &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: envPVCName(env), Namespace: env.Namespace, UID: "pvc-uid", OwnerReferences: []metav1.OwnerReference{owner}}}
+			policy := &networkingv1.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{Name: envNetworkPolicyName(env), Namespace: env.Namespace, UID: "policy-uid", OwnerReferences: []metav1.OwnerReference{owner}}}
+			c := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(env).WithObjects(env, tmpl, project, pvc, policy).Build()
+			r := &EnvironmentReconciler{Client: c, APIReader: c, Scheme: scheme}
+			for range 2 {
+				if _, err := r.Reconcile(context.Background(), provisioningRequest(env)); err != nil {
+					t.Fatal(err)
+				}
+			}
+			var captured platformv1alpha1.Environment
+			if err := c.Get(context.Background(), client.ObjectKeyFromObject(env), &captured); err != nil {
+				t.Fatal(err)
+			}
+			if captured.Status.Provisioning == nil || captured.Status.Provisioning.TemplateVerified || captured.Status.Provisioning.ProjectVerified {
+				t.Fatalf("migration did not stop at unverified capture: %#v", captured.Status.Provisioning)
+			}
+
+			if source == "Template" {
+				if err := c.Delete(context.Background(), tmpl); err != nil {
+					t.Fatal(err)
+				}
+				replacement := tmpl.DeepCopy()
+				replacement.ResourceVersion = ""
+				replacement.UID = "template-new"
+				if err := c.Create(context.Background(), replacement); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				if err := c.Delete(context.Background(), project); err != nil {
+					t.Fatal(err)
+				}
+				replacement := project.DeepCopy()
+				replacement.ResourceVersion = ""
+				replacement.UID = "project-new"
+				if err := c.Create(context.Background(), replacement); err != nil {
+					t.Fatal(err)
+				}
+			}
+			for attempt := 0; attempt < 6; attempt++ {
+				if _, err := r.Reconcile(context.Background(), provisioningRequest(env)); err != nil {
+					t.Fatal(err)
+				}
+				var stable platformv1alpha1.Environment
+				if err := c.Get(context.Background(), client.ObjectKeyFromObject(env), &stable); err != nil {
+					t.Fatal(err)
+				}
+				if stable.Status.Phase != platformv1alpha1.EnvironmentPhaseFailed {
+					t.Fatalf("attempt %d changed failed migration status after same-name %s replacement: %#v", attempt, source, stable.Status)
+				}
+			}
+			var got platformv1alpha1.Environment
+			if err := c.Get(context.Background(), client.ObjectKeyFromObject(env), &got); err != nil {
+				t.Fatal(err)
+			}
+			if got.Status.Phase != platformv1alpha1.EnvironmentPhaseFailed || got.Status.Provisioning.TemplateVerified || got.Status.Provisioning.ProjectVerified {
+				t.Fatalf("same-name %s replacement gained migration authority: %#v", source, got.Status)
+			}
+			if err := c.Get(context.Background(), client.ObjectKey{Namespace: env.Namespace, Name: envPodName(env)}, &corev1.Pod{}); !apierrors.IsNotFound(err) {
+				t.Fatalf("same-name %s replacement created a Pod: %v", source, err)
+			}
+		})
 	}
 }

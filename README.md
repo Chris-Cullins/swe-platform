@@ -548,11 +548,26 @@ exact Template name/UID/generation, effective backend, image, size, resolved CPU
 RuntimeClass name and disk size, plus the bound Project name/UID/generation and repository when
 present. Monotonic Template and Project verification flags record a separate uncached
 post-publication source check; no provisioning child or warm capacity is created or counted
-until the required checks complete. That snapshot is reused for Pod replacement and pause/resume. Template image, size,
+until the required checks complete. A migrated snapshot also freezes the exact retained PVC UID.
+That snapshot is reused for Pod replacement and pause/resume. Template image, size,
 disk, RuntimeClass and backend edits, and Project repository edits therefore affect future
 Environments, not existing ones. Template `idleTimeout` and `warmPool.min`, and Project egress
 policy, remain live policy. Workspace PVC expansion is unsupported: create a new Environment to
 request a different disk size.
+
+On the first operator upgrade that introduces this snapshot, a previously provisioned
+Environment is migrated without discarding its workspace. The operator withdraws readiness,
+deletes the exact-owned legacy Pod, revokes its exact-owned sandboxd credential only after the
+Pod is gone, and retains the exact-owned PVC and NetworkPolicy. Before teardown it durably fences
+the exact PVC UID in controller-owned migration status. It then freezes the current
+authoritative managed Template and Project sources through the same unverified/verified capture
+handshake before creating any replacement Pod. Historical source values that were never stored
+cannot be reconstructed; migration intentionally freezes the current authoritative values.
+Held or suspended Environments remain podless and paused throughout capture. Foreign fixed-name
+children are never adopted or deleted. A missing, deleting, or same-name replacement retained
+PVC fails closed and is never replaced. Immediately before and after Pod creation, uncached
+Environment and source-incarnation checks prevent drift from gaining execution authority; a Pod
+created across that race is UID-precondition-deleted before readiness is published.
 
 `templateRef` and an explicit backend (including whether it was specified) are immutable.
 `projectRef` can only be added once to a Project-less warm Environment and then cannot change or

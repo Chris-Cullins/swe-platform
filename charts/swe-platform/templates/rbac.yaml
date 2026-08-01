@@ -11,7 +11,7 @@ rules:
     verbs: ["create", "delete", "get", "list", "patch", "update", "watch"]
   - apiGroups: [""]
     resources: ["secrets"]
-    verbs: ["create", "delete", "get", "update"]
+    verbs: ["create", "delete", "get", "list", "update", "watch"]
   - apiGroups: ["networking.k8s.io"]
     resources: ["networkpolicies"]
     verbs: ["create", "delete", "get", "list", "patch", "update", "watch"]
@@ -160,9 +160,14 @@ rules:
       {{- if .Values.controlPlane.portal.enabled }}
       - "list"
       {{- end }}
+  {{- if .Values.controlPlane.portal.enabled }}
+  # The gateway is the sole owner of status.portalRoutes and
+  # status.nextPortalRouteGeneration. Keep status authority absent when the
+  # portal is disabled rather than granting it to every control-plane install.
   - apiGroups: ["swe.dev"]
     resources: ["environments/status"]
-    verbs: ["get", "update"]
+    verbs: ["update"]
+  {{- end }}
   - apiGroups: ["swe.dev"]
     resources: ["environmenttemplates"]
     verbs: ["get"]

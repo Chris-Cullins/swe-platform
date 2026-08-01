@@ -60,6 +60,7 @@ test: ## Run unit tests in both modules
 	go test ./...
 	cd sandboxd && go test ./...
 	./hack/argocd-port-forward_test.sh
+	./hack/helm-rbac_test.sh
 
 .PHONY: vet
 vet: ## Run go vet in both modules
