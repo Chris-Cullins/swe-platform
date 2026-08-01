@@ -414,11 +414,104 @@ spec:
 EOF
 kubectl patch environment legacy-execution-generation-migration --subresource=status --type=merge -p \
 	'{"status":{"lifecycle":{"activityReceipts":[{"source":"Terminal","requestID":"legacy-terminal-activity"}]}}}'
+
+# Exercise the exact pre-portal service schema with a declaration persisted
+# before instanceID existed. The upgraded schema must leave it writable and
+# permit only a revision-advancing missing-to-valid migration.
+PRE_SERVICE_INSTANCE_ID_SHA=5654ba351a6a80c71d9bdcfa3f123fe39c060bea
+git fetch --depth=1 origin "$PRE_SERVICE_INSTANCE_ID_SHA"
+git show "$PRE_SERVICE_INSTANCE_ID_SHA:config/crd/bases/swe.dev_environments.yaml" | kubectl apply --server-side --force-conflicts -f -
+cat <<'EOF' | kubectl create -f -
+apiVersion: swe.dev/v1alpha1
+kind: Environment
+metadata:
+  name: legacy-service-instance-id-migration
+spec:
+  templateRef: small
+  services:
+  - name: web
+    revision: 1
+    protocol: HTTP
+    targetPort: 3000
+    visibility: Project
+    readiness: TCPConnect
+EOF
 kubectl apply --server-side --force-conflicts -f charts/swe-platform/crds
 kubectl get crd agentcredentialprofiles.swe.dev >/dev/null
 kubectl get environment legacy-execution-generation-migration -o json | jq -e \
 	'.spec.lifecycle.activity[0].executionGeneration == null and .status.lifecycle.activityReceipts[0].executionGeneration == null' >/dev/null
+kubectl patch environment legacy-service-instance-id-migration --subresource=status --type=merge -p '{"status":{"phase":"Pending"}}'
+kubectl patch environment legacy-service-instance-id-migration --type=json -p \
+	'[{"op":"add","path":"/spec/projectRef","value":"legacy-migration"}]'
+kubectl get environment legacy-service-instance-id-migration -o json | jq -e \
+	'.status.phase == "Pending" and .spec.projectRef == "legacy-migration" and .spec.services[0].targetPort == 3000 and .spec.services[0].revision == 1 and .spec.services[0].instanceID == null' >/dev/null
+if kubectl create -f - >/tmp/new-service-missing-instance-id.out 2>&1 <<'EOF'; then
+apiVersion: swe.dev/v1alpha1
+kind: Environment
+metadata:
+  name: new-service-missing-instance-id
+spec:
+  templateRef: small
+  services:
+  - name: web
+    revision: 1
+    protocol: HTTP
+    targetPort: 3000
+    visibility: Project
+    readiness: TCPConnect
+EOF
+	echo "FAIL: upgraded admission accepted a new service without instanceID"
+	exit 1
+fi
+if ! grep -q 'new services require instanceID; a legacy missing instanceID may be added only with a higher revision and is then immutable' /tmp/new-service-missing-instance-id.out; then
+	echo "FAIL: new missing instanceID was not rejected by the intended migration rule"
+	cat /tmp/new-service-missing-instance-id.out
+	exit 1
+fi
+if kubectl patch environment legacy-service-instance-id-migration --type=json -p \
+	'[{"op":"add","path":"/spec/services/-","value":{"name":"admin","revision":1,"protocol":"HTTP","targetPort":3001,"visibility":"Project","readiness":"TCPConnect"}}]' \
+	>/tmp/legacy-service-new-name-missing-instance-id.out 2>&1; then
+	echo "FAIL: upgraded admission accepted a new service name without instanceID"
+	exit 1
+fi
+if ! grep -q 'new services require instanceID; a legacy missing instanceID may be added only with a higher revision and is then immutable' /tmp/legacy-service-new-name-missing-instance-id.out; then
+	echo "FAIL: update-side new name was not rejected by the intended migration rule"
+	cat /tmp/legacy-service-new-name-missing-instance-id.out
+	exit 1
+fi
+if kubectl patch environment legacy-service-instance-id-migration --type=json -p \
+	'[{"op":"add","path":"/spec/services/0/instanceID","value":"aaaaaaaaaaaaaaaaaaaa"}]' \
+	>/tmp/legacy-service-instance-id-without-revision.out 2>&1; then
+	echo "FAIL: upgraded admission accepted legacy instanceID backfill without a higher revision"
+	exit 1
+fi
+if ! grep -q 'new services require instanceID; a legacy missing instanceID may be added only with a higher revision and is then immutable' /tmp/legacy-service-instance-id-without-revision.out; then
+	echo "FAIL: unrevisioned legacy backfill was not rejected by the intended migration rule"
+	cat /tmp/legacy-service-instance-id-without-revision.out
+	exit 1
+fi
+kubectl get environment legacy-service-instance-id-migration -o json | jq -e \
+	'.spec.services | length == 1 and .[0].revision == 1 and .[0].instanceID == null' >/dev/null
+bin/swe --namespace default environment services update legacy-service-instance-id-migration web --target-port 3000
+LEGACY_SERVICE_INSTANCE_ID=$(kubectl get environment legacy-service-instance-id-migration -o jsonpath='{.spec.services[0].instanceID}')
+if [[ ! "$LEGACY_SERVICE_INSTANCE_ID" =~ ^[a-z0-9]{20,63}$ ]] ||
+	[[ "$(kubectl get environment legacy-service-instance-id-migration -o jsonpath='{.spec.services[0].revision}')" != "2" ]]; then
+	echo "FAIL: CLI did not backfill the legacy service instanceID at a higher revision"
+	exit 1
+fi
+if kubectl patch environment legacy-service-instance-id-migration --type=json -p \
+	'[{"op":"replace","path":"/spec/services/0/instanceID","value":"aaaaaaaaaaaaaaaaaaaa"},{"op":"replace","path":"/spec/services/0/revision","value":3}]' \
+	>/tmp/legacy-service-instance-id-replacement.out 2>&1; then
+	echo "FAIL: admission accepted replacement of a migrated service instanceID"
+	exit 1
+fi
+if ! grep -q 'new services require instanceID; a legacy missing instanceID may be added only with a higher revision and is then immutable' /tmp/legacy-service-instance-id-replacement.out; then
+	echo "FAIL: migrated instanceID replacement was not rejected by the intended immutability rule"
+	cat /tmp/legacy-service-instance-id-replacement.out
+	exit 1
+fi
 kubectl delete environment legacy-execution-generation-migration --wait=false
+kubectl delete environment legacy-service-instance-id-migration --wait=false
 
 echo "==> verifying trusted-admin preset and release-scoped cluster RBAC names"
 TRUSTED_RENDER=$(helm template swe-platform charts/swe-platform --namespace preset-check --values charts/swe-platform/values-kind.yaml)
@@ -1676,8 +1769,15 @@ if bin/swe --namespace "$PROJECT_NAMESPACE" environment services declare "$ENV_N
 	echo "FAIL: service declaration accepted sandboxd control port 50051"
 	exit 1
 fi
-if kubectl patch environment "$ENV_NAME" --type=merge -p '{"spec":{"services":[{"name":"web","revision":2,"protocol":"HTTP","targetPort":3002,"visibility":"Project","readiness":"TCPConnect"},{"name":"web-alias","revision":1,"protocol":"HTTP","targetPort":3000,"visibility":"Project","readiness":"TCPConnect"}]}}' >/dev/null 2>&1; then
+INVALID_SERVICE_REVISION_PATCH=$(kubectl get environment "$ENV_NAME" -o json | jq -c \
+	'.spec.services |= map(if .name == "web" then .targetPort = 3002 else . end) | {spec:{services:.spec.services}}')
+if kubectl patch environment "$ENV_NAME" --type=merge -p "$INVALID_SERVICE_REVISION_PATCH" >/tmp/invalid-service-revision.out 2>&1; then
 	echo "FAIL: admission accepted changed same-name service configuration without a higher revision"
+	exit 1
+fi
+if ! grep -q 'revision must increase when an existing service declaration changes' /tmp/invalid-service-revision.out; then
+	echo "FAIL: unchanged service revision was not rejected by the intended revision rule"
+	cat /tmp/invalid-service-revision.out
 	exit 1
 fi
 bin/swe --namespace "$PROJECT_NAMESPACE" environment services remove "$ENV_NAME" web-alias

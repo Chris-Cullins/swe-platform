@@ -132,6 +132,8 @@ remains behind the environment's portable sandboxd contract rather than Kubernet
 
 ## Install
 
+Kubernetes 1.33 or newer is required.
+
 Choose the values preset for the target cluster and install into a dedicated namespace:
 
 ```sh

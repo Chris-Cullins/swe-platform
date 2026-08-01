@@ -252,7 +252,15 @@ func writeEnvironmentService(ctx context.Context, kube client.Client, key types.
 			environment.Spec.Services = append(environment.Spec.Services, result)
 		} else {
 			existing := environment.Spec.Services[index]
-			desired := desiredEnvironmentService(name, targetPort, existing.Revision, existing.InstanceID)
+			instanceID := existing.InstanceID
+			if update && instanceID == "" {
+				var err error
+				instanceID, err = randomServiceInstanceID()
+				if err != nil {
+					return err
+				}
+			}
+			desired := desiredEnvironmentService(name, targetPort, existing.Revision, instanceID)
 			if existing == desired {
 				result = existing
 				return nil
