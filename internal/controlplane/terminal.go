@@ -416,6 +416,9 @@ func (d KubernetesTerminalDialer) holdPolicyPollInterval() time.Duration {
 func (d KubernetesTerminalDialer) readTerminalPolicy(ctx context.Context, key types.NamespacedName, previousFence lifecycle.ExecutionFence, boundExecution func() (sandboxclient.TerminalExecution, lifecycle.ExecutionFence, bool)) (lifecycle.ExecutionFence, bool, error) {
 	var environment platformv1alpha1.Environment
 	if err := d.Client.Get(ctx, key, &environment); err != nil {
+		if apierrors.IsNotFound(err) {
+			return lifecycle.ExecutionFence{}, false, errTerminalEnvironmentIncarnationChanged
+		}
 		return lifecycle.ExecutionFence{}, false, err
 	}
 	var execution sandboxclient.TerminalExecution
