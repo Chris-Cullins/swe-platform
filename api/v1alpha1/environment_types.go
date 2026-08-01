@@ -326,7 +326,7 @@ type EnvironmentServiceDeclaration struct {
 // EnvironmentSpec defines the desired state of Environment.
 // +kubebuilder:validation:XValidation:rule="self.templateRef == oldSelf.templateRef",message="templateRef is immutable"
 // +kubebuilder:validation:XValidation:rule="has(self.backend) == has(oldSelf.backend) && (!has(self.backend) || self.backend == oldSelf.backend)",message="backend is immutable"
-// +kubebuilder:validation:XValidation:rule="(!has(oldSelf.projectRef) || oldSelf.projectRef.size() == 0) ? (!has(self.projectRef) || self.projectRef.size() > 0) : (has(self.projectRef) && self.projectRef == oldSelf.projectRef)",message="projectRef may only transition once from empty to non-empty"
+// +kubebuilder:validation:XValidation:rule="!has(oldSelf.projectRef) ? (!has(self.projectRef) || self.projectRef.size() > 0) : (oldSelf.projectRef.size() == 0 ? (!has(self.projectRef) || self.projectRef.size() >= 0) : (has(self.projectRef) && self.projectRef == oldSelf.projectRef))",message="projectRef may only transition once from empty to non-empty"
 // +kubebuilder:validation:XValidation:rule="!has(oldSelf.lifecycle) || !has(oldSelf.lifecycle.hold) || (has(self.lifecycle) && has(self.lifecycle.hold))",message="hold policy cannot be removed; disable it at a higher revision"
 type EnvironmentSpec struct {
 	// ProjectRef is the name of the Project this environment belongs to.
@@ -500,11 +500,12 @@ type EnvironmentProvisioningProject struct {
 
 // EnvironmentProvisioningSnapshot is the immutable, resolved input used for
 // every provisioning attempt in one Environment incarnation.
-// +kubebuilder:validation:XValidation:rule="self.template == oldSelf.template && self.backend == oldSelf.backend && self.image == oldSelf.image && self.size == oldSelf.size && self.resources.all(k, k in oldSelf.resources && quantity(self.resources[k]).compareTo(quantity(oldSelf.resources[k])) == 0) && oldSelf.resources.all(k, k in self.resources) && self.runtimeClassName == oldSelf.runtimeClassName && quantity(self.diskSize).compareTo(quantity(oldSelf.diskSize)) == 0",message="resolved provisioning inputs are immutable"
+// +kubebuilder:validation:XValidation:rule="self.template == oldSelf.template && self.backend == oldSelf.backend && self.image == oldSelf.image && self.size == oldSelf.size && self.resources.all(k, k in oldSelf.resources && quantity(self.resources[k]).compareTo(quantity(oldSelf.resources[k])) == 0) && oldSelf.resources.all(k, k in self.resources) && self.runtimeClassName == oldSelf.runtimeClassName && quantity(self.diskSize).compareTo(quantity(oldSelf.diskSize)) == 0 && has(self.legacyWorkspacePVCUID) == has(oldSelf.legacyWorkspacePVCUID) && (!has(self.legacyWorkspacePVCUID) || self.legacyWorkspacePVCUID == oldSelf.legacyWorkspacePVCUID)",message="resolved provisioning inputs are immutable"
 // +kubebuilder:validation:XValidation:rule="has(oldSelf.project) ? (has(self.project) && self.project == oldSelf.project) : (!has(self.project) || !self.projectVerified)",message="project may only be added once and must start unverified"
 // +kubebuilder:validation:XValidation:rule="!oldSelf.templateVerified || self.templateVerified",message="template verification cannot be reset"
 // +kubebuilder:validation:XValidation:rule="!oldSelf.projectVerified || self.projectVerified",message="project verification cannot be reset"
 // +kubebuilder:validation:XValidation:rule="has(self.project) || !self.projectVerified",message="project verification requires a project snapshot"
+// +kubebuilder:validation:XValidation:rule="!has(self.legacyWorkspacePVCUID) || self.legacyWorkspacePVCUID.size() > 0",message="legacy workspace PVC UID must not be empty"
 type EnvironmentProvisioningSnapshot struct {
 	Template EnvironmentProvisioningTemplate `json:"template"`
 	Backend  EnvironmentBackend              `json:"backend"`
@@ -517,6 +518,10 @@ type EnvironmentProvisioningSnapshot struct {
 	Resources        map[string]resource.Quantity `json:"resources"`
 	RuntimeClassName string                       `json:"runtimeClassName"`
 	DiskSize         resource.Quantity            `json:"diskSize"`
+	// LegacyWorkspacePVCUID binds a migrated pre-snapshot Environment to the
+	// exact retained workspace incarnation. Ordinary snapshots omit it.
+	// +optional
+	LegacyWorkspacePVCUID types.UID `json:"legacyWorkspacePVCUID,omitempty"`
 	// +optional
 	Project *EnvironmentProvisioningProject `json:"project,omitempty"`
 	// TemplateVerified records the controller's post-publication verification
@@ -531,6 +536,8 @@ type EnvironmentProvisioningSnapshot struct {
 // +kubebuilder:validation:XValidation:rule="!has(oldSelf.executionGeneration) || (has(self.executionGeneration) && self.executionGeneration >= oldSelf.executionGeneration)",message="executionGeneration cannot decrease or be removed"
 // +kubebuilder:validation:XValidation:rule="!has(oldSelf.nextPortalRouteGeneration) || (has(self.nextPortalRouteGeneration) && self.nextPortalRouteGeneration >= oldSelf.nextPortalRouteGeneration)",message="nextPortalRouteGeneration cannot decrease or be removed"
 // +kubebuilder:validation:XValidation:rule="!has(oldSelf.provisioning) || has(self.provisioning)",message="provisioning snapshot cannot be removed"
+// +kubebuilder:validation:XValidation:rule="!has(oldSelf.provisioningMigrationPVCUID) || (has(self.provisioningMigrationPVCUID) && self.provisioningMigrationPVCUID == oldSelf.provisioningMigrationPVCUID)",message="provisioning migration PVC UID cannot change or be removed"
+// +kubebuilder:validation:XValidation:rule="!has(self.provisioningMigrationPVCUID) || self.provisioningMigrationPVCUID.size() > 0",message="provisioning migration PVC UID must not be empty"
 type EnvironmentStatus struct {
 	// ObservedGeneration is the Environment generation reflected by this status.
 	// +optional
@@ -549,6 +556,11 @@ type EnvironmentStatus struct {
 	// child is created and may only gain its one-time Project binding.
 	// +optional
 	Provisioning *EnvironmentProvisioningSnapshot `json:"provisioning,omitempty"`
+
+	// ProvisioningMigrationPVCUID durably fences the exact retained legacy
+	// workspace before migration tears down any execution child.
+	// +optional
+	ProvisioningMigrationPVCUID types.UID `json:"provisioningMigrationPVCUID,omitempty"`
 
 	// +optional
 	Phase EnvironmentPhase `json:"phase,omitempty"`

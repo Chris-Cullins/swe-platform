@@ -1,0 +1,65 @@
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: {{ include "swe-platform.controlPlaneClusterFullname" . }}-portal-status
+  labels:
+    {{- include "swe-platform.labels" . | nindent 4 }}
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: ["swe.dev"]
+        apiVersions: ["v1alpha1"]
+        operations: ["UPDATE"]
+        resources: ["environments/status"]
+        scope: Namespaced
+  matchConditions:
+    - name: portal-control-plane-service-account
+      expression: request.userInfo.username == {{ printf "system:serviceaccount:%s:%s" .Release.Namespace (include "swe-platform.controlPlaneFullname" .) | quote }}
+  validations:
+    - expression: object.?status.?observedGeneration == oldObject.?status.?observedGeneration
+      message: the portal gateway may not change status.observedGeneration
+    - expression: object.?status.?executionGeneration == oldObject.?status.?executionGeneration
+      message: the portal gateway may not change status.executionGeneration
+    - expression: object.?status.?provisioning == oldObject.?status.?provisioning
+      message: the portal gateway may not change status.provisioning
+    - expression: object.?status.?provisioningMigrationPVCUID == oldObject.?status.?provisioningMigrationPVCUID
+      message: the portal gateway may not change status.provisioningMigrationPVCUID
+    - expression: object.?status.?phase == oldObject.?status.?phase
+      message: the portal gateway may not change status.phase
+    - expression: object.?status.?lifecycle == oldObject.?status.?lifecycle
+      message: the portal gateway may not change status.lifecycle
+    - expression: object.?status.?claimedBy == oldObject.?status.?claimedBy
+      message: the portal gateway may not change status.claimedBy
+    - expression: object.?status.?endpoints == oldObject.?status.?endpoints
+      message: the portal gateway may not change status.endpoints
+    - expression: object.?status.?serviceObservations == oldObject.?status.?serviceObservations
+      message: the portal gateway may not change status.serviceObservations
+    - expression: object.?status.?podName == oldObject.?status.?podName
+      message: the portal gateway may not change status.podName
+    - expression: object.?status.?imageID == oldObject.?status.?imageID
+      message: the portal gateway may not change status.imageID
+    - expression: object.?status.?lastActiveAt == oldObject.?status.?lastActiveAt
+      message: the portal gateway may not change status.lastActiveAt
+    - expression: object.?status.?recovery == oldObject.?status.?recovery
+      message: the portal gateway may not change status.recovery
+    - expression: object.?status.?podRecoveryAttempts == oldObject.?status.?podRecoveryAttempts
+      message: the portal gateway may not change status.podRecoveryAttempts
+    - expression: object.?status.?podRecoveryExhausted == oldObject.?status.?podRecoveryExhausted
+      message: the portal gateway may not change status.podRecoveryExhausted
+    - expression: object.?status.?podRecoveryUID == oldObject.?status.?podRecoveryUID
+      message: the portal gateway may not change status.podRecoveryUID
+    - expression: object.?status.?podRecoveryNextAttemptAt == oldObject.?status.?podRecoveryNextAttemptAt
+      message: the portal gateway may not change status.podRecoveryNextAttemptAt
+    - expression: object.?status.?conditions == oldObject.?status.?conditions
+      message: the portal gateway may not change status.conditions
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: {{ include "swe-platform.controlPlaneClusterFullname" . }}-portal-status
+  labels:
+    {{- include "swe-platform.labels" . | nindent 4 }}
+spec:
+  policyName: {{ include "swe-platform.controlPlaneClusterFullname" . }}-portal-status
+  validationActions: [Deny]

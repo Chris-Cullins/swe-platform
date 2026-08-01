@@ -129,6 +129,12 @@ The operator reconciles each `Run` as the single task intent and allocates or cl
 `Environment`; clients must not create the two resources independently. Its RBAC permits
 Run status/finalizer updates and Environment allocation/claim updates. Process execution
 remains behind the environment's portable sandboxd contract rather than Kubernetes exec.
+Environment status is controller-owned: the control-plane role can read and patch the base
+Environment resource where required, but has no `environments/status` authority unless the
+portal gateway is enabled. The enabled gateway receives update-only status authority for its
+bounded portal route allocation fields; a release-scoped fail-closed admission policy rejects
+changes by that ServiceAccount to every controller-owned status field. The policy is pre-staged
+when portals are disabled so later enablement cannot expose an unfenced status writer.
 
 ## Install
 
@@ -273,6 +279,16 @@ RuntimeClass, or backend affects new Environments (and rolls stale warm-pool mem
 existing Environment's replacement or resume; `idleTimeout` and `warmPool.min` remain live
 policy. PVC expansion is unsupported, so disk-size changes require a new Environment. Apply the
 CRD upgrade above before relying on this status schema and selector immutability admission.
+The upgraded operator migrates a pre-snapshot Environment by first durably recording its exact
+PVC UID in controller-owned status, withdrawing readiness, deleting its exact-owned Pod, and
+then revoking its exact-owned sandboxd credential. It retains
+the exact-owned PVC and NetworkPolicy, freezes the current authoritative managed Template and
+Project values plus the retained PVC UID through the normal unverified/verified handshake, and
+only then may recreate an active Pod on the retained workspace. Missing, deleting, or same-name
+replacement PVCs fail closed. Uncached authority checks immediately before and after Pod creation
+delete a raced Pod before readiness publication. This cannot reconstruct historical source values that the
+old API never stored. Held or suspended Environments remain podless and paused during capture;
+foreign fixed-name children are neither adopted nor deleted.
 
 The production presets create a `medium` catalog source using the published `env-base` image;
 onboarding creates each runnable Project-local Template copy. Operator, control-plane, and

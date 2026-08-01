@@ -120,7 +120,12 @@ func newProcessPoolFixtureAt(t *testing.T, identity, podIP string, certificate [
 			Annotations: map[string]string{sandboxdauth.IdentityAnnotation: identity, sandboxdauth.PodUIDAnnotation: "pod-uid"}},
 		Data: map[string][]byte{sandboxdauth.TLSCertKey: certificate, sandboxdauth.CapabilitiesKey: capabilities, sandboxdauth.ProcessTokenKey: []byte("process-token")},
 	}
-	template := &platformv1alpha1.EnvironmentTemplate{ObjectMeta: metav1.ObjectMeta{Name: "default", Namespace: "ns", UID: "template-uid", Generation: 1}}
+	template := &platformv1alpha1.EnvironmentTemplate{
+		ObjectMeta: metav1.ObjectMeta{Name: "default", Namespace: "ns", UID: "template-uid", Generation: 1},
+		Spec:       platformv1alpha1.EnvironmentTemplateSpec{Image: "environment:test", Size: "small"},
+	}
+	env.Status.Provisioning = platformv1alpha1.ResolveEnvironmentProvisioning(env, template, nil)
+	env.Status.Provisioning.TemplateVerified = true
 	scheme := runtime.NewScheme()
 	if err := corev1.AddToScheme(scheme); err != nil {
 		t.Fatal(err)
@@ -322,7 +327,7 @@ func TestProcessConnectionPoolCompleteHitProofInvalidatesDrift(t *testing.T) {
 		mutate          func(*testing.T, *processPoolCountingReader)
 		wantReplacement bool
 	}{
-		{name: "Template UID", wantReplacement: true, mutate: func(_ *testing.T, reader *processPoolCountingReader) {
+		{name: "Template UID", mutate: func(_ *testing.T, reader *processPoolCountingReader) {
 			reader.setMutation(func(object client.Object) {
 				if template, ok := object.(*platformv1alpha1.EnvironmentTemplate); ok {
 					template.UID = "replacement-template"
@@ -336,7 +341,7 @@ func TestProcessConnectionPoolCompleteHitProofInvalidatesDrift(t *testing.T) {
 				}
 			})
 		}},
-		{name: "Template backend", mutate: func(_ *testing.T, reader *processPoolCountingReader) {
+		{name: "Template backend", wantReplacement: true, mutate: func(_ *testing.T, reader *processPoolCountingReader) {
 			reader.setMutation(func(object client.Object) {
 				if template, ok := object.(*platformv1alpha1.EnvironmentTemplate); ok {
 					template.Spec.Backend = platformv1alpha1.EnvironmentBackendKubeVirt

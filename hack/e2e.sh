@@ -38,8 +38,21 @@ E2E_KUBECONFIG=""
 SESSION_KEYRING_FILE=""
 E2E_SESSION_FIXTURE=""
 SELECTOR_ENV_NAME=""
+LEGACY_CRD_ACTIVE="false"
+LEGACY_ENV_NAMES=""
 
 cleanup() {
+	if [[ "$LEGACY_CRD_ACTIVE" == "true" ]]; then
+		kubectl apply --server-side --force-conflicts -f charts/swe-platform/crds >/dev/null 2>&1 || true
+		LEGACY_CRD_ACTIVE="false"
+	fi
+	if [[ -n "$LEGACY_ENV_NAMES" ]]; then
+		for legacy_env in $LEGACY_ENV_NAMES; do
+			kubectl -n "$PROJECT_NAMESPACE" patch secret "env-$legacy_env-sandboxd" --type=merge \
+				-p '{"metadata":{"finalizers":[]}}' >/dev/null 2>&1 || true
+		done
+		kubectl -n "$PROJECT_NAMESPACE" delete environment $LEGACY_ENV_NAMES --wait=false >/dev/null 2>&1 || true
+	fi
 	if [[ -n "$SELECTOR_ENV_NAME" ]]; then
 		kubectl -n "$PROJECT_NAMESPACE" delete environment "$SELECTOR_ENV_NAME" --wait=false >/dev/null 2>&1 || true
 	fi
@@ -730,6 +743,199 @@ kubectl -n "$PROJECT_NAMESPACE" get resourcequota/swe-project serviceaccount/swe
 kubectl -n "$PROJECT_NAMESPACE" get networkpolicy swe-default-deny-ingress -o json | jq -e '.spec.policyTypes == ["Ingress"] and (.spec.ingress | length == 0)' >/dev/null
 wait_for_resource_quota_observation "$PROJECT_NAMESPACE"
 
+echo "==> verifying scoped portal status RBAC and legacy Environment upgrade fencing"
+CONTROL_PLANE_SA="$INSTALLATION_NAME-control-plane"
+CONTROL_PLANE_CAN_UPDATE_STATUS=$(kubectl auth can-i update environments.swe.dev --subresource=status \
+	--namespace "$PROJECT_NAMESPACE" --as="system:serviceaccount:${SYSTEM_NAMESPACE}:${CONTROL_PLANE_SA}")
+if [[ "$CONTROL_PLANE_CAN_UPDATE_STATUS" != "yes" ]]; then
+	echo "FAIL: portal-enabled control-plane ServiceAccount cannot update gateway-owned Environment portal status"
+	exit 1
+fi
+STATUS_POLICY_PROBE="status-policy-probe-$RANDOM"
+cat <<EOF | kubectl -n "$PROJECT_NAMESPACE" create -f - >/dev/null
+apiVersion: swe.dev/v1alpha1
+kind: Environment
+metadata:
+  name: ${STATUS_POLICY_PROBE}
+spec:
+  templateRef: small
+  lifecycle:
+    hold:
+      enabled: true
+      revision: 1
+EOF
+CONTROL_PLANE_SA_TOKEN=$(kubectl -n "$SYSTEM_NAMESPACE" create token "$CONTROL_PLANE_SA" --duration=10m)
+KUBE_API=$(kubectl config view --raw --minify -o jsonpath='{.clusters[0].cluster.server}')
+STATUS_URL="$KUBE_API/apis/swe.dev/v1alpha1/namespaces/${PROJECT_NAMESPACE}/environments/${STATUS_POLICY_PROBE}/status?dryRun=All"
+for _ in {1..5}; do
+	kubectl -n "$PROJECT_NAMESPACE" get environment "$STATUS_POLICY_PROBE" -o json |
+		jq '.status.phase="Failed"' >/tmp/swe-e2e-status-policy-probe.json
+	STATUS_PATCH_CODE=$(curl --silent --output /tmp/swe-e2e-status-policy.out --write-out '%{http_code}' \
+		--cacert <(kubectl config view --raw --minify -o jsonpath='{.clusters[0].cluster.certificate-authority-data}' | base64 --decode) \
+		-H "Authorization: Bearer ${CONTROL_PLANE_SA_TOKEN}" -H 'Content-Type: application/json' \
+		-X PUT --data-binary @/tmp/swe-e2e-status-policy-probe.json "$STATUS_URL")
+	[[ "$STATUS_PATCH_CODE" == "409" ]] || break
+done
+unset CONTROL_PLANE_SA_TOKEN
+if [[ "$STATUS_PATCH_CODE" != "422" ]] || ! grep -q 'portal gateway may not change status.phase' /tmp/swe-e2e-status-policy.out; then
+	echo "FAIL: control-plane bearer-token non-portal status update returned $STATUS_PATCH_CODE without the field fence"
+	cat /tmp/swe-e2e-status-policy.out
+	exit 1
+fi
+kubectl -n "$PROJECT_NAMESPACE" delete environment "$STATUS_POLICY_PROBE" --wait=false >/dev/null
+
+# Install the exact pre-#164 storage schema while this namespace is deliberately
+# outside every controller watch. This permits realistic persisted legacy objects
+# without allowing the new controller to partially migrate them during setup.
+PRE_164_SHA=fe6cd74815f52155aed51f31b081302e989db0b8
+git fetch --depth=1 origin "$PRE_164_SHA"
+git show "$PRE_164_SHA:config/crd/bases/swe.dev_environments.yaml" | kubectl apply --server-side --force-conflicts -f -
+LEGACY_CRD_ACTIVE="true"
+LEGACY_ACTIVE=legacy-upgrade-active
+LEGACY_HELD=legacy-upgrade-held
+LEGACY_EMPTY=legacy-explicit-empty
+LEGACY_ENV_NAMES="$LEGACY_ACTIVE $LEGACY_HELD $LEGACY_EMPTY"
+LEGACY_DISK_SIZE=$(kubectl -n "$PROJECT_NAMESPACE" get environmenttemplate small -o jsonpath='{.spec.diskSize}')
+cat <<EOF | kubectl -n "$PROJECT_NAMESPACE" create -f - >/dev/null
+apiVersion: swe.dev/v1alpha1
+kind: Environment
+metadata:
+  name: $LEGACY_ACTIVE
+spec:
+  templateRef: small
+  projectRef: $PROJECT_NAME
+---
+apiVersion: swe.dev/v1alpha1
+kind: Environment
+metadata:
+  name: $LEGACY_HELD
+spec:
+  templateRef: small
+  projectRef: $PROJECT_NAME
+  paused: true
+---
+apiVersion: swe.dev/v1alpha1
+kind: Environment
+metadata:
+  name: $LEGACY_EMPTY
+  annotations:
+    swe.dev/e2e-persisted-empty: original
+spec:
+  templateRef: small
+  projectRef: ""
+EOF
+
+for legacy_env in "$LEGACY_ACTIVE" "$LEGACY_HELD"; do
+	legacy_uid=$(kubectl -n "$PROJECT_NAMESPACE" get environment "$legacy_env" -o jsonpath='{.metadata.uid}')
+	cat <<EOF | kubectl -n "$PROJECT_NAMESPACE" create -f - >/dev/null
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: env-$legacy_env
+  ownerReferences:
+  - apiVersion: swe.dev/v1alpha1
+    kind: Environment
+    name: $legacy_env
+    uid: $legacy_uid
+    controller: true
+    blockOwnerDeletion: true
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: $LEGACY_DISK_SIZE
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: env-$legacy_env-sandboxd
+  finalizers: [swe.dev/e2e-observe-deletion]
+  ownerReferences:
+  - apiVersion: swe.dev/v1alpha1
+    kind: Environment
+    name: $legacy_env
+    uid: $legacy_uid
+    controller: true
+    blockOwnerDeletion: true
+stringData:
+  legacy: credential
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: env-$legacy_env-sandboxd
+  ownerReferences:
+  - apiVersion: swe.dev/v1alpha1
+    kind: Environment
+    name: $legacy_env
+    uid: $legacy_uid
+    controller: true
+    blockOwnerDeletion: true
+spec:
+  podSelector:
+    matchLabels:
+      swe.dev/environment: $legacy_env
+  policyTypes: [Ingress]
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: env-$legacy_env
+  labels:
+    swe.dev/environment: $legacy_env
+  ownerReferences:
+  - apiVersion: swe.dev/v1alpha1
+    kind: Environment
+    name: $legacy_env
+    uid: $legacy_uid
+    controller: true
+    blockOwnerDeletion: true
+spec:
+  containers:
+  - name: environment
+    image: $E2E_ENV_IMAGE
+    command: [sh, -c, 'git -C /workspace init -q; git -C /workspace config --local swe.setup-complete true; printf "%s\\n" "$legacy_env" > /workspace/pre-164-marker; exec sleep 3600']
+    resources:
+      requests: {cpu: 100m, memory: 128Mi}
+    volumeMounts:
+    - {name: workspace, mountPath: /workspace}
+  volumes:
+  - name: workspace
+    persistentVolumeClaim: {claimName: env-$legacy_env}
+EOF
+	kubectl -n "$PROJECT_NAMESPACE" annotate environment "$legacy_env" \
+		swe.dev/e2e-legacy-pvc-uid="$(kubectl -n "$PROJECT_NAMESPACE" get pvc "env-$legacy_env" -o jsonpath='{.metadata.uid}')" \
+		swe.dev/e2e-legacy-policy-uid="$(kubectl -n "$PROJECT_NAMESPACE" get networkpolicy "env-$legacy_env-sandboxd" -o jsonpath='{.metadata.uid}')" >/dev/null
+	kubectl -n "$PROJECT_NAMESPACE" wait --for=condition=Ready pod/"env-$legacy_env" --timeout=2m
+	kubectl -n "$PROJECT_NAMESPACE" patch environment "$legacy_env" --subresource=status --type=merge \
+		-p "{\"status\":{\"phase\":\"Ready\",\"executionGeneration\":1,\"podName\":\"env-${legacy_env}\"}}" >/dev/null
+done
+
+kubectl apply --server-side --force-conflicts -f charts/swe-platform/crds
+LEGACY_CRD_ACTIVE="false"
+# Existing explicit-empty values are grandfathered for metadata and status
+# writes, but admission must reject creation of another such object.
+kubectl -n "$PROJECT_NAMESPACE" annotate environment "$LEGACY_EMPTY" swe.dev/e2e-persisted-empty=updated --overwrite >/dev/null
+kubectl -n "$PROJECT_NAMESPACE" patch environment "$LEGACY_EMPTY" --subresource=status --type=merge \
+	-p '{"status":{"phase":"Paused"}}' >/dev/null
+kubectl -n "$PROJECT_NAMESPACE" get environment "$LEGACY_EMPTY" -o json | jq -e \
+	'.spec.projectRef == "" and .metadata.annotations["swe.dev/e2e-persisted-empty"] == "updated" and .status.phase == "Paused"' >/dev/null
+kubectl -n "$PROJECT_NAMESPACE" delete environment "$LEGACY_EMPTY" --wait=true >/dev/null
+LEGACY_ENV_NAMES="$LEGACY_ACTIVE $LEGACY_HELD"
+if cat <<'EOF' | kubectl -n "$PROJECT_NAMESPACE" create -f - >/dev/null 2>&1; then
+apiVersion: swe.dev/v1alpha1
+kind: Environment
+metadata:
+  name: rejected-explicit-empty
+spec:
+  templateRef: small
+  projectRef: ""
+EOF
+	echo "FAIL: current CRD admitted a new Environment with explicit empty projectRef"
+	kubectl -n "$PROJECT_NAMESPACE" delete environment rejected-explicit-empty --wait=false >/dev/null 2>&1 || true
+	exit 1
+fi
+
 echo "==> verifying fail-closed namespace adoption and ownership"
 ADOPT_NAMESPACE=swe-e2e-adopt
 kubectl create namespace "$ADOPT_NAMESPACE"
@@ -798,6 +1004,89 @@ jq -e --arg deadline "$LEGACY_DEADLINE" '
 		(.conditions[] | select(.type=="Ready") | .status=="False" and .reason=="PodRecoveryExhausted"))' <<<"$RECOVERY_FIXTURES" >/dev/null
 kubectl delete environments legacy-recovery-existing legacy-recovery-missing legacy-recovery-exhausted --wait=false >/dev/null
 kubectl delete pod env-legacy-recovery-existing --ignore-not-found --wait=false >/dev/null
+
+echo "==> verifying legacy Environments migrate through teardown, snapshot, and resume"
+for legacy_env in "$LEGACY_ACTIVE" "$LEGACY_HELD"; do
+	for _ in $(seq 1 120); do
+		if ! kubectl get pod "env-$legacy_env" >/dev/null 2>&1; then
+			break
+		fi
+		sleep 1
+	done
+	if kubectl get pod "env-$legacy_env" >/dev/null 2>&1; then
+		echo "FAIL: legacy $legacy_env did not remove its Pod"
+		exit 1
+	fi
+	for _ in $(seq 1 120); do
+		if [[ -n "$(kubectl get secret "env-$legacy_env-sandboxd" -o jsonpath='{.metadata.deletionTimestamp}')" ]]; then
+			break
+		fi
+		sleep 1
+	done
+	if [[ -z "$(kubectl get secret "env-$legacy_env-sandboxd" -o jsonpath='{.metadata.deletionTimestamp}')" ]] || \
+		[[ "$(kubectl get environment "$legacy_env" -o jsonpath='{.status.provisioning}')" != "" ]]; then
+		echo "FAIL: legacy $legacy_env did not fence Pod before requesting credential deletion and snapshot"
+		exit 1
+	fi
+	kubectl patch secret "env-$legacy_env-sandboxd" --type=json \
+		-p '[{"op":"remove","path":"/metadata/finalizers"}]' >/dev/null
+	for _ in $(seq 1 120); do
+		if ! kubectl get secret "env-$legacy_env-sandboxd" >/dev/null 2>&1; then
+			break
+		fi
+		sleep 1
+	done
+	if kubectl get secret "env-$legacy_env-sandboxd" >/dev/null 2>&1; then
+		echo "FAIL: legacy $legacy_env did not revoke credentials"
+		exit 1
+	fi
+	if ! kubectl get pvc "env-$legacy_env" >/dev/null 2>&1; then
+		echo "FAIL: legacy $legacy_env migration removed its workspace PVC"
+		exit 1
+	fi
+	if [[ "$(kubectl get pvc "env-$legacy_env" -o jsonpath='{.metadata.uid}')" != \
+		"$(kubectl get environment "$legacy_env" -o jsonpath='{.metadata.annotations.swe\.dev/e2e-legacy-pvc-uid}')" ]] || \
+		[[ "$(kubectl get networkpolicy "env-$legacy_env-sandboxd" -o jsonpath='{.metadata.uid}')" != \
+		"$(kubectl get environment "$legacy_env" -o jsonpath='{.metadata.annotations.swe\.dev/e2e-legacy-policy-uid}')" ]]; then
+		echo "FAIL: legacy $legacy_env migration replaced its retained PVC or NetworkPolicy"
+		exit 1
+	fi
+	for _ in $(seq 1 120); do
+		if kubectl get environment "$legacy_env" -o json | jq -e \
+			'.status.provisioning.templateVerified == true and .status.provisioning.projectVerified == true' >/dev/null; then
+			break
+		fi
+		sleep 1
+	done
+	legacy_pvc_uid=$(kubectl get environment "$legacy_env" -o jsonpath='{.metadata.annotations.swe\.dev/e2e-legacy-pvc-uid}')
+	kubectl get environment "$legacy_env" -o json | jq -e --arg pvc_uid "$legacy_pvc_uid" \
+		'.status.provisioning.templateVerified == true and .status.provisioning.projectVerified == true and .status.provisioning.legacyWorkspacePVCUID == $pvc_uid' >/dev/null || {
+		echo "FAIL: legacy $legacy_env did not receive a verified provisioning snapshot"
+		kubectl get environment "$legacy_env" -o yaml >&2
+		exit 1
+	}
+done
+kubectl wait --for=jsonpath='{.status.phase}'=Ready environment/"$LEGACY_ACTIVE" --timeout=2m
+kubectl wait --for=condition=Ready pod/"env-$LEGACY_ACTIVE" --timeout=2m
+if [[ "$(kubectl get pod "env-$LEGACY_ACTIVE" -o jsonpath='{.metadata.creationTimestamp}')" == "" ]] || \
+	! kubectl exec "env-$LEGACY_ACTIVE" -- grep -qx "$LEGACY_ACTIVE" /workspace/pre-164-marker; then
+	echo "FAIL: active legacy Environment did not resume on its durable workspace"
+	exit 1
+fi
+if [[ "$(kubectl get environment "$LEGACY_HELD" -o jsonpath='{.status.phase}')" != "Paused" ]] || \
+	kubectl get pod "env-$LEGACY_HELD" >/dev/null 2>&1; then
+	echo "FAIL: held legacy Environment did not remain Paused and podless after migration"
+	exit 1
+fi
+bin/swe --namespace "$PROJECT_NAMESPACE" environment release "$LEGACY_HELD"
+kubectl wait --for=jsonpath='{.status.phase}'=Ready environment/"$LEGACY_HELD" --timeout=2m
+kubectl wait --for=condition=Ready pod/"env-$LEGACY_HELD" --timeout=2m
+if ! kubectl exec "env-$LEGACY_HELD" -- grep -qx "$LEGACY_HELD" /workspace/pre-164-marker; then
+	echo "FAIL: released legacy Environment did not retain its durable workspace marker"
+	exit 1
+fi
+kubectl delete environment "$LEGACY_ACTIVE" "$LEGACY_HELD" --wait=true >/dev/null
+LEGACY_ENV_NAMES=""
 
 echo "==> waiting for local warm environment"
 if ! kubectl wait --for=jsonpath='{.status.warmPoolReady}'=1 environmenttemplate/small --timeout=2m; then
@@ -1901,7 +2190,7 @@ if kubectl patch environment "$SELECTOR_ENV_NAME" --type=json -p '[{"op":"remove
 	echo "FAIL: admission accepted clearing a promoted Environment projectRef"
 	exit 1
 fi
-kubectl patch environment "$SELECTOR_ENV_NAME" --type=merge -p '{"spec":{"services":[{"name":"admission","revision":1,"protocol":"HTTP","targetPort":3000,"visibility":"Project","readiness":"TCPConnect"}]}}' >/dev/null
+kubectl patch environment "$SELECTOR_ENV_NAME" --type=merge -p '{"spec":{"services":[{"name":"admission","instanceID":"admissionabcdefghijkl","revision":1,"protocol":"HTTP","targetPort":3000,"visibility":"Project","readiness":"TCPConnect"}]}}' >/dev/null
 kubectl delete environment "$SELECTOR_ENV_NAME" --wait=false >/dev/null
 SELECTOR_ENV_NAME=""
 
@@ -1945,6 +2234,11 @@ if ! jq -e --argjson snapshot "$PROVISIONING_SNAPSHOT" '
 fi
 if ! kubectl exec "$POD_NAME" -- sh -c 'test "$(wc -l < /workspace/setup-result)" -eq 1'; then
 	echo "FAIL: .agents/setup ran again for an initialized workspace"
+	exit 1
+fi
+if ! kubectl exec "$POD_NAME" -- sh -c \
+	'test "$(wc -l < /workspace/resume-result)" -eq 1 && ! grep -vx credential-absent /workspace/resume-result'; then
+	echo "FAIL: active Pod recreation did not run exactly one credential-free resume hook"
 	exit 1
 fi
 
@@ -2333,7 +2627,7 @@ if [[ -z "$RESUMED_IMAGE_ID" || "$RESUMED_IMAGE_ID" != "$RESUMED_POD_IMAGE_ID" ]
 	exit 1
 fi
 if ! kubectl exec "$POD_NAME" -- sh -c \
-	'test "$(cat /workspace/resume-result)" = credential-absent && test "$(wc -l < /workspace/agent-credential-marker)" -eq 1 && test -z "${ANTHROPIC_API_KEY+x}" && ! tr "\000" "\n" < /proc/1/environ | grep -q "^ANTHROPIC_API_KEY="'; then
+	'test "$(wc -l < /workspace/resume-result)" -eq 2 && ! grep -vx credential-absent /workspace/resume-result && test "$(wc -l < /workspace/agent-credential-marker)" -eq 1 && test -z "${ANTHROPIC_API_KEY+x}" && ! tr "\000" "\n" < /proc/1/environ | grep -q "^ANTHROPIC_API_KEY="'; then
 	echo "FAIL: resume hook or fresh sandboxd received the agent API key before agent launch"
 	exit 1
 fi
