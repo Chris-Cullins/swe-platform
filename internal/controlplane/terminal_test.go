@@ -903,6 +903,38 @@ func TestTerminalHeartbeatRevokesConnectionForReplacementUID(t *testing.T) {
 	}
 }
 
+func TestTerminalHeartbeatRevokesConnectionWhenEnvironmentDeleted(t *testing.T) {
+	metrics := NewMetrics(prometheus.NewRegistry())
+	scheme := runtime.NewScheme()
+	if err := platformv1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	environment := &platformv1alpha1.Environment{ObjectMeta: metav1.ObjectMeta{Name: "env-1", Namespace: "project-1", UID: "env-uid"}, Status: platformv1alpha1.EnvironmentStatus{ExecutionGeneration: 1}}
+	kubeClient := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(environment).WithObjects(environment).Build()
+	dialer := KubernetesTerminalDialer{Client: kubeClient, Metrics: metrics, policyPollInterval: time.Millisecond}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	closed := make(chan struct{})
+	lease := &terminalConnectionLease{}
+	if !lease.attach(closeFunc(func() error { close(closed); return nil }), sandboxclient.TerminalExecution{}, lifecycle.CaptureExecutionFence(environment)) {
+		t.Fatal("failed to attach test terminal connection")
+	}
+	go dialer.heartbeatActivity(ctx, client.ObjectKeyFromObject(environment), lifecycle.CaptureExecutionFence(environment), time.Hour, nil, nil, func() bool { revoked, _ := lease.revoke(); return revoked })
+
+	if err := kubeClient.Delete(context.Background(), environment); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-closed:
+	case <-time.After(time.Second):
+		t.Fatal("deleted Environment did not close the live terminal connection")
+	}
+	waitForTerminalRevocationMetric(t, metrics, "environment_changed", 1)
+	if got := testutil.ToFloat64(metrics.terminalRevocations.WithLabelValues("environment_changed")); got != 1 {
+		t.Fatalf("environment-change revocations = %v, want exactly 1", got)
+	}
+}
+
 func TestTerminalHeartbeatRevokesConnectionWhenBoundExecutionChanges(t *testing.T) {
 	for _, test := range []struct {
 		name   string
@@ -1267,6 +1299,60 @@ func TestRunTerminalHeartbeatClassifiesEnvironmentReplacement(t *testing.T) {
 	if got := testutil.ToFloat64(metrics.terminalRevocations.WithLabelValues("run_association_changed")); got != 0 {
 		t.Fatalf("run-association revocations = %v, want 0", got)
 	}
+}
+
+func TestRunTerminalHeartbeatRevokesConnectionWhenEnvironmentDeleted(t *testing.T) {
+	metrics := NewMetrics(prometheus.NewRegistry())
+	run := &platformv1alpha1.Run{
+		ObjectMeta: metav1.ObjectMeta{Name: "run", Namespace: "ns", UID: "run-uid"},
+		Status:     platformv1alpha1.RunStatus{EnvironmentRef: &platformv1alpha1.RunEnvironmentReference{Name: "env", UID: "env-uid", Ownership: platformv1alpha1.EnvironmentOwnershipClaimed}},
+	}
+	environment := &platformv1alpha1.Environment{
+		ObjectMeta: metav1.ObjectMeta{Name: "env", Namespace: "ns", UID: "env-uid"},
+		Status: platformv1alpha1.EnvironmentStatus{
+			ExecutionGeneration: 1,
+			ClaimedBy:           &platformv1alpha1.RunReference{Name: "run", UID: "run-uid"},
+		},
+	}
+	kubeClient := fake.NewClientBuilder().WithScheme(resourceScheme(t)).WithStatusSubresource(environment, run).WithObjects(run, environment).Build()
+	dialer := KubernetesTerminalDialer{Client: kubeClient, Metrics: metrics, policyPollInterval: time.Millisecond}
+	association := &RunTerminalAssociation{RunName: "run", RunUID: "run-uid", EnvironmentName: "env", EnvironmentUID: "env-uid", EnvironmentOwnership: string(platformv1alpha1.EnvironmentOwnershipClaimed)}
+	lease := &terminalConnectionLease{}
+	closed := make(chan struct{})
+	if !lease.attach(closeFunc(func() error { close(closed); return nil }), sandboxclient.TerminalExecution{}, lifecycle.CaptureExecutionFence(environment)) {
+		t.Fatal("failed to attach test terminal connection")
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go dialer.heartbeatActivity(ctx, client.ObjectKeyFromObject(environment), lifecycle.CaptureExecutionFence(environment), time.Hour, association, nil, func() bool { revoked, _ := lease.revoke(); return revoked })
+
+	if err := kubeClient.Delete(context.Background(), environment); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-closed:
+	case <-time.After(time.Second):
+		t.Fatal("deleted Environment did not close the active Run terminal")
+	}
+	waitForTerminalRevocationMetric(t, metrics, "environment_changed", 1)
+	if got := testutil.ToFloat64(metrics.terminalRevocations.WithLabelValues("environment_changed")); got != 1 {
+		t.Fatalf("environment-change revocations = %v, want exactly 1", got)
+	}
+	if got := testutil.ToFloat64(metrics.terminalRevocations.WithLabelValues("run_association_changed")); got != 0 {
+		t.Fatalf("run-association revocations = %v, want 0", got)
+	}
+}
+
+func waitForTerminalRevocationMetric(t *testing.T, metrics *Metrics, reason string, want float64) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		if got := testutil.ToFloat64(metrics.terminalRevocations.WithLabelValues(reason)); got == want {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("%s terminal revocations did not reach %v", reason, want)
 }
 
 func waitForTerminalActivityRevision(t *testing.T, kubeClient client.Client, environment *platformv1alpha1.Environment, revision int64) {
