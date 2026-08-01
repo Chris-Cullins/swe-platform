@@ -478,15 +478,15 @@ throughput because only the leader reconciles.
 Adapter observation still uses a fixed two-second requeue, so 50 continuously active Runs imply a
 nominal 25 adapter polls per second before event-driven reconciles and retries. ProcessService
 connections are reused by exact Environment UID/execution generation and idle-close after 30
-seconds; deterministic one-minute-equivalent tests reduce process-connector reads from 150 to 37,
-complete adapter-path reads from 390 to 277, and physical connection creations from 30 to 1 per
+seconds; deterministic one-minute-equivalent tests reduce process-connector reads from 150 to 124,
+complete adapter-path reads from 390 to 364, and physical connection creations from 30 to 1 per
 continuously polled Run. Each poll intentionally
-retains uncached pre-call Run association, complete execution-fence lease, and post-call exact
-association/backend currentness reads. Pooling therefore removes TLS-redial and most connector
-resolution amplification but does **not** remove API-server work, guarantee every Run is observed
-exactly every two seconds under queueing, or make the in-process polling design horizontally
-scalable. Capacity above this planning envelope needs measured validation; replacing polling or
-extracting adapters is separate work.
+retains uncached pre-call Run association, complete execution/Template/Pod/credential lease, and
+post-call exact association/backend currentness reads. Pooling therefore removes TLS-redial and
+some connector resolution amplification but does **not** remove API-server work, guarantee every
+Run is observed exactly every two seconds under queueing, or make the in-process polling design
+horizontally scalable. Capacity above this planning envelope needs measured validation;
+replacing polling or extracting adapters is separate work.
 
 ### Provider prerequisites
 

@@ -157,20 +157,21 @@ func TestProcessConnectionPoolOneMinutePollContract(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if dials.Load() != 1 || reader.envs != 31 || reader.templates != 2 || reader.pods != 2 || reader.secrets != 2 || reader.gets != 37 {
-		t.Fatalf("pooled minute: dials=%d reads=%d (Environment=%d Template=%d Pod=%d Secret=%d), want 1 and 37 (31/2/2/2)", dials.Load(), reader.gets, reader.envs, reader.templates, reader.pods, reader.secrets)
+	if dials.Load() != 1 || reader.envs != 31 || reader.templates != 31 || reader.pods != 31 || reader.secrets != 31 || reader.gets != 124 {
+		t.Fatalf("pooled minute: dials=%d reads=%d (Environment=%d Template=%d Pod=%d Secret=%d), want 1 and 124 (31/31/31/31)", dials.Load(), reader.gets, reader.envs, reader.templates, reader.pods, reader.secrets)
 	}
 	// The pre-pool process dial performed five reads per poll (Environment,
 	// Template, Pod, Secret, final Environment): 150 reads and 30 creations.
-	// Pooling removes 29/30 creations and 113/150 process-connector reads (75.3%)
-	// while strengthening the first miss to a complete eight-read post-proof.
+	// Pooling removes 29/30 creations and 26/150 process-connector reads (17.3%)
+	// while retaining a complete four-object proof before every lease and a
+	// complete post-dial proof on the first miss.
 	// The unchanged Run association/receipt/currentness path costs eight reads
-	// per poll, so the complete adapter-call contract moves from 390 to 277 API
-	// reads per minute-equivalent sequence (29.0%) without removing a proof.
+	// per poll, so the complete adapter-call contract moves from 390 to 364 API
+	// reads per minute-equivalent sequence (6.7%) without removing a proof.
 	beforeConnectorReads, beforeDials := polls*5, polls
 	beforeAllReads := polls * (8 + 5)
 	afterAllReads := polls*8 + reader.gets
-	if beforeConnectorReads != 150 || beforeDials != 30 || beforeAllReads != 390 || afterAllReads != 277 {
+	if beforeConnectorReads != 150 || beforeDials != 30 || beforeAllReads != 390 || afterAllReads != 364 {
 		t.Fatalf("minute contract changed: connector=%d dials=%d all-before=%d all-after=%d", beforeConnectorReads, beforeDials, beforeAllReads, afterAllReads)
 	}
 	if err := pool.Close(); err != nil {
@@ -307,6 +308,134 @@ func TestProcessConnectionPoolEndpointChangeEvictsBeforeMissResolution(t *testin
 	}
 	if dials.Load() != 1 || (*connections)[0].closes.Load() != 1 {
 		t.Fatalf("dials=%d closes=%d, want 1/1", dials.Load(), (*connections)[0].closes.Load())
+	}
+}
+
+func TestProcessConnectionPoolCompleteHitProofInvalidatesDrift(t *testing.T) {
+	testCases := []struct {
+		name            string
+		mutate          func(*testing.T, *processPoolCountingReader)
+		wantReplacement bool
+	}{
+		{name: "Template UID", wantReplacement: true, mutate: func(_ *testing.T, reader *processPoolCountingReader) {
+			reader.setMutation(func(object client.Object) {
+				if template, ok := object.(*platformv1alpha1.EnvironmentTemplate); ok {
+					template.UID = "replacement-template"
+				}
+			})
+		}},
+		{name: "Template spec", wantReplacement: true, mutate: func(_ *testing.T, reader *processPoolCountingReader) {
+			reader.setMutation(func(object client.Object) {
+				if template, ok := object.(*platformv1alpha1.EnvironmentTemplate); ok {
+					template.Spec.Image = "replacement.example/environment:v2"
+				}
+			})
+		}},
+		{name: "Template backend", mutate: func(_ *testing.T, reader *processPoolCountingReader) {
+			reader.setMutation(func(object client.Object) {
+				if template, ok := object.(*platformv1alpha1.EnvironmentTemplate); ok {
+					template.Spec.Backend = platformv1alpha1.EnvironmentBackendKubeVirt
+				}
+			})
+		}},
+		{name: "Pod deletion", mutate: func(t *testing.T, reader *processPoolCountingReader) {
+			if err := reader.Reader.(client.Client).Delete(context.Background(), &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "pod", Namespace: "ns"}}); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{name: "Pod UID", mutate: func(_ *testing.T, reader *processPoolCountingReader) {
+			reader.setMutation(func(object client.Object) {
+				if pod, ok := object.(*corev1.Pod); ok {
+					pod.UID = "replacement-pod"
+				}
+			})
+		}},
+		{name: "Pod readiness", mutate: func(_ *testing.T, reader *processPoolCountingReader) {
+			reader.setMutation(func(object client.Object) {
+				if pod, ok := object.(*corev1.Pod); ok {
+					pod.Status.Conditions[0].Status = corev1.ConditionFalse
+				}
+			})
+		}},
+		{name: "Pod execution generation", mutate: func(_ *testing.T, reader *processPoolCountingReader) {
+			reader.setMutation(func(object client.Object) {
+				if pod, ok := object.(*corev1.Pod); ok {
+					pod.Annotations[executionGenerationAnnotation] = "4"
+				}
+			})
+		}},
+		{name: "Secret deletion", mutate: func(t *testing.T, reader *processPoolCountingReader) {
+			if err := reader.Reader.(client.Client).Delete(context.Background(), &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "credential", Namespace: "ns"}}); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{name: "Secret UID", mutate: func(_ *testing.T, reader *processPoolCountingReader) {
+			reader.setMutation(func(object client.Object) {
+				if secret, ok := object.(*corev1.Secret); ok {
+					secret.UID = "replacement-secret"
+				}
+			})
+		}},
+		{name: "Secret resource version", wantReplacement: true, mutate: func(_ *testing.T, reader *processPoolCountingReader) {
+			reader.setMutation(func(object client.Object) {
+				if secret, ok := object.(*corev1.Secret); ok {
+					secret.ResourceVersion = "2"
+				}
+			})
+		}},
+		{name: "Secret process token", wantReplacement: true, mutate: func(_ *testing.T, reader *processPoolCountingReader) {
+			reader.setMutation(func(object client.Object) {
+				if secret, ok := object.(*corev1.Secret); ok {
+					secret.Data[sandboxdauth.ProcessTokenKey] = []byte("replacement-process-token")
+				}
+			})
+		}},
+		{name: "Secret TLS certificate", wantReplacement: true, mutate: func(t *testing.T, reader *processPoolCountingReader) {
+			certificate := processTestCertificate(t, "process.sandboxd.swe.dev")
+			reader.setMutation(func(object client.Object) {
+				if secret, ok := object.(*corev1.Secret); ok {
+					secret.Data[sandboxdauth.TLSCertKey] = certificate
+				}
+			})
+		}},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			env, reader := newProcessPoolFixture(t)
+			pool, dials, connections := newCountingProcessPool(reader)
+			_, release, err := pool.acquire(context.Background(), lifecycle.CaptureExecutionFence(env))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := release(); err != nil {
+				t.Fatal(err)
+			}
+
+			testCase.mutate(t, reader)
+			_, replacementRelease, err := pool.acquire(context.Background(), lifecycle.CaptureExecutionFence(env))
+			if testCase.wantReplacement {
+				if err != nil || replacementRelease == nil {
+					t.Fatalf("replacement acquisition: release nil=%t error=%v", replacementRelease == nil, err)
+				}
+				if err := replacementRelease(); err != nil {
+					t.Fatal(err)
+				}
+			} else if err == nil || replacementRelease != nil {
+				t.Fatalf("invalid current target acquisition: release nil=%t error=%v", replacementRelease == nil, err)
+			}
+
+			wantDials := int32(1)
+			if testCase.wantReplacement {
+				wantDials = 2
+			}
+			if dials.Load() != wantDials || (*connections)[0].closes.Load() != 1 {
+				t.Fatalf("dials=%d old closes=%d, want %d/1", dials.Load(), (*connections)[0].closes.Load(), wantDials)
+			}
+			if err := pool.Close(); err != nil {
+				t.Fatal(err)
+			}
+		})
 	}
 }
 

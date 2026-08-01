@@ -8,10 +8,10 @@ import (
 	"time"
 
 	"google.golang.org/grpc"
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
-	platformv1alpha1 "github.com/Chris-Cullins/swe-platform/api/v1alpha1"
 	"github.com/Chris-Cullins/swe-platform/internal/lifecycle"
 	sandboxdv1 "github.com/Chris-Cullins/swe-platform/sandboxd/gen/proto/sandboxd/v1"
 )
@@ -131,9 +131,9 @@ func (p *ProcessConnectionPool) acquire(ctx context.Context, fence lifecycle.Exe
 			return nil, nil, errProcessConnectionPoolClosed
 		default:
 		}
-		// Mandatory uncached read on every attempted reuse: the full opaque fence,
-		// explicit hold, suspension, readiness, and connector-private endpoint
-		// receipt must still identify a reachable execution.
+		// Mandatory uncached proof on every attempted reuse: the full opaque fence,
+		// Template/backend, exact Pod, and credential Secret must still identify
+		// the same reachable execution and process capability.
 		env, err := fence.Revalidate(ctx, p.reader)
 		if err != nil {
 			p.invalidate(key)
@@ -143,6 +143,11 @@ func (p *ProcessConnectionPool) acquire(ctx context.Context, fence lifecycle.Exe
 			p.invalidate(key)
 			return nil, nil, fmt.Errorf("environment is not the current reachable incarnation")
 		}
+		_, secret, proof, err := (Connector{Reader: p.reader}).resolveProcessTargetForEnvironment(ctx, env)
+		if err != nil {
+			p.invalidate(key)
+			return nil, nil, err
+		}
 
 		p.mu.Lock()
 		if p.closed {
@@ -150,7 +155,7 @@ func (p *ProcessConnectionPool) acquire(ctx context.Context, fence lifecycle.Exe
 			return nil, nil, errProcessConnectionPoolClosed
 		}
 		if entry := p.entries[key]; entry != nil && !entry.evicted {
-			if entry.proof.matchesEnvironment(env) {
+			if entry.proof.matches(proof) {
 				entry.borrowers++
 				entry.idleSince = time.Time{}
 				p.mu.Unlock()
@@ -174,7 +179,7 @@ func (p *ProcessConnectionPool) acquire(ctx context.Context, fence lifecycle.Exe
 		p.pending[key] = pending
 		p.mu.Unlock()
 
-		connection, proof, err := p.open(ctx, fence, env)
+		connection, proof, err := p.open(ctx, fence, secret, proof)
 		p.mu.Lock()
 		delete(p.pending, key)
 		close(pending.ready)
@@ -194,11 +199,7 @@ func (p *ProcessConnectionPool) acquire(ctx context.Context, fence lifecycle.Exe
 	}
 }
 
-func (p *ProcessConnectionPool) open(ctx context.Context, fence lifecycle.ExecutionFence, envHint *platformv1alpha1.Environment) (processConnection, processConnectionProof, error) {
-	_, secret, proof, err := (Connector{Reader: p.reader}).resolveProcessTargetForEnvironment(ctx, envHint)
-	if err != nil {
-		return nil, processConnectionProof{}, err
-	}
+func (p *ProcessConnectionPool) open(ctx context.Context, fence lifecycle.ExecutionFence, secret *corev1.Secret, proof processConnectionProof) (processConnection, processConnectionProof, error) {
 	options, err := processDialOptions(secret, proof.identity)
 	if err != nil {
 		return nil, processConnectionProof{}, err
