@@ -247,6 +247,19 @@ generation; raw Pod identity remains connector-private. Warm pools maintain read
 claiming a generic warm member for a Project recreates its pod so Project initialization runs
 before the Run becomes ready.
 
+For one compatibility rollout, the deprecated flat `podRecoveryAttempts`,
+`podRecoveryExhausted`, `podRecoveryUID`, and `podRecoveryNextAttemptAt` status fields remain
+served. In an early migration phase after deletion handling and before lifecycle or dependency
+gates, meaningful nested `recovery` state is authoritative and stale flat
+state is cleared. Otherwise the controller atomically migrates the legacy budget, exhaustion
+latch, and deadline before enforcing them. It maps identity to the current execution generation
+only when an uncached read proves the exact legacy Pod UID, Environment ownership, canonical
+annotation, and current generation; a missing Pod therefore leaves generation zero. Confirmed
+sandboxd readiness clears both representations atomically. Remove these compatibility fields
+after one rollout has allowed all persisted legacy recovery sequences to settle. Chart installs
+unconditionally use `Recreate` operator upgrades, including leader-elected production presets,
+so flat-only and nested-aware controller versions cannot write status concurrently.
+
 ### Durable desired service declarations
 
 `Environment.spec.services` is a map-list of at most 32 durable desired declarations keyed by

@@ -436,6 +436,43 @@ spec:
     visibility: Project
     readiness: TCPConnect
 EOF
+# Upgrade to the immediate pre-#162 schema and persist representative flat
+# recovery states in the eventual Project namespace. They remain outside
+# operator scope only until that precreated namespace is adopted below.
+PRE_NESTED_RECOVERY_SHA=f0fea8ba44fc002e342bfae316cf1d6a6d15fa6f
+git fetch --depth=1 origin "$PRE_NESTED_RECOVERY_SHA"
+git show "$PRE_NESTED_RECOVERY_SHA:config/crd/bases/swe.dev_environments.yaml" | kubectl apply --server-side --force-conflicts -f -
+kubectl create namespace "$PROJECT_NAMESPACE"
+for name in legacy-recovery-existing legacy-recovery-missing legacy-recovery-exhausted; do
+	kubectl -n "$PROJECT_NAMESPACE" create -f - <<EOF
+apiVersion: swe.dev/v1alpha1
+kind: Environment
+metadata: {name: $name}
+spec: {templateRef: small}
+EOF
+done
+LEGACY_ENV_UID=$(kubectl -n "$PROJECT_NAMESPACE" get environment legacy-recovery-existing -o jsonpath='{.metadata.uid}')
+cat <<'EOF' | kubectl -n "$PROJECT_NAMESPACE" create -f -
+apiVersion: v1
+kind: Pod
+metadata:
+  name: env-legacy-recovery-existing
+  annotations: {swe.dev/execution-generation: "1"}
+spec:
+  restartPolicy: Never
+  containers: [{name: environment, image: busybox, command: [sh, -c, "exit 1"]}]
+EOF
+kubectl -n "$PROJECT_NAMESPACE" wait --for=jsonpath='{.status.phase}'=Failed pod/env-legacy-recovery-existing --timeout=1m
+kubectl -n "$PROJECT_NAMESPACE" patch pod env-legacy-recovery-existing --type=merge -p \
+	"{\"metadata\":{\"ownerReferences\":[{\"apiVersion\":\"swe.dev/v1alpha1\",\"kind\":\"Environment\",\"name\":\"legacy-recovery-existing\",\"uid\":\"$LEGACY_ENV_UID\",\"controller\":true,\"blockOwnerDeletion\":true}]}}"
+LEGACY_POD_UID=$(kubectl -n "$PROJECT_NAMESPACE" get pod env-legacy-recovery-existing -o jsonpath='{.metadata.uid}')
+LEGACY_DEADLINE=2099-01-01T00:00:00Z
+kubectl -n "$PROJECT_NAMESPACE" patch environment legacy-recovery-existing --subresource=status --type=merge -p \
+	"{\"status\":{\"executionGeneration\":1,\"podRecoveryAttempts\":1,\"podRecoveryUID\":\"$LEGACY_POD_UID\",\"podRecoveryNextAttemptAt\":\"$LEGACY_DEADLINE\"}}"
+kubectl -n "$PROJECT_NAMESPACE" patch environment legacy-recovery-missing --subresource=status --type=merge -p \
+	"{\"status\":{\"executionGeneration\":1,\"podRecoveryAttempts\":2,\"podRecoveryUID\":\"missing-pod-uid\",\"podRecoveryNextAttemptAt\":\"$LEGACY_DEADLINE\"}}"
+kubectl -n "$PROJECT_NAMESPACE" patch environment legacy-recovery-exhausted --subresource=status --type=merge -p \
+	'{"status":{"executionGeneration":1,"podRecoveryAttempts":3,"podRecoveryExhausted":true,"podRecoveryUID":"exhausted-pod-uid"}}'
 kubectl apply --server-side --force-conflicts -f charts/swe-platform/crds
 kubectl get crd agentcredentialprofiles.swe.dev >/dev/null
 kubectl get environment legacy-execution-generation-migration -o json | jq -e \
@@ -510,6 +547,10 @@ if ! grep -q 'new services require instanceID; a legacy missing instanceID may b
 	cat /tmp/legacy-service-instance-id-replacement.out
 	exit 1
 fi
+kubectl -n "$PROJECT_NAMESPACE" get environments legacy-recovery-existing legacy-recovery-missing legacy-recovery-exhausted -o json | jq -e --arg uid "$LEGACY_POD_UID" --arg deadline "$LEGACY_DEADLINE" '
+  (.items[] | select(.metadata.name=="legacy-recovery-existing") | .status | .podRecoveryAttempts==1 and .podRecoveryUID==$uid and .podRecoveryNextAttemptAt==$deadline) and
+  (.items[] | select(.metadata.name=="legacy-recovery-missing") | .status | .podRecoveryAttempts==2 and .podRecoveryUID=="missing-pod-uid" and .podRecoveryNextAttemptAt==$deadline) and
+  (.items[] | select(.metadata.name=="legacy-recovery-exhausted") | .status | .podRecoveryAttempts==3 and .podRecoveryExhausted==true)' >/dev/null
 kubectl delete environment legacy-execution-generation-migration --wait=false
 kubectl delete environment legacy-service-instance-id-migration --wait=false
 
@@ -518,6 +559,10 @@ TRUSTED_RENDER=$(helm template swe-platform charts/swe-platform --namespace pres
 grep -q -- '--tenancy-mode=trusted-admin' <<<"$TRUSTED_RENDER"
 grep -q 'SWE_TENANCY_MODE' <<<"$TRUSTED_RENDER"
 grep -q '^kind: ClusterRoleBinding$' <<<"$TRUSTED_RENDER"
+for preset in kind argocd k3s gke eks; do
+	helm template swe-platform charts/swe-platform --namespace preset-check --values "charts/swe-platform/values-$preset.yaml" \
+		| awk '/^kind: Deployment$/{deployment=1; next} deployment && /^  name: swe-platform-swe-platform$/{operator=1} operator && /^    type: Recreate$/{found=1} /^---$/{if (operator) exit !found; deployment=operator=found=0} END{if (operator) exit !found}'
+done
 RBAC_A=$(helm template swe-platform charts/swe-platform --namespace render-system-a --values charts/swe-platform/values-kind.yaml --set tenancy.mode=scoped | awk '/^kind: ClusterRole(Binding)?$/{k=$2} k && /^  name:/{print k "/" $2; k=""}' | sort -u)
 RBAC_B=$(helm template swe-platform charts/swe-platform --namespace render-system-b --values charts/swe-platform/values-kind.yaml --set tenancy.mode=scoped | awk '/^kind: ClusterRole(Binding)?$/{k=$2} k && /^  name:/{print k "/" $2; k=""}' | sort -u)
 if comm -12 <(printf '%s\n' "$RBAC_A") <(printf '%s\n' "$RBAC_B") | grep -q .; then
@@ -592,6 +637,10 @@ if [[ -n "${E2E_RUNTIME_CLASS:-}" ]]; then
 fi
 helm "${HELM_ARGS[@]}"
 
+# Installation must not prune compatibility status before Project adoption.
+kubectl -n "$PROJECT_NAMESPACE" get environments legacy-recovery-existing legacy-recovery-missing legacy-recovery-exhausted -o json | jq -e \
+	'[.items[].status.podRecoveryAttempts] | sort == [1,2,3]' >/dev/null
+
 CATALOG_TEMPLATE=$(kubectl -n "$SYSTEM_NAMESPACE" get environmenttemplates -o json | jq -r '.items[] | select(.metadata.annotations["swe.dev/catalog-name"] == "small") | .metadata.name' | head -1)
 if [[ -z "$CATALOG_TEMPLATE" ]] || kubectl -n "$SYSTEM_NAMESPACE" get environmenttemplate small >/dev/null 2>&1; then
 	echo "FAIL: chart catalog source is absent or a runnable small Template exists in the system namespace"
@@ -613,7 +662,10 @@ if bin/swe --namespace "" project onboard implicit-refusal --system-namespace "$
 	echo "FAIL: project onboarding accepted an implicit/empty CLI namespace"
 	exit 1
 fi
-bin/swe --namespace "$PROJECT_NAMESPACE" "${ONBOARD_ARGS[@]:2}"
+bin/swe --namespace "$PROJECT_NAMESPACE" project onboard "$PROJECT_NAME" --adopt \
+	--system-namespace "$SYSTEM_NAMESPACE" --installation "$INSTALLATION_NAME" \
+	--repository "git://e2e-git-server.$PROJECT_NAMESPACE.svc.cluster.local/e2e.git" \
+	--default-template small --template small "${QUOTA_ARGS[@]}"
 
 INSTALLATION_UID=$(kubectl -n "$SYSTEM_NAMESPACE" get installation "$INSTALLATION_NAME" -o jsonpath='{.metadata.uid}')
 PROJECT_UID=$(kubectl -n "$PROJECT_NAMESPACE" get project "$PROJECT_NAME" -o jsonpath='{.metadata.uid}')
@@ -664,6 +716,38 @@ fi
 kubectl -n "$SYSTEM_NAMESPACE" rollout status deployment/"$INSTALLATION_NAME" --timeout=2m
 kubectl -n "$SYSTEM_NAMESPACE" rollout status deployment/"$INSTALLATION_NAME-control-plane" --timeout=2m
 kubectl config set-context --current --namespace="$PROJECT_NAMESPACE" >/dev/null
+
+echo "==> verifying migration and enforcement of upgraded flat Pod recovery state"
+for _ in $(seq 1 60); do
+	RECOVERY_FIXTURES=$(kubectl get environments legacy-recovery-existing legacy-recovery-missing legacy-recovery-exhausted -o json)
+	if jq -e '
+		(.items[] | select(.metadata.name=="legacy-recovery-existing") | .status.conditions[]? | select(.type=="Ready" and .reason=="PodRecoveryPending")) and
+		(.items[] | select(.metadata.name=="legacy-recovery-missing") | .status.conditions[]? | select(.type=="Ready" and .reason=="PodRecoveryPending")) and
+		(.items[] | select(.metadata.name=="legacy-recovery-exhausted") | .status.conditions[]? | select(.type=="Ready" and .reason=="PodRecoveryExhausted"))' <<<"$RECOVERY_FIXTURES" >/dev/null; then
+		break
+	fi
+	sleep 1
+done
+[[ "$(kubectl get pod env-legacy-recovery-existing -o jsonpath='{.metadata.uid}')" == "$LEGACY_POD_UID" ]]
+if kubectl get pod env-legacy-recovery-missing >/dev/null 2>&1 || kubectl get pod env-legacy-recovery-exhausted >/dev/null 2>&1; then
+	echo "FAIL: controller replaced a Pod blocked by upgraded legacy recovery state" >&2
+	exit 1
+fi
+jq -e --arg deadline "$LEGACY_DEADLINE" '
+	(.items[] | select(.metadata.name=="legacy-recovery-existing") | .status |
+		(.recovery | .attempts==1 and .executionGeneration==1 and .nextAttemptAt==$deadline) and
+		(has("podRecoveryAttempts")|not) and (has("podRecoveryExhausted")|not) and (has("podRecoveryUID")|not) and (has("podRecoveryNextAttemptAt")|not) and
+		(.conditions[] | select(.type=="Ready") | .status=="False" and .reason=="PodRecoveryPending")) and
+	(.items[] | select(.metadata.name=="legacy-recovery-missing") | .status |
+		(.recovery | .attempts==2 and (.executionGeneration // 0)==0 and .nextAttemptAt==$deadline) and
+		(has("podRecoveryAttempts")|not) and (has("podRecoveryExhausted")|not) and (has("podRecoveryUID")|not) and (has("podRecoveryNextAttemptAt")|not) and
+		(.conditions[] | select(.type=="Ready") | .status=="False" and .reason=="PodRecoveryPending")) and
+	(.items[] | select(.metadata.name=="legacy-recovery-exhausted") | .status |
+		(.recovery | .attempts==3 and .exhausted==true and (.executionGeneration // 0)==0) and
+		(has("podRecoveryAttempts")|not) and (has("podRecoveryExhausted")|not) and (has("podRecoveryUID")|not) and (has("podRecoveryNextAttemptAt")|not) and
+		(.conditions[] | select(.type=="Ready") | .status=="False" and .reason=="PodRecoveryExhausted"))' <<<"$RECOVERY_FIXTURES" >/dev/null
+kubectl delete environments legacy-recovery-existing legacy-recovery-missing legacy-recovery-exhausted --wait=false >/dev/null
+kubectl delete pod env-legacy-recovery-existing --ignore-not-found --wait=false >/dev/null
 
 echo "==> waiting for local warm environment"
 if ! kubectl wait --for=jsonpath='{.status.warmPoolReady}'=1 environmenttemplate/small --timeout=2m; then

@@ -499,6 +499,24 @@ type EnvironmentStatus struct {
 	// +optional
 	Recovery EnvironmentRecoveryStatus `json:"recovery,omitempty"`
 
+	// PodRecoveryAttempts is deprecated compatibility state retained for one
+	// rollout. New writers use Recovery.
+	// +optional
+	PodRecoveryAttempts int32 `json:"podRecoveryAttempts,omitempty"`
+
+	// PodRecoveryExhausted is deprecated compatibility state retained for one rollout.
+	// +optional
+	PodRecoveryExhausted bool `json:"podRecoveryExhausted,omitempty"`
+
+	// PodRecoveryUID is deprecated Pod-identity compatibility state. It must not
+	// be interpreted as an execution generation without observing that exact Pod.
+	// +optional
+	PodRecoveryUID types.UID `json:"podRecoveryUID,omitempty"`
+
+	// PodRecoveryNextAttemptAt is deprecated compatibility state retained for one rollout.
+	// +optional
+	PodRecoveryNextAttemptAt *metav1.Time `json:"podRecoveryNextAttemptAt,omitempty"`
+
 	// +optional
 	// +listType=map
 	// +listMapKey=type

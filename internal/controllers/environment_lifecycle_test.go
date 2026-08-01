@@ -74,6 +74,7 @@ func TestSyncStatusPublishesSandboxdEndpoint(t *testing.T) {
 	env := &platformv1alpha1.Environment{ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default", Generation: 4}, Status: platformv1alpha1.EnvironmentStatus{
 		ExecutionGeneration: 1,
 		Recovery:            platformv1alpha1.EnvironmentRecoveryStatus{Attempts: 2, Exhausted: true, ExecutionGeneration: 1, NextAttemptAt: &nextRecovery},
+		PodRecoveryAttempts: 3, PodRecoveryExhausted: true, PodRecoveryUID: "legacy-pod", PodRecoveryNextAttemptAt: &nextRecovery,
 	}}
 	reconciler := &EnvironmentReconciler{
 		Client: fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(env).WithObjects(env).Build(),
@@ -107,6 +108,9 @@ func TestSyncStatusPublishesSandboxdEndpoint(t *testing.T) {
 	}
 	if updated.Status.Recovery.Attempts != 0 || updated.Status.Recovery.Exhausted || updated.Status.Recovery.ExecutionGeneration != 0 || updated.Status.Recovery.NextAttemptAt != nil {
 		t.Fatalf("recovery budget was not reset after health-aware readiness: %#v", updated.Status)
+	}
+	if legacyRecoveryMeaningful(&updated.Status) {
+		t.Fatalf("legacy recovery budget was not reset after health-aware readiness: %#v", updated.Status)
 	}
 }
 

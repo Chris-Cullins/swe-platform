@@ -1084,14 +1084,17 @@ func TestReconcileHonorsRecoveryWhenTerminalPodIsMissing(t *testing.T) {
 		name                string
 		exhausted           bool
 		due                 bool
+		legacy              bool
 		conditionGeneration int64
 		wantDelay           time.Duration
 		wantReason          string
 	}{
 		{name: "pending backoff", wantDelay: 10 * time.Second, wantReason: "PodRecoveryPending"},
+		{name: "legacy pending backoff", legacy: true, wantDelay: 10 * time.Second, wantReason: "PodRecoveryPending"},
 		{name: "pending backoff survives generation change", conditionGeneration: 2, wantDelay: 10 * time.Second, wantReason: "PodRecoveryPending"},
 		{name: "due attempt is counted before creation", due: true, wantReason: "PodRecovering"},
 		{name: "exhaustion remains latched", exhausted: true, wantReason: "PodRecoveryExhausted"},
+		{name: "legacy exhaustion remains latched", legacy: true, exhausted: true, wantReason: "PodRecoveryExhausted"},
 		{name: "exhaustion survives generation change", exhausted: true, conditionGeneration: 2, wantReason: "PodRecoveryExhausted"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -1131,7 +1134,15 @@ func TestReconcileHonorsRecoveryWhenTerminalPodIsMissing(t *testing.T) {
 						ObservedGeneration: conditionGeneration, Reason: reason, Message: "recovering"}},
 				},
 			}
-			if !test.exhausted {
+			if test.legacy {
+				env.Status.Recovery = platformv1alpha1.EnvironmentRecoveryStatus{}
+				env.Status.PodRecoveryAttempts = attempts
+				env.Status.PodRecoveryExhausted = test.exhausted
+				env.Status.PodRecoveryUID = "missing-pod-uid"
+				if !test.exhausted {
+					env.Status.PodRecoveryNextAttemptAt = &next
+				}
+			} else if !test.exhausted {
 				env.Status.Recovery.NextAttemptAt = &next
 			}
 			template := &platformv1alpha1.EnvironmentTemplate{ObjectMeta: metav1.ObjectMeta{Name: "small", Namespace: env.Namespace}}
@@ -1146,6 +1157,19 @@ func TestReconcileHonorsRecoveryWhenTerminalPodIsMissing(t *testing.T) {
 			}
 
 			result, err := reconciler.Reconcile(context.Background(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(env)})
+			if test.legacy {
+				if err != nil || !result.Requeue || result.RequeueAfter != 0 {
+					t.Fatalf("legacy migration Reconcile() = (%#v, %v), want immediate requeue", result, err)
+				}
+				var migrated platformv1alpha1.Environment
+				if err := reconciler.Get(context.Background(), client.ObjectKeyFromObject(env), &migrated); err != nil {
+					t.Fatal(err)
+				}
+				if legacyRecoveryMeaningful(&migrated.Status) || migrated.Status.Recovery.Attempts != attempts || migrated.Status.Recovery.Exhausted != test.exhausted || migrated.Status.Recovery.ExecutionGeneration != 0 {
+					t.Fatalf("legacy recovery was not migrated before enforcement: %#v", migrated.Status)
+				}
+				result, err = reconciler.Reconcile(context.Background(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(env)})
+			}
 			if err != nil || result.RequeueAfter != test.wantDelay || (test.due && !result.Requeue) {
 				t.Fatalf("Reconcile() = (%#v, %v), want delay %s", result, err, test.wantDelay)
 			}
@@ -1199,6 +1223,141 @@ func TestTerminalPodRecoveryUsesPersistedExponentialBackoff(t *testing.T) {
 	}
 	if err := reconciler.Get(context.Background(), client.ObjectKeyFromObject(pod), &corev1.Pod{}); err != nil {
 		t.Fatalf("Pod deleted before persisted deadline: %v", err)
+	}
+}
+
+func TestLegacyTerminalPodRecoveryPreservesFutureDeadline(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	if err := platformv1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 7, 19, 12, 0, 0, 0, time.UTC)
+	next := metav1.NewTime(now.Add(time.Minute))
+	env := &platformv1alpha1.Environment{ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default", UID: "env-uid"}, Status: platformv1alpha1.EnvironmentStatus{
+		ExecutionGeneration: 1, PodRecoveryAttempts: 2, PodRecoveryUID: "dead-pod", PodRecoveryNextAttemptAt: &next,
+	}}
+	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "env-test", Namespace: "default", UID: "dead-pod", Annotations: map[string]string{executionGenerationAnnotation: "1"}}, Status: corev1.PodStatus{Phase: corev1.PodFailed}}
+	reconciler := &EnvironmentReconciler{Client: fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(env).WithObjects(env, pod).Build(), Scheme: scheme, Now: func() time.Time { return now }}
+	result, handled, err := reconciler.reconcilePodRecoveryMigration(context.Background(), env)
+	if err != nil || !handled || !result.Requeue || result.RequeueAfter != 0 {
+		t.Fatalf("legacy pending migration = (%#v, %t, %v), want immediate requeue", result, handled, err)
+	}
+	var retained platformv1alpha1.Environment
+	if err := reconciler.Get(context.Background(), client.ObjectKeyFromObject(env), &retained); err != nil {
+		t.Fatal(err)
+	}
+	if legacyRecoveryMeaningful(&retained.Status) || retained.Status.Recovery.Attempts != 2 || retained.Status.Recovery.ExecutionGeneration != 0 || retained.Status.Recovery.NextAttemptAt == nil || !retained.Status.Recovery.NextAttemptAt.Equal(&next) {
+		t.Fatalf("legacy pending gate did not migrate unowned Pod state safely: %#v", retained.Status)
+	}
+	result, handled, err = reconciler.reconcilePendingPodRecovery(context.Background(), &retained)
+	if err != nil || !handled || result.RequeueAfter != time.Minute {
+		t.Fatalf("nested pending gate = (%#v, %t, %v), want one minute", result, handled, err)
+	}
+	var retainedPod corev1.Pod
+	if err := reconciler.Get(context.Background(), client.ObjectKeyFromObject(pod), &retainedPod); err != nil || retainedPod.UID != pod.UID {
+		t.Fatalf("legacy pending gate replaced terminal Pod: uid=%q, error=%v", retainedPod.UID, err)
+	}
+}
+
+func TestLegacyTerminalPodRecoveryMigratesMatchingLivePod(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	if err := platformv1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 7, 19, 12, 0, 0, 0, time.UTC)
+	next := metav1.NewTime(now.Add(time.Minute))
+	env := &platformv1alpha1.Environment{ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default", UID: "env-uid"}, Status: platformv1alpha1.EnvironmentStatus{
+		ExecutionGeneration: 1, PodRecoveryAttempts: 2, PodRecoveryUID: "dead-pod", PodRecoveryNextAttemptAt: &next,
+	}}
+	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "env-test", Namespace: "default", UID: "dead-pod", Annotations: map[string]string{executionGenerationAnnotation: "1"}}, Status: corev1.PodStatus{Phase: corev1.PodFailed}}
+	reconciler := &EnvironmentReconciler{Client: fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(env).WithObjects(env, pod).Build(), Scheme: scheme, Now: func() time.Time { return now }}
+
+	if err := controllerutil.SetControllerReference(env, pod, scheme); err != nil {
+		t.Fatal(err)
+	}
+	// Persist the ownership added after the fake client was built.
+	if err := reconciler.Update(context.Background(), pod); err != nil {
+		t.Fatal(err)
+	}
+	result, handled, err := reconciler.reconcilePodRecoveryMigration(context.Background(), env)
+	if err != nil || !handled || !result.Requeue {
+		t.Fatalf("legacy migration = (%#v, %v), want immediate requeue", result, err)
+	}
+	var migrated platformv1alpha1.Environment
+	if err := reconciler.Get(context.Background(), client.ObjectKeyFromObject(env), &migrated); err != nil {
+		t.Fatal(err)
+	}
+	if migrated.Status.Recovery.Attempts != 2 || migrated.Status.Recovery.ExecutionGeneration != 1 || migrated.Status.Recovery.NextAttemptAt == nil || !migrated.Status.Recovery.NextAttemptAt.Equal(&next) || legacyRecoveryMeaningful(&migrated.Status) {
+		t.Fatalf("legacy recovery was not migrated losslessly: %#v", migrated.Status)
+	}
+	result, err = reconciler.reconcileTerminalPod(context.Background(), &migrated, pod)
+	if err != nil || result.RequeueAfter != time.Minute {
+		t.Fatalf("migrated deadline = (%#v, %v), want one minute", result, err)
+	}
+	var retained corev1.Pod
+	if err := reconciler.Get(context.Background(), client.ObjectKeyFromObject(pod), &retained); err != nil || retained.UID != pod.UID {
+		t.Fatalf("legacy terminal Pod was replaced: uid=%q, error=%v", retained.UID, err)
+	}
+}
+
+func TestLegacyTerminalPodRecoveryUsesUncachedPodProof(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	if err := platformv1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	next := metav1.NewTime(time.Date(2026, 8, 2, 12, 1, 0, 0, time.UTC))
+	env := &platformv1alpha1.Environment{ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default", UID: "env-uid"}, Status: platformv1alpha1.EnvironmentStatus{
+		ExecutionGeneration: 1, PodRecoveryAttempts: 2, PodRecoveryUID: "deleted-pod", PodRecoveryNextAttemptAt: &next,
+	}}
+	stalePod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
+		Name: envPodName(env), Namespace: env.Namespace, UID: "deleted-pod",
+		Annotations: map[string]string{executionGenerationAnnotation: "1"},
+	}}
+	if err := controllerutil.SetControllerReference(env, stalePod, scheme); err != nil {
+		t.Fatal(err)
+	}
+	cached := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(env).WithObjects(env, stalePod).Build()
+	live := interceptor.NewClient(cached, interceptor.Funcs{Get: func(ctx context.Context, underlying client.WithWatch, key client.ObjectKey, object client.Object, options ...client.GetOption) error {
+		if _, ok := object.(*corev1.Pod); ok && key == client.ObjectKeyFromObject(stalePod) {
+			return apierrors.NewNotFound(schema.GroupResource{Resource: "pods"}, key.Name)
+		}
+		return underlying.Get(ctx, key, object, options...)
+	}})
+	reconciler := &EnvironmentReconciler{Client: cached, APIReader: live, Scheme: scheme}
+
+	result, handled, err := reconciler.reconcilePodRecoveryMigration(context.Background(), env)
+	if err != nil || !handled || !result.Requeue {
+		t.Fatalf("legacy migration = (%#v, %t, %v), want immediate requeue", result, handled, err)
+	}
+	var migrated platformv1alpha1.Environment
+	if err := cached.Get(context.Background(), client.ObjectKeyFromObject(env), &migrated); err != nil {
+		t.Fatal(err)
+	}
+	if legacyRecoveryMeaningful(&migrated.Status) || migrated.Status.Recovery.Attempts != 2 || migrated.Status.Recovery.ExecutionGeneration != 0 || migrated.Status.Recovery.NextAttemptAt == nil || !migrated.Status.Recovery.NextAttemptAt.Equal(&next) {
+		t.Fatalf("stale cached Pod was trusted as live migration proof: %#v", migrated.Status)
+	}
+}
+
+func TestEffectivePodRecoveryCoexistence(t *testing.T) {
+	next := metav1.NewTime(time.Now().Add(time.Minute))
+	legacy := platformv1alpha1.EnvironmentStatus{PodRecoveryAttempts: 2, PodRecoveryExhausted: true, PodRecoveryUID: "legacy", PodRecoveryNextAttemptAt: &next}
+	got, isLegacy := effectivePodRecovery(&legacy)
+	if !isLegacy || got.Attempts != 2 || !got.Exhausted || got.NextAttemptAt != &next || got.ExecutionGeneration != 0 {
+		t.Fatalf("legacy effective recovery = %#v, legacy=%t", got, isLegacy)
+	}
+	legacy.Recovery = platformv1alpha1.EnvironmentRecoveryStatus{ExecutionGeneration: 9}
+	got, isLegacy = effectivePodRecovery(&legacy)
+	if isLegacy || got.ExecutionGeneration != 9 || got.Attempts != 0 || got.Exhausted {
+		t.Fatalf("nested recovery did not take precedence = %#v, legacy=%t", got, isLegacy)
 	}
 }
 

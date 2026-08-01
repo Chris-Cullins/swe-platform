@@ -75,6 +75,7 @@ func phaseHandled(result ctrl.Result, err error) environmentPhaseOutcome {
 var environmentReconcilePhases = []environmentReconcilePhase{
 	{name: "tenancy-fencing", run: reconcileEnvironmentTenancyFencing},
 	{name: "deletion", run: reconcileEnvironmentDeletionGate},
+	{name: "recovery-migration", run: reconcileEnvironmentRecoveryMigrationGate},
 	{name: "lifecycle", run: reconcileEnvironmentLifecycleGate},
 	{name: "provisioning-fence", run: reconcileEnvironmentProvisioningFenceGate},
 	{name: "project-resolution", run: reconcileEnvironmentProjectResolutionGate},
@@ -131,6 +132,13 @@ func reconcileEnvironmentDeletionGate(r *EnvironmentReconciler, ctx context.Cont
 			return phaseHandled(ctrl.Result{}, err)
 		}
 		return phaseHandled(ctrl.Result{Requeue: true}, nil)
+	}
+	return phaseContinue()
+}
+
+func reconcileEnvironmentRecoveryMigrationGate(r *EnvironmentReconciler, ctx context.Context, state *environmentReconcileState) environmentPhaseOutcome {
+	if result, handled, err := r.reconcilePodRecoveryMigration(ctx, &state.env); handled || err != nil {
+		return phaseHandled(result, err)
 	}
 	return phaseContinue()
 }

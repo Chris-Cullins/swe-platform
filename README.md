@@ -505,6 +505,16 @@ the current-generation `Ready` condition only after initialization completes and
 startup/readiness probes pass; `status.phase` is a display summary rather than the scheduling
 contract. GitHub App token minting is not implemented yet.
 
+Upgrade compatibility: the deprecated flat `status.podRecovery*` fields remain in the CRD for
+one rollout. An early phase after deletion handling and before lifecycle or dependency gates
+first migrates pending deadlines, attempt budgets, and exhaustion
+to nested state, or preserves authoritative nested state while clearing stale flat fields. It
+sets the nested execution generation only when an uncached read proves the exact legacy Pod UID,
+Environment ownership, canonical annotation, and current generation. The chart unconditionally
+uses `Recreate` operator upgrades during this transition. Readiness clears both forms. These flat
+fields are scheduled for removal after that compatibility rollout; clients must use
+`status.recovery` now.
+
 Transient operational reconciliation errors withdraw readiness with an `OperationalError`
 reason and use controller-runtime's rate-limited retry; they do not put the Environment in the
 terminal `Failed` phase. Missing or blank references, invalid specifications, and deterministic

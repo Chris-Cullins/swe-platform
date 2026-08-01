@@ -1108,7 +1108,11 @@ func samePodRecoveryState(left, right *platformv1alpha1.EnvironmentStatus) bool 
 		left.Recovery.Attempts == right.Recovery.Attempts &&
 		left.Recovery.Exhausted == right.Recovery.Exhausted &&
 		left.Recovery.ExecutionGeneration == right.Recovery.ExecutionGeneration &&
-		apiequality.Semantic.DeepEqual(left.Recovery.NextAttemptAt, right.Recovery.NextAttemptAt)
+		apiequality.Semantic.DeepEqual(left.Recovery.NextAttemptAt, right.Recovery.NextAttemptAt) &&
+		left.PodRecoveryAttempts == right.PodRecoveryAttempts &&
+		left.PodRecoveryExhausted == right.PodRecoveryExhausted &&
+		left.PodRecoveryUID == right.PodRecoveryUID &&
+		apiequality.Semantic.DeepEqual(left.PodRecoveryNextAttemptAt, right.PodRecoveryNextAttemptAt)
 }
 
 func applyEnvironmentStatus(env *platformv1alpha1.Environment, phase platformv1alpha1.EnvironmentPhase, podName, sandboxdEndpoint, reason, message string, lastActiveAt *metav1.Time) {

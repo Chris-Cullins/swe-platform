@@ -7,6 +7,10 @@ metadata:
     {{- include "swe-platform.labels" . | nindent 4 }}
 spec:
   replicas: {{ .Values.replicaCount }}
+  # Prevent old flat-status and new nested-status controller versions from
+  # writing Environment recovery state concurrently during this transition.
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       app.kubernetes.io/name: {{ include "swe-platform.name" . }}

@@ -284,21 +284,48 @@ func TestOperatorMetricsCountRecoveryTransitionsOnce(t *testing.T) {
 	due := metav1.NewTime(now.Add(-time.Second))
 	pending := &platformv1alpha1.Environment{ObjectMeta: metav1.ObjectMeta{Name: "pending", Namespace: "ns", UID: "pending-uid"}, Status: platformv1alpha1.EnvironmentStatus{ExecutionGeneration: 1, Recovery: platformv1alpha1.EnvironmentRecoveryStatus{ExecutionGeneration: 1, NextAttemptAt: &due}}}
 	exhausted := &platformv1alpha1.Environment{ObjectMeta: metav1.ObjectMeta{Name: "exhausted", Namespace: "ns", UID: "exhausted-uid"}, Status: platformv1alpha1.EnvironmentStatus{ExecutionGeneration: 2, Recovery: platformv1alpha1.EnvironmentRecoveryStatus{Attempts: podRecoveryLimit, ExecutionGeneration: 1}}}
+	// Flat fields deliberately coexist with authoritative nested state. Neither
+	// coexistence nor lossless migration is a recovery transition.
+	pending.Status.PodRecoveryAttempts = podRecoveryLimit
+	pending.Status.PodRecoveryExhausted = true
+	exhausted.Status.PodRecoveryAttempts = 1
 	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "env-exhausted", Namespace: "ns", UID: "terminal", Annotations: map[string]string{executionGenerationAnnotation: "2"}}, Status: corev1.PodStatus{Phase: corev1.PodFailed}}
+	future := metav1.NewTime(now.Add(time.Minute))
+	migrating := &platformv1alpha1.Environment{ObjectMeta: metav1.ObjectMeta{Name: "migrating", Namespace: "ns", UID: "migrating-uid"}, Status: platformv1alpha1.EnvironmentStatus{ExecutionGeneration: 1, PodRecoveryAttempts: 2, PodRecoveryUID: "legacy-terminal", PodRecoveryNextAttemptAt: &future}}
+	migratingPod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "env-migrating", Namespace: "ns", UID: "legacy-terminal", Annotations: map[string]string{executionGenerationAnnotation: "1"}}, Status: corev1.PodStatus{Phase: corev1.PodFailed}}
 	metrics, _ := testOperatorMetrics(t)
 	r := &EnvironmentReconciler{
-		Client: fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(pending, exhausted).WithObjects(pending, exhausted).Build(),
+		Client: fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(pending, exhausted, migrating).WithObjects(pending, exhausted, migrating, migratingPod).Build(),
 		Now:    func() time.Time { return now }, Metrics: metrics,
 	}
 	var currentPending platformv1alpha1.Environment
 	if err := r.Get(context.Background(), client.ObjectKeyFromObject(pending), &currentPending); err != nil {
 		t.Fatal(err)
 	}
+	if _, handled, err := r.reconcilePodRecoveryMigration(context.Background(), &currentPending); err != nil || !handled {
+		t.Fatalf("stale flat cleanup = handled %t, error %v", handled, err)
+	}
+	if err := r.Get(context.Background(), client.ObjectKeyFromObject(pending), &currentPending); err != nil {
+		t.Fatal(err)
+	}
 	if _, handled, err := r.reconcilePendingPodRecovery(context.Background(), &currentPending); err != nil || !handled {
 		t.Fatalf("recovery attempt = handled %t, error %v", handled, err)
 	}
-	if _, err := r.reconcileTerminalPod(context.Background(), exhausted, pod); err != nil {
+	var currentExhausted platformv1alpha1.Environment
+	if err := r.Get(context.Background(), client.ObjectKeyFromObject(exhausted), &currentExhausted); err != nil {
 		t.Fatal(err)
+	}
+	if _, handled, err := r.reconcilePodRecoveryMigration(context.Background(), &currentExhausted); err != nil || !handled {
+		t.Fatalf("exhausted stale flat cleanup = handled %t, error %v", handled, err)
+	}
+	if err := r.Get(context.Background(), client.ObjectKeyFromObject(exhausted), &currentExhausted); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.reconcileTerminalPod(context.Background(), &currentExhausted, pod); err != nil {
+		t.Fatal(err)
+	}
+	if result, handled, err := r.reconcilePodRecoveryMigration(context.Background(), migrating); err != nil || !handled || !result.Requeue {
+		t.Fatalf("legacy migration = (%#v, %v)", result, err)
 	}
 	var current platformv1alpha1.Environment
 	if err := r.Get(context.Background(), client.ObjectKeyFromObject(exhausted), &current); err != nil {
@@ -312,6 +339,57 @@ func TestOperatorMetricsCountRecoveryTransitionsOnce(t *testing.T) {
 	}
 	if got := testutil.ToFloat64(metrics.podRecoveryTransitions.WithLabelValues("exhausted")); got != 1 {
 		t.Fatalf("recovery exhaustion = %v, want 1", got)
+	}
+}
+
+func TestReconcileMigratesHeldRecoveryBeforeSuspensionAndMissingTemplateGates(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	if err := platformv1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	env := &platformv1alpha1.Environment{
+		ObjectMeta: metav1.ObjectMeta{Name: "held", Namespace: "ns", UID: "held-uid", Finalizers: []string{environmentFinalizer}},
+		Spec: platformv1alpha1.EnvironmentSpec{
+			TemplateRef: "missing",
+			Lifecycle:   platformv1alpha1.EnvironmentLifecycleSpec{Hold: &platformv1alpha1.EnvironmentHoldPolicy{Enabled: true, Revision: 1}},
+		},
+		Status: platformv1alpha1.EnvironmentStatus{
+			Phase:                platformv1alpha1.EnvironmentPhaseReady,
+			PodRecoveryAttempts:  podRecoveryLimit,
+			PodRecoveryExhausted: true,
+			PodRecoveryUID:       "missing-terminal-pod",
+			Lifecycle: platformv1alpha1.EnvironmentLifecycleStatus{
+				Suspended: true, SuspensionReason: platformv1alpha1.EnvironmentSuspensionReasonHold, ObservedHoldPolicyRevision: 1,
+			},
+		},
+	}
+	metrics, _ := testOperatorMetrics(t)
+	r := &EnvironmentReconciler{
+		Client:  fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(env).WithObjects(env).Build(),
+		Scheme:  scheme,
+		Metrics: metrics,
+	}
+	result, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(env)})
+	if err != nil || !result.Requeue || result.RequeueAfter != 0 {
+		t.Fatalf("held recovery migration Reconcile() = (%#v, %v), want immediate requeue", result, err)
+	}
+	var migrated platformv1alpha1.Environment
+	if err := r.Get(context.Background(), client.ObjectKeyFromObject(env), &migrated); err != nil {
+		t.Fatal(err)
+	}
+	if legacyRecoveryMeaningful(&migrated.Status) || migrated.Status.Recovery.Attempts != podRecoveryLimit || !migrated.Status.Recovery.Exhausted || migrated.Status.Recovery.ExecutionGeneration != 0 {
+		t.Fatalf("held recovery migration = %#v", migrated.Status)
+	}
+	if migrated.Status.Phase != platformv1alpha1.EnvironmentPhaseReady {
+		t.Fatalf("suspension handling ran before migration requeue: phase = %q", migrated.Status.Phase)
+	}
+	for _, transition := range []string{"attempt", "exhausted"} {
+		if got := testutil.ToFloat64(metrics.podRecoveryTransitions.WithLabelValues(transition)); got != 0 {
+			t.Fatalf("migration emitted %s metric = %v", transition, got)
+		}
 	}
 }
 

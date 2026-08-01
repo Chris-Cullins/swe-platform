@@ -8,11 +8,11 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
-func TestEnvironmentRecoveryStatusJSONContractIsNestedAndBackendNeutral(t *testing.T) {
+func TestEnvironmentRecoveryStatusJSONContractRetainsLegacyCompatibility(t *testing.T) {
 	nextAttemptAt := metav1.NewTime(time.Date(2026, 7, 27, 12, 0, 0, 0, time.UTC))
 	status := EnvironmentStatus{Recovery: EnvironmentRecoveryStatus{
 		Attempts: 2, Exhausted: true, ExecutionGeneration: 7, NextAttemptAt: &nextAttemptAt,
-	}}
+	}, PodRecoveryAttempts: 1, PodRecoveryExhausted: true, PodRecoveryUID: "pod-uid", PodRecoveryNextAttemptAt: &nextAttemptAt}
 
 	encoded, err := json.Marshal(status)
 	if err != nil {
@@ -22,14 +22,11 @@ func TestEnvironmentRecoveryStatusJSONContractIsNestedAndBackendNeutral(t *testi
 	if err := json.Unmarshal(encoded, &object); err != nil {
 		t.Fatal(err)
 	}
-	for _, oldField := range []string{
-		"pod" + "RecoveryAttempts",
-		"pod" + "RecoveryExhausted",
-		"pod" + "RecoveryUID",
-		"pod" + "RecoveryNextAttemptAt",
+	for _, field := range []string{
+		"podRecoveryAttempts", "podRecoveryExhausted", "podRecoveryUID", "podRecoveryNextAttemptAt",
 	} {
-		if _, exists := object[oldField]; exists {
-			t.Fatalf("legacy field %q remains in Environment status JSON: %s", oldField, encoded)
+		if _, exists := object[field]; !exists {
+			t.Fatalf("compatibility field %q is absent from Environment status JSON: %s", field, encoded)
 		}
 	}
 	var recovery map[string]json.RawMessage
@@ -45,5 +42,13 @@ func TestEnvironmentRecoveryStatusJSONContractIsNestedAndBackendNeutral(t *testi
 		if field == "podUID" || field == "podName" || field == "uid" {
 			t.Fatalf("backend-private identity field %q is exposed in recovery JSON: %s", field, encoded)
 		}
+	}
+
+	var decoded EnvironmentStatus
+	if err := json.Unmarshal([]byte(`{"podRecoveryAttempts":2,"podRecoveryExhausted":true,"podRecoveryUID":"legacy-pod","podRecoveryNextAttemptAt":"2026-07-27T12:00:00Z"}`), &decoded); err != nil {
+		t.Fatalf("decode legacy compatibility status: %v", err)
+	}
+	if decoded.PodRecoveryAttempts != 2 || !decoded.PodRecoveryExhausted || decoded.PodRecoveryUID != "legacy-pod" || decoded.PodRecoveryNextAttemptAt == nil || !decoded.PodRecoveryNextAttemptAt.Equal(&nextAttemptAt) {
+		t.Fatalf("decoded legacy compatibility status = %#v", decoded)
 	}
 }

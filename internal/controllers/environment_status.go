@@ -40,10 +40,11 @@ func (r *EnvironmentReconciler) syncStatus(ctx context.Context, env *platformv1a
 		applyEnvironmentStatus(current, phase, pod.Name, sandboxdEndpoint, reason, message, env.Status.LastActiveAt)
 		current.Status.ImageID = environmentImageID(pod)
 		if phase == platformv1alpha1.EnvironmentPhaseReady {
-			current.Status.Recovery.Attempts = 0
-			current.Status.Recovery.Exhausted = false
-			current.Status.Recovery.ExecutionGeneration = 0
-			current.Status.Recovery.NextAttemptAt = nil
+			current.Status.Recovery = platformv1alpha1.EnvironmentRecoveryStatus{}
+			current.Status.PodRecoveryAttempts = 0
+			current.Status.PodRecoveryExhausted = false
+			current.Status.PodRecoveryUID = ""
+			current.Status.PodRecoveryNextAttemptAt = nil
 		}
 		clearChildOwnershipCollision(current)
 	})
