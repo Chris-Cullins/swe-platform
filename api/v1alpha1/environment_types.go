@@ -252,6 +252,7 @@ const EnvironmentServiceReadinessTCPConnect EnvironmentServiceReadiness = "TCPCo
 // an address. Duplicate TargetPorts are allowed as explicit aliases.
 //
 // +kubebuilder:validation:XValidation:rule="self == oldSelf || self.revision > oldSelf.revision",message="revision must increase when an existing service declaration changes"
+// +kubebuilder:validation:XValidation:rule="!oldSelf.hasValue() ? has(self.instanceID) : (has(oldSelf.value().instanceID) ? (has(self.instanceID) && self.instanceID == oldSelf.value().instanceID) : (self == oldSelf.value() || (has(self.instanceID) && self.revision > oldSelf.value().revision)))",message="new services require instanceID; a legacy missing instanceID may be added only with a higher revision and is then immutable",optionalOldSelf=true
 type EnvironmentServiceDeclaration struct {
 	// Name is the stable service name within this Environment.
 	// +kubebuilder:validation:MinLength=1
@@ -313,7 +314,6 @@ type EnvironmentSpec struct {
 	// +listType=map
 	// +listMapKey=name
 	// +kubebuilder:validation:MaxItems=32
-	// +kubebuilder:validation:XValidation:rule="!oldSelf.hasValue() ? self.all(s, has(s.instanceID)) : self.all(s, !oldSelf.value().exists(o, o.name == s.name) ? has(s.instanceID) : oldSelf.value().exists(o, o.name == s.name && (has(o.instanceID) ? (has(s.instanceID) && o.instanceID == s.instanceID) : (s == o || (has(s.instanceID) && s.revision > o.revision)))))",message="new services require instanceID; a legacy missing instanceID may be added only with a higher revision and is then immutable",optionalOldSelf=true
 	Services []EnvironmentServiceDeclaration `json:"services,omitempty"`
 
 	// Paused is a deprecated compatibility input. The lifecycle controller

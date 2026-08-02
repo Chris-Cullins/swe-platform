@@ -20,6 +20,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/util/retry"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
@@ -653,12 +654,15 @@ func TestPortalWebSocketSurvivesLeaseRevalidationThenClosesOnRouteRevocation(t *
 		t.Fatalf("post-poll echo = kind %d payload %q err %v", kind, payload, err)
 	}
 
-	var environment platformv1alpha1.Environment
-	if err := fixture.resolver.Get(context.Background(), types.NamespacedName{Namespace: "ns", Name: "env"}, &environment); err != nil {
-		t.Fatal(err)
-	}
-	environment.Status.PortalRoutes[0].Active = false
-	if err := fixture.resolver.Status().Update(context.Background(), &environment); err != nil {
+	key := types.NamespacedName{Namespace: "ns", Name: "env"}
+	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		var environment platformv1alpha1.Environment
+		if err := fixture.resolver.Get(context.Background(), key, &environment); err != nil {
+			return err
+		}
+		environment.Status.PortalRoutes[0].Active = false
+		return fixture.resolver.Status().Update(context.Background(), &environment)
+	}); err != nil {
 		t.Fatal(err)
 	}
 	_ = connection.SetReadDeadline(time.Now().Add(time.Second))
