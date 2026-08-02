@@ -6,6 +6,14 @@ image:
   tag: ""
   pullPolicy: IfNotPresent
 
+operator:
+  metrics:
+    # Exposed on the internal operator metrics Service.
+    port: 8080
+  health:
+    # Used only for the operator pod's health and readiness probes.
+    port: 8081
+
 controlPlane:
   enabled: true
   replicaCount: 1
@@ -68,8 +76,6 @@ serviceAccount:
   name: ""
 
 leaderElection: true
-metricsBindAddress: ":8080"
-healthProbeBindAddress: ":8081"
 
 # Tenancy mode is intentionally required. Scoped mode watches only the exact
 # claimed Project namespaces listed here. Adding or removing a namespace is a

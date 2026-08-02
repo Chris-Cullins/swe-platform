@@ -18,6 +18,14 @@
 {{- else if .Values.controlPlane.sessions.keyringSecret.name -}}
   {{- fail "controlPlane.sessions.backend=memory must not set controlPlane.sessions.keyringSecret.name" -}}
 {{- end -}}
+{{- $operatorMetricsPort := int .Values.operator.metrics.port -}}
+{{- $operatorHealthPort := int .Values.operator.health.port -}}
+{{- if or (lt $operatorMetricsPort 1) (gt $operatorMetricsPort 65535) -}}
+{{- fail "operator.metrics.port must be from 1 through 65535" -}}
+{{- end -}}
+{{- if or (lt $operatorHealthPort 1) (gt $operatorHealthPort 65535) (eq $operatorMetricsPort $operatorHealthPort) -}}
+{{- fail "operator.health.port must be from 1 through 65535 and must differ from operator.metrics.port" -}}
+{{- end -}}
 {{- $metricsPort := int .Values.controlPlane.metrics.port -}}
 {{- if or (lt $metricsPort 1) (gt $metricsPort 65535) (eq $metricsPort 80) (eq $metricsPort 8080) -}}
 {{- fail "controlPlane.metrics.port must be from 1 through 65535 and must not be 80 or 8080" -}}

@@ -37,6 +37,10 @@ CLI / TUI / local MCP / browser console
   reconcile Environment pods and volumes, maintain warm pools, reap idle Environments, and
   drive adapter lifecycle. Platform services and the Installation identity live in a system
   namespace; each onboarded Project and its resources live in one dedicated claimed namespace.
+  The chart exposes controller-runtime's existing operator `/metrics` endpoint through an
+  internal Service. Platform-specific collectors use only fixed allocation, fence-component,
+  call-site, registered-adapter, operation, outcome, recovery, transition, and lifecycle-reason
+  labels; they never label tenant or resource identity.
 - **Control plane.** A singleton HTTP service exposes typed Run and Environment operations,
   Run watches, transcript ingestion/SSE, browser sessions, the embedded operations console,
   and terminal WebSockets. A separate internal HTTP listener exposes bounded-cardinality

@@ -82,6 +82,48 @@ or live events with low lag, terminal grants, and allowed authentication reviews
 Histogram families add the standard `_bucket`, `_sum`, and `_count` series. Prometheus Go and
 process collectors are also exposed for runtime and process health.
 
+## Operator metrics
+
+The internal `<release>-swe-platform-operator-metrics` Service exposes controller-runtime's
+existing operator metrics endpoint on port `metrics` (`operator.metrics.port`, 8080 by
+default). Scrape `/metrics` on that port.
+The chart does not install a ServiceMonitor or make this Service externally reachable; apply
+cluster-local scrape discovery and NetworkPolicy appropriate to your Prometheus installation.
+The same endpoint retains controller-runtime's standard Go, process, workqueue, and controller
+metrics alongside these bounded-cardinality platform collectors:
+
+| Metric | Labels |
+|---|---|
+| `swe_operator_run_allocation_duration_seconds` | `path`: `owned_create`, `warm_claim` |
+| `swe_operator_warm_pool_allocations_total` | `outcome`: `hit`, `miss` |
+| `swe_operator_execution_fence_rejections_total` | `component`: `environment_uid`, `execution_generation`, `lifecycle_epoch`, `hold_revision`; `call_site`: `ensure_accepted`, `observe`, `run_cancel`, `terminal_cleanup`, `finalizer_cleanup` |
+| `swe_operator_adapter_operations_total` | `adapter`: registered adapter (`amp`, `claude-code`, `codex`, `pi`); `operation`: `ensure_accepted`, `observe`, `cancel`; `outcome`: `success`, `pending`, `rejected`, `error` |
+| `swe_operator_adapter_operation_duration_seconds` | same `adapter`, `operation`, and `outcome` values |
+| `swe_operator_pod_recovery_transitions_total` | `transition`: `attempt`, `exhausted` |
+| `swe_operator_environment_lifecycle_transitions_total` | `transition`: `suspend`, `resume`; `reason`: `Hold`, `Idle`, `Requested` |
+
+Allocation duration starts at the durable Run creation timestamp and ends only when the Run
+controller successfully publishes `EnvironmentAllocated`. Automatic owned creation is a warm
+pool miss; a successful warm claim is a hit. A recovered allocation is not observed again,
+which prevents reconcile/restart duplicates but can omit a process-local sample after an
+uncertain prior status response. The current durable contract has no stable warm-claim
+timestamp that survives the later readiness transition, so this release deliberately does not
+publish claim-to-ready latency rather than approximating it or adding status solely for metrics.
+
+Healthy operation normally shows allocation observations paired with warm hit/miss traffic,
+successful adapter operations, and occasional balanced suspend/resume transitions. Investigate:
+
+- sustained adapter `error` or acceptance `rejected` growth, or elevated adapter duration;
+- execution-fence rejection spikes, especially repeated rejection at one closed call site;
+- repeated recovery `attempt` growth or any `exhausted` transition; and
+- sustained aggregate suspension growth without corresponding aggregate resumes; use the
+  fixed reason labels diagnostically because a suspended Environment can change reasons.
+
+`pending` cancellation is an expected retryable adapter state, not a failure by itself. Fence
+components name tuple members only, never their values. No custom label contains credentials,
+sessions, cookies, users, namespaces, repositories, URLs, errors, Runs, Environments, Pods, or
+other resource identity.
+
 The operator reconciles each `Run` as the single task intent and allocates or claims its
 `Environment`; clients must not create the two resources independently. Its RBAC permits
 Run status/finalizer updates and Environment allocation/claim updates. Process execution
