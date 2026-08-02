@@ -247,6 +247,9 @@ func convergeRepositoryDeclarations(env *platformv1alpha1.Environment, desired [
 			occupied[*d.Port] = true
 		}
 	}
+	if len(api)+len(desired) > platformv1alpha1.EnvironmentServiceMaxDeclarations {
+		return nil, "", fmt.Errorf("%d API-owned and %d repository service declarations exceed the Environment limit of %d", len(api), len(desired), platformv1alpha1.EnvironmentServiceMaxDeclarations)
+	}
 	result := make([]platformv1alpha1.EnvironmentServiceDeclaration, 0, len(api)+len(desired))
 	for _, d := range api {
 		result = append(result, d)

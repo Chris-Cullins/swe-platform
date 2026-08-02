@@ -3,8 +3,10 @@ package controllers
 import (
 	"context"
 	"errors"
+	"fmt"
 	"math"
 	"reflect"
+	"strings"
 	"testing"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -13,6 +15,7 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	platformv1alpha1 "github.com/Chris-Cullins/swe-platform/api/v1alpha1"
 	"github.com/Chris-Cullins/swe-platform/internal/controlplaneclient"
@@ -73,7 +76,7 @@ func declaredEnvironment() *platformv1alpha1.Environment {
 	return &platformv1alpha1.Environment{ObjectMeta: metav1.ObjectMeta{Name: "env", Namespace: "ns", UID: types.UID("env-uid"), Generation: 4}, Spec: platformv1alpha1.EnvironmentSpec{TemplateRef: "default"}, Status: platformv1alpha1.EnvironmentStatus{Phase: platformv1alpha1.EnvironmentPhaseReady, ObservedGeneration: 4, ExecutionGeneration: 2, Lifecycle: platformv1alpha1.EnvironmentLifecycleStatus{Epoch: 3}, Conditions: []metav1.Condition{{Type: platformv1alpha1.EnvironmentConditionReady, Status: metav1.ConditionTrue, ObservedGeneration: 4}}}}
 }
 
-func declaredClient(t *testing.T, env *platformv1alpha1.Environment) client.Client {
+func declaredClient(t *testing.T, env *platformv1alpha1.Environment) client.WithWatch {
 	t.Helper()
 	scheme := runtime.NewScheme()
 	if err := platformv1alpha1.AddToScheme(scheme); err != nil {
@@ -201,6 +204,38 @@ func TestDeclaredServiceReconcilerMissingMalformedAndCollision(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestDeclaredServiceReconcilerCombinedCapacityDoesNotPatchOrReconcile(t *testing.T) {
+	env := declaredEnvironment()
+	api := platformv1alpha1.EnvironmentServiceDeclaration{Name: "api", Source: platformv1alpha1.EnvironmentServiceSourceAPI, InstanceID: "api-instance-abcdefghijkl", Revision: 1, TargetPort: 9000}
+	env.Spec.Services = []platformv1alpha1.EnvironmentServiceDeclaration{api}
+	base := declaredClient(t, env)
+	patches := 0
+	c := interceptor.NewClient(base, interceptor.Funcs{Patch: func(ctx context.Context, underlying client.WithWatch, object client.Object, patch client.Patch, options ...client.PatchOption) error {
+		patches++
+		return underlying.Patch(ctx, object, patch, options...)
+	}})
+	var file strings.Builder
+	file.WriteString("version: 1\nservices:\n")
+	for i := 0; i < platformv1alpha1.EnvironmentServiceMaxDeclarations; i++ {
+		fmt.Fprintf(&file, "  repo-%02d: {command: [serve]}\n", i)
+	}
+	connector := &declaredConnectorFake{file: sandboxclient.WorkspaceServicesFile{Data: []byte(file.String())}}
+	routes := &declaredRoutesFake{}
+	for range 2 {
+		result := runDeclared(t, c, connector, routes)
+		if result.RequeueAfter != declaredServiceInterval {
+			t.Fatalf("overflow requeue = %s, want %s", result.RequeueAfter, declaredServiceInterval)
+		}
+	}
+	var current platformv1alpha1.Environment
+	if err := c.Get(context.Background(), client.ObjectKeyFromObject(env), &current); err != nil {
+		t.Fatal(err)
+	}
+	if patches != 0 || len(connector.reconciles) != 0 || routes.calls != 0 || !reflect.DeepEqual(current.Spec.Services, []platformv1alpha1.EnvironmentServiceDeclaration{api}) {
+		t.Fatalf("overflow mutated intent: patches=%d reconciles=%d routes=%d services=%#v", patches, len(connector.reconciles), routes.calls, current.Spec.Services)
 	}
 }
 
@@ -380,6 +415,23 @@ func TestConvergeRepositoryDeclarationsPreservesAPIAndRejectsCollisions(t *testi
 	result, collision, _ := convergeRepositoryDeclarations(env, []serviceconfig.Declaration{{Name: "repo", Argv: []string{"x"}, Port: &p}})
 	if collision != "" || len(result) != 2 || !reflect.DeepEqual(result[0], api) {
 		t.Fatalf("API preservation result=%#v collision=%q", result, collision)
+	}
+}
+
+func TestConvergeRepositoryDeclarationsEnforcesCombinedCapacity(t *testing.T) {
+	api := platformv1alpha1.EnvironmentServiceDeclaration{Name: "api", InstanceID: "abcdefghijklmnopqrst", Revision: 1, Source: platformv1alpha1.EnvironmentServiceSourceAPI, TargetPort: 8000}
+	env := &platformv1alpha1.Environment{ObjectMeta: metav1.ObjectMeta{UID: "uid"}, Spec: platformv1alpha1.EnvironmentSpec{Services: []platformv1alpha1.EnvironmentServiceDeclaration{api}}}
+	desired := make([]serviceconfig.Declaration, platformv1alpha1.EnvironmentServiceMaxDeclarations)
+	for i := range desired {
+		desired[i] = serviceconfig.Declaration{Name: fmt.Sprintf("repo-%02d", i), Argv: []string{"serve"}}
+	}
+	boundary, collision, err := convergeRepositoryDeclarations(env, desired[:platformv1alpha1.EnvironmentServiceMaxDeclarations-1])
+	if err != nil || collision != "" || len(boundary) != platformv1alpha1.EnvironmentServiceMaxDeclarations {
+		t.Fatalf("combined boundary result=%d collision=%q err=%v", len(boundary), collision, err)
+	}
+	result, collision, err := convergeRepositoryDeclarations(env, desired)
+	if err == nil || collision != "" || result != nil || !strings.Contains(err.Error(), "exceed the Environment limit of 32") {
+		t.Fatalf("combined overflow result=%#v collision=%q err=%v", result, collision, err)
 	}
 }
 
