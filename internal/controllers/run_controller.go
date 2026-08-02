@@ -139,6 +139,7 @@ type RunReconciler struct {
 	Scope     *tenancy.ReconcileScope
 	Adapters  map[string]AdapterLifecycle
 	EventSink AdapterEventSink
+	Connector sandboxclient.Connector
 }
 
 // +kubebuilder:rbac:groups=swe.dev,resources=runs,verbs=get;list;watch;update;patch
@@ -1192,6 +1193,10 @@ func (r *RunReconciler) adapterSandbox(run *platformv1alpha1.Run, env *platformv
 	sandbox := AdapterSandbox{EnvironmentName: env.Name, EnvironmentUID: env.UID,
 		DialProcess: func(ctx context.Context) (sandboxdv1.ProcessServiceClient, func() error, error) {
 			reader := r.apiReader()
+			// Mandatory uncached pre-call association proof: a still-current
+			// execution must not accept work after this Run lost its exact owned or
+			// claimed allocation. The connector separately revalidates its opaque
+			// complete fence before leasing a pooled physical connection.
 			current, err := getAllocatedEnvironment(ctx, reader, run)
 			if err != nil {
 				return nil, nil, err
@@ -1199,7 +1204,7 @@ func (r *RunReconciler) adapterSandbox(run *platformv1alpha1.Run, env *platformv
 			if err := fence.Validate(current); err != nil {
 				return nil, nil, err
 			}
-			return (sandboxclient.Connector{Reader: reader}).DialProcess(ctx, fence)
+			return r.connector().DialProcess(ctx, fence)
 		}}
 	if r.EventSink != nil {
 		runUID := string(run.UID)
@@ -1212,6 +1217,9 @@ func (r *RunReconciler) adapterSandbox(run *platformv1alpha1.Run, env *platformv
 
 func (r *RunReconciler) resolveAllocatedExecution(ctx context.Context, run *platformv1alpha1.Run, expected *platformv1alpha1.Environment) (sandboxclient.Execution, bool, error) {
 	fence := lifecycle.CaptureExecutionFence(expected)
+	// Mandatory uncached pre-call association proof. ResolveExecution then
+	// proves the connector-private exact Pod execution used for the later
+	// post-adapter currentness comparison.
 	current, err := getAllocatedEnvironment(ctx, r.apiReader(), run)
 	if apierrors.IsNotFound(err) || errors.Is(err, errAllocatedEnvironmentGone) {
 		return sandboxclient.Execution{}, false, nil
@@ -1222,7 +1230,7 @@ func (r *RunReconciler) resolveAllocatedExecution(ctx context.Context, run *plat
 	if err := fence.Validate(current); err != nil || !environmentReachable(current) {
 		return sandboxclient.Execution{}, false, nil
 	}
-	execution, err := (sandboxclient.Connector{Reader: r.apiReader()}).ResolveExecution(ctx, fence)
+	execution, err := r.connector().ResolveExecution(ctx, fence)
 	if err != nil {
 		return sandboxclient.Execution{}, false, err
 	}
@@ -1231,6 +1239,9 @@ func (r *RunReconciler) resolveAllocatedExecution(ctx context.Context, run *plat
 
 func (r *RunReconciler) allocatedExecutionCurrent(ctx context.Context, run *platformv1alpha1.Run, expected *platformv1alpha1.Environment, execution sandboxclient.Execution) (bool, error) {
 	fence := lifecycle.CaptureExecutionFence(expected)
+	// Mandatory uncached post-call association proof: adapter results cannot be
+	// published after allocation moved, even when the old execution still
+	// answers. ExecutionCurrent adds the exact live backend proof.
 	current, err := getAllocatedEnvironment(ctx, r.apiReader(), run)
 	if apierrors.IsNotFound(err) || errors.Is(err, errAllocatedEnvironmentGone) {
 		return false, nil
@@ -1241,11 +1252,18 @@ func (r *RunReconciler) allocatedExecutionCurrent(ctx context.Context, run *plat
 	if err := fence.Validate(current); err != nil || !environmentReachable(current) {
 		return false, nil
 	}
-	currentExecution, err := (sandboxclient.Connector{Reader: r.apiReader()}).ExecutionCurrent(ctx, fence, execution)
+	currentExecution, err := r.connector().ExecutionCurrent(ctx, fence, execution)
 	if errors.Is(err, lifecycle.ErrExecutionFenceChanged) {
 		return false, nil
 	}
 	return currentExecution, err
+}
+
+func (r *RunReconciler) connector() sandboxclient.Connector {
+	if r.Connector.Reader != nil {
+		return r.Connector
+	}
+	return sandboxclient.Connector{Reader: r.apiReader()}
 }
 
 // SetupWithManager registers Run watches. Owned Environments enqueue through

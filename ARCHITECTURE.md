@@ -279,7 +279,31 @@ The registered `claude-code` (default), `amp`, `codex`, and `pi` adapters each r
 CLI through sandboxd's keyed managed-process service. Starts are duplicate-safe within one
 sandboxd daemon epoch, and bounded output includes absolute offsets and observable gaps.
 Adapters map their own completion protocol to normalized Run state. Process exit alone is not
-a universal platform completion rule.
+a universal platform completion rule. The operator owns one concurrency-safe ProcessService
+connection pool and injects its connector into Run and service-observation controllers. The pool
+keys physical gRPC/TLS connections by exact `(Environment UID, execution generation)`, retains
+only the process capability, and treats adapter close callbacks as leases. Before every reuse it
+uncached-revalidates the complete execution fence, exact Template/backend, owned Pod
+UID/endpoint, and credential Secret UID/resourceVersion, TLS identity, and process token;
+pause, deletion, hold or lifecycle drift, generation changes, credential drift, and unreachable
+or replaced backends evict the entry. A miss reuses that pre-resolved target and post-resolves the
+same complete proof after dialing without exposing those details. Idle entries close after 30
+seconds, active borrowers delay invalidation close until release, and manager shutdown closes all
+entries.
+Interactive terminal connections and the separately capability-scoped service-observation RPC
+are not pooled.
+
+Uncached reads around an adapter call remain deliberate: the Run controller proves the exact
+Run/Environment association before the call, the pool proves the complete fence before every
+lease, and the controller repeats exact association plus backend-execution currentness after the
+call. Cached reads are not accepted for these authorization/currentness boundaries. In the stable
+one-minute-equivalent contract (30 polls at the fixed two-second cadence), reuse reduces physical
+connection creations from 30 to 1 and process-connector Kubernetes reads from 150 to 124. Across
+the complete adapter call path, including unchanged mandatory association and execution-receipt
+proofs, the recorded read contract moves from 390 to 364 reads (6.7% fewer): the
+first complete miss costs two reads each of Environment, Template, Pod, and Secret, while every
+hit costs one read of each object to preserve complete backend and credential currentness. This
+is deterministic contract evidence, not an end-to-end API-server load benchmark.
 
 Transcript transport is fenced by namespace name, immutable Namespace UID, Run name, and
 immutable Run UID. It supplies

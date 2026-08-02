@@ -513,6 +513,27 @@ and networking requirements that a BYOC operator needs beyond the [install](#ins
 [#79](https://github.com/Chris-Cullins/swe-platform/issues/79); the hosted offering alpha is
 out of scope here and requires separate maintainer product input.
 
+### Active Run capacity
+
+Use **50 concurrently active, non-terminal Runs per elected operator leader** as the conservative
+planning envelope for this release, not as an admission limit or a demonstrated maximum. Validate
+larger installations against their Kubernetes API-server latency, sandboxd RPC duration, and
+transcript backend before raising that envelope. Standby operator replicas do not add Run
+throughput because only the leader reconciles.
+
+Adapter observation still uses a fixed two-second requeue, so 50 continuously active Runs imply a
+nominal 25 adapter polls per second before event-driven reconciles and retries. ProcessService
+connections are reused by exact Environment UID/execution generation and idle-close after 30
+seconds; deterministic one-minute-equivalent tests reduce process-connector reads from 150 to 124,
+complete adapter-path reads from 390 to 364, and physical connection creations from 30 to 1 per
+continuously polled Run. Each poll intentionally
+retains uncached pre-call Run association, complete execution/Template/Pod/credential lease, and
+post-call exact association/backend currentness reads. Pooling therefore removes TLS-redial and
+some connector resolution amplification but does **not** remove API-server work, guarantee every
+Run is observed exactly every two seconds under queueing, or make the in-process polling design
+horizontally scalable. Capacity above this planning envelope needs measured validation;
+replacing polling or extracting adapters is separate work.
+
 ### Provider prerequisites
 
 Each production preset assumes out-of-band `swe-platform-postgres` and
