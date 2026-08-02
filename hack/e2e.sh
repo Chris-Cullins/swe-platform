@@ -208,6 +208,11 @@ manage_observation_listener() {
 		fi
 		sleep 1
 	done
+	if ! grep -q 'Forwarding from' /tmp/swe-platform-observation-port-forward.log; then
+		cat /tmp/swe-platform-observation-port-forward.log >&2
+		echo "FAIL: sandboxd observation port-forward did not become ready" >&2
+		return 1
+	fi
 	if [[ "$action" == "service-start" ]]; then
 		go run ./hack/e2e-process-check "$action" 127.0.0.1:15052 "$identity" /tmp/swe-platform-observation-cert-"$$" /tmp/swe-platform-observation-process-token-"$$" "$owner" "$role" "$port"
 	else
@@ -409,11 +414,104 @@ spec:
 EOF
 kubectl patch environment legacy-execution-generation-migration --subresource=status --type=merge -p \
 	'{"status":{"lifecycle":{"activityReceipts":[{"source":"Terminal","requestID":"legacy-terminal-activity"}]}}}'
+
+# Exercise the exact pre-portal service schema with a declaration persisted
+# before instanceID existed. The upgraded schema must leave it writable and
+# permit only a revision-advancing missing-to-valid migration.
+PRE_SERVICE_INSTANCE_ID_SHA=5654ba351a6a80c71d9bdcfa3f123fe39c060bea
+git fetch --depth=1 origin "$PRE_SERVICE_INSTANCE_ID_SHA"
+git show "$PRE_SERVICE_INSTANCE_ID_SHA:config/crd/bases/swe.dev_environments.yaml" | kubectl apply --server-side --force-conflicts -f -
+cat <<'EOF' | kubectl create -f -
+apiVersion: swe.dev/v1alpha1
+kind: Environment
+metadata:
+  name: legacy-service-instance-id-migration
+spec:
+  templateRef: small
+  services:
+  - name: web
+    revision: 1
+    protocol: HTTP
+    targetPort: 3000
+    visibility: Project
+    readiness: TCPConnect
+EOF
 kubectl apply --server-side --force-conflicts -f charts/swe-platform/crds
 kubectl get crd agentcredentialprofiles.swe.dev >/dev/null
 kubectl get environment legacy-execution-generation-migration -o json | jq -e \
 	'.spec.lifecycle.activity[0].executionGeneration == null and .status.lifecycle.activityReceipts[0].executionGeneration == null' >/dev/null
+kubectl patch environment legacy-service-instance-id-migration --subresource=status --type=merge -p '{"status":{"phase":"Creating"}}'
+kubectl patch environment legacy-service-instance-id-migration --type=json -p \
+	'[{"op":"add","path":"/spec/projectRef","value":"legacy-migration"}]'
+kubectl get environment legacy-service-instance-id-migration -o json | jq -e \
+	'.status.phase == "Creating" and .spec.projectRef == "legacy-migration" and .spec.services[0].targetPort == 3000 and .spec.services[0].revision == 1 and .spec.services[0].instanceID == null' >/dev/null
+if kubectl create -f - >/tmp/new-service-missing-instance-id.out 2>&1 <<'EOF'; then
+apiVersion: swe.dev/v1alpha1
+kind: Environment
+metadata:
+  name: new-service-missing-instance-id
+spec:
+  templateRef: small
+  services:
+  - name: web
+    revision: 1
+    protocol: HTTP
+    targetPort: 3000
+    visibility: Project
+    readiness: TCPConnect
+EOF
+	echo "FAIL: upgraded admission accepted a new service without instanceID"
+	exit 1
+fi
+if ! grep -q 'new services require instanceID; a legacy missing instanceID may be added only with a higher revision and is then immutable' /tmp/new-service-missing-instance-id.out; then
+	echo "FAIL: new missing instanceID was not rejected by the intended migration rule"
+	cat /tmp/new-service-missing-instance-id.out
+	exit 1
+fi
+if kubectl patch environment legacy-service-instance-id-migration --type=json -p \
+	'[{"op":"add","path":"/spec/services/-","value":{"name":"admin","revision":1,"protocol":"HTTP","targetPort":3001,"visibility":"Project","readiness":"TCPConnect"}}]' \
+	>/tmp/legacy-service-new-name-missing-instance-id.out 2>&1; then
+	echo "FAIL: upgraded admission accepted a new service name without instanceID"
+	exit 1
+fi
+if ! grep -q 'new services require instanceID; a legacy missing instanceID may be added only with a higher revision and is then immutable' /tmp/legacy-service-new-name-missing-instance-id.out; then
+	echo "FAIL: update-side new name was not rejected by the intended migration rule"
+	cat /tmp/legacy-service-new-name-missing-instance-id.out
+	exit 1
+fi
+if kubectl patch environment legacy-service-instance-id-migration --type=json -p \
+	'[{"op":"add","path":"/spec/services/0/instanceID","value":"aaaaaaaaaaaaaaaaaaaa"}]' \
+	>/tmp/legacy-service-instance-id-without-revision.out 2>&1; then
+	echo "FAIL: upgraded admission accepted legacy instanceID backfill without a higher revision"
+	exit 1
+fi
+if ! grep -q 'new services require instanceID; a legacy missing instanceID may be added only with a higher revision and is then immutable' /tmp/legacy-service-instance-id-without-revision.out; then
+	echo "FAIL: unrevisioned legacy backfill was not rejected by the intended migration rule"
+	cat /tmp/legacy-service-instance-id-without-revision.out
+	exit 1
+fi
+kubectl get environment legacy-service-instance-id-migration -o json | jq -e \
+	'.spec.services | length == 1 and .[0].revision == 1 and .[0].instanceID == null' >/dev/null
+bin/swe --namespace default environment services update legacy-service-instance-id-migration web --target-port 3000
+LEGACY_SERVICE_INSTANCE_ID=$(kubectl get environment legacy-service-instance-id-migration -o jsonpath='{.spec.services[0].instanceID}')
+if [[ ! "$LEGACY_SERVICE_INSTANCE_ID" =~ ^[a-z0-9]{20,63}$ ]] ||
+	[[ "$(kubectl get environment legacy-service-instance-id-migration -o jsonpath='{.spec.services[0].revision}')" != "2" ]]; then
+	echo "FAIL: CLI did not backfill the legacy service instanceID at a higher revision"
+	exit 1
+fi
+if kubectl patch environment legacy-service-instance-id-migration --type=json -p \
+	'[{"op":"replace","path":"/spec/services/0/instanceID","value":"aaaaaaaaaaaaaaaaaaaa"},{"op":"replace","path":"/spec/services/0/revision","value":3}]' \
+	>/tmp/legacy-service-instance-id-replacement.out 2>&1; then
+	echo "FAIL: admission accepted replacement of a migrated service instanceID"
+	exit 1
+fi
+if ! grep -q 'new services require instanceID; a legacy missing instanceID may be added only with a higher revision and is then immutable' /tmp/legacy-service-instance-id-replacement.out; then
+	echo "FAIL: migrated instanceID replacement was not rejected by the intended immutability rule"
+	cat /tmp/legacy-service-instance-id-replacement.out
+	exit 1
+fi
 kubectl delete environment legacy-execution-generation-migration --wait=false
+kubectl delete environment legacy-service-instance-id-migration --wait=false
 
 echo "==> verifying trusted-admin preset and release-scoped cluster RBAC names"
 TRUSTED_RENDER=$(helm template swe-platform charts/swe-platform --namespace preset-check --values charts/swe-platform/values-kind.yaml)
@@ -481,6 +579,8 @@ HELM_ARGS=(
 	--namespace "$SYSTEM_NAMESPACE" --values charts/swe-platform/values-kind.yaml
 	--set tenancy.mode=scoped --set-json 'tenancy.namespaces=[]'
 	--set controlPlane.auth.bootstrapTokenSecret.name=swe-platform-bootstrap
+	--set controlPlane.portal.enabled=true --set-string controlPlane.portal.suffix=portal.test
+	--set controlPlane.portal.scheme=http
 	--set controlPlane.sessions.backend=postgres
 	--set controlPlane.sessions.keyringSecret.name=swe-platform-session-keyring
 	--set controlPlane.transcripts.postgresSecret.name=swe-platform-postgres
@@ -973,6 +1073,18 @@ rules:
     verbs: ["get"]
   - apiGroups: ["swe.dev"]
     resources: ["environments/terminal"]
+    verbs: ["get"]
+  - apiGroups: ["swe.dev"]
+    resources: ["environments/portal"]
+    resourceNames: ["${ENV_NAME}"]
+    verbs: ["get"]
+  - apiGroups: ["swe.dev"]
+    resources: ["environmentservices/portal"]
+    resourceNames: ["${ENV_NAME}.web"]
+    verbs: ["get"]
+  - apiGroups: ["swe.dev"]
+    resources: ["projects"]
+    resourceNames: ["${PROJECT_NAME}"]
     verbs: ["get"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
@@ -1662,8 +1774,15 @@ if bin/swe --namespace "$PROJECT_NAMESPACE" environment services declare "$ENV_N
 	echo "FAIL: service declaration accepted sandboxd control port 50051"
 	exit 1
 fi
-if kubectl patch environment "$ENV_NAME" --type=merge -p '{"spec":{"services":[{"name":"web","revision":2,"protocol":"HTTP","targetPort":3002,"visibility":"Project","readiness":"TCPConnect"},{"name":"web-alias","revision":1,"protocol":"HTTP","targetPort":3000,"visibility":"Project","readiness":"TCPConnect"}]}}' >/dev/null 2>&1; then
+INVALID_SERVICE_REVISION_PATCH=$(kubectl get environment "$ENV_NAME" -o json | jq -c \
+	'.spec.services |= map(if .name == "web" then .targetPort = 3002 else . end) | {spec:{services:.spec.services}}')
+if kubectl patch environment "$ENV_NAME" --type=merge -p "$INVALID_SERVICE_REVISION_PATCH" >/tmp/invalid-service-revision.out 2>&1; then
 	echo "FAIL: admission accepted changed same-name service configuration without a higher revision"
+	exit 1
+fi
+if ! grep -q 'revision must increase when an existing service declaration changes' /tmp/invalid-service-revision.out; then
+	echo "FAIL: unchanged service revision was not rejected by the intended revision rule"
+	cat /tmp/invalid-service-revision.out
 	exit 1
 fi
 bin/swe --namespace "$PROJECT_NAMESPACE" environment services remove "$ENV_NAME" web-alias
@@ -1681,6 +1800,39 @@ if [[ "$(kubectl get environment "$ENV_NAME" -o jsonpath='{.spec.services[?(@.na
 fi
 manage_observation_listener service-start "$POD_NAME" "$OBSERVATION_OWNER" observation-listener-c 3002
 wait_service_observation "$ENV_NAME" web 1 Healthy
+echo "==> verifying authenticated portal discovery and real sandboxd HTTP tunnel"
+PORTAL_URL=$(SWE_CONTROL_PLANE_URL=http://127.0.0.1:18080 SWE_CONTROL_PLANE_TOKEN="$CONSOLE_TOKEN" \
+	bin/swe --namespace "$PROJECT_NAMESPACE" portal "$ENV_NAME" web)
+PORTAL_HOST=${PORTAL_URL#http://}
+if [[ "$PORTAL_HOST" != *.portal.test ]]; then
+	echo "FAIL: portal CLI returned unexpected URL $PORTAL_URL"
+	exit 1
+fi
+PORTAL_BODY=$(curl --silent --fail -H "Host: $PORTAL_HOST" -H "Authorization: Bearer $CONSOLE_TOKEN" \
+	-H 'Cookie: swe-platform-session=must-not-forward; application=visible' \
+	-H 'X-Portal-Check: accepted' http://127.0.0.1:18080/portal-check)
+if ! jq -e '.marker == "portal-listener" and .authorization == "" and .cookie == "application=visible" and .portalHeader == "accepted"' <<<"$PORTAL_BODY" >/dev/null; then
+	echo "FAIL: portal did not proxy the real body or strip platform credentials: $PORTAL_BODY"
+	exit 1
+fi
+set +e
+curl --silent --include --http1.1 --max-time 2 -H "Host: $PORTAL_HOST" -H "Authorization: Bearer $CONSOLE_TOKEN" \
+	-H 'Connection: Upgrade' -H 'Upgrade: websocket' -H 'Sec-WebSocket-Version: 13' \
+	-H 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==' http://127.0.0.1:18080/socket > /tmp/swe-platform-portal-websocket.out
+PORTAL_WEBSOCKET_STATUS=$?
+set -e
+if [[ "$PORTAL_WEBSOCKET_STATUS" != "0" && "$PORTAL_WEBSOCKET_STATUS" != "28" ]] || ! grep -q '101 Switching Protocols' /tmp/swe-platform-portal-websocket.out; then
+	echo "FAIL: portal WebSocket upgrade did not traverse the real sandboxd tunnel"
+	cat /tmp/swe-platform-portal-websocket.out || true
+	exit 1
+fi
+PORTAL_NO_AUTH=$(curl --silent --output /tmp/portal-no-auth-"$$" --write-out '%{http_code}' -H "Host: $PORTAL_HOST" http://127.0.0.1:18080/)
+PORTAL_UNKNOWN=$(curl --silent --output /tmp/portal-unknown-"$$" --write-out '%{http_code}' -H 'Host: aaaaaaaaaaaaaaaaaaaa.portal.test' http://127.0.0.1:18080/)
+if [[ "$PORTAL_NO_AUTH" != "404" || "$PORTAL_UNKNOWN" != "404" ]] || ! cmp -s /tmp/portal-no-auth-"$$" /tmp/portal-unknown-"$$"; then
+	echo "FAIL: unauthenticated and unknown portal locators were not uniform 404s"
+	exit 1
+fi
+rm -f /tmp/portal-no-auth-"$$" /tmp/portal-unknown-"$$"
 PRE_PAUSE_OBSERVATION_EXECUTION=$(kubectl get environment "$ENV_NAME" -o jsonpath='{.status.serviceObservations.executionGeneration}')
 
 echo "==> verifying pause retains the workspace and resume runs its hook"
@@ -1705,6 +1857,10 @@ if ! kubectl get pvc "$PVC_NAME" >/dev/null 2>&1; then
 	echo "FAIL: pause removed the workspace PVC"
 	exit 1
 fi
+if [[ "$(curl --silent --output /dev/null --write-out '%{http_code}' -H "Host: $PORTAL_HOST" -H "Authorization: Bearer $CONSOLE_TOKEN" http://127.0.0.1:18080/)" != "404" ]]; then
+	echo "FAIL: explicit hold did not uniformly deny portal routing"
+	exit 1
+fi
 HOLD_REVISION=$(kubectl get environment "$ENV_NAME" -o jsonpath='{.spec.lifecycle.hold.revision}')
 if [[ "$(kubectl get environment "$ENV_NAME" -o jsonpath='{.spec.lifecycle.hold.enabled}')" != "true" || -z "$HOLD_REVISION" ]]; then
 	echo "FAIL: swe environment hold did not publish enabled revisioned policy"
@@ -1726,6 +1882,18 @@ if [[ -z "$POST_RESUME_OBSERVATION_EXECUTION" || "$POST_RESUME_OBSERVATION_EXECU
 fi
 manage_observation_listener service-start "$POD_NAME" "$OBSERVATION_OWNER" observation-listener-d 3002
 wait_service_observation "$ENV_NAME" web 1 Healthy
+bin/swe --namespace "$PROJECT_NAMESPACE" environment services remove "$ENV_NAME" web
+if [[ "$(curl --silent --output /dev/null --write-out '%{http_code}' -H "Host: $PORTAL_HOST" -H "Authorization: Bearer $CONSOLE_TOKEN" http://127.0.0.1:18080/)" != "404" ]]; then
+	echo "FAIL: removed declaration retained its old portal locator"
+	exit 1
+fi
+bin/swe --namespace "$PROJECT_NAMESPACE" environment services declare "$ENV_NAME" web --target-port 3002
+NEW_PORTAL_URL=$(SWE_CONTROL_PLANE_URL=http://127.0.0.1:18080 SWE_CONTROL_PLANE_TOKEN="$CONSOLE_TOKEN" \
+	bin/swe --namespace "$PROJECT_NAMESPACE" portal "$ENV_NAME" web)
+if [[ "$NEW_PORTAL_URL" == "$PORTAL_URL" ]]; then
+	echo "FAIL: same-name service re-add reused a tombstoned portal locator"
+	exit 1
+fi
 bin/swe --namespace "$PROJECT_NAMESPACE" environment services remove "$ENV_NAME" web
 for _ in $(seq 1 30); do
 	if [[ -z "$(kubectl get environment "$ENV_NAME" -o jsonpath='{.status.serviceObservations}' 2>/dev/null || true)" ]]; then
@@ -1940,6 +2108,10 @@ kubectl wait --for=jsonpath='{.status.state}'=Failed run/"$PI_FAILED_RUN_NAME" -
 kubectl delete run "$PI_FAILED_RUN_NAME" --wait=true >/dev/null
 
 echo "==> verifying idle pause and terminal wake through the control plane"
+bin/swe --namespace "$PROJECT_NAMESPACE" environment services declare "$ENV_NAME" web --target-port 3002
+IDLE_PORTAL_URL=$(SWE_CONTROL_PLANE_URL=http://127.0.0.1:18080 SWE_CONTROL_PLANE_TOKEN="$CONSOLE_TOKEN" \
+	bin/swe --namespace "$PROJECT_NAMESPACE" portal "$ENV_NAME" web)
+IDLE_PORTAL_HOST=${IDLE_PORTAL_URL#http://}
 PRE_IDLE_POD_UID=$(kubectl get pod "$POD_NAME" -o jsonpath='{.metadata.uid}')
 kubectl patch environmenttemplate small --type=merge -p '{"spec":{"idleTimeout":"5s"}}' >/dev/null
 for _ in $(seq 1 30); do
@@ -1951,6 +2123,46 @@ for _ in $(seq 1 30); do
 done
 if [[ "${PHASE:-}" != "Paused" ]] || kubectl get pod "$POD_NAME" >/dev/null 2>&1; then
 	echo "FAIL: idle environment did not pause and remove its pod"
+	exit 1
+fi
+echo "==> verifying a portal request queues across Idle wake and fresh listener proof"
+curl --silent --fail --max-time 130 -H "Host: $IDLE_PORTAL_HOST" -H "Authorization: Bearer $CONSOLE_TOKEN" \
+	http://127.0.0.1:18080/idle-wake > /tmp/swe-platform-portal-idle-wake.out &
+PORTAL_WAKE_PID=$!
+WOKEN_PORTAL_POD=""
+for _ in $(seq 1 180); do
+	WOKEN_PORTAL_POD=$(kubectl get environment "$ENV_NAME" -o jsonpath='{.status.podName}' 2>/dev/null || true)
+	if [[ -n "$WOKEN_PORTAL_POD" ]] && kubectl get pod "$WOKEN_PORTAL_POD" >/dev/null 2>&1 && \
+		[[ -n "$(kubectl get pod "$WOKEN_PORTAL_POD" -o jsonpath='{.metadata.annotations.swe\.dev/sandboxd-secret-name}' 2>/dev/null || true)" ]]; then
+		break
+	fi
+	sleep 0.5
+done
+if [[ -z "$WOKEN_PORTAL_POD" ]]; then
+	kill "$PORTAL_WAKE_PID" >/dev/null 2>&1 || true
+	echo "FAIL: portal request did not create a fresh pod for Idle wake"
+	exit 1
+fi
+if ! kubectl -n "$PROJECT_NAMESPACE" wait --for=condition=Ready pod/"$WOKEN_PORTAL_POD" --timeout=90s; then
+	kill "$PORTAL_WAKE_PID" >/dev/null 2>&1 || true
+	echo "FAIL: portal wake replacement pod did not become ready"
+	exit 1
+fi
+manage_observation_listener service-start "$WOKEN_PORTAL_POD" "$OBSERVATION_OWNER" portal-idle-listener 3002
+if ! wait "$PORTAL_WAKE_PID" || ! jq -e '.marker == "portal-listener"' /tmp/swe-platform-portal-idle-wake.out >/dev/null; then
+	echo "FAIL: queued portal request did not route after fresh listener proof"
+	cat /tmp/swe-platform-portal-idle-wake.out || true
+	exit 1
+fi
+for _ in $(seq 1 30); do
+	PHASE=$(kubectl get environment "$ENV_NAME" -o jsonpath='{.status.phase}')
+	if [[ "$PHASE" == "Paused" ]] && ! kubectl get pod "$WOKEN_PORTAL_POD" >/dev/null 2>&1; then
+		break
+	fi
+	sleep 1
+done
+if [[ "${PHASE:-}" != "Paused" ]]; then
+	echo "FAIL: portal-woken environment did not return to Idle suspension for terminal wake coverage"
 	exit 1
 fi
 printf 'printf web-terminal-e2e-ok; exit\n' | \

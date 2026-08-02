@@ -353,6 +353,23 @@ message ObserveServicesResponse {
   repeated ServiceProbeObservation observations = 1;
 }
 
+// PortalService is a bounded, stateless byte tunnel to exactly one logical
+// loopback TCP port. Route ownership and authorization remain outside sandboxd.
+service PortalService {
+  rpc Tunnel(stream PortalFrame) returns (stream PortalFrame);
+}
+
+message PortalFrame {
+  // target_port is required on the first client frame and forbidden later.
+  uint32 target_port = 1;
+  bytes data = 2;
+  // write_eof half-closes the client-to-target direction.
+  bool write_eof = 3;
+  // opened is sent exactly once by sandboxd after the target connection has
+  // been established. It is forbidden on client frames.
+  bool opened = 4;
+}
+
 // HealthService reports daemon liveness and version.
 service HealthService {
   rpc Check(HealthCheckRequest) returns (HealthCheckResponse);

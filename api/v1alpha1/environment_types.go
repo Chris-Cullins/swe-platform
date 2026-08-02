@@ -224,15 +224,15 @@ const (
 	EnvironmentBackendExternalRunner EnvironmentBackend = "external-runner"
 )
 
-// EnvironmentServiceProtocol is the application protocol a future gateway
-// may use for a declared service.
+// EnvironmentServiceProtocol is the application protocol the portal gateway
+// uses for a declared service.
 // +kubebuilder:validation:Enum=HTTP
 type EnvironmentServiceProtocol string
 
 const EnvironmentServiceProtocolHTTP EnvironmentServiceProtocol = "HTTP"
 
-// EnvironmentServiceVisibility is the authorization scope a future gateway
-// must enforce. Anonymous and public visibility are not supported.
+// EnvironmentServiceVisibility is the authorization scope the portal gateway
+// enforces. Anonymous and public visibility are not supported.
 // +kubebuilder:validation:Enum=Project
 type EnvironmentServiceVisibility string
 
@@ -252,12 +252,21 @@ const EnvironmentServiceReadinessTCPConnect EnvironmentServiceReadiness = "TCPCo
 // an address. Duplicate TargetPorts are allowed as explicit aliases.
 //
 // +kubebuilder:validation:XValidation:rule="self == oldSelf || self.revision > oldSelf.revision",message="revision must increase when an existing service declaration changes"
+// +kubebuilder:validation:XValidation:rule="!oldSelf.hasValue() ? has(self.instanceID) : (has(oldSelf.value().instanceID) ? (has(self.instanceID) && self.instanceID == oldSelf.value().instanceID) : (self == oldSelf.value() || (has(self.instanceID) && self.revision > oldSelf.value().revision)))",message="new services require instanceID; a legacy missing instanceID may be added only with a higher revision and is then immutable",optionalOldSelf=true
 type EnvironmentServiceDeclaration struct {
 	// Name is the stable service name within this Environment.
 	// +kubebuilder:validation:MinLength=1
 	// +kubebuilder:validation:MaxLength=63
 	// +kubebuilder:validation:Pattern=`^[a-z0-9]([-a-z0-9]*[a-z0-9])?$`
 	Name string `json:"name"`
+
+	// InstanceID is a cryptographically random identity for this declaration
+	// incarnation. It is retained by updates and replaced after remove/re-add.
+	// +kubebuilder:validation:MinLength=20
+	// +kubebuilder:validation:MaxLength=63
+	// +kubebuilder:validation:Pattern=`^[a-z0-9]{20,63}$`
+	// +optional
+	InstanceID string `json:"instanceID,omitempty"`
 
 	// Revision starts at one and strictly increases when this same-name
 	// declaration's configuration changes. An exact no-op is idempotent.
@@ -385,8 +394,26 @@ type EnvironmentServiceObservations struct {
 	Records []EnvironmentServiceObservation `json:"records"`
 }
 
+// EnvironmentPortalRoute is gateway-owned durable route state. Locators are
+// opaque and never reused; inactive records are denial tombstones.
+type EnvironmentPortalRoute struct {
+	Name string `json:"name"`
+	// +kubebuilder:validation:MinLength=20
+	// +kubebuilder:validation:MaxLength=63
+	// +kubebuilder:validation:Pattern=`^[a-z0-9]{20,63}$`
+	DeclarationInstanceID string `json:"declarationInstanceID"`
+	// +kubebuilder:validation:Minimum=1
+	DeclarationRevision int64 `json:"declarationRevision"`
+	// +kubebuilder:validation:Pattern=`^[a-z0-9]{20,63}$`
+	Locator string `json:"locator"`
+	// +kubebuilder:validation:Minimum=1
+	Generation int64 `json:"generation"`
+	Active     bool  `json:"active"`
+}
+
 // EnvironmentStatus defines the observed state of Environment.
 // +kubebuilder:validation:XValidation:rule="!has(oldSelf.executionGeneration) || (has(self.executionGeneration) && self.executionGeneration >= oldSelf.executionGeneration)",message="executionGeneration cannot decrease or be removed"
+// +kubebuilder:validation:XValidation:rule="!has(oldSelf.nextPortalRouteGeneration) || (has(self.nextPortalRouteGeneration) && self.nextPortalRouteGeneration >= oldSelf.nextPortalRouteGeneration)",message="nextPortalRouteGeneration cannot decrease or be removed"
 type EnvironmentStatus struct {
 	// ObservedGeneration is the Environment generation reflected by this status.
 	// +optional
@@ -421,6 +448,15 @@ type EnvironmentStatus struct {
 	// the correlated generations, lifecycle fence, declarations, and time.
 	// +optional
 	ServiceObservations *EnvironmentServiceObservations `json:"serviceObservations,omitempty"`
+
+	// PortalRoutes is bounded gateway-owned state. Other status writers must
+	// preserve it. NextPortalRouteGeneration is monotonic.
+	// +optional
+	// +kubebuilder:validation:MaxItems=64
+	PortalRoutes []EnvironmentPortalRoute `json:"portalRoutes,omitempty"`
+	// +kubebuilder:validation:Minimum=0
+	// +optional
+	NextPortalRouteGeneration int64 `json:"nextPortalRouteGeneration,omitempty"`
 
 	// PodName is the name of the backing pod, when one exists.
 	// +optional

@@ -8,6 +8,8 @@ tenancy:
 controlPlane:
   metrics:
     port: 8082
+  portal:
+    enabled: false
   sessions:
     backend: postgres
     keyringSecret:

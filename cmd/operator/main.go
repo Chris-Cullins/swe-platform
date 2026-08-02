@@ -28,6 +28,7 @@ import (
 	"github.com/Chris-Cullins/swe-platform/internal/adapters/claudecode"
 	"github.com/Chris-Cullins/swe-platform/internal/adapters/codex"
 	"github.com/Chris-Cullins/swe-platform/internal/adapters/pi"
+	"github.com/Chris-Cullins/swe-platform/internal/agent"
 	"github.com/Chris-Cullins/swe-platform/internal/controllers"
 	"github.com/Chris-Cullins/swe-platform/internal/sandboxclient"
 	"github.com/Chris-Cullins/swe-platform/internal/tenancy"
@@ -174,7 +175,7 @@ func main() {
 			os.Exit(1)
 		}
 	}
-	var eventSink controllers.AdapterEventSink
+	var eventSink agent.AdapterEventSink
 	if transcriptURL != "" {
 		if transcriptTokenFile == "" {
 			setupLog.Error(nil, "transcript-token-file is required when transcript-url is set")
@@ -243,8 +244,8 @@ func installationLeaderElectionID(uid types.UID) string {
 	return fmt.Sprintf("swe-platform-operator-%x", sum[:16])
 }
 
-func registeredAdapters() map[string]controllers.AdapterLifecycle {
-	return map[string]controllers.AdapterLifecycle{
+func registeredAdapters() map[string]agent.AdapterLifecycle {
+	return map[string]agent.AdapterLifecycle{
 		"amp":         &amp.Adapter{},
 		"claude-code": &claudecode.Adapter{},
 		"codex":       &codex.Adapter{},

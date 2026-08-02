@@ -27,6 +27,27 @@ const (
 	maxExactResourceResponse = 8 << 20
 )
 
+// PortalRoute is the stable authenticated route allocated for a declared service.
+type PortalRoute struct {
+	URL            string `json:"url"`
+	EnvironmentUID string `json:"environmentUID"`
+	Service        string `json:"service"`
+	Revision       int64  `json:"revision"`
+}
+
+// GetPortalRoute discovers (and lazily allocates) an Environment service route.
+func (c *Client) GetPortalRoute(ctx context.Context, namespace, environment, service string) (PortalRoute, error) {
+	endpoint := c.Endpoint("api", "v1", "namespaces", namespace, "environments", environment, "portal", service)
+	var route PortalRoute
+	if err := c.getJSONLimit(ctx, endpoint, &route, 64<<10); err != nil {
+		return PortalRoute{}, err
+	}
+	if route.URL == "" || route.EnvironmentUID == "" || route.Service != service || route.Revision < 1 {
+		return PortalRoute{}, fmt.Errorf("control plane returned an invalid portal route")
+	}
+	return route, nil
+}
+
 var ErrRunRelist = errors.New("Run watch requires a full relist")
 
 type initialRunWatchCompatibilityError struct{ error }

@@ -19,12 +19,13 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	platformv1alpha1 "github.com/Chris-Cullins/swe-platform/api/v1alpha1"
+	"github.com/Chris-Cullins/swe-platform/internal/agent"
 )
 
 func testOperatorMetrics(t *testing.T) (*OperatorMetrics, *prometheus.Registry) {
 	t.Helper()
 	registry := prometheus.NewRegistry()
-	metrics := NewOperatorMetrics(registry, map[string]AdapterLifecycle{"test": &scriptedAdapter{}})
+	metrics := NewOperatorMetrics(registry, map[string]agent.AdapterLifecycle{"test": &scriptedAdapter{}})
 	return metrics, registry
 }
 
@@ -32,17 +33,17 @@ type dialAfterMutationAdapter struct {
 	mutate func()
 }
 
-func (a *dialAfterMutationAdapter) EnsureAccepted(ctx context.Context, _ AdapterTask, sandbox AdapterSandbox, _ *AdapterCredential) error {
+func (a *dialAfterMutationAdapter) EnsureAccepted(ctx context.Context, _ agent.AdapterTask, sandbox agent.AdapterSandbox, _ *agent.AdapterCredential) error {
 	a.mutate()
 	_, _, err := sandbox.DialProcess(ctx)
 	return err
 }
 
-func (*dialAfterMutationAdapter) Observe(context.Context, AdapterTask, AdapterSandbox) (AdapterObservation, string, error) {
-	return AdapterObservationRunning, "running", nil
+func (*dialAfterMutationAdapter) Observe(context.Context, agent.AdapterTask, agent.AdapterSandbox) (agent.AdapterObservation, string, error) {
+	return agent.AdapterObservationRunning, "running", nil
 }
 
-func (*dialAfterMutationAdapter) Cancel(context.Context, AdapterTask, AdapterSandbox) error {
+func (*dialAfterMutationAdapter) Cancel(context.Context, agent.AdapterTask, agent.AdapterSandbox) error {
 	return nil
 }
 
@@ -107,22 +108,24 @@ func TestOperatorMetricsObserveAdapterOutcomesOnCalls(t *testing.T) {
 		outcome   string
 	}{
 		{name: "accept success", state: platformv1alpha1.RunStateEnvironmentReady, operation: adapterOperationEnsureAccepted, outcome: adapterOutcomeSuccess},
-		{name: "accept rejected", state: platformv1alpha1.RunStateEnvironmentReady, operation: adapterOperationEnsureAccepted, outcome: adapterOutcomeRejected, configure: func(_ *platformv1alpha1.Run, adapter *scriptedAdapter) { adapter.acceptErr = ErrAdapterTaskRejected }},
+		{name: "accept rejected", state: platformv1alpha1.RunStateEnvironmentReady, operation: adapterOperationEnsureAccepted, outcome: adapterOutcomeRejected, configure: func(_ *platformv1alpha1.Run, adapter *scriptedAdapter) {
+			adapter.acceptErr = agent.ErrAdapterTaskRejected
+		}},
 		{name: "observe error", state: platformv1alpha1.RunStateRunning, operation: adapterOperationObserve, outcome: adapterOutcomeError, configure: func(_ *platformv1alpha1.Run, adapter *scriptedAdapter) {
 			adapter.observeErr = errors.New("rpc unavailable")
 		}},
 		{name: "invalid observation", state: platformv1alpha1.RunStateRunning, operation: adapterOperationObserve, outcome: adapterOutcomeError, configure: func(_ *platformv1alpha1.Run, adapter *scriptedAdapter) {
-			adapter.observations = []AdapterObservation{"Unknown"}
+			adapter.observations = []agent.AdapterObservation{"Unknown"}
 		}},
 		{name: "cancel pending", state: platformv1alpha1.RunStateRunning, operation: adapterOperationCancel, outcome: adapterOutcomePending, configure: func(run *platformv1alpha1.Run, adapter *scriptedAdapter) {
 			run.Spec.Cancel = true
-			adapter.cancelErr = ErrAdapterCancellationPending
+			adapter.cancelErr = agent.ErrAdapterCancellationPending
 		}},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			run, env := adapterRaceObjects(platformv1alpha1.EnvironmentOwnershipOwned, test.state)
-			adapter := &scriptedAdapter{observations: []AdapterObservation{AdapterObservationRunning}}
+			adapter := &scriptedAdapter{observations: []agent.AdapterObservation{agent.AdapterObservationRunning}}
 			if test.state == platformv1alpha1.RunStateEnvironmentReady {
 				setAcceptanceAttempted(run)
 			} else {

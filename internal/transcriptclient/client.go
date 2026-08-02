@@ -12,7 +12,7 @@ import (
 	"os"
 	"strings"
 
-	"github.com/Chris-Cullins/swe-platform/internal/controllers"
+	"github.com/Chris-Cullins/swe-platform/internal/agent"
 	"github.com/Chris-Cullins/swe-platform/internal/controlplane"
 )
 
@@ -25,7 +25,9 @@ type Client struct {
 	HTTP      *http.Client
 }
 
-func (c Client) Append(ctx context.Context, namespace, run, runUID string, event controllers.AdapterEvent) error {
+var _ agent.AdapterEventSink = Client{}
+
+func (c Client) Append(ctx context.Context, namespace, run, runUID string, event agent.AdapterEvent) error {
 	token, err := os.ReadFile(c.TokenFile)
 	if err != nil {
 		return fmt.Errorf("read transcript credential: %w", err)
@@ -66,7 +68,7 @@ func (c Client) Append(ctx context.Context, namespace, run, runUID string, event
 		message, _ := io.ReadAll(io.LimitReader(response.Body, 4096))
 		err := fmt.Errorf("append transcript event: control plane returned %s: %s", response.Status, strings.TrimSpace(string(message)))
 		if permanentRejection(response.StatusCode) {
-			return fmt.Errorf("%w: %v", controllers.ErrAdapterEventRejected, err)
+			return fmt.Errorf("%w: %v", agent.ErrAdapterEventRejected, err)
 		}
 		return err
 	}

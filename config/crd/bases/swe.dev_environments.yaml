@@ -233,6 +233,14 @@ spec:
                     target is always that Environment's logical loopback; callers cannot supply
                     an address. Duplicate TargetPorts are allowed as explicit aliases.
                   properties:
+                    instanceID:
+                      description: |-
+                        InstanceID is a cryptographically random identity for this declaration
+                        incarnation. It is retained by updates and replaced after remove/re-add.
+                      maxLength: 63
+                      minLength: 20
+                      pattern: ^[a-z0-9]{20,63}$
+                      type: string
                     name:
                       description: Name is the stable service name within this Environment.
                       maxLength: 63
@@ -241,8 +249,8 @@ spec:
                       type: string
                     protocol:
                       description: |-
-                        EnvironmentServiceProtocol is the application protocol a future gateway
-                        may use for a declared service.
+                        EnvironmentServiceProtocol is the application protocol the portal gateway
+                        uses for a declared service.
                       enum:
                       - HTTP
                       type: string
@@ -274,8 +282,8 @@ spec:
                         rule: self != 50051
                     visibility:
                       description: |-
-                        EnvironmentServiceVisibility is the authorization scope a future gateway
-                        must enforce. Anonymous and public visibility are not supported.
+                        EnvironmentServiceVisibility is the authorization scope the portal gateway
+                        enforces. Anonymous and public visibility are not supported.
                       enum:
                       - Project
                       type: string
@@ -291,6 +299,13 @@ spec:
                   - message: revision must increase when an existing service declaration
                       changes
                     rule: self == oldSelf || self.revision > oldSelf.revision
+                  - message: new services require instanceID; a legacy missing instanceID
+                      may be added only with a higher revision and is then immutable
+                    optionalOldSelf: true
+                    rule: '!oldSelf.hasValue() ? has(self.instanceID) : (has(oldSelf.value().instanceID)
+                      ? (has(self.instanceID) && self.instanceID == oldSelf.value().instanceID)
+                      : (self == oldSelf.value() || (has(self.instanceID) && self.revision
+                      > oldSelf.value().revision)))'
                 maxItems: 32
                 type: array
                 x-kubernetes-list-map-keys:
@@ -510,6 +525,10 @@ spec:
                       Requested suspension.
                     type: string
                 type: object
+              nextPortalRouteGeneration:
+                format: int64
+                minimum: 0
+                type: integer
               observedGeneration:
                 description: ObservedGeneration is the Environment generation reflected
                   by this status.
@@ -554,6 +573,45 @@ spec:
                   PodRecoveryUID identifies the exact terminal Pod covered by the pending or
                   in-progress recovery attempt.
                 type: string
+              portalRoutes:
+                description: |-
+                  PortalRoutes is bounded gateway-owned state. Other status writers must
+                  preserve it. NextPortalRouteGeneration is monotonic.
+                items:
+                  description: |-
+                    EnvironmentPortalRoute is gateway-owned durable route state. Locators are
+                    opaque and never reused; inactive records are denial tombstones.
+                  properties:
+                    active:
+                      type: boolean
+                    declarationInstanceID:
+                      maxLength: 63
+                      minLength: 20
+                      pattern: ^[a-z0-9]{20,63}$
+                      type: string
+                    declarationRevision:
+                      format: int64
+                      minimum: 1
+                      type: integer
+                    generation:
+                      format: int64
+                      minimum: 1
+                      type: integer
+                    locator:
+                      pattern: ^[a-z0-9]{20,63}$
+                      type: string
+                    name:
+                      type: string
+                  required:
+                  - active
+                  - declarationInstanceID
+                  - declarationRevision
+                  - generation
+                  - locator
+                  - name
+                  type: object
+                maxItems: 64
+                type: array
               serviceObservations:
                 description: |-
                   ServiceObservations is advisory point-in-time service state owned solely
@@ -653,6 +711,9 @@ spec:
             - message: executionGeneration cannot decrease or be removed
               rule: '!has(oldSelf.executionGeneration) || (has(self.executionGeneration)
                 && self.executionGeneration >= oldSelf.executionGeneration)'
+            - message: nextPortalRouteGeneration cannot decrease or be removed
+              rule: '!has(oldSelf.nextPortalRouteGeneration) || (has(self.nextPortalRouteGeneration)
+                && self.nextPortalRouteGeneration >= oldSelf.nextPortalRouteGeneration)'
         type: object
     served: true
     storage: true

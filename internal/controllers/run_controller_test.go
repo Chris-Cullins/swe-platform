@@ -24,11 +24,12 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
 	platformv1alpha1 "github.com/Chris-Cullins/swe-platform/api/v1alpha1"
+	"github.com/Chris-Cullins/swe-platform/internal/agent"
 	"github.com/Chris-Cullins/swe-platform/internal/lifecycle"
 )
 
 type scriptedAdapter struct {
-	observations          []AdapterObservation
+	observations          []agent.AdapterObservation
 	accepted, observed    int
 	cancelled             int
 	acceptErr             error
@@ -41,22 +42,24 @@ type scriptedAdapter struct {
 }
 
 type blockingObserveAdapter struct {
-	observation AdapterObservation
+	observation agent.AdapterObservation
 	started     chan struct{}
 	release     chan struct{}
 }
 
-func (*blockingObserveAdapter) EnsureAccepted(context.Context, AdapterTask, AdapterSandbox, *AdapterCredential) error {
+func (*blockingObserveAdapter) EnsureAccepted(context.Context, agent.AdapterTask, agent.AdapterSandbox, *agent.AdapterCredential) error {
 	return nil
 }
 
-func (a *blockingObserveAdapter) Observe(context.Context, AdapterTask, AdapterSandbox) (AdapterObservation, string, error) {
+func (a *blockingObserveAdapter) Observe(context.Context, agent.AdapterTask, agent.AdapterSandbox) (agent.AdapterObservation, string, error) {
 	close(a.started)
 	<-a.release
 	return a.observation, string(a.observation), nil
 }
 
-func (*blockingObserveAdapter) Cancel(context.Context, AdapterTask, AdapterSandbox) error { return nil }
+func (*blockingObserveAdapter) Cancel(context.Context, agent.AdapterTask, agent.AdapterSandbox) error {
+	return nil
+}
 
 type failAcceptedStatusClient struct {
 	client.Client
@@ -82,36 +85,38 @@ func (w *failAcceptedStatusWriter) Update(ctx context.Context, object client.Obj
 
 // foregroundAdapter models a CLI agent whose managed process exit is the task
 // outcome.
-type foregroundAdapter struct{ process AdapterObservation }
+type foregroundAdapter struct{ process agent.AdapterObservation }
 
-func (*foregroundAdapter) EnsureAccepted(context.Context, AdapterTask, AdapterSandbox, *AdapterCredential) error {
+func (*foregroundAdapter) EnsureAccepted(context.Context, agent.AdapterTask, agent.AdapterSandbox, *agent.AdapterCredential) error {
 	return nil
 }
-func (a *foregroundAdapter) Observe(context.Context, AdapterTask, AdapterSandbox) (AdapterObservation, string, error) {
+func (a *foregroundAdapter) Observe(context.Context, agent.AdapterTask, agent.AdapterSandbox) (agent.AdapterObservation, string, error) {
 	return a.process, "managed process state", nil
 }
-func (*foregroundAdapter) Cancel(context.Context, AdapterTask, AdapterSandbox) error { return nil }
+func (*foregroundAdapter) Cancel(context.Context, agent.AdapterTask, agent.AdapterSandbox) error {
+	return nil
+}
 
 // serviceAdapter models a long-lived agent service: task events change while
 // the service process remains running, so service exit is not task completion.
 type serviceAdapter struct {
 	serviceRunning bool
-	event          AdapterObservation
+	event          agent.AdapterObservation
 }
 
-func (a *serviceAdapter) EnsureAccepted(context.Context, AdapterTask, AdapterSandbox, *AdapterCredential) error {
+func (a *serviceAdapter) EnsureAccepted(context.Context, agent.AdapterTask, agent.AdapterSandbox, *agent.AdapterCredential) error {
 	a.serviceRunning = true
 	return nil
 }
-func (a *serviceAdapter) Observe(context.Context, AdapterTask, AdapterSandbox) (AdapterObservation, string, error) {
+func (a *serviceAdapter) Observe(context.Context, agent.AdapterTask, agent.AdapterSandbox) (agent.AdapterObservation, string, error) {
 	return a.event, "service task event", nil
 }
-func (a *serviceAdapter) Cancel(context.Context, AdapterTask, AdapterSandbox) error {
+func (a *serviceAdapter) Cancel(context.Context, agent.AdapterTask, agent.AdapterSandbox) error {
 	a.serviceRunning = false
 	return nil
 }
 
-func (a *scriptedAdapter) EnsureAccepted(_ context.Context, _ AdapterTask, _ AdapterSandbox, credential *AdapterCredential) error {
+func (a *scriptedAdapter) EnsureAccepted(_ context.Context, _ agent.AdapterTask, _ agent.AdapterSandbox, credential *agent.AdapterCredential) error {
 	a.accepted++
 	if a.onAccept != nil {
 		a.onAccept()
@@ -124,14 +129,14 @@ func (a *scriptedAdapter) EnsureAccepted(_ context.Context, _ AdapterTask, _ Ada
 	}
 	return a.acceptErr
 }
-func (a *scriptedAdapter) Cancel(context.Context, AdapterTask, AdapterSandbox) error {
+func (a *scriptedAdapter) Cancel(context.Context, agent.AdapterTask, agent.AdapterSandbox) error {
 	a.cancelled++
 	if a.onCancel != nil {
 		a.onCancel()
 	}
 	return a.cancelErr
 }
-func (a *scriptedAdapter) Observe(context.Context, AdapterTask, AdapterSandbox) (AdapterObservation, string, error) {
+func (a *scriptedAdapter) Observe(context.Context, agent.AdapterTask, agent.AdapterSandbox) (agent.AdapterObservation, string, error) {
 	a.observed++
 	if a.observeErr != nil {
 		return "", "", a.observeErr
@@ -155,7 +160,7 @@ func runScheme(t *testing.T) *runtime.Scheme {
 	return s
 }
 
-func reconciler(t *testing.T, adapter AdapterLifecycle, objects ...client.Object) *RunReconciler {
+func reconciler(t *testing.T, adapter agent.AdapterLifecycle, objects ...client.Object) *RunReconciler {
 	t.Helper()
 	s := runScheme(t)
 	templates := make(map[types.NamespacedName]bool)
@@ -213,7 +218,7 @@ func reconciler(t *testing.T, adapter AdapterLifecycle, objects ...client.Object
 		objects = append(objects, runExecutionPod(env, types.UID("pod-"+env.Name), "10.0.0.1"))
 	}
 	c := fake.NewClientBuilder().WithScheme(s).WithStatusSubresource(&platformv1alpha1.Run{}, &platformv1alpha1.Environment{}).WithObjects(objects...).Build()
-	return &RunReconciler{Client: c, Scheme: s, Adapters: map[string]AdapterLifecycle{"test": adapter}}
+	return &RunReconciler{Client: c, Scheme: s, Adapters: map[string]agent.AdapterLifecycle{"test": adapter}}
 }
 
 func runExecutionPod(env *platformv1alpha1.Environment, uid types.UID, podIP string) *corev1.Pod {
@@ -699,10 +704,10 @@ func TestAcceptedRunIgnoresActivityWithoutRereadingCredentials(t *testing.T) {
 	for _, test := range []struct {
 		name        string
 		state       platformv1alpha1.RunState
-		observation AdapterObservation
+		observation agent.AdapterObservation
 	}{
-		{name: "running", state: platformv1alpha1.RunStateRunning, observation: AdapterObservationRunning},
-		{name: "needs input", state: platformv1alpha1.RunStateNeedsInput, observation: AdapterObservationNeedsInput},
+		{name: "running", state: platformv1alpha1.RunStateRunning, observation: agent.AdapterObservationRunning},
+		{name: "needs input", state: platformv1alpha1.RunStateNeedsInput, observation: agent.AdapterObservationNeedsInput},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			acceptedEpoch := int64(0)
@@ -722,7 +727,7 @@ func TestAcceptedRunIgnoresActivityWithoutRereadingCredentials(t *testing.T) {
 			environment := &platformv1alpha1.Environment{ObjectMeta: metav1.ObjectMeta{Name: "e", Namespace: "ns", UID: "env-uid", Generation: 1}}
 			environment.Status.ExecutionGeneration = 1
 			applyEnvironmentStatus(environment, platformv1alpha1.EnvironmentPhaseReady, "env-e", "10.0.0.1:50051", "SandboxdReady", "ready", nil)
-			adapter := &scriptedAdapter{observations: []AdapterObservation{test.observation}}
+			adapter := &scriptedAdapter{observations: []agent.AdapterObservation{test.observation}}
 			r := reconciler(t, adapter, run, environment)
 			credentialReads := 0
 			r.APIReader = interceptor.NewClient(r.Client.(client.WithWatch), interceptor.Funcs{Get: func(ctx context.Context, delegate client.WithWatch, key client.ObjectKey, object client.Object, options ...client.GetOption) error {
@@ -872,7 +877,7 @@ func TestTerminalClaimReleaseRemainsReleasedAcrossReconcileAndRestart(t *testing
 				t.Fatal(err)
 			}
 
-			restarted := &RunReconciler{Client: r.Client, Scheme: r.Scheme, Adapters: map[string]AdapterLifecycle{"test": adapter}}
+			restarted := &RunReconciler{Client: r.Client, Scheme: r.Scheme, Adapters: map[string]agent.AdapterLifecycle{"test": adapter}}
 			got := reconcileRun(t, restarted, run.Name)
 			assertTerminalEnvironmentCondition(t, got, state, "EnvironmentReleased", "claimed environment was released")
 			var retainedReplacement platformv1alpha1.Environment
@@ -978,12 +983,12 @@ func assertTerminalEnvironmentCondition(t *testing.T, run platformv1alpha1.Run, 
 func TestAdapterShapesPauseResumeAndStatus(t *testing.T) {
 	for _, tc := range []struct {
 		name         string
-		observations []AdapterObservation
+		observations []agent.AdapterObservation
 		want         []platformv1alpha1.RunState
 	}{
-		{"foreground-process", []AdapterObservation{AdapterObservationRunning, AdapterObservationSucceeded}, []platformv1alpha1.RunState{platformv1alpha1.RunStateRunning, platformv1alpha1.RunStateSucceeded}},
-		{"foreground-process-failure", []AdapterObservation{AdapterObservationFailed}, []platformv1alpha1.RunState{platformv1alpha1.RunStateFailed}},
-		{"service-events", []AdapterObservation{AdapterObservationRunning, AdapterObservationNeedsInput}, []platformv1alpha1.RunState{platformv1alpha1.RunStateRunning, platformv1alpha1.RunStateNeedsInput}},
+		{"foreground-process", []agent.AdapterObservation{agent.AdapterObservationRunning, agent.AdapterObservationSucceeded}, []platformv1alpha1.RunState{platformv1alpha1.RunStateRunning, platformv1alpha1.RunStateSucceeded}},
+		{"foreground-process-failure", []agent.AdapterObservation{agent.AdapterObservationFailed}, []platformv1alpha1.RunState{platformv1alpha1.RunStateFailed}},
+		{"service-events", []agent.AdapterObservation{agent.AdapterObservationRunning, agent.AdapterObservationNeedsInput}, []platformv1alpha1.RunState{platformv1alpha1.RunStateRunning, platformv1alpha1.RunStateNeedsInput}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			run := &platformv1alpha1.Run{ObjectMeta: metav1.ObjectMeta{Name: "r", Namespace: "ns", UID: "uid", Finalizers: []string{runFinalizer}}, Spec: platformv1alpha1.RunSpec{Agent: "test"}, Status: platformv1alpha1.RunStatus{State: platformv1alpha1.RunStateAllocating, EnvironmentRef: &platformv1alpha1.RunEnvironmentReference{Name: "e", UID: "euid", Ownership: platformv1alpha1.EnvironmentOwnershipOwned}}}
@@ -1031,7 +1036,7 @@ func TestPermanentAdapterAcceptanceRejectionFailsRun(t *testing.T) {
 		Conditions:     []metav1.Condition{{Type: runConditionAdapterAcceptanceAttempted, Status: metav1.ConditionTrue}},
 	}}
 	env := &platformv1alpha1.Environment{ObjectMeta: metav1.ObjectMeta{Name: "e", Namespace: "ns", UID: "euid"}, Status: platformv1alpha1.EnvironmentStatus{Phase: platformv1alpha1.EnvironmentPhaseReady}}
-	adapter := &scriptedAdapter{acceptErr: fmt.Errorf("%w: unsupported task configuration", ErrAdapterTaskRejected)}
+	adapter := &scriptedAdapter{acceptErr: fmt.Errorf("%w: unsupported task configuration", agent.ErrAdapterTaskRejected)}
 	r := reconciler(t, adapter, run, env)
 	got := reconcileRun(t, r, run.Name)
 	condition := apiMeta.FindStatusCondition(got.Status.Conditions, runConditionAdapterAccepted)
@@ -1049,25 +1054,25 @@ func TestDifferentAdapterShapesDriveSameLifecycleContract(t *testing.T) {
 	}
 
 	foregroundRun := readyRun("foreground")
-	foreground := &foregroundAdapter{process: AdapterObservationRunning}
+	foreground := &foregroundAdapter{process: agent.AdapterObservationRunning}
 	foregroundReconciler := reconciler(t, foreground, foregroundRun, readyEnvironment(foregroundRun))
 	reconcileRun(t, foregroundReconciler, foregroundRun.Name) // acceptance attempt marker
 	reconcileRun(t, foregroundReconciler, foregroundRun.Name) // acceptance
 	if got := reconcileRun(t, foregroundReconciler, foregroundRun.Name); got.Status.State != platformv1alpha1.RunStateRunning {
 		t.Fatalf("foreground state = %s", got.Status.State)
 	}
-	foreground.process = AdapterObservationSucceeded
+	foreground.process = agent.AdapterObservationSucceeded
 	if got := reconcileRun(t, foregroundReconciler, foregroundRun.Name); got.Status.State != platformv1alpha1.RunStateSucceeded {
 		t.Fatalf("foreground terminal state = %s", got.Status.State)
 	}
 
 	serviceRun := readyRun("service")
-	service := &serviceAdapter{event: AdapterObservationRunning}
+	service := &serviceAdapter{event: agent.AdapterObservationRunning}
 	serviceReconciler := reconciler(t, service, serviceRun, readyEnvironment(serviceRun))
 	reconcileRun(t, serviceReconciler, serviceRun.Name) // acceptance attempt marker
 	reconcileRun(t, serviceReconciler, serviceRun.Name) // task acknowledgement
 	reconcileRun(t, serviceReconciler, serviceRun.Name) // running event
-	service.event = AdapterObservationNeedsInput
+	service.event = agent.AdapterObservationNeedsInput
 	if got := reconcileRun(t, serviceReconciler, serviceRun.Name); got.Status.State != platformv1alpha1.RunStateNeedsInput || !service.serviceRunning {
 		t.Fatalf("service state = %s, serviceRunning = %v", got.Status.State, service.serviceRunning)
 	}
@@ -1076,7 +1081,7 @@ func TestDifferentAdapterShapesDriveSameLifecycleContract(t *testing.T) {
 func TestNonterminalAdapterObservationSchedulesPolling(t *testing.T) {
 	run := &platformv1alpha1.Run{ObjectMeta: metav1.ObjectMeta{Name: "r", Namespace: "ns", UID: "uid", Finalizers: []string{runFinalizer}}, Spec: platformv1alpha1.RunSpec{Agent: "test"}, Status: platformv1alpha1.RunStatus{State: platformv1alpha1.RunStateAdapterAccepted, EnvironmentRef: &platformv1alpha1.RunEnvironmentReference{Name: "e", UID: "euid", Ownership: platformv1alpha1.EnvironmentOwnershipOwned}}}
 	env := &platformv1alpha1.Environment{ObjectMeta: metav1.ObjectMeta{Name: "e", Namespace: "ns", UID: "euid"}, Status: platformv1alpha1.EnvironmentStatus{Phase: platformv1alpha1.EnvironmentPhaseReady}}
-	r := reconciler(t, &foregroundAdapter{process: AdapterObservationRunning}, run, env)
+	r := reconciler(t, &foregroundAdapter{process: agent.AdapterObservationRunning}, run, env)
 	result, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(run)})
 	if err != nil {
 		t.Fatal(err)
@@ -1127,7 +1132,7 @@ func TestEnvironmentReadyConditionIsIndependentFromTaskOutcome(t *testing.T) {
 		name         string
 		runState     platformv1alpha1.RunState
 		envPhase     platformv1alpha1.EnvironmentPhase
-		adapter      AdapterLifecycle
+		adapter      agent.AdapterLifecycle
 		cancel       bool
 		accepted     bool
 		wantReady    metav1.ConditionStatus
@@ -1135,7 +1140,7 @@ func TestEnvironmentReadyConditionIsIndependentFromTaskOutcome(t *testing.T) {
 	}{
 		{
 			name: "adapter failure leaves ready Environment", runState: platformv1alpha1.RunStateAdapterAccepted,
-			envPhase: platformv1alpha1.EnvironmentPhaseReady, adapter: &scriptedAdapter{observations: []AdapterObservation{AdapterObservationFailed}},
+			envPhase: platformv1alpha1.EnvironmentPhaseReady, adapter: &scriptedAdapter{observations: []agent.AdapterObservation{agent.AdapterObservationFailed}},
 			accepted: true, wantReady: metav1.ConditionTrue, wantRunState: platformv1alpha1.RunStateFailed,
 		},
 		{
@@ -1170,7 +1175,7 @@ func TestEnvironmentReadyConditionIsIndependentFromTaskOutcome(t *testing.T) {
 			}
 			r := reconciler(t, tc.adapter, run, env)
 			if tc.adapter == nil {
-				r.Adapters = map[string]AdapterLifecycle{}
+				r.Adapters = map[string]agent.AdapterLifecycle{}
 			}
 			got := reconcileRun(t, r, run.Name)
 			condition := apiMeta.FindStatusCondition(got.Status.Conditions, runConditionEnvironmentReady)
@@ -1459,7 +1464,7 @@ func TestCancellationPendingRetainsRunAndClaim(t *testing.T) {
 		Phase: platformv1alpha1.EnvironmentPhaseReady, PodName: "env-shared", Endpoints: platformv1alpha1.EnvironmentEndpoints{Sandboxd: "10.0.0.1:50051"},
 		ClaimedBy: &platformv1alpha1.RunReference{Name: run.Name, UID: run.UID},
 	}}
-	adapter := &scriptedAdapter{cancelErr: ErrAdapterCancellationPending}
+	adapter := &scriptedAdapter{cancelErr: agent.ErrAdapterCancellationPending}
 	r := reconciler(t, adapter, run, env)
 	result, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(run)})
 	if err != nil || result.RequeueAfter != adapterPollInterval {
@@ -1704,7 +1709,7 @@ func TestMissingAdapterCleanupFallsBackToBackendFence(t *testing.T) {
 		ClaimedBy: &platformv1alpha1.RunReference{Name: run.Name, UID: run.UID},
 	}}
 	r := reconciler(t, &scriptedAdapter{}, run, env)
-	r.Adapters = map[string]AdapterLifecycle{}
+	r.Adapters = map[string]agent.AdapterLifecycle{}
 	result, err := r.finalize(context.Background(), run)
 	if err != nil || result.RequeueAfter != adapterPollInterval {
 		t.Fatalf("missing-adapter fence = (%#v, %v)", result, err)
@@ -1861,7 +1866,7 @@ func TestOwnershipMismatchNeverCancelsOrMutatesEnvironment(t *testing.T) {
 	s := runScheme(t)
 	c := fake.NewClientBuilder().WithScheme(s).WithStatusSubresource(&platformv1alpha1.Run{}, &platformv1alpha1.Environment{}).WithObjects(run, env).Build()
 	adapter := &scriptedAdapter{}
-	r := &RunReconciler{Client: c, Scheme: s, Adapters: map[string]AdapterLifecycle{"test": adapter}}
+	r := &RunReconciler{Client: c, Scheme: s, Adapters: map[string]agent.AdapterLifecycle{"test": adapter}}
 	if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(run)}); err != nil {
 		t.Fatal(err)
 	}
@@ -2217,7 +2222,7 @@ func TestCredentialRotationIsRematerializedAfterResumeEpoch(t *testing.T) {
 	}
 	reconcileRun(t, r, run.Name) // Paused -> EnvironmentReady.
 	reconcileRun(t, r, run.Name) // Reaccept in the fresh sandbox epoch.
-	adapter.observations = []AdapterObservation{AdapterObservationAccepted}
+	adapter.observations = []agent.AdapterObservation{agent.AdapterObservationAccepted}
 	reconcileRun(t, r, run.Name) // Observe without accepting the same epoch again.
 	if len(adapter.acceptedCredentials) != 2 || string(adapter.acceptedCredentials[0]) != "!!FIRST-EPOCH-KEY!!" || string(adapter.acceptedCredentials[1]) != "!!SECOND-EPOCH-KEY!!" {
 		t.Fatalf("epoch credentials = %#v", adapter.acceptedCredentials)
@@ -2228,10 +2233,10 @@ func TestMissedPauseTransitionReacceptsFreshEnvironmentEpoch(t *testing.T) {
 	for _, test := range []struct {
 		name        string
 		state       platformv1alpha1.RunState
-		observation AdapterObservation
+		observation agent.AdapterObservation
 	}{
-		{name: "running", state: platformv1alpha1.RunStateRunning, observation: AdapterObservationRunning},
-		{name: "needs input", state: platformv1alpha1.RunStateNeedsInput, observation: AdapterObservationNeedsInput},
+		{name: "running", state: platformv1alpha1.RunStateRunning, observation: agent.AdapterObservationRunning},
+		{name: "needs input", state: platformv1alpha1.RunStateNeedsInput, observation: agent.AdapterObservationNeedsInput},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			epoch0 := int64(0)
@@ -2254,7 +2259,7 @@ func TestMissedPauseTransitionReacceptsFreshEnvironmentEpoch(t *testing.T) {
 			applyEnvironmentStatus(env, platformv1alpha1.EnvironmentPhaseReady, "env-e-0", "10.0.0.1:50051", "SandboxdReady", "ready", nil)
 			profile, staleSecret := credentialProfileAndSecret(run, []byte("!!EPOCH-ZERO-KEY!!"))
 			_, rotatedSecret := credentialProfileAndSecret(run, []byte("!!EPOCH-ONE-KEY!!"))
-			adapter := &scriptedAdapter{observations: []AdapterObservation{test.observation}}
+			adapter := &scriptedAdapter{observations: []agent.AdapterObservation{test.observation}}
 			r := reconciler(t, adapter, run, env, profile, staleSecret)
 
 			// The Environment completes an entire pause/resume while the Run
@@ -2318,7 +2323,7 @@ func TestObserveDiscardsStaleExecutionResults(t *testing.T) {
 		platformv1alpha1.EnvironmentOwnershipOwned,
 		platformv1alpha1.EnvironmentOwnershipClaimed,
 	} {
-		for _, observation := range []AdapterObservation{AdapterObservationNeedsInput, AdapterObservationSucceeded} {
+		for _, observation := range []agent.AdapterObservation{agent.AdapterObservationNeedsInput, agent.AdapterObservationSucceeded} {
 			t.Run(string(ownership)+"/"+string(observation), func(t *testing.T) {
 				epoch := int64(0)
 				executionGeneration := int64(1)
@@ -2386,7 +2391,7 @@ func TestAdapterResultsRequireSameLivePodWithUnchangedStatus(t *testing.T) {
 		platformv1alpha1.EnvironmentOwnershipOwned,
 		platformv1alpha1.EnvironmentOwnershipClaimed,
 	} {
-		for _, acceptErr := range []error{nil, ErrAdapterTaskRejected} {
+		for _, acceptErr := range []error{nil, agent.ErrAdapterTaskRejected} {
 			name := "successful accept"
 			if acceptErr != nil {
 				name = "rejected accept"
@@ -2418,7 +2423,7 @@ func TestAdapterResultsRequireSameLivePodWithUnchangedStatus(t *testing.T) {
 			run.Status.AcceptedEnvironmentEpoch = &epoch
 			run.Status.AcceptedEnvironmentExecutionGeneration = &generation
 			apiMeta.SetStatusCondition(&run.Status.Conditions, metav1.Condition{Type: runConditionAdapterAccepted, Status: metav1.ConditionTrue, Reason: "AdapterAccepted"})
-			adapter := &scriptedAdapter{observations: []AdapterObservation{AdapterObservationSucceeded}}
+			adapter := &scriptedAdapter{observations: []agent.AdapterObservation{agent.AdapterObservationSucceeded}}
 			r := reconciler(t, adapter, run, environment)
 			// scripted Observe is synchronous, so replace the Pod from its
 			// observation hook by using a one-shot wrapper.
@@ -2445,7 +2450,7 @@ type mutatingObserveAdapter struct {
 	mutate func()
 }
 
-func (a *mutatingObserveAdapter) Observe(ctx context.Context, task AdapterTask, sandbox AdapterSandbox) (AdapterObservation, string, error) {
+func (a *mutatingObserveAdapter) Observe(ctx context.Context, task agent.AdapterTask, sandbox agent.AdapterSandbox) (agent.AdapterObservation, string, error) {
 	observation, message, err := a.scriptedAdapter.Observe(ctx, task, sandbox)
 	a.mutate()
 	return observation, message, err
@@ -2661,7 +2666,7 @@ func TestCancellationBeforeAllocationDoesNotReadCredentialProfileOrSecret(t *tes
 func TestLifecycleTimestampsSetOnceAcrossPauseResumeAndTerminal(t *testing.T) {
 	run := &platformv1alpha1.Run{ObjectMeta: metav1.ObjectMeta{Name: "r", Namespace: "ns", UID: "uid", Finalizers: []string{runFinalizer}}, Spec: platformv1alpha1.RunSpec{Agent: "test"}, Status: platformv1alpha1.RunStatus{State: platformv1alpha1.RunStateAllocating, EnvironmentRef: &platformv1alpha1.RunEnvironmentReference{Name: "e", UID: "euid", Ownership: platformv1alpha1.EnvironmentOwnershipOwned}}}
 	env := &platformv1alpha1.Environment{ObjectMeta: metav1.ObjectMeta{Name: "e", Namespace: "ns", UID: "euid"}, Status: platformv1alpha1.EnvironmentStatus{Phase: platformv1alpha1.EnvironmentPhaseReady}}
-	r := reconciler(t, &scriptedAdapter{observations: []AdapterObservation{AdapterObservationRunning}}, run, env)
+	r := reconciler(t, &scriptedAdapter{observations: []agent.AdapterObservation{agent.AdapterObservationRunning}}, run, env)
 
 	// Drive through allocation to AdapterAccepted.
 	reconcileRun(t, r, "r")        // EnvironmentReady
@@ -2720,7 +2725,7 @@ func TestLifecycleTimestampsSetOnceAcrossPauseResumeAndTerminal(t *testing.T) {
 
 	// Terminal: FinishedAt is set once, StartedAt unchanged.
 	adapter := r.Adapters["test"].(*scriptedAdapter)
-	adapter.observations = []AdapterObservation{AdapterObservationSucceeded}
+	adapter.observations = []agent.AdapterObservation{agent.AdapterObservationSucceeded}
 	got = reconcileRun(t, r, "r")
 	if got.Status.State != platformv1alpha1.RunStateSucceeded {
 		t.Fatalf("state = %s, want Succeeded", got.Status.State)
@@ -2738,7 +2743,7 @@ func TestLifecycleTimestampsSetOnImmediateTerminalSuccess(t *testing.T) {
 	// Running: the Run goes directly from AdapterAccepted to Succeeded.
 	run := &platformv1alpha1.Run{ObjectMeta: metav1.ObjectMeta{Name: "r", Namespace: "ns", UID: "uid", Finalizers: []string{runFinalizer}}, Spec: platformv1alpha1.RunSpec{Agent: "test"}, Status: platformv1alpha1.RunStatus{State: platformv1alpha1.RunStateAllocating, EnvironmentRef: &platformv1alpha1.RunEnvironmentReference{Name: "e", UID: "euid", Ownership: platformv1alpha1.EnvironmentOwnershipOwned}}}
 	env := &platformv1alpha1.Environment{ObjectMeta: metav1.ObjectMeta{Name: "e", Namespace: "ns", UID: "euid"}, Status: platformv1alpha1.EnvironmentStatus{Phase: platformv1alpha1.EnvironmentPhaseReady}}
-	r := reconciler(t, &scriptedAdapter{observations: []AdapterObservation{AdapterObservationSucceeded}}, run, env)
+	r := reconciler(t, &scriptedAdapter{observations: []agent.AdapterObservation{agent.AdapterObservationSucceeded}}, run, env)
 
 	reconcileRun(t, r, "r")        // EnvironmentReady
 	reconcileRun(t, r, "r")        // acceptance attempt marker
@@ -2787,7 +2792,7 @@ func TestLifecycleTimestampsNilForNeverAcceptedFailureAndCancellation(t *testing
 			Conditions:     []metav1.Condition{{Type: runConditionAdapterAcceptanceAttempted, Status: metav1.ConditionTrue}},
 		}}
 		env := &platformv1alpha1.Environment{ObjectMeta: metav1.ObjectMeta{Name: "e", Namespace: "ns", UID: "euid"}, Status: platformv1alpha1.EnvironmentStatus{Phase: platformv1alpha1.EnvironmentPhaseReady}}
-		adapter := &scriptedAdapter{acceptErr: fmt.Errorf("%w: unsupported task configuration", ErrAdapterTaskRejected)}
+		adapter := &scriptedAdapter{acceptErr: fmt.Errorf("%w: unsupported task configuration", agent.ErrAdapterTaskRejected)}
 		r := reconciler(t, adapter, run, env)
 
 		got := reconcileRun(t, r, "r")
@@ -2824,7 +2829,7 @@ func TestAdapterSandboxEmitEventSendsExactRunUID(t *testing.T) {
 	env := &platformv1alpha1.Environment{ObjectMeta: metav1.ObjectMeta{Name: "env", Namespace: "ns", UID: "env-uid"}}
 
 	var gotNamespace, gotName, gotUID string
-	sink := eventSinkFunc(func(ctx context.Context, namespace, name, runUID string, event AdapterEvent) error {
+	sink := eventSinkFunc(func(ctx context.Context, namespace, name, runUID string, event agent.AdapterEvent) error {
 		gotNamespace, gotName, gotUID = namespace, name, runUID
 		return nil
 	})
@@ -2833,7 +2838,7 @@ func TestAdapterSandboxEmitEventSendsExactRunUID(t *testing.T) {
 	if sandbox.EmitEvent == nil {
 		t.Fatal("EmitEvent closure was not wired")
 	}
-	if err := sandbox.EmitEvent(context.Background(), AdapterEvent{Source: "adapter", IdempotencyKey: "k", Type: "output", Data: json.RawMessage(`{}`)}); err != nil {
+	if err := sandbox.EmitEvent(context.Background(), agent.AdapterEvent{Source: "adapter", IdempotencyKey: "k", Type: "output", Data: json.RawMessage(`{}`)}); err != nil {
 		t.Fatal(err)
 	}
 	if gotNamespace != "ns" || gotName != "r" || gotUID != "run-uid" {
@@ -2841,8 +2846,8 @@ func TestAdapterSandboxEmitEventSendsExactRunUID(t *testing.T) {
 	}
 }
 
-type eventSinkFunc func(context.Context, string, string, string, AdapterEvent) error
+type eventSinkFunc func(context.Context, string, string, string, agent.AdapterEvent) error
 
-func (f eventSinkFunc) Append(ctx context.Context, namespace, name, runUID string, event AdapterEvent) error {
+func (f eventSinkFunc) Append(ctx context.Context, namespace, name, runUID string, event agent.AdapterEvent) error {
 	return f(ctx, namespace, name, runUID, event)
 }

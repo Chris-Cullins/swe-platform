@@ -27,9 +27,11 @@ Run/Environment resource APIs for the console.
 The CLI also provides a local stdio `swe mcp` server with bounded `create_run` and
 UID-fenced `read_transcript` tools that act through the caller's existing explicit
 control-plane bearer credential; interactive terminal attach is intentionally not an MCP tool.
-Remaining gaps are tracked in `ARCHITECTURE.md`, code comments, and linked issues — most notably
-additional credential forms, additional agent adapters, GitHub App–scoped git tokens, and
-egress/portal networking. The `claude-code` (default), `amp`, `codex`, and `pi` adapters are
+The control plane also provides the authenticated declared-service portal gateway, with fenced
+wake/currentness checks and a purpose-scoped sandboxd tunnel. Remaining gaps are tracked in
+`ARCHITECTURE.md`, code comments, and linked issues — most notably additional credential forms,
+additional agent adapters, GitHub App–scoped git tokens, service-file ingestion, and egress
+networking. The `claude-code` (default), `amp`, `codex`, and `pi` adapters are
 registered and use sandboxd managed processes. API-key profiles use process-scoped launch
 material as `ANTHROPIC_API_KEY`,
 `AMP_API_KEY`, or `CODEX_API_KEY`; tests use fake process services and no provider credentials.
@@ -59,11 +61,15 @@ Pi deliberately supports no credential profiles or credential injection.
 
 - **Language:** Go for control plane, operator, `sandboxd`, and CLI.
 - **Layout:** kubebuilder conventions — `api/v1alpha1/` for types,
-  `internal/controllers/`, `cmd/{operator,swe}`. Shared fenced Environment intent
+  `internal/controllers/`, `cmd/{operator,swe}`. The exact adapter contract boundary is
+  `internal/agent/`. Shared fenced Environment intent
   publication and validation belongs in `internal/lifecycle/`; controllers remain
-  the sole owners of observed lifecycle transitions. `sandboxd/` is a **separate Go
-  module** with its own `go.mod`: keep its dependencies minimal so it stays portable and
-  the environment base image stays small.
+  the sole owners of observed lifecycle transitions. Environment reconciliation is split
+  within `internal/controllers/` into ordered gate orchestration, lifecycle intent,
+  provisioning/resources, pod recovery, status, and manager setup files; keep gate names
+  bounded and preserve the ordering contract in its direct test. `sandboxd/` is a
+  **separate Go module** with its own `go.mod`: keep its dependencies minimal so it stays
+  portable and the environment base image stays small.
   Generated protobuf code lives in `sandboxd/gen/` and is committed.
 - **APIs:** CRDs are `v1alpha1`; breaking changes are acceptable pre-1.0. Whenever CRD
   fields or contracts change, update the relevant current resource table and
@@ -164,8 +170,8 @@ runs both via `make` targets:
   the local stdio MCP tool list plus UID-fenced bounded transcript read,
   actual-listener service observation through healthy/unhealthy/restart/pause/resume/removal
   transitions with declaration and fresh-execution correlation and no URL,
-  process-scoped fake Claude and Amp API-key delivery without ambient
-  setup/resume/sandboxd exposure, and Secret-only sandboxd process/service-observation
+  declared-service portal allocation/proxy authorization and lifecycle fencing, process-scoped fake Claude and Amp API-key delivery without ambient
+  setup/resume/sandboxd exposure, and Secret-only sandboxd process/service-observation/portal
   capability tokens without Environment pod projection.
   Runs in CI as the `e2e` workflow on relevant PRs and via `workflow_dispatch`.
 - **CRD installation/upgrades:** `make install-crds` uses server-side apply with force-conflicts;

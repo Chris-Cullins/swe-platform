@@ -137,12 +137,24 @@ rules:
   - apiGroups: [""]
     resources: ["pods"]
     verbs: ["get"]
+  {{- if .Values.controlPlane.portal.enabled }}
+  # The enabled gateway resolves only the exact credential Secret named by the
+  # current Environment pod. It cannot list or watch Secrets.
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get"]
+  {{- end }}
   - apiGroups: ["swe.dev"]
     resources: ["projects"]
     verbs: ["get", "list"]
   - apiGroups: ["swe.dev"]
     resources: ["environments"]
-    verbs: ["get", "patch"]
+    verbs:
+      - "get"
+      - "patch"
+      {{- if .Values.controlPlane.portal.enabled }}
+      - "list"
+      {{- end }}
   - apiGroups: ["swe.dev"]
     resources: ["environments/status"]
     verbs: ["get", "update"]

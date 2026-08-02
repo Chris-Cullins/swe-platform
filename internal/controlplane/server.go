@@ -52,6 +52,7 @@ type Server struct {
 	terminalOpenTimeout   time.Duration
 	terminalWriteTimeout  time.Duration
 	metrics               *Metrics
+	portal                *portalGateway
 }
 
 // RunResolver verifies that a namespaced Run exists before transcript state is used.
@@ -75,15 +76,20 @@ func (r KubernetesRunResolver) ResolveRun(ctx context.Context, namespace, name s
 
 // ServerOptions supplies the control plane's resource and authorization dependencies.
 type ServerOptions struct {
-	Access                AccessController
-	Sessions              SessionAuthenticator
-	Resources             ResourceService
-	Runs                  RunResolver
-	TranscriptStore       TranscriptStore
-	TerminalDialer        TerminalDialer
-	ConsoleAssets         fs.FS
-	TrustProxy            bool
-	AllowInsecureSessions bool
+	Access                      AccessController
+	Sessions                    SessionAuthenticator
+	Resources                   ResourceService
+	Runs                        RunResolver
+	TranscriptStore             TranscriptStore
+	TerminalDialer              TerminalDialer
+	PortalResolver              PortalResolver
+	PortalEnvironmentEnumerator PortalEnvironmentEnumerator
+	PortalDialer                PortalDialer
+	PortalSuffix                string
+	PortalScheme                string
+	ConsoleAssets               fs.FS
+	TrustProxy                  bool
+	AllowInsecureSessions       bool
 	// StreamLifecycle is canceled when long-lived SSE and terminal handlers
 	// must exit during process shutdown. Ordinary requests do not use it.
 	StreamLifecycle context.Context
@@ -106,7 +112,7 @@ func NewServer(log *slog.Logger, options ServerOptions) *Server {
 	if streams == nil {
 		streams = context.Background()
 	}
-	return &Server{
+	server := &Server{
 		log:                   log,
 		store:                 options.TranscriptStore,
 		access:                options.Access,
@@ -124,6 +130,8 @@ func NewServer(log *slog.Logger, options ServerOptions) *Server {
 		terminalWriteTimeout:  terminalStreamingWriteTimeout,
 		metrics:               options.Metrics,
 	}
+	server.portal = newPortalGateway(server, options)
+	return server
 }
 
 func (s *Server) withStreamLifecycle(r *http.Request) (*http.Request, func()) {
@@ -146,20 +154,38 @@ func (s *Server) Handler() http.Handler {
 	})
 	mux.HandleFunc("/api/v1/session", s.handleSession)
 	mux.HandleFunc(namespacedPathPrefix, s.handleNamespacedAPI)
+	base := http.Handler(mux)
 	if s.consoleAssets == nil {
-		return mux
+		if s.portal == nil {
+			return base
+		}
+		return s.portal.wrap(base)
 	}
 	console := newConsoleHandler(s.consoleAssets)
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	base = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if isReservedServerPath(r.URL.Path) {
 			mux.ServeHTTP(w, r)
 			return
 		}
 		console.ServeHTTP(w, r)
 	})
+	if s.portal != nil {
+		return s.portal.wrap(base)
+	}
+	return base
 }
 
 func (s *Server) handleNamespacedAPI(w http.ResponseWriter, r *http.Request) {
+	if s.portal != nil {
+		if namespace, environment, service, ok := portalDiscoveryPath(r.URL.EscapedPath()); ok {
+			if r.Method == http.MethodGet {
+				s.portal.discover(w, r, namespace, environment, service)
+			} else {
+				writeResourceMethodError(w, "GET")
+			}
+			return
+		}
+	}
 	if namespace, run, runUID, environmentUID, ok := browserRunTerminalPath(r.URL.EscapedPath()); ok {
 		if r.Method == http.MethodGet {
 			s.handleBrowserRunTerminal(w, r, namespace, run, runUID, environmentUID)

@@ -12,7 +12,7 @@ import (
 	"google.golang.org/grpc/status"
 
 	platformv1alpha1 "github.com/Chris-Cullins/swe-platform/api/v1alpha1"
-	"github.com/Chris-Cullins/swe-platform/internal/controllers"
+	"github.com/Chris-Cullins/swe-platform/internal/agent"
 	sandboxdv1 "github.com/Chris-Cullins/swe-platform/sandboxd/gen/proto/sandboxd/v1"
 )
 
@@ -97,10 +97,10 @@ func (f *fakeProcessClient) ReadOutput(_ context.Context, request *sandboxdv1.Re
 	return &sandboxdv1.ReadOutputResponse{Data: append([]byte(nil), data[start:end]...), Offset: offset, NextOffset: retainedFrom + uint64(end), GapBytes: gapBytes, RetainedStart: retainedFrom, ProducedEnd: producedEnd, Eof: end == len(data)}, nil
 }
 
-func sandboxFor(client sandboxdv1.ProcessServiceClient) controllers.AdapterSandbox {
-	return controllers.AdapterSandbox{
+func sandboxFor(client sandboxdv1.ProcessServiceClient) agent.AdapterSandbox {
+	return agent.AdapterSandbox{
 		EnvironmentName: "environment",
-		EnvironmentUID:  "environment-uid",
+		EnvironmentUID:  agent.EnvironmentUID("environment-uid"),
 		DialProcess: func(context.Context) (sandboxdv1.ProcessServiceClient, func() error, error) {
 			return client, func() error { return nil }, nil
 		},
@@ -108,7 +108,7 @@ func sandboxFor(client sandboxdv1.ProcessServiceClient) controllers.AdapterSandb
 }
 
 func TestAcceptanceIsDuplicateSafeAndResumeKeepsTaskIdentity(t *testing.T) {
-	task := controllers.AdapterTask{ID: "run-uid", Prompt: "fix the test"}
+	task := agent.AdapterTask{ID: "run-uid", Prompt: "fix the test"}
 	adapter := &Adapter{Executable: "fake-claude"}
 	firstEpoch := &fakeProcessClient{}
 	for range 2 {
@@ -136,7 +136,7 @@ func TestAcceptanceIsDuplicateSafeAndResumeKeepsTaskIdentity(t *testing.T) {
 }
 
 func TestPromptIsSeparatedFromClaudeFlags(t *testing.T) {
-	spec := (&Adapter{}).processSpec(controllers.AdapterTask{Prompt: "--version"})
+	spec := (&Adapter{}).processSpec(agent.AdapterTask{Prompt: "--version"})
 	if got := spec.Argv[len(spec.Argv)-2:]; !reflect.DeepEqual(got, []string{"--", "--version"}) {
 		t.Fatalf("argv suffix = %#v, want flag terminator and prompt", got)
 	}
@@ -145,7 +145,7 @@ func TestPromptIsSeparatedFromClaudeFlags(t *testing.T) {
 func TestAPIKeyUsesLaunchMaterialOnly(t *testing.T) {
 	client := &fakeProcessClient{}
 	key := []byte("!!CLAUDE-API-KEY-FIXTURE!!")
-	err := (&Adapter{}).EnsureAccepted(context.Background(), controllers.AdapterTask{ID: "run", Prompt: "task"}, sandboxFor(client), &controllers.AdapterCredential{Type: platformv1alpha1.AgentCredentialTypeAPIKey, APIKey: key})
+	err := (&Adapter{}).EnsureAccepted(context.Background(), agent.AdapterTask{ID: "run", Prompt: "task"}, sandboxFor(client), &agent.AdapterCredential{Type: platformv1alpha1.AgentCredentialTypeAPIKey, APIKey: key})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -162,7 +162,7 @@ func TestAPIKeyUsesLaunchMaterialOnly(t *testing.T) {
 
 func TestLaunchMaterialUnimplementedDoesNotFallback(t *testing.T) {
 	client := &fakeProcessClient{launchErr: status.Error(codes.Unimplemented, "old sandboxd")}
-	err := (&Adapter{}).EnsureAccepted(context.Background(), controllers.AdapterTask{ID: "run"}, sandboxFor(client), &controllers.AdapterCredential{Type: platformv1alpha1.AgentCredentialTypeAPIKey, APIKey: []byte("key")})
+	err := (&Adapter{}).EnsureAccepted(context.Background(), agent.AdapterTask{ID: "run"}, sandboxFor(client), &agent.AdapterCredential{Type: platformv1alpha1.AgentCredentialTypeAPIKey, APIKey: []byte("key")})
 	if status.Code(err) != codes.Unimplemented || client.startCalls != 0 {
 		t.Fatalf("error/start calls = %v/%d", err, client.startCalls)
 	}
@@ -170,11 +170,11 @@ func TestLaunchMaterialUnimplementedDoesNotFallback(t *testing.T) {
 
 func TestUnsupportedCredentialTypeFailsBeforeDial(t *testing.T) {
 	dials := 0
-	sandbox := controllers.AdapterSandbox{DialProcess: func(context.Context) (sandboxdv1.ProcessServiceClient, func() error, error) {
+	sandbox := agent.AdapterSandbox{DialProcess: func(context.Context) (sandboxdv1.ProcessServiceClient, func() error, error) {
 		dials++
 		return &fakeProcessClient{}, func() error { return nil }, nil
 	}}
-	err := (&Adapter{}).EnsureAccepted(context.Background(), controllers.AdapterTask{ID: "run"}, sandbox, &controllers.AdapterCredential{Type: "FutureType", APIKey: []byte("!!UNUSED-KEY-FIXTURE!!")})
+	err := (&Adapter{}).EnsureAccepted(context.Background(), agent.AdapterTask{ID: "run"}, sandbox, &agent.AdapterCredential{Type: "FutureType", APIKey: []byte("!!UNUSED-KEY-FIXTURE!!")})
 	if err == nil || dials != 0 {
 		t.Fatalf("unsupported credential = error %v, dials %d", err, dials)
 	}
@@ -182,7 +182,7 @@ func TestUnsupportedCredentialTypeFailsBeforeDial(t *testing.T) {
 
 func TestCancelStopsOnlyRunOwnedProcessTree(t *testing.T) {
 	client := &fakeProcessClient{}
-	task := controllers.AdapterTask{ID: "run-uid"}
+	task := agent.AdapterTask{ID: "run-uid"}
 	if err := (&Adapter{}).Cancel(context.Background(), task, sandboxFor(client)); err != nil {
 		t.Fatal(err)
 	}
@@ -193,8 +193,8 @@ func TestCancelStopsOnlyRunOwnedProcessTree(t *testing.T) {
 
 func TestCancelWaitsForProcessTreeToBecomeTerminal(t *testing.T) {
 	client := &fakeProcessClient{process: &sandboxdv1.Process{State: sandboxdv1.ProcessState_PROCESS_STATE_STOPPING, ExecutionId: "execution"}}
-	err := (&Adapter{}).Cancel(context.Background(), controllers.AdapterTask{ID: "run-uid"}, sandboxFor(client))
-	if !errors.Is(err, controllers.ErrAdapterCancellationPending) {
+	err := (&Adapter{}).Cancel(context.Background(), agent.AdapterTask{ID: "run-uid"}, sandboxFor(client))
+	if !errors.Is(err, agent.ErrAdapterCancellationPending) {
 		t.Fatalf("Cancel() error = %v, want cancellation pending", err)
 	}
 }
@@ -205,23 +205,23 @@ func TestObservationMapping(t *testing.T) {
 		name    string
 		process *sandboxdv1.Process
 		stdout  string
-		want    controllers.AdapterObservation
+		want    agent.AdapterObservation
 	}{
-		{name: "running", process: &sandboxdv1.Process{State: sandboxdv1.ProcessState_PROCESS_STATE_RUNNING, ExecutionId: "e"}, want: controllers.AdapterObservationRunning},
-		{name: "start failure", process: &sandboxdv1.Process{State: sandboxdv1.ProcessState_PROCESS_STATE_FAILED, Error: "executable not found", ExecutionId: "e"}, want: controllers.AdapterObservationFailed},
-		{name: "nonzero exit", process: &sandboxdv1.Process{State: sandboxdv1.ProcessState_PROCESS_STATE_EXITED, ExitCode: &exit1, ExecutionId: "e"}, want: controllers.AdapterObservationFailed},
-		{name: "success", process: &sandboxdv1.Process{State: sandboxdv1.ProcessState_PROCESS_STATE_EXITED, ExitCode: &exit0, ExecutionId: "e"}, stdout: "{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"done\"}\n", want: controllers.AdapterObservationSucceeded},
-		{name: "success with historical denial", process: &sandboxdv1.Process{State: sandboxdv1.ProcessState_PROCESS_STATE_EXITED, ExitCode: &exit0, ExecutionId: "e"}, stdout: "{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"permission_denials\":[{\"tool\":\"Bash\"}]}\n", want: controllers.AdapterObservationSucceeded},
-		{name: "reported error", process: &sandboxdv1.Process{State: sandboxdv1.ProcessState_PROCESS_STATE_EXITED, ExitCode: &exit0, ExecutionId: "e"}, stdout: "{\"type\":\"result\",\"subtype\":\"error_max_turns\",\"is_error\":true}\n", want: controllers.AdapterObservationFailed},
-		{name: "error with denial", process: &sandboxdv1.Process{State: sandboxdv1.ProcessState_PROCESS_STATE_EXITED, ExitCode: &exit0, ExecutionId: "e"}, stdout: "{\"type\":\"result\",\"subtype\":\"error_during_execution\",\"is_error\":true,\"permission_denials\":[{}]}\n", want: controllers.AdapterObservationFailed},
-		{name: "missing error marker", process: &sandboxdv1.Process{State: sandboxdv1.ProcessState_PROCESS_STATE_EXITED, ExitCode: &exit0, ExecutionId: "e"}, stdout: "{\"type\":\"result\",\"subtype\":\"success\"}\n", want: controllers.AdapterObservationFailed},
-		{name: "malformed result", process: &sandboxdv1.Process{State: sandboxdv1.ProcessState_PROCESS_STATE_EXITED, ExitCode: &exit0, ExecutionId: "e"}, stdout: "not-json\n", want: controllers.AdapterObservationFailed},
-		{name: "missing exit code", process: &sandboxdv1.Process{State: sandboxdv1.ProcessState_PROCESS_STATE_EXITED, ExecutionId: "e"}, want: controllers.AdapterObservationFailed},
+		{name: "running", process: &sandboxdv1.Process{State: sandboxdv1.ProcessState_PROCESS_STATE_RUNNING, ExecutionId: "e"}, want: agent.AdapterObservationRunning},
+		{name: "start failure", process: &sandboxdv1.Process{State: sandboxdv1.ProcessState_PROCESS_STATE_FAILED, Error: "executable not found", ExecutionId: "e"}, want: agent.AdapterObservationFailed},
+		{name: "nonzero exit", process: &sandboxdv1.Process{State: sandboxdv1.ProcessState_PROCESS_STATE_EXITED, ExitCode: &exit1, ExecutionId: "e"}, want: agent.AdapterObservationFailed},
+		{name: "success", process: &sandboxdv1.Process{State: sandboxdv1.ProcessState_PROCESS_STATE_EXITED, ExitCode: &exit0, ExecutionId: "e"}, stdout: "{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"done\"}\n", want: agent.AdapterObservationSucceeded},
+		{name: "success with historical denial", process: &sandboxdv1.Process{State: sandboxdv1.ProcessState_PROCESS_STATE_EXITED, ExitCode: &exit0, ExecutionId: "e"}, stdout: "{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"permission_denials\":[{\"tool\":\"Bash\"}]}\n", want: agent.AdapterObservationSucceeded},
+		{name: "reported error", process: &sandboxdv1.Process{State: sandboxdv1.ProcessState_PROCESS_STATE_EXITED, ExitCode: &exit0, ExecutionId: "e"}, stdout: "{\"type\":\"result\",\"subtype\":\"error_max_turns\",\"is_error\":true}\n", want: agent.AdapterObservationFailed},
+		{name: "error with denial", process: &sandboxdv1.Process{State: sandboxdv1.ProcessState_PROCESS_STATE_EXITED, ExitCode: &exit0, ExecutionId: "e"}, stdout: "{\"type\":\"result\",\"subtype\":\"error_during_execution\",\"is_error\":true,\"permission_denials\":[{}]}\n", want: agent.AdapterObservationFailed},
+		{name: "missing error marker", process: &sandboxdv1.Process{State: sandboxdv1.ProcessState_PROCESS_STATE_EXITED, ExitCode: &exit0, ExecutionId: "e"}, stdout: "{\"type\":\"result\",\"subtype\":\"success\"}\n", want: agent.AdapterObservationFailed},
+		{name: "malformed result", process: &sandboxdv1.Process{State: sandboxdv1.ProcessState_PROCESS_STATE_EXITED, ExitCode: &exit0, ExecutionId: "e"}, stdout: "not-json\n", want: agent.AdapterObservationFailed},
+		{name: "missing exit code", process: &sandboxdv1.Process{State: sandboxdv1.ProcessState_PROCESS_STATE_EXITED, ExecutionId: "e"}, want: agent.AdapterObservationFailed},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			client := &fakeProcessClient{process: test.process, stdout: []byte(test.stdout)}
-			got, _, err := (&Adapter{}).Observe(context.Background(), controllers.AdapterTask{ID: "run"}, sandboxFor(client))
+			got, _, err := (&Adapter{}).Observe(context.Background(), agent.AdapterTask{ID: "run"}, sandboxFor(client))
 			if err != nil || got != test.want {
 				t.Fatalf("Observe() = (%q, %v), want %q", got, err, test.want)
 			}
@@ -231,15 +231,15 @@ func TestObservationMapping(t *testing.T) {
 
 func TestUnavailableAndAbsentExecution(t *testing.T) {
 	dialError := errors.New("sandbox unavailable")
-	sandbox := controllers.AdapterSandbox{DialProcess: func(context.Context) (sandboxdv1.ProcessServiceClient, func() error, error) {
+	sandbox := agent.AdapterSandbox{DialProcess: func(context.Context) (sandboxdv1.ProcessServiceClient, func() error, error) {
 		return nil, nil, dialError
 	}}
-	if err := (&Adapter{}).EnsureAccepted(context.Background(), controllers.AdapterTask{ID: "run"}, sandbox, nil); !errors.Is(err, dialError) {
+	if err := (&Adapter{}).EnsureAccepted(context.Background(), agent.AdapterTask{ID: "run"}, sandbox, nil); !errors.Is(err, dialError) {
 		t.Fatalf("EnsureAccepted() error = %v", err)
 	}
 	client := &fakeProcessClient{getErr: status.Error(codes.NotFound, "absent")}
-	got, _, err := (&Adapter{}).Observe(context.Background(), controllers.AdapterTask{ID: "run"}, sandboxFor(client))
-	if err != nil || got != controllers.AdapterObservationFailed {
+	got, _, err := (&Adapter{}).Observe(context.Background(), agent.AdapterTask{ID: "run"}, sandboxFor(client))
+	if err != nil || got != agent.AdapterObservationFailed {
 		t.Fatalf("Observe(absent) = (%q, %v)", got, err)
 	}
 }
@@ -249,15 +249,15 @@ func TestOutputForwardingIsBoundedCursorBasedAndAdapterOwned(t *testing.T) {
 		process: &sandboxdv1.Process{State: sandboxdv1.ProcessState_PROCESS_STATE_RUNNING, ExecutionId: "execution"},
 		stdout:  []byte("stdout"), stderr: []byte("stderr"),
 	}
-	var events []controllers.AdapterEvent
+	var events []agent.AdapterEvent
 	sandbox := sandboxFor(client)
-	sandbox.EmitEvent = func(_ context.Context, event controllers.AdapterEvent) error {
+	sandbox.EmitEvent = func(_ context.Context, event agent.AdapterEvent) error {
 		events = append(events, event)
 		return nil
 	}
 	adapter := &Adapter{}
 	for range 2 {
-		if _, _, err := adapter.Observe(context.Background(), controllers.AdapterTask{ID: "run"}, sandbox); err != nil {
+		if _, _, err := adapter.Observe(context.Background(), agent.AdapterTask{ID: "run"}, sandbox); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -275,15 +275,15 @@ func TestOutputRetryAfterRestartUsesContentAddressedKeys(t *testing.T) {
 	client := &fakeProcessClient{process: &sandboxdv1.Process{State: sandboxdv1.ProcessState_PROCESS_STATE_RUNNING, ExecutionId: "execution"}, stdout: []byte("first")}
 	var keys []string
 	sandbox := sandboxFor(client)
-	sandbox.EmitEvent = func(_ context.Context, event controllers.AdapterEvent) error {
+	sandbox.EmitEvent = func(_ context.Context, event agent.AdapterEvent) error {
 		keys = append(keys, event.IdempotencyKey)
 		return nil
 	}
-	if _, _, err := (&Adapter{}).Observe(context.Background(), controllers.AdapterTask{ID: "run"}, sandbox); err != nil {
+	if _, _, err := (&Adapter{}).Observe(context.Background(), agent.AdapterTask{ID: "run"}, sandbox); err != nil {
 		t.Fatal(err)
 	}
 	client.stdout = []byte("first-second")
-	if _, _, err := (&Adapter{}).Observe(context.Background(), controllers.AdapterTask{ID: "run"}, sandbox); err != nil {
+	if _, _, err := (&Adapter{}).Observe(context.Background(), agent.AdapterTask{ID: "run"}, sandbox); err != nil {
 		t.Fatal(err)
 	}
 	if len(keys) != 2 || keys[0] == keys[1] {
@@ -296,7 +296,7 @@ func TestTransientOutputFailureRetriesSameEvent(t *testing.T) {
 	transient := errors.New("temporary transcript outage")
 	var keys []string
 	sandbox := sandboxFor(client)
-	sandbox.EmitEvent = func(_ context.Context, event controllers.AdapterEvent) error {
+	sandbox.EmitEvent = func(_ context.Context, event agent.AdapterEvent) error {
 		keys = append(keys, event.IdempotencyKey)
 		if len(keys) == 1 {
 			return transient
@@ -304,11 +304,11 @@ func TestTransientOutputFailureRetriesSameEvent(t *testing.T) {
 		return nil
 	}
 	adapter := &Adapter{}
-	if _, _, err := adapter.Observe(context.Background(), controllers.AdapterTask{ID: "run"}, sandbox); !errors.Is(err, transient) {
+	if _, _, err := adapter.Observe(context.Background(), agent.AdapterTask{ID: "run"}, sandbox); !errors.Is(err, transient) {
 		t.Fatalf("first Observe() error = %v, want transient error", err)
 	}
-	got, _, err := adapter.Observe(context.Background(), controllers.AdapterTask{ID: "run"}, sandbox)
-	if err != nil || got != controllers.AdapterObservationRunning {
+	got, _, err := adapter.Observe(context.Background(), agent.AdapterTask{ID: "run"}, sandbox)
+	if err != nil || got != agent.AdapterObservationRunning {
 		t.Fatalf("retry Observe() = (%q, %v)", got, err)
 	}
 	if len(keys) != 2 || keys[0] != keys[1] {
@@ -319,11 +319,11 @@ func TestTransientOutputFailureRetriesSameEvent(t *testing.T) {
 func TestPermanentOutputRejectionFailsObservation(t *testing.T) {
 	client := &fakeProcessClient{process: &sandboxdv1.Process{State: sandboxdv1.ProcessState_PROCESS_STATE_RUNNING, ExecutionId: "execution"}, stdout: []byte("output")}
 	sandbox := sandboxFor(client)
-	sandbox.EmitEvent = func(context.Context, controllers.AdapterEvent) error {
-		return controllers.ErrAdapterEventRejected
+	sandbox.EmitEvent = func(context.Context, agent.AdapterEvent) error {
+		return agent.ErrAdapterEventRejected
 	}
-	got, message, err := (&Adapter{}).Observe(context.Background(), controllers.AdapterTask{ID: "run"}, sandbox)
-	if err != nil || got != controllers.AdapterObservationFailed || !strings.Contains(message, "permanently rejected") {
+	got, message, err := (&Adapter{}).Observe(context.Background(), agent.AdapterTask{ID: "run"}, sandbox)
+	if err != nil || got != agent.AdapterObservationFailed || !strings.Contains(message, "permanently rejected") {
 		t.Fatalf("Observe() = (%q, %q, %v)", got, message, err)
 	}
 }
@@ -338,8 +338,8 @@ func TestTerminalValidationFailsOnRetainedOutputGap(t *testing.T) {
 		stdout:       []byte(`{"type":"result","subtype":"success","is_error":false,"result":"done"}` + "\n"),
 		retainedFrom: 512,
 	}
-	got, detail, err := (&Adapter{}).Observe(context.Background(), controllers.AdapterTask{ID: "run"}, sandboxFor(client))
-	if err != nil || got != controllers.AdapterObservationFailed || !strings.Contains(detail, "truncated before terminal validation") || !strings.Contains(detail, "retained from offset 512") {
+	got, detail, err := (&Adapter{}).Observe(context.Background(), agent.AdapterTask{ID: "run"}, sandboxFor(client))
+	if err != nil || got != agent.AdapterObservationFailed || !strings.Contains(detail, "truncated before terminal validation") || !strings.Contains(detail, "retained from offset 512") {
 		t.Fatalf("Observe() = (%q, %q, %v)", got, detail, err)
 	}
 }
@@ -348,10 +348,10 @@ func TestTerminalCancellationIgnoresPermanentOutputRejection(t *testing.T) {
 	exitCode := int32(0)
 	client := &fakeProcessClient{process: &sandboxdv1.Process{State: sandboxdv1.ProcessState_PROCESS_STATE_EXITED, ExecutionId: "execution", ExitCode: &exitCode}, stdout: []byte("output")}
 	sandbox := sandboxFor(client)
-	sandbox.EmitEvent = func(context.Context, controllers.AdapterEvent) error {
-		return controllers.ErrAdapterEventRejected
+	sandbox.EmitEvent = func(context.Context, agent.AdapterEvent) error {
+		return agent.ErrAdapterEventRejected
 	}
-	if err := (&Adapter{}).Cancel(context.Background(), controllers.AdapterTask{ID: "run"}, sandbox); err != nil {
+	if err := (&Adapter{}).Cancel(context.Background(), agent.AdapterTask{ID: "run"}, sandbox); err != nil {
 		t.Fatalf("Cancel() error = %v", err)
 	}
 }

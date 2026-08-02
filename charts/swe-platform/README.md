@@ -33,8 +33,9 @@ The control plane accepts adapter-owned transcript events and streams them over 
 Production installs must configure the PostgreSQL transcript store described below. The chart
 still requires one control-plane replica and uses a non-overlapping `Recreate` deployment:
 durable transcripts and encrypted PostgreSQL browser sessions survive process replacement, but
-open SSE/WebSocket connections do not and this release makes no control-plane HA claim. Portal
-proxying is not implemented yet.
+open SSE/WebSocket connections do not and this release makes no control-plane HA claim. The
+optional authenticated portal gateway exposes explicitly declared HTTP services through one
+wildcard host namespace.
 
 ## Control-plane metrics
 
@@ -130,6 +131,8 @@ Run status/finalizer updates and Environment allocation/claim updates. Process e
 remains behind the environment's portable sandboxd contract rather than Kubernetes exec.
 
 ## Install
+
+Kubernetes 1.33 or newer is required.
 
 Choose the values preset for the target cluster and install into a dedicated namespace:
 
@@ -615,7 +618,7 @@ plane pod from starting after installation, with no memory fallback.
 
 | Requirement | Chart behavior | Operator action |
 |---|---|---|
-| Control-plane exposure | ClusterIP Service on port 80 (HTTP); no Ingress or TLS termination created | Provide a TLS-terminating reverse proxy or load balancer; production browser sessions require HTTPS |
+| Control-plane exposure | ClusterIP Service on port 80. Optional portal Ingress owns only `*.controlPlane.portal.suffix` | Expose the ordinary API separately; provide wildcard DNS and an administrator-owned wildcard TLS Secret for portals |
 | Environment sandboxd isolation | Ingress NetworkPolicy per environment pod: port 50051 admitted only from release-namespace control-plane and operator pods | CNI must enforce Kubernetes NetworkPolicy for defense in depth; TLS and capability authorization remain mandatory regardless |
 | Environment egress | No default-deny egress or egress proxy | Environment egress is subject to cluster network configuration; `Project.spec.egressAllowlist` is reserved and rejected when non-empty |
 | Operator → control plane | In-cluster HTTP to the control-plane Service | No external networking required; both components run in the release namespace |
@@ -644,6 +647,7 @@ exact namespace, resource name, and subresource on every request:
 | Append a transcript event | `update` on `runs/transcript` with the requested Run `resourceName` |
 | Open a direct Environment terminal | `get` on `environments/terminal` with the requested Environment `resourceName` |
 | Open a Run terminal | `get` on the requested base `runs` `resourceName`, then `get` on the resolved `environments/terminal` `resourceName` |
+| Discover/use a portal | exact `get` on `environments/portal`, exact `get` on synthetic `environmentservices/portal` name `<environment>.<service>`, then exact current base Run or Project `get` |
 
 This permits producer credentials to be restricted to one Run using an RBAC Role with
 `resourceNames`. The namespace is part of the URL only as a resource selector; it becomes
@@ -763,6 +767,63 @@ subjects:
 
 Create the ServiceAccount, then mint a short-lived credential with
 `kubectl create token run-123-adapter -n project-a --audience=swe-platform`.
+
+### Declared-service portals
+
+Portals are disabled in every checked-in preset. Production enables a canonical suffix and
+HTTPS. The optional Ingress owns only the wildcard host and references, but never creates, TLS:
+
+```yaml
+controlPlane:
+  auth:
+    # Required for the chart's TLS-terminating portal Ingress. The ingress
+    # must overwrite both X-Forwarded-Host and X-Forwarded-Proto.
+    trustProxyHeaders: true
+  portal:
+    enabled: true
+    suffix: portal.example.com
+    scheme: https
+    ingress:
+      enabled: true
+      ingressClassName: nginx
+      annotations: {}
+      tls:
+        secretName: portal-example-wildcard
+```
+
+All wildcard-host paths route to the control-plane Service `http` port; configure ordinary API
+ingress separately. HTTP is valid only with explicit insecure development sessions and portal
+Ingress disabled. For kind, forward the Service, run
+`SWE_CONTROL_PLANE_TOKEN=... swe --namespace project-a portal ENV SERVICE`, and send requests to
+the forward with the printed URL's exact Host and bearer. This tests the same gateway/sandboxd
+transport used by a hairpin, not arbitrary wildcard DNS. Real in-Environment use requires
+operator-supplied wildcard DNS, an internal route to the gateway, and explicit authentication;
+cookies are host-only, never Domain cookies.
+
+Helm/onboarding deliberately grants no arbitrary user portal access. A least-privilege Role is:
+
+```yaml
+rules:
+  - apiGroups: ["swe.dev"]
+    resources: ["environments/portal"]
+    resourceNames: ["env-a"]
+    verbs: ["get"]
+  - apiGroups: ["swe.dev"]
+    resources: ["environmentservices/portal"]
+    resourceNames: ["env-a.web"]
+    verbs: ["get"]
+  - apiGroups: ["swe.dev"]
+    resources: ["runs"] # or projects, with its exact name
+    resourceNames: ["run-a"]
+    verbs: ["get"]
+```
+
+When portals are enabled, the control plane can list namespaced Environments, update Environment
+status routes, and has Secret `get` (but not list/watch) in onboarded namespaces; sandboxclient
+requests only the exact credential named by the current pod. Environment NetworkPolicy is
+unchanged: only installation-labeled operator/control-plane pods reach sandboxd port 50051, and
+Ingress never targets an Environment pod. No services-file ingestion or `$PUBLIC_URL` injection
+exists (#70).
 
 ## Operations console
 

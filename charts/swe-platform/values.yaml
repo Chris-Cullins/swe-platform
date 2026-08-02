@@ -20,6 +20,20 @@ controlPlane:
   metrics:
     # Exposed on the internal control-plane Service as a dedicated listener.
     port: 8082
+  portal:
+    # Portal routing is disabled unless explicitly enabled. Suffix is the
+    # canonical wildcard DNS suffix without a leading "*." or trailing dot.
+    enabled: false
+    suffix: ""
+    scheme: https
+    ingress:
+      # This Ingress owns only *.suffix; expose the ordinary API separately.
+      enabled: false
+      ingressClassName: ""
+      annotations: {}
+      tls:
+        # Administrator-owned wildcard certificate Secret; never created here.
+        secretName: ""
   sessions:
     # memory is development-only. Production presets explicitly select postgres.
     backend: memory
