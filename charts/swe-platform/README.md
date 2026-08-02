@@ -36,6 +36,52 @@ durable transcripts and encrypted PostgreSQL browser sessions survive process re
 open SSE/WebSocket connections do not and this release makes no control-plane HA claim. Portal
 proxying is not implemented yet.
 
+## Control-plane metrics
+
+The stable control-plane Service exposes a dedicated internal Prometheus scrape port named
+`metrics` (8082 by default). Scrape `/metrics` on that port; the listener serves no console,
+session, transcript, terminal, or other application route. The binary's
+`--metrics-bind-address` defaults to `127.0.0.1:8082` for fail-closed direct execution, while
+the chart explicitly binds `:<controlPlane.metrics.port>` so the cluster-internal Service is a
+usable scrape target. The port must be 1-65535 and cannot overlap the API's Service port 80 or
+container port 8080. The chart
+does not install a ServiceMonitor or make the Service externally reachable; apply cluster-local
+scrape discovery and NetworkPolicy appropriate to your Prometheus installation.
+
+All custom labels are fixed outcome, kind, or reason sets. They never contain credentials,
+sessions, users, namespaces, repositories, URLs, Runs, or Environments. Healthy traffic should
+show committed/replayed appends, admitted subscribers returning to baseline, delivered replay
+or live events with low lag, terminal grants, and allowed authentication reviews. Investigate:
+
+| Metric | Labels |
+|---|---|
+| `swe_control_plane_transcript_appends_total` | `outcome`: `committed`, `replayed`, `rejected`, `error` |
+| `swe_control_plane_transcript_append_duration_seconds` | same `outcome` values |
+| `swe_control_plane_transcript_sse_subscribers` | none |
+| `swe_control_plane_transcript_sse_deliveries_total` | `kind`: `replay`, `live`, `gap`; `outcome`: `delivered`, `error`, plus `dropped` for live delivery |
+| `swe_control_plane_transcript_sse_delivery_lag_seconds` | `kind`: `replay`, `live` |
+| `swe_control_plane_terminal_lease_grants_total` | `outcome`: `granted`, `failed` |
+| `swe_control_plane_terminal_lease_revocations_total` | `reason`: `run_association_changed`, `environment_changed`, `execution_changed`, `hold_policy_changed` |
+| `swe_control_plane_token_reviews_total` | `outcome`: `authenticated`, `denied`, `error` |
+| `swe_control_plane_token_review_duration_seconds` | same `outcome` values |
+| `swe_control_plane_subject_access_reviews_total` | `outcome`: `allowed`, `denied`, `error` |
+| `swe_control_plane_subject_access_review_duration_seconds` | same `outcome` values |
+
+- sustained `swe_control_plane_transcript_appends_total{outcome="error"}` or
+  `{outcome="rejected"}` growth;
+- a `swe_control_plane_transcript_sse_subscribers` gauge that does not fall after clients
+  disconnect, `swe_control_plane_transcript_sse_deliveries_total{outcome="dropped"}` growth,
+  or rising `swe_control_plane_transcript_sse_delivery_lag_seconds`;
+- repeated `swe_control_plane_terminal_lease_grants_total{outcome="failed"}` or unexpected
+  `swe_control_plane_terminal_lease_revocations_total` growth; and
+- `swe_control_plane_token_reviews_total` or
+  `swe_control_plane_subject_access_reviews_total` denial/error spikes, together with elevated
+  matching review duration histograms. Denials can be expected for unauthorized traffic, so
+  correlate them with request volume and audit logs rather than paging on every denial.
+
+Histogram families add the standard `_bucket`, `_sum`, and `_count` series. Prometheus Go and
+process collectors are also exposed for runtime and process health.
+
 The operator reconciles each `Run` as the single task intent and allocates or claims its
 `Environment`; clients must not create the two resources independently. Its RBAC permits
 Run status/finalizer updates and Environment allocation/claim updates. Process execution
@@ -468,6 +514,27 @@ and networking requirements that a BYOC operator needs beyond the [install](#ins
 [upgrade](#upgrade) procedures above. The acceptance criteria track
 [#79](https://github.com/Chris-Cullins/swe-platform/issues/79); the hosted offering alpha is
 out of scope here and requires separate maintainer product input.
+
+### Active Run capacity
+
+Use **50 concurrently active, non-terminal Runs per elected operator leader** as the conservative
+planning envelope for this release, not as an admission limit or a demonstrated maximum. Validate
+larger installations against their Kubernetes API-server latency, sandboxd RPC duration, and
+transcript backend before raising that envelope. Standby operator replicas do not add Run
+throughput because only the leader reconciles.
+
+Adapter observation still uses a fixed two-second requeue, so 50 continuously active Runs imply a
+nominal 25 adapter polls per second before event-driven reconciles and retries. ProcessService
+connections are reused by exact Environment UID/execution generation and idle-close after 30
+seconds; deterministic one-minute-equivalent tests reduce process-connector reads from 150 to 124,
+complete adapter-path reads from 390 to 364, and physical connection creations from 30 to 1 per
+continuously polled Run. Each poll intentionally
+retains uncached pre-call Run association, complete execution/Template/Pod/credential lease, and
+post-call exact association/backend currentness reads. Pooling therefore removes TLS-redial and
+some connector resolution amplification but does **not** remove API-server work, guarantee every
+Run is observed exactly every two seconds under queueing, or make the in-process polling design
+horizontally scalable. Capacity above this planning envelope needs measured validation;
+replacing polling or extracting adapters is separate work.
 
 ### Provider prerequisites
 

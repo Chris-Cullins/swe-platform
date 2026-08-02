@@ -34,10 +34,13 @@ import (
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	platformv1alpha1 "github.com/Chris-Cullins/swe-platform/api/v1alpha1"
@@ -98,7 +101,7 @@ func terminalEnvironment(err error) error {
 
 const (
 	sandboxdCredentialMount    = "/var/run/swe-platform/sandboxd"
-	sandboxdSecurityRevision   = "3"
+	sandboxdSecurityRevision   = "4"
 	sandboxdRevisionAnnotation = "swe.dev/sandboxd-security-revision"
 	environmentFinalizer       = "swe.dev/environment-security"
 )
@@ -1279,7 +1282,7 @@ func (r *EnvironmentReconciler) currentSandboxdPod(ctx context.Context, env *pla
 		pod.UID != "" && secret.Annotations[sandboxdauth.PodUIDAnnotation] == string(pod.UID) &&
 		len(secret.Data[sandboxdauth.TLSCertKey]) > 0 && len(secret.Data[sandboxdauth.TLSKeyKey]) > 0 &&
 		len(secret.Data[sandboxdauth.CapabilitiesKey]) > 0 && len(secret.Data[sandboxdauth.HealthTokenKey]) > 0 &&
-		len(secret.Data[sandboxdauth.ProcessTokenKey]) > 0, nil
+		len(secret.Data[sandboxdauth.ProcessTokenKey]) > 0 && len(secret.Data[sandboxdauth.ServiceObservationTokenKey]) > 0, nil
 }
 
 func (r *EnvironmentReconciler) rotateSandboxdCredentials(ctx context.Context, env *platformv1alpha1.Environment) (string, []byte, string, error) {
@@ -1304,10 +1307,15 @@ func (r *EnvironmentReconciler) rotateSandboxdCredentials(ctx context.Context, e
 	if err != nil {
 		return "", nil, "", err
 	}
+	observationToken, err := randomCredential(32)
+	if err != nil {
+		return "", nil, "", err
+	}
 	capabilities, err := json.Marshal(sandboxdauth.Config{Grants: []sandboxdauth.Grant{
 		{TokenHash: sandboxdauth.TokenVerifier(terminalToken), Capabilities: []sandboxdauth.Capability{sandboxdauth.CapabilityHealth, sandboxdauth.CapabilityTerminal}},
 		{TokenHash: sandboxdauth.TokenVerifier(healthToken), Capabilities: []sandboxdauth.Capability{sandboxdauth.CapabilityHealth}},
 		{TokenHash: sandboxdauth.TokenVerifier(processToken), Capabilities: []sandboxdauth.Capability{sandboxdauth.CapabilityProcess}},
+		{TokenHash: sandboxdauth.TokenVerifier(observationToken), Capabilities: []sandboxdauth.Capability{sandboxdauth.CapabilityServiceObservation}},
 	}})
 	if err != nil {
 		return "", nil, "", err
@@ -1321,7 +1329,7 @@ func (r *EnvironmentReconciler) rotateSandboxdCredentials(ctx context.Context, e
 		if err := controllerutil.SetControllerReference(env, &secret, r.Scheme); err != nil {
 			return "", nil, "", err
 		}
-		secret.Data = sandboxdCredentialData(certificate, privateKey, capabilities, healthToken, processToken)
+		secret.Data = sandboxdCredentialData(certificate, privateKey, capabilities, healthToken, processToken, observationToken)
 		secret.Annotations = map[string]string{sandboxdauth.IdentityAnnotation: serverName}
 		if err := r.Create(ctx, &secret); err != nil {
 			return "", nil, "", collisionOnAlreadyExists(err, "Secret", key.Name)
@@ -1332,7 +1340,7 @@ func (r *EnvironmentReconciler) rotateSandboxdCredentials(ctx context.Context, e
 		if !exactControllerOwner(&secret, platformv1alpha1.GroupVersion.String(), "Environment", env.Name, env.UID) {
 			return "", nil, "", &childOwnershipCollisionError{kind: "Secret", name: secret.Name}
 		}
-		secret.Data = sandboxdCredentialData(certificate, privateKey, capabilities, healthToken, processToken)
+		secret.Data = sandboxdCredentialData(certificate, privateKey, capabilities, healthToken, processToken, observationToken)
 		if secret.Annotations == nil {
 			secret.Annotations = map[string]string{}
 		}
@@ -1344,13 +1352,14 @@ func (r *EnvironmentReconciler) rotateSandboxdCredentials(ctx context.Context, e
 	return serverName, certificate, terminalToken, nil
 }
 
-func sandboxdCredentialData(certificate, privateKey, capabilities []byte, healthToken, processToken string) map[string][]byte {
+func sandboxdCredentialData(certificate, privateKey, capabilities []byte, healthToken, processToken, observationToken string) map[string][]byte {
 	return map[string][]byte{
-		sandboxdauth.TLSCertKey:      certificate,
-		sandboxdauth.TLSKeyKey:       privateKey,
-		sandboxdauth.CapabilitiesKey: capabilities,
-		sandboxdauth.HealthTokenKey:  []byte(healthToken),
-		sandboxdauth.ProcessTokenKey: []byte(processToken),
+		sandboxdauth.TLSCertKey:                 certificate,
+		sandboxdauth.TLSKeyKey:                  privateKey,
+		sandboxdauth.CapabilitiesKey:            capabilities,
+		sandboxdauth.HealthTokenKey:             []byte(healthToken),
+		sandboxdauth.ProcessTokenKey:            []byte(processToken),
+		sandboxdauth.ServiceObservationTokenKey: []byte(observationToken),
 	}
 }
 
@@ -1966,7 +1975,11 @@ func (r *EnvironmentReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		return fmt.Errorf("index templates by RuntimeClass: %w", err)
 	}
 	return ctrl.NewControllerManagedBy(mgr).
-		For(&platformv1alpha1.Environment{}).
+		For(&platformv1alpha1.Environment{}, builder.WithPredicates(predicate.Funcs{UpdateFunc: func(e event.UpdateEvent) bool {
+			old, ok1 := e.ObjectOld.(*platformv1alpha1.Environment)
+			new, ok2 := e.ObjectNew.(*platformv1alpha1.Environment)
+			return !ok1 || !ok2 || observationRelevantEnvironmentUpdate(old, new)
+		}})).
 		Owns(&corev1.Pod{}).
 		Owns(&corev1.PersistentVolumeClaim{}).
 		Owns(&networkingv1.NetworkPolicy{}).

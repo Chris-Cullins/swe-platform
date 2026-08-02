@@ -21,6 +21,8 @@ import (
 
 const ordinaryMarker = "ordinary-process-credential-absent"
 
+const listenerScript = `require("net").createServer((socket) => socket.end()).listen(Number(process.argv[1]), "127.0.0.1")`
+
 func main() {
 	if err := run(); err != nil {
 		fmt.Fprintln(os.Stderr, "sandboxd e2e process check failed:", err)
@@ -29,6 +31,9 @@ func main() {
 }
 
 func run() error {
+	if len(os.Args) >= 2 && (os.Args[1] == "service-start" || os.Args[1] == "service-stop") {
+		return runServiceProcess(os.Args[1:])
+	}
 	if len(os.Args) != 6 {
 		return fmt.Errorf("usage: e2e-process-check ADDRESS SERVER_NAME CERT TOKEN RUN_UID")
 	}
@@ -120,6 +125,82 @@ func run() error {
 	}
 	if string(output) != ordinaryMarker {
 		return fmt.Errorf("ordinary process did not report credential absence")
+	}
+	return nil
+}
+
+func runServiceProcess(args []string) error {
+	wantArgs := 7
+	if args[0] == "service-start" {
+		wantArgs = 8
+	}
+	if len(args) != wantArgs {
+		return fmt.Errorf("usage: e2e-process-check service-{start|stop} ADDRESS SERVER_NAME CERT TOKEN OWNER ROLE [PORT]")
+	}
+	certificate, err := os.ReadFile(args[3])
+	if err != nil {
+		return fmt.Errorf("read trust certificate: %w", err)
+	}
+	roots := x509.NewCertPool()
+	if !roots.AppendCertsFromPEM(certificate) {
+		return fmt.Errorf("parse trust certificate")
+	}
+	token, err := os.ReadFile(args[4])
+	if err != nil {
+		return fmt.Errorf("read process capability: %w", err)
+	}
+	defer clear(token)
+	connection, err := grpc.NewClient(args[1],
+		grpc.WithTransportCredentials(credentials.NewTLS(&tls.Config{RootCAs: roots, ServerName: args[2], MinVersion: tls.VersionTLS13})),
+		grpc.WithPerRPCCredentials(sandboxdauth.BearerCredentials{Token: strings.TrimSpace(string(token))}),
+	)
+	if err != nil {
+		return fmt.Errorf("create process client: %w", err)
+	}
+	defer connection.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	processes := sandboxdv1.NewProcessServiceClient(connection)
+	key := &sandboxdv1.ProcessKey{OwnerId: args[5], Role: args[6]}
+	if args[0] == "service-stop" {
+		process, err := processes.Stop(ctx, &sandboxdv1.StopProcessRequest{Key: key, Mode: sandboxdv1.StopMode_STOP_MODE_FORCE})
+		if err != nil {
+			return fmt.Errorf("stop listener: %w", err)
+		}
+		for process.State == sandboxdv1.ProcessState_PROCESS_STATE_RUNNING || process.State == sandboxdv1.ProcessState_PROCESS_STATE_STOPPING {
+			time.Sleep(25 * time.Millisecond)
+			process, err = processes.Get(ctx, &sandboxdv1.GetProcessRequest{Key: key})
+			if err != nil {
+				return fmt.Errorf("get stopping listener: %w", err)
+			}
+		}
+		if process.State != sandboxdv1.ProcessState_PROCESS_STATE_EXITED && process.State != sandboxdv1.ProcessState_PROCESS_STATE_FAILED {
+			return fmt.Errorf("listener did not stop: %s", process.State)
+		}
+		return nil
+	}
+	port := args[7]
+	for _, character := range port {
+		if character < '0' || character > '9' {
+			return fmt.Errorf("invalid listener port")
+		}
+	}
+	process, err := processes.Start(ctx, &sandboxdv1.StartProcessRequest{Key: key, Spec: &sandboxdv1.ProcessSpec{Argv: []string{
+		"node", "-e", listenerScript, port,
+	}}})
+	if err != nil {
+		return fmt.Errorf("start listener: %w", err)
+	}
+	if process.State != sandboxdv1.ProcessState_PROCESS_STATE_RUNNING {
+		return fmt.Errorf("listener did not start: %s", process.State)
+	}
+	time.Sleep(250 * time.Millisecond)
+	process, err = processes.Get(ctx, &sandboxdv1.GetProcessRequest{Key: key})
+	if err != nil {
+		return fmt.Errorf("confirm listener: %w", err)
+	}
+	if process.State != sandboxdv1.ProcessState_PROCESS_STATE_RUNNING {
+		return fmt.Errorf("listener exited before observation: %s: %s", process.State, process.Error)
 	}
 	return nil
 }

@@ -16,8 +16,8 @@ to ~$0. Reviewable diff, branch, and PR publication remain planned work.
 > environments pause automatically before terminal requests wake them. Template warm
 > pools keep unclaimed environments ready for `swe run` to claim. The `claude-code` (default),
 > `amp`, `codex`, and `pi` adapters run through sandboxd's managed-process API. Environments
-> accept bounded durable desired service declarations, but observation and portal proxying are
-> not built yet.
+> accept bounded durable desired service declarations and publish fenced advisory TCP-connect
+> observations; portal proxying is not built yet.
 > The Helm chart installs the
 > operator, control plane, CRDs, a stable Installation identity, and inert Template catalog
 > sources in a system namespace. `swe project onboard` creates a dedicated claimed namespace,
@@ -56,15 +56,17 @@ implemented today, approved next contracts, and remaining open work.
 
 - **`sandboxd`** — a small daemon inside every environment exposing one gRPC contract:
   exec, filesystem, terminal, health, and bounded stateless loopback service observations.
-  No platform connector or declaration observer uses that internal observation primitive yet;
-  the control plane never touches a pod except through sandboxd.
+  The operator's dedicated declaration observer invokes that primitive through an exact fenced
+  connector; the control plane never touches a pod except through sandboxd.
 - **Operator + CRDs** — `Installation`, `Environment`, `EnvironmentTemplate`, `Run`, `Project`, with
   controllers for lifecycle, warm pools (pre-booted environments), and idle reaping.
 - **Control plane** — API, auth, transcripts, resource watches, and a web terminal sharing
   the Environment's tmux session; terminal requests can wake Idle suspension.
 - **Desired services** — `Environment.spec.services` and the CLI hold bounded durable HTTP
-  loopback target declarations. Health publication, authenticated portal URLs, and reverse
-  proxying remain planned gateway work.
+  loopback target declarations. A dedicated controller publishes fenced advisory TCP-connect
+  state without URLs; `services list` marks it CURRENT only while both exact execution/intent
+  correlation and a short wall-clock age bound hold. It remains advisory. Authenticated portal
+  URLs and reverse proxying remain gateway work.
 - **Planned Run actors** — inboxes, child spawning, messaging, and wake-on-message are not
   implemented.
 

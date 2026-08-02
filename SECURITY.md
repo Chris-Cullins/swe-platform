@@ -29,13 +29,15 @@ Bearer tokens are random per incarnation and map to explicit service capabilitie
 authorize both unary and streaming RPCs before handlers run. The terminal credential grants
 `health` and `terminal`; a separate operator-held adapter credential grants only `process`.
 `service-observation` authorizes only bounded stateless TCP-connect probes against sandboxd's
-logical loopback; the operator does not yet issue that token and no connector invokes the RPC.
-The mounted authorization file contains SHA-256 verifiers, not raw tokens, and the raw process
-token is not projected into the environment pod or published in pod annotations. Possession of
+logical loopback. The operator issues a distinct observation-only token and its connector uses
+it; the control plane has no Secret access. The mounted authorization file contains SHA-256
+verifiers, not raw tokens, and the raw process and observation tokens exist only in the
+Environment-owned Secret: neither is mounted, injected, or published in pod annotations.
+Possession of
 one environment's token grants nothing in another environment.
 
 The Environment-owned Secret contains the private key, authorization configuration, and raw
-process token. The public trust certificate and terminal token are published atomically as pod
+process and observation tokens. The public trust certificate and terminal token are published atomically as pod
 annotations, which makes pod `get` plus `pods/portforward` the Kubernetes authorization boundary
 for CLI attachment without granting callers access to arbitrary namespace Secrets. The control
 plane has pod `get` but not Secret access. The operator validates the exact Run, Environment,
@@ -73,8 +75,9 @@ intentionally uses the cluster default runtime.
 1. **Bootstrap:** before creating a pod, the operator generates a new certificate, private key,
    random identity, and random capability tokens. It writes them to an Environment-owned
    Kubernetes Secret. The pod projects only the TLS keypair and hashed capability configuration
-   read-only at `/var/run/swe-platform/sandboxd`; the raw process token remains available only
-   through an exact-name operator Secret read. sandboxd fails closed if any TLS or capability
+   read-only at `/var/run/swe-platform/sandboxd`; the distinct raw process and service-observation
+   tokens remain available only through exact-name operator Secret reads and are never mounted,
+   annotated, or injected into a process. sandboxd fails closed if any TLS or capability
    file is absent or invalid.
 2. **Rotation:** whenever the backing pod has disappeared and is recreated (including resume),
    the operator replaces every credential and annotates the new pod with the new identity.

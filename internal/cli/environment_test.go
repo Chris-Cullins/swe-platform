@@ -7,8 +7,10 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
@@ -242,9 +244,9 @@ func TestEnvironmentServiceDeclarationsAreRevisionedAndIdempotent(t *testing.T) 
 	if err := listEnvironmentServices(context.Background(), kube, key, &output); err != nil {
 		t.Fatal(err)
 	}
-	want := "NAME\tREVISION\tPROTOCOL\tTARGET-PORT\tVISIBILITY\tREADINESS\n" +
-		"alias\t1\tHTTP\t3000\tProject\tTCPConnect\n" +
-		"web\t2\tHTTP\t3001\tProject\tTCPConnect\n"
+	want := "NAME\tREVISION\tPROTOCOL\tTARGET-PORT\tVISIBILITY\tREADINESS\tSTATE\tREASON\tOBSERVED-AT\tFRESHNESS\n" +
+		"alias\t1\tHTTP\t3000\tProject\tTCPConnect\t-\t-\t-\tNO-OBSERVATION\n" +
+		"web\t2\tHTTP\t3001\tProject\tTCPConnect\t-\t-\t-\tNO-OBSERVATION\n"
 	if output.String() != want {
 		t.Fatalf("service list:\n%s\nwant:\n%s", output.String(), want)
 	}
@@ -258,6 +260,50 @@ func TestEnvironmentServiceDeclarationsAreRevisionedAndIdempotent(t *testing.T) 
 	web, err = writeEnvironmentService(context.Background(), kube, key, "web", 3002, false)
 	if err != nil || web.Revision != 1 {
 		t.Fatalf("same-name re-declare = %#v, %v", web, err)
+	}
+}
+
+func TestServiceListCurrentRequiresExecutionAndWallClockFreshness(t *testing.T) {
+	now := time.Unix(1000, 0)
+	execution := int64(4)
+	env := &platformv1alpha1.Environment{ObjectMeta: metav1.ObjectMeta{Name: "e", Namespace: "n", UID: "u", Generation: 2}, Spec: platformv1alpha1.EnvironmentSpec{Services: []platformv1alpha1.EnvironmentServiceDeclaration{desiredEnvironmentService("web", 3000, 1)}}, Status: platformv1alpha1.EnvironmentStatus{Phase: platformv1alpha1.EnvironmentPhaseReady, ObservedGeneration: 2, ExecutionGeneration: execution, Conditions: []metav1.Condition{{Type: platformv1alpha1.EnvironmentConditionReady, Status: metav1.ConditionTrue, ObservedGeneration: 2}}, ServiceObservations: &platformv1alpha1.EnvironmentServiceObservations{ObservedGeneration: 2, ExecutionGeneration: &execution, ObservedAt: metav1.NewTime(now.Add(-time.Second)), Records: []platformv1alpha1.EnvironmentServiceObservation{{Name: "web", DeclarationRevision: 1, State: platformv1alpha1.EnvironmentServiceObservationHealthy}}}}}
+	scheme := runtime.NewScheme()
+	_ = platformv1alpha1.AddToScheme(scheme)
+	list := func(at time.Time) string {
+		var out bytes.Buffer
+		c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(env.DeepCopy()).Build()
+		if err := listEnvironmentServicesAt(context.Background(), c, types.NamespacedName{Namespace: "n", Name: "e"}, &out, at); err != nil {
+			t.Fatal(err)
+		}
+		return out.String()
+	}
+	if !strings.Contains(list(now), "\tCURRENT\n") {
+		t.Fatal("exact fresh execution was not current")
+	}
+	deleting := metav1.NewTime(now)
+	env.DeletionTimestamp = &deleting
+	env.Finalizers = []string{"test"}
+	if !strings.Contains(list(now), "\tSTALE\n") {
+		t.Fatal("deleting environment retained a current observation")
+	}
+	env.DeletionTimestamp = nil
+	env.Finalizers = nil
+	if !strings.Contains(list(now.Add(serviceObservationMaxAge+time.Second)), "\tSTALE\n") {
+		t.Fatal("old observation remained current")
+	}
+	*env.Status.ServiceObservations.ExecutionGeneration = 3
+	if !strings.Contains(list(now), "\tSTALE\n") {
+		t.Fatal("old execution remained current")
+	}
+	env.Status.ServiceObservations.ExecutionGeneration = nil
+	env.Status.ServiceObservations.Records[0].State = platformv1alpha1.EnvironmentServiceObservationPending
+	env.Status.Conditions = nil
+	if !strings.Contains(list(now), "\tCURRENT\n") {
+		t.Fatal("fresh pending classification was not current")
+	}
+	env.Status.Conditions = []metav1.Condition{{Type: platformv1alpha1.EnvironmentConditionReady, Status: metav1.ConditionTrue, ObservedGeneration: 2}}
+	if !strings.Contains(list(now), "\tSTALE\n") {
+		t.Fatal("pending classification remained current after readiness")
 	}
 }
 

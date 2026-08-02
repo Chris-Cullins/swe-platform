@@ -6,6 +6,7 @@ import (
 	"io"
 	"math"
 	"sort"
+	"time"
 
 	"github.com/spf13/cobra"
 	"k8s.io/apimachinery/pkg/types"
@@ -299,16 +300,48 @@ func environmentServiceIndex(services []platformv1alpha1.EnvironmentServiceDecla
 	return -1
 }
 
+const serviceObservationMaxAge = 15 * time.Second
+
 func listEnvironmentServices(ctx context.Context, kube client.Reader, key types.NamespacedName, out io.Writer) error {
+	return listEnvironmentServicesAt(ctx, kube, key, out, time.Now())
+}
+
+// listEnvironmentServicesAt keeps the advisory display's wall-clock qualification testable.
+func listEnvironmentServicesAt(ctx context.Context, kube client.Reader, key types.NamespacedName, out io.Writer, now time.Time) error {
 	var environment platformv1alpha1.Environment
 	if err := kube.Get(ctx, key, &environment); err != nil {
 		return fmt.Errorf("get environment %q: %w", key.Name, err)
 	}
 	services := append([]platformv1alpha1.EnvironmentServiceDeclaration(nil), environment.Spec.Services...)
 	sort.Slice(services, func(i, j int) bool { return services[i].Name < services[j].Name })
-	fmt.Fprintln(out, "NAME\tREVISION\tPROTOCOL\tTARGET-PORT\tVISIBILITY\tREADINESS")
+	fmt.Fprintln(out, "NAME\tREVISION\tPROTOCOL\tTARGET-PORT\tVISIBILITY\tREADINESS\tSTATE\tREASON\tOBSERVED-AT\tFRESHNESS")
 	for _, service := range services {
-		fmt.Fprintf(out, "%s\t%d\t%s\t%d\t%s\t%s\n", service.Name, service.Revision, service.Protocol, service.TargetPort, service.Visibility, service.Readiness)
+		state, reason, observedAt, freshness := "-", "-", "-", "NO-OBSERVATION"
+		observations := environment.Status.ServiceObservations
+		if observations != nil {
+			for _, observation := range observations.Records {
+				if observation.Name == service.Name {
+					state, reason, observedAt, freshness = string(observation.State), string(observation.Reason), observations.ObservedAt.UTC().Format("2006-01-02T15:04:05Z"), "STALE"
+					suspended := environment.Spec.Paused || environment.Status.Lifecycle.Suspended || environment.Spec.Lifecycle.Hold != nil && environment.Spec.Lifecycle.Hold.Enabled
+					ready := platformv1alpha1.IsEnvironmentReady(&environment)
+					classificationCurrent := false
+					switch observation.State {
+					case platformv1alpha1.EnvironmentServiceObservationPending:
+						classificationCurrent = observations.ExecutionGeneration == nil && !suspended && !ready
+					case platformv1alpha1.EnvironmentServiceObservationUnavailable:
+						classificationCurrent = observations.ExecutionGeneration == nil && suspended
+					default:
+						classificationCurrent = observations.ExecutionGeneration != nil && *observations.ExecutionGeneration == environment.Status.ExecutionGeneration && ready && !suspended
+					}
+					age := now.Sub(observations.ObservedAt.Time)
+					if environment.DeletionTimestamp.IsZero() && observations.ObservedGeneration == environment.Generation && observation.DeclarationRevision == service.Revision && observations.LifecycleEpoch == environment.Status.Lifecycle.Epoch && observations.HoldRevision == lifecycle.HoldPolicyRevision(&environment) && classificationCurrent && age >= 0 && age <= serviceObservationMaxAge {
+						freshness = "CURRENT"
+					}
+					break
+				}
+			}
+		}
+		fmt.Fprintf(out, "%s\t%d\t%s\t%d\t%s\t%s\t%s\t%s\t%s\t%s\n", service.Name, service.Revision, service.Protocol, service.TargetPort, service.Visibility, service.Readiness, state, reason, observedAt, freshness)
 	}
 	return nil
 }

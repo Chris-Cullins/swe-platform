@@ -2,10 +2,12 @@ package sandboxclient
 
 import (
 	"context"
+	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
 	"fmt"
 	"net"
+	"reflect"
 	"strconv"
 
 	"google.golang.org/grpc"
@@ -32,7 +34,8 @@ const executionGenerationAnnotation = "swe.dev/execution-generation"
 // without exposing its transport identity to terminal, exec, filesystem, or
 // process features.
 type Connector struct {
-	Reader client.Reader
+	Reader      client.Reader
+	ProcessPool *ProcessConnectionPool
 }
 
 // Execution is a connector-owned opaque identity for one exact live backend
@@ -43,6 +46,7 @@ type Execution struct {
 	lifecycleEpoch      int64
 	podName             string
 	podUID              types.UID
+	endpoint            string
 }
 
 // TerminalExecution is retained as the terminal feature's opaque handle.
@@ -122,50 +126,34 @@ func executionForPod(env *platformv1alpha1.Environment, pod *corev1.Pod) Executi
 	return Execution{
 		environmentUID: env.UID, executionGeneration: env.Status.ExecutionGeneration,
 		lifecycleEpoch: env.Status.Lifecycle.Epoch, podName: pod.Name, podUID: pod.UID,
+		endpoint: env.Status.Endpoints.Sandboxd,
 	}
 }
 
 // DialProcess resolves only the complete captured execution fence and returns
 // a process-only sandboxd client.
 func (c Connector) DialProcess(ctx context.Context, fence lifecycle.ExecutionFence) (sandboxdv1.ProcessServiceClient, func() error, error) {
-	env, pod, err := c.resolvePod(ctx, fence)
+	if c.ProcessPool != nil {
+		return c.ProcessPool.acquire(ctx, fence)
+	}
+	env, secret, proof, err := c.resolveProcessTarget(ctx, fence)
 	if err != nil {
 		return nil, nil, err
 	}
-
-	secretName := pod.Annotations[sandboxdauth.SecretNameAnnotation]
-	if secretName == "" {
-		return nil, nil, fmt.Errorf("sandboxd endpoint does not identify its credential")
-	}
-	var secret corev1.Secret
-	if err := c.Reader.Get(ctx, types.NamespacedName{Namespace: env.Namespace, Name: secretName}, &secret); err != nil {
-		return nil, nil, err
-	}
-	identity := pod.Annotations[sandboxdauth.IdentityAnnotation]
-	if identity == "" || secret.UID == "" || pod.Annotations[sandboxdauth.SecretUIDAnnotation] != string(secret.UID) || !exactEnvironmentOwner(&secret, env) || secret.Annotations[sandboxdauth.IdentityAnnotation] != identity || secret.Annotations[sandboxdauth.PodUIDAnnotation] != string(pod.UID) {
-		return nil, nil, fmt.Errorf("sandboxd credential does not identify the current environment pod")
-	}
-	roots := x509.NewCertPool()
-	if !roots.AppendCertsFromPEM(secret.Data[sandboxdauth.TLSCertKey]) {
-		return nil, nil, fmt.Errorf("sandboxd credential has no valid trust certificate")
-	}
-	token := string(secret.Data[sandboxdauth.ProcessTokenKey])
-	if token == "" {
-		return nil, nil, fmt.Errorf("sandboxd credential has no process capability")
-	}
-	conn, err := grpc.NewClient(env.Status.Endpoints.Sandboxd,
-		grpc.WithTransportCredentials(credentials.NewTLS(&tls.Config{RootCAs: roots, ServerName: identity, MinVersion: tls.VersionTLS13})),
-		grpc.WithPerRPCCredentials(sandboxdauth.BearerCredentials{Token: token}))
+	dialOptions, err := processDialOptions(secret, proof.identity)
 	if err != nil {
 		return nil, nil, err
 	}
-	// Re-read after pinning the endpoint, TLS identity, and token. If an
-	// execution-fence transition raced resolution, reject this client; if a
-	// transition starts after this check, the old credentials cannot
-	// authenticate to the replacement backend execution.
-	current, err := fence.Revalidate(ctx, c.Reader)
-	if err != nil || current.Spec.Paused || current.Status.Lifecycle.Suspended || !platformv1alpha1.IsEnvironmentReady(current) ||
-		current.Status.PodName != env.Status.PodName || current.Status.Endpoints.Sandboxd != env.Status.Endpoints.Sandboxd {
+	conn, err := grpc.NewClient(env.Status.Endpoints.Sandboxd, dialOptions...)
+	if err != nil {
+		return nil, nil, err
+	}
+	// Re-resolve the complete backend and credential proof after pinning the
+	// endpoint, TLS identity, and process token. A racing Pod, Template, Secret,
+	// or execution-fence replacement cannot enter either an unpooled client or
+	// the reusable pool.
+	_, _, currentProof, err := c.resolveProcessTarget(ctx, fence)
+	if err != nil || !proof.matches(currentProof) {
 		_ = conn.Close()
 		if err != nil {
 			return nil, nil, fmt.Errorf("environment execution changed while resolving process endpoint: %w", err)
@@ -175,12 +163,101 @@ func (c Connector) DialProcess(ctx context.Context, fence lifecycle.ExecutionFen
 	return sandboxdv1.NewProcessServiceClient(conn), conn.Close, nil
 }
 
+type processConnectionProof struct {
+	execution             Execution
+	holdPolicyRevision    int64
+	templateUID           types.UID
+	templateGeneration    int64
+	templateSpec          platformv1alpha1.EnvironmentTemplateSpec
+	secretName            string
+	secretUID             types.UID
+	secretResourceVersion string
+	identity              string
+	secretIdentity        string
+	secretPodUID          string
+	certificateHash       [sha256.Size]byte
+	tokenHash             [sha256.Size]byte
+}
+
+func (c Connector) resolveProcessTarget(ctx context.Context, fence lifecycle.ExecutionFence) (*platformv1alpha1.Environment, *corev1.Secret, processConnectionProof, error) {
+	env, err := fence.Revalidate(ctx, c.Reader)
+	if err != nil {
+		return nil, nil, processConnectionProof{}, err
+	}
+	return c.resolveProcessTargetForEnvironment(ctx, env)
+}
+
+func (c Connector) resolveProcessTargetForEnvironment(ctx context.Context, env *platformv1alpha1.Environment) (*platformv1alpha1.Environment, *corev1.Secret, processConnectionProof, error) {
+	pod, template, err := c.resolvePodForEnvironment(ctx, env)
+	if err != nil {
+		return nil, nil, processConnectionProof{}, err
+	}
+	secretName := pod.Annotations[sandboxdauth.SecretNameAnnotation]
+	if secretName == "" {
+		return nil, nil, processConnectionProof{}, fmt.Errorf("sandboxd endpoint does not identify its credential")
+	}
+	var secret corev1.Secret
+	if err := c.Reader.Get(ctx, types.NamespacedName{Namespace: env.Namespace, Name: secretName}, &secret); err != nil {
+		return nil, nil, processConnectionProof{}, err
+	}
+	identity := pod.Annotations[sandboxdauth.IdentityAnnotation]
+	token := string(secret.Data[sandboxdauth.ProcessTokenKey])
+	if identity == "" || secret.UID == "" || pod.Annotations[sandboxdauth.SecretUIDAnnotation] != string(secret.UID) || !exactEnvironmentOwner(&secret, env) || secret.Annotations[sandboxdauth.IdentityAnnotation] != identity || secret.Annotations[sandboxdauth.PodUIDAnnotation] != string(pod.UID) {
+		return nil, nil, processConnectionProof{}, fmt.Errorf("sandboxd credential does not identify the current environment pod")
+	}
+	if token == "" {
+		return nil, nil, processConnectionProof{}, fmt.Errorf("sandboxd credential has no process capability")
+	}
+	proof := processConnectionProof{
+		execution: executionForPod(env, pod), holdPolicyRevision: lifecycle.HoldPolicyRevision(env),
+		templateUID: template.UID, templateGeneration: template.Generation, templateSpec: template.Spec,
+		secretName: secret.Name, secretUID: secret.UID, secretResourceVersion: secret.ResourceVersion,
+		identity: identity, secretIdentity: secret.Annotations[sandboxdauth.IdentityAnnotation], secretPodUID: secret.Annotations[sandboxdauth.PodUIDAnnotation],
+		certificateHash: sha256.Sum256(secret.Data[sandboxdauth.TLSCertKey]), tokenHash: sha256.Sum256([]byte(token)),
+	}
+	return env, &secret, proof, nil
+}
+
+func processDialOptions(secret *corev1.Secret, identity string) ([]grpc.DialOption, error) {
+	roots := x509.NewCertPool()
+	if !roots.AppendCertsFromPEM(secret.Data[sandboxdauth.TLSCertKey]) {
+		return nil, fmt.Errorf("sandboxd credential has no valid trust certificate")
+	}
+	token := string(secret.Data[sandboxdauth.ProcessTokenKey])
+	if token == "" {
+		return nil, fmt.Errorf("sandboxd credential has no process capability")
+	}
+	return []grpc.DialOption{
+		grpc.WithTransportCredentials(credentials.NewTLS(&tls.Config{RootCAs: roots, ServerName: identity, MinVersion: tls.VersionTLS13})),
+		grpc.WithPerRPCCredentials(sandboxdauth.BearerCredentials{Token: token}),
+	}, nil
+}
+
+func (p processConnectionProof) matches(other processConnectionProof) bool {
+	return p.execution == other.execution && p.holdPolicyRevision == other.holdPolicyRevision &&
+		p.templateUID == other.templateUID && p.templateGeneration == other.templateGeneration &&
+		reflect.DeepEqual(p.templateSpec, other.templateSpec) && p.secretName == other.secretName && p.secretUID == other.secretUID &&
+		p.secretResourceVersion == other.secretResourceVersion && p.identity == other.identity && p.secretIdentity == other.secretIdentity &&
+		p.secretPodUID == other.secretPodUID && p.certificateHash == other.certificateHash && p.tokenHash == other.tokenHash
+}
+
+func processEnvironmentReachable(env *platformv1alpha1.Environment) bool {
+	return !env.Spec.Paused && !env.Status.Lifecycle.Suspended &&
+		(env.Spec.Lifecycle.Hold == nil || !env.Spec.Lifecycle.Hold.Enabled) && platformv1alpha1.IsEnvironmentReady(env) &&
+		env.Status.PodName != "" && env.Status.Endpoints.Sandboxd != ""
+}
+
 func (c Connector) resolvePod(ctx context.Context, fence lifecycle.ExecutionFence) (*platformv1alpha1.Environment, *corev1.Pod, error) {
 	env, err := fence.Revalidate(ctx, c.Reader)
 	if err != nil {
 		return nil, nil, err
 	}
-	if env.Spec.Paused || env.Status.Lifecycle.Suspended || !platformv1alpha1.IsEnvironmentReady(env) || env.Status.PodName == "" || env.Status.Endpoints.Sandboxd == "" {
+	pod, _, err := c.resolvePodForEnvironment(ctx, env)
+	return env, pod, err
+}
+
+func (c Connector) resolvePodForEnvironment(ctx context.Context, env *platformv1alpha1.Environment) (*corev1.Pod, *platformv1alpha1.EnvironmentTemplate, error) {
+	if !processEnvironmentReachable(env) {
 		return nil, nil, fmt.Errorf("environment is not the current reachable incarnation")
 	}
 	var template platformv1alpha1.EnvironmentTemplate
@@ -208,7 +285,7 @@ func (c Connector) resolvePod(ctx context.Context, fence lifecycle.ExecutionFenc
 	if !generationValid || podGeneration != env.Status.ExecutionGeneration {
 		return nil, nil, fmt.Errorf("environment pod does not identify the current execution generation")
 	}
-	return env, &pod, nil
+	return &pod, &template, nil
 }
 
 func parseExecutionGeneration(pod *corev1.Pod) (int64, bool) {

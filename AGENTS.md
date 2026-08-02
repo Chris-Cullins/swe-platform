@@ -162,8 +162,11 @@ runs both via `make` targets:
   the embedded console entry point/SPA fallback/static assets, typed Run
   list/get/create/retry/cancel, Environment get, transcript SSE, terminal attach, and
   the local stdio MCP tool list plus UID-fenced bounded transcript read,
+  actual-listener service observation through healthy/unhealthy/restart/pause/resume/removal
+  transitions with declaration and fresh-execution correlation and no URL,
   process-scoped fake Claude and Amp API-key delivery without ambient
-  setup/resume/sandboxd exposure.
+  setup/resume/sandboxd exposure, and Secret-only sandboxd process/service-observation
+  capability tokens without Environment pod projection.
   Runs in CI as the `e2e` workflow on relevant PRs and via `workflow_dispatch`.
 - **CRD installation/upgrades:** `make install-crds` uses server-side apply with force-conflicts;
   plain Helm upgrades must apply the chart's `crds/` directory before `helm upgrade`.
