@@ -299,20 +299,18 @@ spec:
                   - message: revision must increase when an existing service declaration
                       changes
                     rule: self == oldSelf || self.revision > oldSelf.revision
+                  - message: new services require instanceID; a legacy missing instanceID
+                      may be added only with a higher revision and is then immutable
+                    optionalOldSelf: true
+                    rule: '!oldSelf.hasValue() ? has(self.instanceID) : (has(oldSelf.value().instanceID)
+                      ? (has(self.instanceID) && self.instanceID == oldSelf.value().instanceID)
+                      : (self == oldSelf.value() || (has(self.instanceID) && self.revision
+                      > oldSelf.value().revision)))'
                 maxItems: 32
                 type: array
                 x-kubernetes-list-map-keys:
                 - name
                 x-kubernetes-list-type: map
-                x-kubernetes-validations:
-                - message: new services require instanceID; a legacy missing instanceID
-                    may be added only with a higher revision and is then immutable
-                  optionalOldSelf: true
-                  rule: '!oldSelf.hasValue() ? self.all(s, has(s.instanceID)) : self.all(s,
-                    !oldSelf.value().exists(o, o.name == s.name) ? has(s.instanceID)
-                    : oldSelf.value().exists(o, o.name == s.name && (has(o.instanceID)
-                    ? (has(s.instanceID) && o.instanceID == s.instanceID) : (s ==
-                    o || (has(s.instanceID) && s.revision > o.revision)))))'
               templateRef:
                 description: TemplateRef is the name of the EnvironmentTemplate to
                   build from.

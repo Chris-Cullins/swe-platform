@@ -440,11 +440,11 @@ kubectl apply --server-side --force-conflicts -f charts/swe-platform/crds
 kubectl get crd agentcredentialprofiles.swe.dev >/dev/null
 kubectl get environment legacy-execution-generation-migration -o json | jq -e \
 	'.spec.lifecycle.activity[0].executionGeneration == null and .status.lifecycle.activityReceipts[0].executionGeneration == null' >/dev/null
-kubectl patch environment legacy-service-instance-id-migration --subresource=status --type=merge -p '{"status":{"phase":"Pending"}}'
+kubectl patch environment legacy-service-instance-id-migration --subresource=status --type=merge -p '{"status":{"phase":"Creating"}}'
 kubectl patch environment legacy-service-instance-id-migration --type=json -p \
 	'[{"op":"add","path":"/spec/projectRef","value":"legacy-migration"}]'
 kubectl get environment legacy-service-instance-id-migration -o json | jq -e \
-	'.status.phase == "Pending" and .spec.projectRef == "legacy-migration" and .spec.services[0].targetPort == 3000 and .spec.services[0].revision == 1 and .spec.services[0].instanceID == null' >/dev/null
+	'.status.phase == "Creating" and .spec.projectRef == "legacy-migration" and .spec.services[0].targetPort == 3000 and .spec.services[0].revision == 1 and .spec.services[0].instanceID == null' >/dev/null
 if kubectl create -f - >/tmp/new-service-missing-instance-id.out 2>&1 <<'EOF'; then
 apiVersion: swe.dev/v1alpha1
 kind: Environment
