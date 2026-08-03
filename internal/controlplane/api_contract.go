@@ -62,19 +62,20 @@ type RunUsage struct {
 
 // Run is the stable HTTP representation of a Run CRD.
 type Run struct {
-	Name              string          `json:"name"`
-	UID               string          `json:"uid"`
-	Generation        int64           `json:"generation"`
-	CreatedAt         time.Time       `json:"createdAt"`
-	Intent            RunIntent       `json:"intent"`
-	CancelRequested   bool            `json:"cancelRequested"`
-	State             string          `json:"state"`
-	StartedAt         *time.Time      `json:"startedAt,omitempty"`
-	FinishedAt        *time.Time      `json:"finishedAt,omitempty"`
-	Environment       *RunEnvironment `json:"environment,omitempty"`
-	TerminalAvailable bool            `json:"terminalAvailable,omitempty"`
-	Branch            string          `json:"branch,omitempty"`
-	Usage             RunUsage        `json:"usage"`
+	Name                       string          `json:"name"`
+	UID                        string          `json:"uid"`
+	Generation                 int64           `json:"generation"`
+	CreatedAt                  time.Time       `json:"createdAt"`
+	Intent                     RunIntent       `json:"intent"`
+	CancelRequested            bool            `json:"cancelRequested"`
+	State                      string          `json:"state"`
+	RepositoryCredentialReason string          `json:"repositoryCredentialReason,omitempty"`
+	StartedAt                  *time.Time      `json:"startedAt,omitempty"`
+	FinishedAt                 *time.Time      `json:"finishedAt,omitempty"`
+	Environment                *RunEnvironment `json:"environment,omitempty"`
+	TerminalAvailable          bool            `json:"terminalAvailable,omitempty"`
+	Branch                     string          `json:"branch,omitempty"`
+	Usage                      RunUsage        `json:"usage"`
 }
 
 // RunList is a bounded page of Runs. Continue is opaque and may be supplied to

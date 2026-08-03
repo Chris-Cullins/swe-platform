@@ -557,9 +557,11 @@ Secret records the exact frozen source, canonical repository, installation, expi
 generation, Environment UID, and execution generation. The clone init container receives the
 Secret through one exact key reference and derives only a temporary Git extra header; setup and
 resume hooks receive no credential. The selected adapter process receives `GH_TOKEN` and the
-same process-scoped Git header through sandboxd write-only launch material. The token is absent
-from status, transcripts, repository URLs, command arguments, persistent Git config, workspace,
-sandboxd's environment, and public process specifications.
+same process-scoped Git header through sandboxd write-only launch material. Platform-owned
+serialization keeps the token out of status, transcript fields, repository URLs, command
+arguments, persistent Git config, workspace files, sandboxd's environment, and public process
+specifications. The selected process and descendants can nevertheless read, emit, or persist
+the token; transcript redaction is not guaranteed.
 
 Before expiry or after pod loss, a durable rotation record fences the prior execution, revokes
 and deletes its exact lease, issues a replacement, and wakes or resumes with the next execution

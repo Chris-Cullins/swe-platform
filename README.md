@@ -397,10 +397,11 @@ swe --namespace my-project cancel fix-flaky-42
 `https://github.com/<owner>/<repo>[.git]` Project repository. It mints a short-lived installation
 token for that repository with only `contents:write`, uses it for the initial clone, and supplies
 authenticated Git and `gh` access only to the selected agent process. The token is refreshed
-through an execution fence on resume or before expiry and revoked when the Run completes. It is
-not supplied to setup/resume hooks, sandboxd's ambient environment, status, transcripts,
-repository URLs, or persistent workspace configuration. Public repositories continue to clone
-without credentials when the flag is omitted. See the
+through an execution fence on resume or before expiry and revoked when the Run completes. The
+platform does not supply it to setup/resume hooks or sandboxd's ambient environment and does not
+serialize it into status, transcripts, repository URLs, or persistent workspace configuration.
+The selected agent and descendants can still read, emit, or persist it; transcript redaction is
+not guaranteed. Public repositories continue to clone without credentials when the flag is omitted. See the
 [chart configuration](charts/swe-platform/README.md#github-app-repository-credentials) for the
 administrator-owned Secret contract.
 
@@ -447,7 +448,7 @@ or its descendants, repository wrappers left by setup, same-UID peers, or explic
 output. Transcript redaction is not guaranteed. Anyone authorized to create Runs in a namespace
 can initially select any profile there; profile creation and rotation additionally require
 Secret and CRD administration. Subscription/OAuth credentials, refresh and writeback, leases,
-Amp login persistence, per-user profiles, Git/setup/service credentials, hard same-user
+Amp login persistence, per-user profiles, setup/service credentials, hard same-user
 isolation, and stronger redaction remain deferred to issue #9. GitHub App repository tokens use
 the separate per-Run contract above. Never place credentials in a Run prompt or Project
 configuration.

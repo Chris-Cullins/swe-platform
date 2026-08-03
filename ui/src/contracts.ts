@@ -39,6 +39,7 @@ export interface Run {
   }
   cancelRequested: boolean
   state: string
+  repositoryCredentialReason?: string
   startedAt?: string
   finishedAt?: string
   environment?: {

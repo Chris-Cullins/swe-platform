@@ -66,7 +66,7 @@ func TestMCPCreateRunUsesFixedNamespaceAndReturnsUID(t *testing.T) {
 	result, err := clientSession.CallTool(context.Background(), &mcp.CallToolParams{
 		Name: "create_run",
 		Arguments: map[string]any{
-			"name": "task-1", "prompt": "do the work", "project": "repo",
+			"name": "task-1", "prompt": "do the work", "project": "repo", "repositoryCredential": "GitHubApp",
 		},
 	})
 	if err != nil || result.IsError {
@@ -76,7 +76,7 @@ func TestMCPCreateRunUsesFixedNamespaceAndReturnsUID(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if fake.createdNamespace != "team-a" || fake.createdRequest.Agent != "claude-code" || fake.createdRequest.Selector.Project != "repo" {
+	if fake.createdNamespace != "team-a" || fake.createdRequest.Agent != "claude-code" || fake.createdRequest.Selector.Project != "repo" || fake.createdRequest.RepositoryCredential != "GitHubApp" {
 		t.Fatalf("create = %q/%#v", fake.createdNamespace, fake.createdRequest)
 	}
 	if !strings.Contains(string(encoded), `"namespace":"team-a"`) || !strings.Contains(string(encoded), `"uid":"run-uid"`) || strings.Contains(string(encoded), "do the work") {

@@ -14,6 +14,7 @@ import (
 	"encoding/pem"
 	stderrors "errors"
 	"fmt"
+	"io"
 	"math"
 	"math/big"
 	"strconv"
@@ -66,7 +67,33 @@ const (
 	projectAnnotation                = "swe.dev/project"
 	runtimeClassUIDAnnotation        = "swe.dev/runtime-class-uid"
 	executionGenerationAnnotation    = "swe.dev/execution-generation"
+	repositoryProvisioningAnnotation = "credentials.swe.dev/repository-provisioning"
 )
+
+type repositoryProvisioningRecord struct {
+	SecretUID           types.UID `json:"secretUID"`
+	ExecutionGeneration int64     `json:"executionGeneration"`
+}
+
+func parseRepositoryProvisioningRecord(value string) (*repositoryProvisioningRecord, error) {
+	if value == "" {
+		return nil, nil
+	}
+	decoder := json.NewDecoder(strings.NewReader(value))
+	decoder.DisallowUnknownFields()
+	var record repositoryProvisioningRecord
+	if decoder.Decode(&record) != nil || record.SecretUID == "" || record.ExecutionGeneration < 1 {
+		return nil, stderrors.New("invalid repository provisioning record")
+	}
+	if err := decoder.Decode(&struct{}{}); err != io.EOF {
+		return nil, stderrors.New("invalid repository provisioning record")
+	}
+	return &record, nil
+}
+
+func repositoryProvisioning(env *platformv1alpha1.Environment) (*repositoryProvisioningRecord, error) {
+	return parseRepositoryProvisioningRecord(env.Annotations[repositoryProvisioningAnnotation])
+}
 
 var (
 	errPodReplacing                  = stderrors.New("environment pod is being replaced")
@@ -815,10 +842,17 @@ func (r *EnvironmentReconciler) repositoryCloneCredential(ctx context.Context, e
 		repositorycredential.ClearLease(lease)
 		return nil, terminalEnvironment(stderrors.New("repository credential Secret does not match provisioning authority"))
 	}
-	nextExecution := env.Status.ExecutionGeneration + 1
-	if lease.EnvironmentUID != "" && (lease.EnvironmentUID != env.UID || lease.ExecutionGeneration != nextExecution) {
-		repositorycredential.ClearLease(lease)
-		return nil, errRepositoryCredentialPending
+	if lease.EnvironmentUID != "" {
+		record, recordErr := repositoryProvisioning(env)
+		if recordErr != nil {
+			repositorycredential.ClearLease(lease)
+			return nil, terminalEnvironment(recordErr)
+		}
+		if lease.EnvironmentUID != env.UID || record == nil || record.SecretUID != lease.SecretUID ||
+			record.ExecutionGeneration != env.Status.ExecutionGeneration || lease.ExecutionGeneration != record.ExecutionGeneration {
+			repositorycredential.ClearLease(lease)
+			return nil, errRepositoryCredentialPending
+		}
 	}
 	return lease, nil
 }
@@ -916,6 +950,9 @@ func (r *EnvironmentReconciler) ensurePodForProject(ctx context.Context, env *pl
 					return &pod, nil
 				}
 			}
+			if err := r.clearRepositoryProvisioning(ctx, env); err != nil {
+				return nil, err
+			}
 			if err := r.setEnvironmentStatus(ctx, env, platformv1alpha1.EnvironmentPhaseCreating, "", "", "PodTerminating", "the previous environment pod is terminating"); err != nil {
 				return nil, err
 			}
@@ -925,6 +962,13 @@ func (r *EnvironmentReconciler) ensurePodForProject(ctx context.Context, env *pl
 			return nil, nil
 		}
 		if metav1.IsControlledBy(&pod, env) {
+			recovered, recoverErr := r.recoverRepositoryProvisioningPod(ctx, env, &pod)
+			if recoverErr != nil {
+				return nil, recoverErr
+			}
+			if recovered {
+				return &pod, nil
+			}
 			secure, err := r.currentSandboxdPod(ctx, env, &pod)
 			if err != nil {
 				return nil, err
@@ -942,6 +986,9 @@ func (r *EnvironmentReconciler) ensurePodForProject(ctx context.Context, env *pl
 				return nil, errPodReplacing
 			}
 			if secure {
+				if err := r.clearRepositoryProvisioning(ctx, env); err != nil {
+					return nil, err
+				}
 				return &pod, nil
 			}
 		}
@@ -954,6 +1001,9 @@ func (r *EnvironmentReconciler) ensurePodForProject(ctx context.Context, env *pl
 		if env.Status.PodName != "" || env.Status.Endpoints.Sandboxd != "" {
 			return nil, errPodReplacing
 		}
+		if err := r.clearRepositoryProvisioning(ctx, env); err != nil {
+			return nil, err
+		}
 		if err := r.deleteObservedChild(ctx, &pod); err != nil && !errors.IsNotFound(err) {
 			return nil, err
 		}
@@ -962,12 +1012,40 @@ func (r *EnvironmentReconciler) ensurePodForProject(ctx context.Context, env *pl
 	if !errors.IsNotFound(err) {
 		return nil, err
 	}
+	// A persisted provisioning record means this exact execution may already
+	// have created a Pod and exposed the repository token. Without that Pod's
+	// UID, absence is ambiguous: clear the reservation and let the Run
+	// controller revoke/rotate the bound lease before any replacement.
+	provisioningRecord, err := repositoryProvisioning(env)
+	if err != nil {
+		return nil, terminalEnvironment(err)
+	}
+	if provisioningRecord != nil {
+		if err := r.clearRepositoryProvisioning(ctx, env); err != nil {
+			return nil, err
+		}
+		return nil, errRepositoryCredentialPending
+	}
 	repositoryLease, err := r.repositoryCloneCredential(ctx, env)
 	if err != nil {
 		return nil, err
 	}
 	if repositoryLease != nil {
 		defer repositorycredential.ClearLease(repositoryLease)
+	}
+	if repositoryLease != nil {
+		provisioningRecord = &repositoryProvisioningRecord{
+			SecretUID:           repositoryLease.SecretUID,
+			ExecutionGeneration: env.Status.ExecutionGeneration + 1,
+		}
+		if err := r.persistRepositoryProvisioning(ctx, env, *provisioningRecord); err != nil {
+			return nil, err
+		}
+		if provisioningRecord.SecretUID != repositoryLease.SecretUID ||
+			provisioningRecord.ExecutionGeneration < env.Status.ExecutionGeneration ||
+			provisioningRecord.ExecutionGeneration > env.Status.ExecutionGeneration+1 {
+			return nil, errRepositoryCredentialPending
+		}
 	}
 	var existingCredentials corev1.Secret
 	err = r.Get(ctx, types.NamespacedName{Namespace: env.Namespace, Name: envCredentialName(env)}, &existingCredentials)
@@ -988,9 +1066,17 @@ func (r *EnvironmentReconciler) ensurePodForProject(ctx context.Context, env *pl
 	if err := r.Get(ctx, types.NamespacedName{Namespace: env.Namespace, Name: envCredentialName(env)}, &credentials); err != nil {
 		return nil, fmt.Errorf("get rotated sandboxd credentials: %w", err)
 	}
-	executionGeneration, err := r.reserveExecutionGeneration(ctx, env)
-	if err != nil {
-		return nil, fmt.Errorf("reserve execution generation: %w", err)
+	executionGeneration := int64(0)
+	if provisioningRecord != nil && provisioningRecord.ExecutionGeneration == env.Status.ExecutionGeneration {
+		executionGeneration = env.Status.ExecutionGeneration
+	} else {
+		executionGeneration, err = r.reserveExecutionGeneration(ctx, env)
+		if err != nil {
+			return nil, fmt.Errorf("reserve execution generation: %w", err)
+		}
+		if provisioningRecord != nil && provisioningRecord.ExecutionGeneration != executionGeneration {
+			return nil, errRepositoryCredentialPending
+		}
 	}
 	repositoryCredentialSecret := ""
 	if repositoryLease != nil {
@@ -1002,10 +1088,14 @@ func (r *EnvironmentReconciler) ensurePodForProject(ctx context.Context, env *pl
 		if secret.UID != repositoryLease.SecretUID || secret.ResourceVersion != repositoryLease.ResourceVersion {
 			return nil, errRepositoryCredentialPending
 		}
-		secret.Annotations[repositorycredential.AnnotationEnvironmentUID] = string(env.UID)
-		secret.Annotations[repositorycredential.AnnotationExecutionGeneration] = strconv.FormatInt(executionGeneration, 10)
-		if err := r.Update(ctx, &secret); err != nil {
-			return nil, err
+		if repositoryLease.EnvironmentUID == "" {
+			secret.Annotations[repositorycredential.AnnotationEnvironmentUID] = string(env.UID)
+			secret.Annotations[repositorycredential.AnnotationExecutionGeneration] = strconv.FormatInt(executionGeneration, 10)
+			if err := r.Update(ctx, &secret); err != nil {
+				return nil, err
+			}
+		} else if repositoryLease.EnvironmentUID != env.UID || repositoryLease.ExecutionGeneration != executionGeneration {
+			return nil, errRepositoryCredentialPending
 		}
 		repositoryCredentialSecret = secret.Name
 	}
@@ -1182,6 +1272,9 @@ func (r *EnvironmentReconciler) ensurePodForProject(ctx context.Context, env *pl
 		if deleteErr != nil && !errors.IsNotFound(deleteErr) {
 			return nil, fmt.Errorf("delete Pod after provisioning authority changed: %w", deleteErr)
 		}
+		if clearErr := r.clearRepositoryProvisioning(ctx, env); clearErr != nil {
+			return nil, fmt.Errorf("clear repository provisioning after Pod deletion: %w", clearErr)
+		}
 		if err != nil {
 			return nil, err
 		}
@@ -1197,7 +1290,64 @@ func (r *EnvironmentReconciler) ensurePodForProject(ctx context.Context, env *pl
 	if err := r.Update(ctx, &credentials); err != nil {
 		return nil, fmt.Errorf("bind sandboxd credentials to pod: %w", err)
 	}
+	if err := r.clearRepositoryProvisioning(ctx, env); err != nil {
+		return nil, err
+	}
 	return &pod, nil
+}
+
+func (r *EnvironmentReconciler) recoverRepositoryProvisioningPod(ctx context.Context, env *platformv1alpha1.Environment, pod *corev1.Pod) (bool, error) {
+	record, err := repositoryProvisioning(env)
+	if err != nil {
+		return false, terminalEnvironment(err)
+	}
+	if record == nil {
+		return false, nil
+	}
+	lease, err := r.repositoryCloneCredential(ctx, env)
+	if err != nil {
+		return false, err
+	}
+	if lease == nil {
+		return false, nil
+	}
+	defer repositorycredential.ClearLease(lease)
+	executionGeneration, generationValid := podExecutionGeneration(pod)
+	if pod.UID == "" || !metav1.IsControlledBy(pod, env) || pod.Spec.RestartPolicy != corev1.RestartPolicyNever ||
+		!generationValid || executionGeneration != record.ExecutionGeneration || executionGeneration != env.Status.ExecutionGeneration ||
+		record.SecretUID != lease.SecretUID || lease.EnvironmentUID != env.UID || lease.ExecutionGeneration != executionGeneration ||
+		pod.Annotations[projectAnnotation] != env.Spec.ProjectRef || pod.Annotations[sandboxdRevisionAnnotation] != sandboxdSecurityRevision ||
+		pod.Annotations[sandboxdauth.IdentityAnnotation] == "" || pod.Annotations[sandboxdauth.TrustAnnotation] == "" ||
+		pod.Annotations[sandboxdauth.TokenAnnotation] == "" || pod.Annotations[sandboxdauth.SecretNameAnnotation] != envCredentialName(env) {
+		return false, nil
+	}
+	var secret corev1.Secret
+	if err := r.Get(ctx, types.NamespacedName{Namespace: env.Namespace, Name: envCredentialName(env)}, &secret); err != nil {
+		if errors.IsNotFound(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	if !exactControllerOwner(&secret, platformv1alpha1.GroupVersion.String(), "Environment", env.Name, env.UID) ||
+		secret.UID == "" || pod.Annotations[sandboxdauth.SecretUIDAnnotation] != string(secret.UID) ||
+		secret.Annotations[sandboxdauth.IdentityAnnotation] != pod.Annotations[sandboxdauth.IdentityAnnotation] ||
+		secret.Annotations[sandboxdauth.PodUIDAnnotation] != "" && secret.Annotations[sandboxdauth.PodUIDAnnotation] != string(pod.UID) ||
+		len(secret.Data[sandboxdauth.TLSCertKey]) == 0 || len(secret.Data[sandboxdauth.TLSKeyKey]) == 0 ||
+		len(secret.Data[sandboxdauth.CapabilitiesKey]) == 0 || len(secret.Data[sandboxdauth.HealthTokenKey]) == 0 ||
+		len(secret.Data[sandboxdauth.ProcessTokenKey]) == 0 || len(secret.Data[sandboxdauth.FilesystemTokenKey]) == 0 ||
+		len(secret.Data[sandboxdauth.ServiceObservationTokenKey]) == 0 || len(secret.Data[sandboxdauth.PortalTokenKey]) == 0 {
+		return false, nil
+	}
+	if secret.Annotations[sandboxdauth.PodUIDAnnotation] == "" {
+		secret.Annotations[sandboxdauth.PodUIDAnnotation] = string(pod.UID)
+		if err := r.Update(ctx, &secret); err != nil {
+			return false, err
+		}
+	}
+	if err := r.clearRepositoryProvisioning(ctx, env); err != nil {
+		return false, fmt.Errorf("acknowledge recovered repository provisioning: %w", err)
+	}
+	return true, nil
 }
 
 func (r *EnvironmentReconciler) currentSandboxdPod(ctx context.Context, env *platformv1alpha1.Environment, pod *corev1.Pod) (bool, error) {
@@ -1450,6 +1600,28 @@ func (r *EnvironmentReconciler) apiReader() client.Reader {
 	return r.Client
 }
 
+func (r *EnvironmentReconciler) persistRepositoryProvisioning(ctx context.Context, env *platformv1alpha1.Environment, record repositoryProvisioningRecord) error {
+	data, err := json.Marshal(record)
+	if err != nil {
+		return err
+	}
+	before := env.DeepCopy()
+	if env.Annotations == nil {
+		env.Annotations = map[string]string{}
+	}
+	env.Annotations[repositoryProvisioningAnnotation] = string(data)
+	return r.Patch(ctx, env, client.MergeFromWithOptions(before, client.MergeFromWithOptimisticLock{}))
+}
+
+func (r *EnvironmentReconciler) clearRepositoryProvisioning(ctx context.Context, env *platformv1alpha1.Environment) error {
+	if env.Annotations[repositoryProvisioningAnnotation] == "" {
+		return nil
+	}
+	before := env.DeepCopy()
+	delete(env.Annotations, repositoryProvisioningAnnotation)
+	return r.Patch(ctx, env, client.MergeFromWithOptions(before, client.MergeFromWithOptimisticLock{}))
+}
+
 // reserveExecutionGeneration durably allocates a fresh backend-neutral
 // execution identity before a Pod creation attempt. Values may be skipped
 // after failed or uncertain creates, but are never reused.
@@ -1481,6 +1653,7 @@ func (r *EnvironmentReconciler) reserveExecutionGeneration(ctx context.Context, 
 		return 0, err
 	}
 	env.Status = current.Status
+	env.ResourceVersion = current.ResourceVersion
 	return next, nil
 }
 

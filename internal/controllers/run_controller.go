@@ -1,6 +1,7 @@
 package controllers
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
@@ -44,6 +45,7 @@ var errAllocatedEnvironmentGone = errors.New("allocated environment is gone or n
 var errExplicitEnvironmentClaimed = errors.New("explicit environment is already claimed")
 var errExplicitEnvironmentHeld = errors.New("explicit environment is held")
 var errExplicitEnvironmentSuspensionNotWakeable = errors.New("explicit environment suspension is not wakeable")
+var errRepositoryCredentialInvalid = errors.New("repository credential authority is invalid")
 
 const (
 	runConditionEnvironmentReady           = "EnvironmentReady"
@@ -123,7 +125,7 @@ func (r *RunReconciler) now() time.Time {
 // +kubebuilder:rbac:groups=swe.dev,resources=environments/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=swe.dev,resources=projects,verbs=get;list;watch
 // +kubebuilder:rbac:groups=swe.dev,resources=agentcredentialprofiles,verbs=get;list;watch
-// +kubebuilder:rbac:groups="",resources=secrets,verbs=get;create;update;patch;delete
+// +kubebuilder:rbac:groups="",resources=secrets,verbs=get;create;update;delete
 
 func (r *RunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	var run platformv1alpha1.Run
@@ -631,14 +633,14 @@ func (r *RunReconciler) setRepositoryCredentialCondition(ctx context.Context, ru
 
 func (r *RunReconciler) repositoryForRun(ctx context.Context, run *platformv1alpha1.Run) (string, error) {
 	if run.Status.EnvironmentRef == nil {
-		return "", errors.New("run has no frozen environment association")
+		return "", fmt.Errorf("%w: run has no frozen environment association", errRepositoryCredentialInvalid)
 	}
 	var env platformv1alpha1.Environment
 	if err := r.apiReader().Get(ctx, types.NamespacedName{Namespace: run.Namespace, Name: run.Status.EnvironmentRef.Name}, &env); err != nil {
 		return "", err
 	}
 	if env.UID != run.Status.EnvironmentRef.UID || !env.DeletionTimestamp.IsZero() {
-		return "", errors.New("environment repository association is malformed")
+		return "", fmt.Errorf("%w: environment repository association is malformed", errRepositoryCredentialInvalid)
 	}
 	if env.Status.Provisioning == nil || env.Status.Provisioning.Project == nil || platformv1alpha1.ValidateEnvironmentProvisioningSnapshot(&env, env.Status.Provisioning) != nil || !env.Status.Provisioning.ProjectVerified {
 		return "", errRepositoryCredentialPending
@@ -649,7 +651,7 @@ func (r *RunReconciler) repositoryForRun(ctx context.Context, run *platformv1alp
 		return "", err
 	}
 	if project.UID != p.UID || !project.DeletionTimestamp.IsZero() {
-		return "", errors.New("environment project association was replaced")
+		return "", fmt.Errorf("%w: environment project association was replaced", errRepositoryCredentialInvalid)
 	}
 	return p.Repository, nil
 }
@@ -675,12 +677,89 @@ func (r *RunReconciler) readRepositoryLease(ctx context.Context, run *platformv1
 	return repositorycredential.Parse(&secret, run.Name, run.UID)
 }
 
+func (r *RunReconciler) readPendingRepositoryRevocation(ctx context.Context, run *platformv1alpha1.Run) (*repositorycredential.Lease, error) {
+	key := types.NamespacedName{Namespace: run.Namespace, Name: repositorycredential.PendingRevocationSecretName(run.UID)}
+	var secret corev1.Secret
+	if err := r.apiReader().Get(ctx, key, &secret); err != nil {
+		return nil, err
+	}
+	defer func() {
+		for _, value := range secret.Data {
+			clear(value)
+		}
+	}()
+	return repositorycredential.ParsePendingRevocation(&secret, run.Name, run.UID)
+}
+
+func (r *RunReconciler) persistPendingRepositoryRevocation(ctx context.Context, run *platformv1alpha1.Run, source string, credential *repositorycredential.Credential, generation int64) error {
+	secret, err := repositorycredential.NewPendingRevocationSecret(run.Namespace, run.Name, run.UID, string(run.Spec.RepositoryCredential), source, credential, generation, r.now())
+	if err != nil {
+		return err
+	}
+	if err = r.Create(ctx, secret); err == nil {
+		return nil
+	}
+	persisted, readErr := r.readPendingRepositoryRevocation(ctx, run)
+	if readErr != nil {
+		return err
+	}
+	exact := persisted.Provider == string(run.Spec.RepositoryCredential) && persisted.SourceRepository == source &&
+		persisted.Repository == credential.Repository && persisted.InstallationID == credential.InstallationID &&
+		persisted.ExpiresAt.Equal(credential.ExpiresAt) && persisted.TokenGeneration == generation && bytes.Equal(persisted.Token, credential.Token)
+	repositorycredential.ClearLease(persisted)
+	if !exact {
+		return err
+	}
+	return nil
+}
+
+func (r *RunReconciler) cleanupPendingRepositoryRevocation(ctx context.Context, run *platformv1alpha1.Run) (bool, ctrl.Result, error) {
+	pending, err := r.readPendingRepositoryRevocation(ctx, run)
+	if apierrors.IsNotFound(err) {
+		return true, ctrl.Result{}, nil
+	}
+	if err != nil {
+		return false, ctrl.Result{}, err
+	}
+	defer repositorycredential.ClearLease(pending)
+	if r.RepositoryCredentials == nil {
+		return false, ctrl.Result{RequeueAfter: repositorycredential.DefaultRetryDelay}, r.setRepositoryCredentialCondition(ctx, run, metav1.ConditionFalse, "RevocationPending", "repository credential revocation is pending")
+	}
+	if revokeErr := r.RepositoryCredentials.Revoke(ctx, &pending.Credential); revokeErr != nil && r.now().Before(pending.ExpiresAt) {
+		if statusErr := r.setRepositoryCredentialCondition(ctx, run, metav1.ConditionFalse, "RevocationPending", "repository credential revocation is pending"); statusErr != nil {
+			return false, ctrl.Result{}, statusErr
+		}
+		return false, ctrl.Result{RequeueAfter: repositorycredential.RetryDelay(revokeErr)}, nil
+	}
+	active, activeErr := r.readRepositoryLease(ctx, run)
+	if activeErr == nil {
+		sameToken := active.Provider == pending.Provider && active.SourceRepository == pending.SourceRepository &&
+			active.Repository == pending.Repository && active.InstallationID == pending.InstallationID && active.ExpiresAt.Equal(pending.ExpiresAt) &&
+			active.TokenGeneration == pending.TokenGeneration && bytes.Equal(active.Token, pending.Token)
+		uid := active.SecretUID
+		repositorycredential.ClearLease(active)
+		if sameToken {
+			if deleteErr := r.Delete(ctx, &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Namespace: run.Namespace, Name: repositorycredential.SecretName(run.UID), UID: uid}}, &client.DeleteOptions{Preconditions: &metav1.Preconditions{UID: &uid}}); deleteErr != nil && !apierrors.IsNotFound(deleteErr) {
+				return false, ctrl.Result{}, deleteErr
+			}
+		}
+	}
+	uid := pending.SecretUID
+	if deleteErr := r.Delete(ctx, &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Namespace: run.Namespace, Name: repositorycredential.PendingRevocationSecretName(run.UID), UID: uid}}, &client.DeleteOptions{Preconditions: &metav1.Preconditions{UID: &uid}}); deleteErr != nil && !apierrors.IsNotFound(deleteErr) {
+		return false, ctrl.Result{}, deleteErr
+	}
+	return false, ctrl.Result{Requeue: true}, nil
+}
+
 func (r *RunReconciler) ensureRepositoryCredential(ctx context.Context, run *platformv1alpha1.Run) (ctrl.Result, bool, error) {
 	if run.Spec.RepositoryCredential == "" {
 		return ctrl.Result{}, false, r.setRepositoryCredentialCondition(ctx, run, metav1.ConditionTrue, "NotRequested", "repository credential was not requested")
 	}
 	if run.Spec.RepositoryCredential != platformv1alpha1.RepositoryCredentialGitHubApp {
 		return ctrl.Result{}, true, r.failRepositoryCredential(ctx, run, "RepositoryUnsupported")
+	}
+	if done, result, err := r.cleanupPendingRepositoryRevocation(ctx, run); !done || err != nil {
+		return result, true, err
 	}
 	if r.RepositoryCredentials == nil {
 		return ctrl.Result{}, true, r.failRepositoryCredential(ctx, run, "ProviderDisabled")
@@ -690,7 +769,10 @@ func (r *RunReconciler) ensureRepositoryCredential(ctx context.Context, run *pla
 		if errors.Is(err, errRepositoryCredentialPending) {
 			return ctrl.Result{RequeueAfter: repositoryCredentialRequeueDelay}, true, r.setRepositoryCredentialCondition(ctx, run, metav1.ConditionFalse, "Issuing", "repository credential is waiting for the frozen provisioning snapshot")
 		}
-		return ctrl.Result{}, true, r.failRepositoryCredential(ctx, run, "RepositoryUnsupported")
+		if errors.Is(err, errRepositoryCredentialInvalid) {
+			return ctrl.Result{}, true, r.failRepositoryCredential(ctx, run, "RepositoryUnsupported")
+		}
+		return ctrl.Result{}, true, err
 	}
 	canonicalRepository, err := r.RepositoryCredentials.CanonicalRepository(repository)
 	if err != nil {
@@ -719,6 +801,15 @@ func (r *RunReconciler) ensureRepositoryCredential(ctx context.Context, run *pla
 					if getErr := r.getExactEnvironment(ctx, run, &env); getErr != nil {
 						return ctrl.Result{}, true, getErr
 					}
+					requestID := fmt.Sprintf("run/%s/repository-refresh/%s", run.UID, lease.SecretUID)
+					wakePublished := env.Spec.Lifecycle.Wake != nil && env.Spec.Lifecycle.Wake.ID == requestID || env.Status.Lifecycle.LastWakeRequestID == requestID
+					if wakePublished {
+						delete(run.Annotations, repositoryRefreshAnnotation)
+						if updateErr := r.Update(ctx, run); updateErr != nil {
+							return ctrl.Result{}, true, updateErr
+						}
+						return ctrl.Result{Requeue: true}, true, nil
+					}
 					if explicitHoldEnabled(&env) {
 						return ctrl.Result{}, false, r.setRepositoryCredentialCondition(ctx, run, metav1.ConditionTrue, "Ready", "fresh repository credential is ready while environment is held")
 					}
@@ -729,7 +820,6 @@ func (r *RunReconciler) ensureRepositoryCredential(ctx context.Context, run *pla
 						result, fenceErr := r.requestEnvironmentFence(ctx, &env)
 						return result, true, fenceErr
 					}
-					requestID := fmt.Sprintf("run/%s/repository-refresh/%s", run.UID, lease.SecretUID)
 					if wakeErr := lifecycle.RequestWakeForReason(ctx, r.Client, client.ObjectKeyFromObject(&env), env.UID, lifecycle.HoldPolicyRevision(&env), requestID, platformv1alpha1.EnvironmentSuspensionReasonRequested); wakeErr != nil {
 						return ctrl.Result{}, true, wakeErr
 					}
@@ -774,11 +864,23 @@ func (r *RunReconciler) ensureRepositoryCredential(ctx context.Context, run *pla
 				var pod corev1.Pod
 				podErr := r.apiReader().Get(ctx, types.NamespacedName{Namespace: env.Namespace, Name: envPodName(&env)}, &pod)
 				if apierrors.IsNotFound(podErr) {
-					if persistErr := r.persistRepositoryRotation(ctx, run, lease, false); persistErr != nil {
-						return ctrl.Result{}, true, persistErr
+					provisioning, provisioningErr := repositoryProvisioning(&env)
+					if provisioningErr != nil {
+						return ctrl.Result{}, true, provisioningErr
 					}
-					return ctrl.Result{Requeue: true}, true, nil
+					provisioningCurrent := provisioning != nil && provisioning.SecretUID == lease.SecretUID &&
+						provisioning.ExecutionGeneration == lease.ExecutionGeneration && lease.EnvironmentUID == env.UID
+					if !provisioningCurrent {
+						if persistErr := r.persistRepositoryRotation(ctx, run, lease, false); persistErr != nil {
+							return ctrl.Result{}, true, persistErr
+						}
+						return ctrl.Result{Requeue: true}, true, nil
+					}
+				} else if podErr != nil {
+					return ctrl.Result{}, true, podErr
 				}
+			} else if getErr != nil && !apierrors.IsNotFound(getErr) {
+				return ctrl.Result{}, true, getErr
 			}
 		}
 		if lease.ExpiresAt.Sub(r.now()) <= repositorycredential.RefreshMargin && run.Status.EnvironmentRef != nil {
@@ -828,14 +930,34 @@ func (r *RunReconciler) ensureRepositoryCredential(ctx context.Context, run *pla
 	if createErr == nil {
 		createErr = r.Create(ctx, secret)
 	}
+	if createErr != nil && secret != nil {
+		persisted, readErr := r.readRepositoryLease(ctx, run)
+		if readErr == nil {
+			exact := persisted.Provider == string(run.Spec.RepositoryCredential) && persisted.SourceRepository == repository &&
+				persisted.Repository == credential.Repository && persisted.InstallationID == credential.InstallationID &&
+				persisted.ExpiresAt.Equal(credential.ExpiresAt) && persisted.TokenGeneration == generation && bytes.Equal(persisted.Token, credential.Token)
+			repositorycredential.ClearLease(persisted)
+			if exact {
+				createErr = nil
+			}
+		}
+	}
 	if createErr != nil {
 		if credential != nil {
-			_ = r.RepositoryCredentials.Revoke(ctx, credential)
+			if revokeErr := r.RepositoryCredentials.Revoke(ctx, credential); revokeErr != nil {
+				if pendingErr := r.persistPendingRepositoryRevocation(ctx, run, repository, credential, generation); pendingErr != nil {
+					return ctrl.Result{}, true, r.failRepositoryCredential(ctx, run, "SecretPersistenceFailed")
+				}
+				if statusErr := r.setRepositoryCredentialCondition(ctx, run, metav1.ConditionFalse, "RevocationPending", "repository credential revocation is pending"); statusErr != nil {
+					return ctrl.Result{}, true, statusErr
+				}
+				return ctrl.Result{RequeueAfter: repositorycredential.RetryDelay(revokeErr)}, true, nil
+			}
 		}
 		if apierrors.IsAlreadyExists(createErr) {
-			return ctrl.Result{Requeue: true}, true, nil
+			return ctrl.Result{}, true, r.failRepositoryCredential(ctx, run, "SecretChanged")
 		}
-		return ctrl.Result{}, true, createErr
+		return ctrl.Result{}, true, r.failRepositoryCredential(ctx, run, "SecretPersistenceFailed")
 	}
 	return ctrl.Result{Requeue: true}, true, nil
 }
@@ -1469,6 +1591,9 @@ func (r *RunReconciler) cleanupRepositoryCredential(ctx context.Context, run *pl
 		result, err := r.requestEnvironmentFence(ctx, env)
 		return false, result, err
 	}
+	if done, result, err := r.cleanupPendingRepositoryRevocation(ctx, run); !done || err != nil {
+		return false, result, err
+	}
 	lease, err := r.readRepositoryLease(ctx, run)
 	if apierrors.IsNotFound(err) {
 		if run.Annotations[repositoryRefreshAnnotation] != "" {
@@ -1487,12 +1612,15 @@ func (r *RunReconciler) cleanupRepositoryCredential(ctx context.Context, run *pl
 		if getErr := r.apiReader().Get(ctx, key, &secret); getErr != nil {
 			return false, ctrl.Result{}, getErr
 		}
-		source, identityErr := r.repositoryForRun(ctx, run)
-		if identityErr != nil {
-			return false, ctrl.Result{}, fmt.Errorf("repository credential cleanup identity unavailable: %w", identityErr)
-		}
 		if r.RepositoryCredentials == nil {
 			return false, ctrl.Result{}, errors.New("repository credential cleanup provider is unavailable")
+		}
+		source, identityErr := r.repositoryForRun(ctx, run)
+		if identityErr != nil {
+			if !apierrors.IsNotFound(identityErr) {
+				return false, ctrl.Result{}, fmt.Errorf("repository credential cleanup identity unavailable: %w", identityErr)
+			}
+			source = secret.Annotations[repositorycredential.AnnotationSourceRepository]
 		}
 		canonical, canonicalErr := r.RepositoryCredentials.CanonicalRepository(source)
 		if canonicalErr != nil {

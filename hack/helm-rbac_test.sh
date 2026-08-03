@@ -74,4 +74,27 @@ for mode in scoped trusted-admin; do
 	fi
 done
 
-echo "scoped and trusted-admin Helm RBAC deny status by default and grant portal-only status update"
+if helm template rbac-test charts/swe-platform --namespace rbac-system \
+	--set tenancy.mode=scoped --set operator.githubApp.enabled=true >/dev/null 2>&1; then
+	echo "GitHub App enablement without administrator-owned identity/Secret references must fail" >&2
+	exit 1
+fi
+github_app_render=$(helm template rbac-test charts/swe-platform \
+	--namespace rbac-system \
+	--set tenancy.mode=scoped \
+	--set operator.githubApp.enabled=true \
+	--set-string operator.githubApp.clientID=Iv1.test \
+	--set-string operator.githubApp.secretName=github-app-private-key)
+github_app_operator=$(awk -v RS='---' '
+	/kind: Deployment/ && /app.kubernetes.io\/component: operator/ { print; exit }
+' <<<"$github_app_render")
+if [[ -z "$github_app_operator" ]] ||
+	! grep -Fq -- '--github-app-client-id=Iv1.test' <<<"$github_app_operator" ||
+	! grep -Fq -- '--github-app-private-key-file=/var/run/secrets/swe-platform-github-app/private-key.pem' <<<"$github_app_operator" ||
+	! grep -Fq 'secretName: github-app-private-key' <<<"$github_app_operator" ||
+	! grep -Fq 'key: private-key.pem' <<<"$github_app_operator"; then
+	echo "GitHub App render did not mount the exact administrator-owned key only for the operator" >&2
+	exit 1
+fi
+
+echo "scoped and trusted-admin Helm RBAC plus disabled-by-default GitHub App mounts are fenced"

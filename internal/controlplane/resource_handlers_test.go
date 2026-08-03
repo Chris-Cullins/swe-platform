@@ -160,7 +160,7 @@ func TestRunListQueryValidation(t *testing.T) {
 }
 
 func TestCreateRunValidation(t *testing.T) {
-	valid := `{"name":"r","selector":{"template":"small"},"agent":"amp","prompt":"go","credentialProfile":"amp-production"}`
+	valid := `{"name":"r","selector":{"template":"small"},"agent":"amp","prompt":"go","credentialProfile":"amp-production","repositoryCredential":"GitHubApp"}`
 	cases := []string{"{", valid + " {}", `{"name":"r","selector":{"template":"small"},"agent":"amp","prompt":"go","x":1}`, `{"name":"r","selector":{"template":"small","x":1},"agent":"amp","prompt":"go"}`, `{"name":"r","selector":{},"agent":"amp","prompt":"go"}`, `{"name":"r","selector":{"environment":"e","project":"p"},"agent":"amp","prompt":"go"}`, `{"name":"BAD NAME","selector":{"template":"small"},"agent":"amp","prompt":"go"}`, `{"name":"r","selector":{"template":"BAD NAME"},"agent":"amp","prompt":"go"}`, `{"name":"r","selector":{"template":"small"},"agent":"amp","prompt":"go","credentialProfile":"BAD PROFILE"}`, `{"name":"r","selector":{"template":"small"},"agent":"","prompt":"go"}`, `{"name":"r","selector":{"template":"small"},"agent":"` + strings.Repeat("a", 129) + `","prompt":"go"}`, `{"name":"r","selector":{"template":"small"},"agent":"amp","prompt":""}`}
 	for i, body := range cases {
 		f := &fakeResources{}
@@ -179,7 +179,7 @@ func TestCreateRunValidation(t *testing.T) {
 	if w.Code != 201 || !strings.Contains(w.Body.String(), `"name":"r"`) {
 		t.Errorf("success=%d %s", w.Code, w.Body.String())
 	}
-	if f.createdRequest.CredentialProfile != "amp-production" {
+	if f.createdRequest.CredentialProfile != "amp-production" || f.createdRequest.RepositoryCredential != "GitHubApp" {
 		t.Fatalf("profile create request = %#v", f.createdRequest)
 	}
 }

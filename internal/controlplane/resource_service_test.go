@@ -59,12 +59,12 @@ func TestResourceServiceCreateRunIntentOnlyAndAlreadyExistsDoesNotGet(t *testing
 	scheme := resourceScheme(t)
 	base := fake.NewClientBuilder().WithScheme(scheme).Build()
 	service := &KubernetesResourceService{Client: base}
-	req := CreateRunRequest{Name: "new", Selector: RunSelector{Project: "p", Template: "t"}, Agent: "a", Prompt: "do it"}
+	req := CreateRunRequest{Name: "new", Selector: RunSelector{Project: "p", Template: "t"}, Agent: "a", Prompt: "do it", RepositoryCredential: "GitHubApp"}
 	created, err := service.CreateRun(context.Background(), "ns", req)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if created.Intent.Selector != req.Selector {
+	if created.Intent.Selector != req.Selector || created.Intent.RepositoryCredential != "GitHubApp" {
 		t.Fatalf("selector = %#v", created.Intent.Selector)
 	}
 	var runs platformv1alpha1.RunList
@@ -87,7 +87,7 @@ func TestResourceServiceCreateRunIntentOnlyAndAlreadyExistsDoesNotGet(t *testing
 }
 
 func TestResourceServiceCreateCollisionComparesFullRunSpec(t *testing.T) {
-	request := CreateRunRequest{Name: "same", Selector: RunSelector{Template: "small"}, Agent: "agent", Prompt: "prompt", CredentialProfile: "profile"}
+	request := CreateRunRequest{Name: "same", Selector: RunSelector{Template: "small"}, Agent: "agent", Prompt: "prompt", CredentialProfile: "profile", RepositoryCredential: "GitHubApp"}
 	for _, test := range []struct {
 		name   string
 		mutate func(*platformv1alpha1.RunSpec)
@@ -100,6 +100,7 @@ func TestResourceServiceCreateCollisionComparesFullRunSpec(t *testing.T) {
 		{name: "notify conflicts", mutate: func(spec *platformv1alpha1.RunSpec) { spec.Notify = []string{"parent"} }, want: errRunIntentConflict},
 		{name: "selector conflicts", mutate: func(spec *platformv1alpha1.RunSpec) { spec.TemplateRef = "other" }, want: errRunIntentConflict},
 		{name: "credential profile conflicts", mutate: func(spec *platformv1alpha1.RunSpec) { spec.CredentialProfileRef = "other" }, want: errRunIntentConflict},
+		{name: "repository credential conflicts", mutate: func(spec *platformv1alpha1.RunSpec) { spec.RepositoryCredential = "" }, want: errRunIntentConflict},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			spec := desiredRunSpec(request)
@@ -280,6 +281,21 @@ func TestResourceServiceRunDTOMapsLifecycleTimestamps(t *testing.T) {
 	}
 	if got.FinishedAt == nil || !got.FinishedAt.Equal(finishedAt.Time) {
 		t.Fatalf("FinishedAt = %v, want %v", got.FinishedAt, finishedAt.Time)
+	}
+}
+
+func TestResourceServiceRunDTOMapsRepositoryCredentialReason(t *testing.T) {
+	run := &platformv1alpha1.Run{
+		ObjectMeta: metav1.ObjectMeta{Name: "run", Namespace: "ns", UID: "run-uid"},
+		Spec:       platformv1alpha1.RunSpec{RepositoryCredential: platformv1alpha1.RepositoryCredentialGitHubApp},
+		Status: platformv1alpha1.RunStatus{State: platformv1alpha1.RunStateFailed, Conditions: []metav1.Condition{{
+			Type: "RepositoryCredentialReady", Status: metav1.ConditionFalse, Reason: "ProviderDisabled",
+		}}},
+	}
+	service := &KubernetesResourceService{Client: fake.NewClientBuilder().WithScheme(resourceScheme(t)).WithObjects(run).Build()}
+	got, err := service.GetRun(context.Background(), "ns", "run")
+	if err != nil || got.RepositoryCredentialReason != "ProviderDisabled" {
+		t.Fatalf("GetRun() = %#v, %v", got, err)
 	}
 }
 

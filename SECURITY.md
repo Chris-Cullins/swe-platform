@@ -6,11 +6,13 @@ When explicitly selected by immutable Run intent, the operator exchanges its
 administrator-owned GitHub App private key for a short-lived installation token.
 The recipient is only the canonical `github.com` repository in frozen provisioning
 data; scope is exactly that repository with `contents:write`. App keys are mounted
-only in the operator. Tokens are intended only for clone and Run-owned agent
-processes, never status, transcripts, sandboxd, hooks, command arguments,
-repository URLs, or persistent git config. Cleanup fences the Environment before
-revocation. GitHub's fixed one-hour maximum expiry bounds a crash between issuance
-and persistence, where no token exists locally to revoke.
+only in the operator. The platform serializes tokens only to the lease Secret, clone
+container, and Run-owned agent process launch material—not status, transcripts,
+sandboxd's ambient environment, hooks, command arguments, repository URLs, or
+persistent git config. The selected agent and its descendants can read, emit, or
+persist the token; transcript redaction is not guaranteed. Cleanup fences the
+Environment before revocation. GitHub's fixed one-hour maximum expiry bounds a crash
+between issuance and persistence, where no token exists locally to revoke.
 
 Repository initialization is split into ordered clone and project-hook init
 containers. After uncached exact Run, Environment, frozen repository, and lease
