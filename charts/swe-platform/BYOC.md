@@ -185,13 +185,7 @@ advertised isolation.
 ./hack/validate-byoc.sh preflight "$PROVIDER"
 
 IMAGE_ARGS=()
-if test -n "${SWE_RELEASE_MANIFEST:-}"; then
-  IMAGE_ARGS=(
-    --set-string "image.digest=$(jq -r '.images.operator.digest' "$SWE_RELEASE_MANIFEST")"
-    --set-string "controlPlane.image.digest=$(jq -r '.images["control-plane"].digest' "$SWE_RELEASE_MANIFEST")"
-    --set-string "environmentImage.digest=$(jq -r '.images["env-base"].digest' "$SWE_RELEASE_MANIFEST")"
-  )
-fi
+mapfile -t IMAGE_ARGS < <(./hack/validate-byoc.sh image-args "$PROVIDER")
 helm upgrade --install "$SWE_RELEASE" ./charts/swe-platform \
   --namespace "$SWE_SYSTEM_NAMESPACE" \
   --values "./charts/swe-platform/values-$PROVIDER.yaml" \
@@ -202,7 +196,8 @@ helm upgrade --install "$SWE_RELEASE" ./charts/swe-platform \
 ```
 
 The first scoped install must keep `tenancy.namespaces: []`. Do not use `trusted-admin` as a
-shortcut.
+shortcut. `image-args` is the single source for both release-manifest digest pins and the
+traceable `SWE_IMAGE_TAG` fallback; do not reconstruct these overrides separately.
 
 ### 3. Onboard and activate a Project
 
@@ -237,7 +232,8 @@ existing multi-Project installation.
 
 1. Record `helm get values "$SWE_RELEASE" -n "$SWE_SYSTEM_NAMESPACE" --all` and the current
    commit/release manifest. Verify the target commit's publish and CI workflows, download its
-   release manifest, reconstruct `IMAGE_ARGS` with the install snippet, and run `render`.
+   release manifest, reconstruct `IMAGE_ARGS` with the `image-args` command above, and run
+   `render`.
 2. Take and verify the PostgreSQL backup below. Confirm the backed-up keyring contains every key
    required by the one-hour session TTL and rollback window.
 3. Review the target preset and all private values. Rerun `project onboard` for each active
