@@ -12,10 +12,12 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -25,6 +27,11 @@ import (
 
 const apiBase = "https://api.github.com"
 const maxBody = 64 << 10
+
+var (
+	ownerPattern      = regexp.MustCompile(`^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$`)
+	repositoryPattern = regexp.MustCompile(`^[A-Za-z0-9._-]{1,100}$`)
+)
 
 type Provider struct {
 	ClientID string
@@ -55,16 +62,19 @@ func New(clientID string, keyPEM []byte, client *http.Client) (*Provider, error)
 
 func canonical(repository string) (string, string, string, error) {
 	u, err := url.Parse(repository)
-	if err != nil || u.Scheme != "https" || u.Host != "github.com" || u.User != nil || u.RawQuery != "" || u.Fragment != "" || u.Port() != "" {
+	if err != nil || u.Scheme != "https" || u.Host != "github.com" || u.User != nil || u.RawQuery != "" || u.Fragment != "" || u.Port() != "" || u.RawPath != "" || strings.Contains(repository, "%") {
 		return "", "", "", fmt.Errorf("unsupported repository URL")
 	}
-	parts := strings.Split(strings.Trim(u.EscapedPath(), "/"), "/")
+	if !strings.HasPrefix(u.Path, "/") || strings.HasSuffix(u.Path, "/") {
+		return "", "", "", fmt.Errorf("unsupported repository URL")
+	}
+	parts := strings.Split(strings.TrimPrefix(u.Path, "/"), "/")
 	if len(parts) != 2 {
 		return "", "", "", fmt.Errorf("unsupported repository URL")
 	}
-	owner, err1 := url.PathUnescape(parts[0])
-	repo, err2 := url.PathUnescape(strings.TrimSuffix(parts[1], ".git"))
-	if err1 != nil || err2 != nil || owner == "" || repo == "" || strings.ContainsAny(owner+repo, "/\\") {
+	owner := parts[0]
+	repo := strings.TrimSuffix(parts[1], ".git")
+	if !ownerPattern.MatchString(owner) || !repositoryPattern.MatchString(repo) || repo == "." || repo == ".." {
 		return "", "", "", fmt.Errorf("unsupported repository URL")
 	}
 	return "https://github.com/" + owner + "/" + repo, owner, repo, nil
@@ -81,7 +91,8 @@ func (p *Provider) CanonicalRepository(repository string) (string, error) {
 func (p *Provider) jwt() (string, error) {
 	now := p.Now()
 	enc := base64.RawURLEncoding
-	header := enc.EncodeToString([]byte(`{"alg":"RS256","typ":"JWT"}`))
+	headerJSON, _ := json.Marshal(map[string]string{"alg": "RS256", "typ": "JWT"})
+	header := enc.EncodeToString(headerJSON)
 	payload, _ := json.Marshal(map[string]any{"iat": now.Add(-time.Minute).Unix(), "exp": now.Add(9 * time.Minute).Unix(), "iss": p.ClientID})
 	unsigned := header + "." + enc.EncodeToString(payload)
 	h := sha256.Sum256([]byte(unsigned))
@@ -126,6 +137,13 @@ func (p *Provider) request(ctx context.Context, method, path, authorization stri
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		retryable := resp.StatusCode == 429 || resp.StatusCode >= 500
 		delay := time.Duration(0)
+		var envelope struct {
+			Message string `json:"message"`
+		}
+		_ = json.Unmarshal(data, &envelope)
+		message := strings.ToLower(envelope.Message)
+		secondaryLimit := resp.StatusCode == http.StatusForbidden &&
+			(strings.Contains(message, "secondary rate limit") || strings.Contains(message, "abuse detection"))
 		if value := resp.Header.Get("Retry-After"); value != "" {
 			if seconds, parseErr := strconv.ParseInt(value, 10, 64); parseErr == nil && seconds > 0 {
 				delay = time.Duration(seconds) * time.Second
@@ -140,13 +158,19 @@ func (p *Provider) request(ctx context.Context, method, path, authorization stri
 				delay = time.Unix(reset, 0).Sub(p.Now())
 			}
 		}
+		if secondaryLimit {
+			retryable = true
+			if delay < time.Minute {
+				delay = time.Minute
+			}
+		}
 		if retryable && delay <= 0 {
 			delay = repositorycredential.DefaultRetryDelay
 		}
 		if delay > 15*time.Minute {
 			delay = 15 * time.Minute
 		}
-		return &repositorycredential.Error{Retryable: retryable, RetryAfter: delay, Operation: "API", Reason: "ProviderAPIError"}
+		return &repositorycredential.Error{Retryable: retryable, RetryAfter: delay, Operation: "API", Reason: "ProviderAPIError", StatusCode: resp.StatusCode}
 	}
 	if out != nil && json.Unmarshal(data, out) != nil {
 		return &repositorycredential.Error{Retryable: false, Operation: "response", Reason: "ProviderInvalidResponse"}
@@ -169,15 +193,30 @@ func (p *Provider) Issue(ctx context.Context, repository string) (*repositorycre
 	if err = p.request(ctx, http.MethodGet, "/repos/"+url.PathEscape(owner)+"/"+url.PathEscape(repo)+"/installation", j, nil, &installation); err != nil {
 		return nil, err
 	}
+	if installation.ID < 1 {
+		return nil, &repositorycredential.Error{Operation: "installation", Reason: "ProviderInvalidResponse"}
+	}
 	var token struct {
-		Token     string    `json:"token"`
-		ExpiresAt time.Time `json:"expires_at"`
+		Token               string            `json:"token"`
+		ExpiresAt           time.Time         `json:"expires_at"`
+		RepositorySelection string            `json:"repository_selection"`
+		Permissions         map[string]string `json:"permissions"`
+		Repositories        []struct {
+			FullName string `json:"full_name"`
+		} `json:"repositories"`
 	}
 	body := map[string]any{"repositories": []string{repo}, "permissions": map[string]string{"contents": "write"}}
 	if err = p.request(ctx, http.MethodPost, fmt.Sprintf("/app/installations/%d/access_tokens", installation.ID), j, body, &token); err != nil {
 		return nil, err
 	}
-	if token.Token == "" || len(token.Token) > repositorycredential.MaxTokenBytes || strings.IndexByte(token.Token, 0) >= 0 || !token.ExpiresAt.After(p.Now().Add(repositorycredential.MinimumValidity)) {
+	validPermissions := len(token.Permissions) >= 1 && len(token.Permissions) <= 2 && token.Permissions["contents"] == "write"
+	for name, access := range token.Permissions {
+		if name != "contents" && (name != "metadata" || access != "read") {
+			validPermissions = false
+		}
+	}
+	validRepositories := len(token.Repositories) == 0 || len(token.Repositories) == 1 && strings.EqualFold(token.Repositories[0].FullName, owner+"/"+repo)
+	if token.Token == "" || len(token.Token) > repositorycredential.MaxTokenBytes || strings.IndexByte(token.Token, 0) >= 0 || !token.ExpiresAt.After(p.Now().Add(repositorycredential.MinimumValidity)) || token.RepositorySelection != "selected" || !validPermissions || !validRepositories {
 		return nil, &repositorycredential.Error{Operation: "token", Reason: "ProviderInvalidToken"}
 	}
 	return &repositorycredential.Credential{Token: []byte(token.Token), Repository: canonicalURL, InstallationID: installation.ID, ExpiresAt: token.ExpiresAt}, nil
@@ -187,5 +226,10 @@ func (p *Provider) Revoke(ctx context.Context, credential *repositorycredential.
 	if credential == nil || len(credential.Token) == 0 {
 		return nil
 	}
-	return p.request(ctx, http.MethodDelete, "/installation/token", string(credential.Token), nil, nil)
+	err := p.request(ctx, http.MethodDelete, "/installation/token", string(credential.Token), nil, nil)
+	var providerErr *repositorycredential.Error
+	if errors.As(err, &providerErr) && providerErr.StatusCode == http.StatusUnauthorized {
+		return nil
+	}
+	return err
 }

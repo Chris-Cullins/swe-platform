@@ -9,6 +9,7 @@ import (
 
 	platformv1alpha1 "github.com/Chris-Cullins/swe-platform/api/v1alpha1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	apiMeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/watch"
@@ -284,6 +285,9 @@ func runDTO(run *platformv1alpha1.Run) Run {
 	}
 	if run.Status.FinishedAt != nil {
 		result.FinishedAt = &run.Status.FinishedAt.Time
+	}
+	if condition := apiMeta.FindStatusCondition(run.Status.Conditions, "RepositoryCredentialReady"); condition != nil && len(condition.Reason) <= 128 {
+		result.RepositoryCredentialReason = condition.Reason
 	}
 	if run.Status.EnvironmentRef != nil {
 		result.Environment = &RunEnvironment{

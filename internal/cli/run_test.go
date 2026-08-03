@@ -275,7 +275,7 @@ func TestCreateRunIsDeclarativeAndIdempotent(t *testing.T) {
 	c := fake.NewClientBuilder().WithScheme(s).Build()
 	clients := &kubeClients{Client: c}
 	call := func(prompt string) error {
-		return createRun(context.Background(), clients, "ns", "stable", "small", "", "", "test", prompt, false, 0)
+		return createRunWithCredentials(context.Background(), clients, "ns", "stable", "small", "", "", "test", prompt, "", "github-app", false, 0)
 	}
 	if err := call("do it"); err != nil {
 		t.Fatal(err)
@@ -294,7 +294,7 @@ func TestCreateRunIsDeclarativeAndIdempotent(t *testing.T) {
 	if err := c.List(context.Background(), &envs); err != nil {
 		t.Fatal(err)
 	}
-	if len(runs.Items) != 1 || len(envs.Items) != 0 {
+	if len(runs.Items) != 1 || runs.Items[0].Spec.RepositoryCredential != platformv1alpha1.RepositoryCredentialGitHubApp || len(envs.Items) != 0 {
 		t.Fatalf("runs=%d environments=%d", len(runs.Items), len(envs.Items))
 	}
 }

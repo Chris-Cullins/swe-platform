@@ -33,6 +33,7 @@ type Error struct {
 	Operation  string
 	Reason     string
 	RetryAfter time.Duration
+	StatusCode int
 }
 
 func (e *Error) Error() string { return "repository credential provider " + e.Operation + " failed" }

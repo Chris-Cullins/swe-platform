@@ -29,6 +29,10 @@ const (
 
 func SecretName(runUID types.UID) string { return "run-repository-credential-" + string(runUID) }
 
+func PendingRevocationSecretName(runUID types.UID) string {
+	return SecretName(runUID) + "-pending-revocation"
+}
+
 // ExactManagedIdentity validates deletion authority without requiring usable token data.
 func ExactManagedIdentity(secret *corev1.Secret, runName string, runUID types.UID, provider, source, canonical string) bool {
 	if secret == nil || secret.Name != SecretName(runUID) || secret.Type != SecretType || len(secret.OwnerReferences) != 0 {
@@ -70,11 +74,34 @@ func Parse(secret *corev1.Secret, runName string, runUID types.UID) (*Lease, err
 	return &Lease{Credential: Credential{Token: append([]byte(nil), token...), Repository: a[AnnotationRepository], InstallationID: installation, ExpiresAt: expiry}, SecretUID: secret.UID, ResourceVersion: secret.ResourceVersion, RunName: runName, RunUID: runUID, Provider: a[AnnotationProvider], SourceRepository: a[AnnotationSourceRepository], EnvironmentUID: types.UID(a[AnnotationEnvironmentUID]), ExecutionGeneration: execution, TokenGeneration: generation}, nil
 }
 
+func ParsePendingRevocation(secret *corev1.Secret, runName string, runUID types.UID) (*Lease, error) {
+	if secret == nil || secret.Name != PendingRevocationSecretName(runUID) {
+		return nil, errors.New("foreign pending repository credential revocation")
+	}
+	copy := secret.DeepCopy()
+	defer func() {
+		for _, value := range copy.Data {
+			clear(value)
+		}
+	}()
+	copy.Name = SecretName(runUID)
+	return Parse(copy, runName, runUID)
+}
+
 func NewSecret(namespace, runName string, runUID types.UID, provider, sourceRepository string, c *Credential, generation int64, envUID types.UID, execution int64, now time.Time) (*corev1.Secret, error) {
 	if sourceRepository == "" || c == nil || c.Repository == "" || c.InstallationID < 1 || !c.ExpiresAt.After(now.Add(MinimumValidity)) || len(c.Token) == 0 || len(c.Token) > MaxTokenBytes || bytes.IndexByte(c.Token, 0) >= 0 {
 		return nil, fmt.Errorf("invalid issued repository credential")
 	}
 	return &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: SecretName(runUID), Annotations: map[string]string{AnnotationRunName: runName, AnnotationRunUID: string(runUID), AnnotationProvider: provider, AnnotationRepository: c.Repository, AnnotationSourceRepository: sourceRepository, AnnotationInstallationID: strconv.FormatInt(c.InstallationID, 10), AnnotationExpiry: c.ExpiresAt.Format(time.RFC3339Nano), AnnotationEnvironmentUID: string(envUID), AnnotationExecutionGeneration: strconv.FormatInt(execution, 10), AnnotationTokenGeneration: strconv.FormatInt(generation, 10)}}, Type: SecretType, Data: map[string][]byte{TokenKey: append([]byte(nil), c.Token...)}}, nil
+}
+
+func NewPendingRevocationSecret(namespace, runName string, runUID types.UID, provider, sourceRepository string, c *Credential, generation int64, now time.Time) (*corev1.Secret, error) {
+	secret, err := NewSecret(namespace, runName, runUID, provider, sourceRepository, c, generation, "", 0, now)
+	if err != nil {
+		return nil, err
+	}
+	secret.Name = PendingRevocationSecretName(runUID)
+	return secret, nil
 }
 
 func ClearLease(l *Lease) {

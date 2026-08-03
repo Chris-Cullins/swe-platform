@@ -1,6 +1,7 @@
 package githubapp
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/rsa"
@@ -31,7 +32,7 @@ func TestCanonicalRepository(t *testing.T) {
 			t.Fatalf("CanonicalRepository(%q) = %q, %v", test.input, got, err)
 		}
 	}
-	for _, invalid := range []string{"http://github.com/a/b", "https://evil.test/a/b", "https://github.com/a/b/c", "git@github.com:a/b"} {
+	for _, invalid := range []string{"http://github.com/a/b", "https://evil.test/a/b", "https://github.com/a/b/c", "git@github.com:a/b", "https://github.com/a/b/", "https://github.com/a/%3Freleases", "https://github.com/-bad/repo", "https://github.com/acme/.."} {
 		if _, err := p.CanonicalRepository(invalid); err == nil {
 			t.Errorf("CanonicalRepository(%q) succeeded", invalid)
 		}
@@ -48,6 +49,7 @@ func TestGitHubRateLimitClassification(t *testing.T) {
 		delay     time.Duration
 	}{
 		{name: "ordinary forbidden", status: 403, headers: http.Header{}, retryable: false},
+		{name: "secondary limit", status: 403, headers: http.Header{}, retryable: true, delay: time.Minute},
 		{name: "forbidden retry after", status: 403, headers: http.Header{"Retry-After": []string{"30"}}, retryable: true, delay: 30 * time.Second},
 		{name: "forbidden exhausted", status: 403, headers: http.Header{"X-Ratelimit-Remaining": []string{"0"}, "X-Ratelimit-Reset": []string{strconv.FormatInt(now.Add(time.Minute).Unix(), 10)}}, retryable: true, delay: time.Minute},
 		{name: "too many requests fallback", status: 429, headers: http.Header{}, retryable: true, delay: repositorycredential.DefaultRetryDelay},
@@ -55,7 +57,12 @@ func TestGitHubRateLimitClassification(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			p := &Provider{Now: func() time.Time { return now }, Client: &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
-				return &http.Response{StatusCode: tc.status, Header: tc.headers, Body: io.NopCloser(strings.NewReader("sensitive body"))}, nil
+				body := "sensitive body"
+				if tc.name == "secondary limit" {
+					encoded, _ := json.Marshal(map[string]string{"message": "You have exceeded a secondary rate limit."})
+					body = string(encoded)
+				}
+				return &http.Response{StatusCode: tc.status, Header: tc.headers, Body: io.NopCloser(strings.NewReader(body))}, nil
 			})}}
 			err := p.request(context.Background(), http.MethodGet, "/test", "token", nil, nil)
 			if repositorycredential.IsRetryable(err) != tc.retryable || repositorycredential.RetryDelay(err) != func() time.Duration {
@@ -88,6 +95,17 @@ func TestIssueAndRevokeGitHubContract(t *testing.T) {
 			if len(parts) != 3 {
 				t.Fatalf("authorization is not JWT")
 			}
+			header, decodeErr := base64.RawURLEncoding.DecodeString(parts[0])
+			if decodeErr != nil {
+				t.Fatal(decodeErr)
+			}
+			var protected struct {
+				Alg string `json:"alg"`
+				Typ string `json:"typ"`
+			}
+			if json.Unmarshal(header, &protected) != nil || protected.Alg != "RS256" || protected.Typ != "JWT" {
+				t.Errorf("JWT header = %q", header)
+			}
 			payload, decodeErr := base64.RawURLEncoding.DecodeString(parts[1])
 			if decodeErr != nil {
 				t.Fatal(decodeErr)
@@ -100,13 +118,19 @@ func TestIssueAndRevokeGitHubContract(t *testing.T) {
 				t.Errorf("JWT claims = %#v", claims)
 			}
 		}
-		body := `{"id":42}`
+		encoded, _ := json.Marshal(map[string]any{"id": int64(42)})
+		body := string(encoded)
 		if req.Method == http.MethodPost {
 			data, _ := io.ReadAll(req.Body)
-			if string(data) != `{"permissions":{"contents":"write"},"repositories":["widget"]}` {
+			var request struct {
+				Repositories []string          `json:"repositories"`
+				Permissions  map[string]string `json:"permissions"`
+			}
+			if json.Unmarshal(data, &request) != nil || len(request.Repositories) != 1 || request.Repositories[0] != "widget" || request.Permissions["contents"] != "write" || len(request.Permissions) != 1 {
 				t.Errorf("token body = %s", data)
 			}
-			body = `{"token":"secret-token","expires_at":"2026-08-03T13:00:00Z"}`
+			encoded, _ = json.Marshal(map[string]any{"token": "secret-token", "expires_at": "2026-08-03T13:00:00Z", "repository_selection": "selected", "permissions": map[string]string{"contents": "write", "metadata": "read"}, "repositories": []map[string]string{{"full_name": "acme/widget"}}})
+			body = string(encoded)
 		}
 		if req.Method == http.MethodDelete {
 			if auth != "secret-token" {
@@ -130,6 +154,16 @@ func TestIssueAndRevokeGitHubContract(t *testing.T) {
 	want := []string{"GET /repos/acme/widget/installation", "POST /app/installations/42/access_tokens", "DELETE /installation/token"}
 	if strings.Join(calls, "|") != strings.Join(want, "|") {
 		t.Fatalf("calls = %v", calls)
+	}
+}
+
+func TestRevokeTreatsUnauthorizedAsAlreadyInactive(t *testing.T) {
+	p := &Provider{Client: &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		body, _ := json.Marshal(map[string]string{"message": "Bad credentials"})
+		return &http.Response{StatusCode: http.StatusUnauthorized, Header: make(http.Header), Body: io.NopCloser(bytes.NewReader(body))}, nil
+	})}}
+	if err := p.Revoke(context.Background(), &repositorycredential.Credential{Token: []byte("already-revoked")}); err != nil {
+		t.Fatal(err)
 	}
 }
 

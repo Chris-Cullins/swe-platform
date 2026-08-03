@@ -34,6 +34,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
 	platformv1alpha1 "github.com/Chris-Cullins/swe-platform/api/v1alpha1"
+	"github.com/Chris-Cullins/swe-platform/internal/repositorycredential"
 	"github.com/Chris-Cullins/swe-platform/internal/tenancy"
 	sandboxdauth "github.com/Chris-Cullins/swe-platform/sandboxd/auth"
 )
@@ -73,6 +74,188 @@ func setTestProvisioningSnapshot(env *platformv1alpha1.Environment, tmpl *platfo
 	env.Status.Provisioning = platformv1alpha1.ResolveEnvironmentProvisioning(env, tmpl, project)
 	env.Status.Provisioning.TemplateVerified = true
 	env.Status.Provisioning.ProjectVerified = project != nil
+}
+
+func TestRepositoryCloneCredentialRecoversBoundProvisioningLease(t *testing.T) {
+	scheme := runtime.NewScheme()
+	for _, add := range []func(*runtime.Scheme) error{corev1.AddToScheme, platformv1alpha1.AddToScheme} {
+		if err := add(scheme); err != nil {
+			t.Fatal(err)
+		}
+	}
+	now := time.Date(2026, 8, 3, 12, 0, 0, 0, time.UTC)
+	project := &platformv1alpha1.Project{ObjectMeta: metav1.ObjectMeta{Name: "project", Namespace: "default", UID: "project-uid", Generation: 1}, Spec: platformv1alpha1.ProjectSpec{Repositories: []string{"https://github.com/acme/repo"}}}
+	tmpl := &platformv1alpha1.EnvironmentTemplate{ObjectMeta: metav1.ObjectMeta{Name: "small", Namespace: "default", UID: "template-uid", Generation: 1}, Spec: platformv1alpha1.EnvironmentTemplateSpec{Image: "image", Size: "small"}}
+	run := &platformv1alpha1.Run{ObjectMeta: metav1.ObjectMeta{Name: "run", Namespace: "default", UID: "run-uid"}, Spec: platformv1alpha1.RunSpec{RepositoryCredential: platformv1alpha1.RepositoryCredentialGitHubApp}}
+	env := &platformv1alpha1.Environment{
+		ObjectMeta: metav1.ObjectMeta{Name: "env", Namespace: "default", UID: "env-uid", Generation: 1, OwnerReferences: []metav1.OwnerReference{{APIVersion: platformv1alpha1.GroupVersion.String(), Kind: "Run", Name: run.Name, UID: run.UID, Controller: ptr(true)}}},
+		Spec:       platformv1alpha1.EnvironmentSpec{TemplateRef: tmpl.Name, ProjectRef: project.Name},
+		Status:     platformv1alpha1.EnvironmentStatus{ExecutionGeneration: 1},
+	}
+	setTestProvisioningSnapshot(env, tmpl, project)
+	run.Status.EnvironmentRef = &platformv1alpha1.RunEnvironmentReference{Name: env.Name, UID: env.UID, Ownership: platformv1alpha1.EnvironmentOwnershipOwned}
+	run.Status.Conditions = []metav1.Condition{{Type: runConditionRepositoryCredentialReady, Status: metav1.ConditionTrue, Reason: "Ready"}}
+	credential := &repositorycredential.Credential{Token: []byte("provisioning-token"), Repository: "https://github.com/acme/repo", InstallationID: 7, ExpiresAt: now.Add(time.Hour)}
+	secret, err := repositorycredential.NewSecret(env.Namespace, run.Name, run.UID, string(run.Spec.RepositoryCredential), project.Spec.Repositories[0], credential, 1, env.UID, 1, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secret.UID = "repository-secret-uid"
+	record, _ := json.Marshal(repositoryProvisioningRecord{SecretUID: secret.UID, ExecutionGeneration: 1})
+	env.Annotations = map[string]string{repositoryProvisioningAnnotation: string(record)}
+	c := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(env, run).WithObjects(env, run, project, tmpl, secret).Build()
+	r := &EnvironmentReconciler{Client: c, APIReader: c, Scheme: scheme, Now: func() time.Time { return now }}
+
+	lease, err := r.repositoryCloneCredential(context.Background(), env)
+	if err != nil || lease == nil || lease.SecretUID != secret.UID || lease.ExecutionGeneration != 1 {
+		t.Fatalf("recovered lease = %#v, %v", lease, err)
+	}
+	repositorycredential.ClearLease(lease)
+	delete(env.Annotations, repositoryProvisioningAnnotation)
+	if _, err := r.repositoryCloneCredential(context.Background(), env); !stderrors.Is(err, errRepositoryCredentialPending) {
+		t.Fatalf("bound lease without provisioning record error = %v", err)
+	}
+}
+
+func TestEnsurePodRecoversReservedRepositoryCredentialExecution(t *testing.T) {
+	scheme := runtime.NewScheme()
+	for _, add := range []func(*runtime.Scheme) error{corev1.AddToScheme, platformv1alpha1.AddToScheme} {
+		if err := add(scheme); err != nil {
+			t.Fatal(err)
+		}
+	}
+	now := time.Date(2026, 8, 3, 12, 0, 0, 0, time.UTC)
+	project := &platformv1alpha1.Project{ObjectMeta: metav1.ObjectMeta{Name: "project", Namespace: "default", UID: "project-uid", Generation: 1}, Spec: platformv1alpha1.ProjectSpec{Repositories: []string{"https://github.com/acme/repo"}}}
+	tmpl := &platformv1alpha1.EnvironmentTemplate{ObjectMeta: metav1.ObjectMeta{Name: "small", Namespace: "default", UID: "template-uid", Generation: 1}, Spec: platformv1alpha1.EnvironmentTemplateSpec{Image: "image", Size: "small"}}
+	run := &platformv1alpha1.Run{ObjectMeta: metav1.ObjectMeta{Name: "run", Namespace: "default", UID: "run-uid"}, Spec: platformv1alpha1.RunSpec{RepositoryCredential: platformv1alpha1.RepositoryCredentialGitHubApp}}
+	env := &platformv1alpha1.Environment{
+		ObjectMeta: metav1.ObjectMeta{Name: "env", Namespace: "default", UID: "env-uid", Generation: 1, OwnerReferences: []metav1.OwnerReference{{APIVersion: platformv1alpha1.GroupVersion.String(), Kind: "Run", Name: run.Name, UID: run.UID, Controller: ptr(true)}}},
+		Spec:       platformv1alpha1.EnvironmentSpec{TemplateRef: tmpl.Name, ProjectRef: project.Name},
+		Status:     platformv1alpha1.EnvironmentStatus{Phase: platformv1alpha1.EnvironmentPhaseCreating},
+	}
+	setTestProvisioningSnapshot(env, tmpl, project)
+	run.Status.EnvironmentRef = &platformv1alpha1.RunEnvironmentReference{Name: env.Name, UID: env.UID, Ownership: platformv1alpha1.EnvironmentOwnershipOwned}
+	run.Status.Conditions = []metav1.Condition{{Type: runConditionRepositoryCredentialReady, Status: metav1.ConditionTrue, Reason: "Ready"}}
+	credential := &repositorycredential.Credential{Token: []byte("provisioning-token"), Repository: "https://github.com/acme/repo", InstallationID: 7, ExpiresAt: now.Add(time.Hour)}
+	secret, err := repositorycredential.NewSecret(env.Namespace, run.Name, run.UID, string(run.Spec.RepositoryCredential), project.Spec.Repositories[0], credential, 1, "", 0, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secret.UID = "repository-secret-uid"
+	record, _ := json.Marshal(repositoryProvisioningRecord{SecretUID: secret.UID, ExecutionGeneration: 1})
+	c := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(env, run).WithObjects(env, run, project, tmpl, secret).Build()
+	r := &EnvironmentReconciler{Client: c, APIReader: c, Scheme: scheme, Now: func() time.Time { return now }}
+	var current platformv1alpha1.Environment
+	if err := c.Get(context.Background(), client.ObjectKeyFromObject(env), &current); err != nil {
+		t.Fatal(err)
+	}
+
+	pod, err := r.ensurePodForProject(context.Background(), &current, tmpl, project, "", tenancy.Claim{})
+	if err != nil || pod == nil {
+		t.Fatalf("recover reserved execution = %#v, %v", pod, err)
+	}
+	if generation, valid := podExecutionGeneration(pod); !valid || generation != 1 {
+		t.Fatalf("recovered Pod execution = %d, valid %t", generation, valid)
+	}
+	if err := c.Get(context.Background(), client.ObjectKeyFromObject(env), &current); err != nil {
+		t.Fatal(err)
+	}
+	if current.Status.ExecutionGeneration != 1 || current.Annotations[repositoryProvisioningAnnotation] != "" {
+		t.Fatalf("recovered Environment = %#v", current)
+	}
+	var retained corev1.Secret
+	if err := c.Get(context.Background(), client.ObjectKeyFromObject(secret), &retained); err != nil {
+		t.Fatal(err)
+	}
+	lease, err := repositorycredential.Parse(&retained, run.Name, run.UID)
+	if err != nil || lease.ExecutionGeneration != 1 || lease.EnvironmentUID != env.UID {
+		t.Fatalf("retained lease = %#v, %v", lease, err)
+	}
+	repositorycredential.ClearLease(lease)
+
+	// Reconstruct the exact crash point after Pod creation but before its UID
+	// was bound into sandboxd credentials and provisioning was acknowledged.
+	var persistedPod corev1.Pod
+	if err := c.Get(context.Background(), types.NamespacedName{Namespace: env.Namespace, Name: envPodName(env)}, &persistedPod); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Delete(context.Background(), &persistedPod); err != nil {
+		t.Fatal(err)
+	}
+	persistedPod.ResourceVersion = ""
+	persistedPod.UID = "created-pod-uid"
+	if err := c.Create(context.Background(), &persistedPod); err != nil {
+		t.Fatal(err)
+	}
+	var sandboxSecret corev1.Secret
+	if err := c.Get(context.Background(), types.NamespacedName{Namespace: env.Namespace, Name: envCredentialName(env)}, &sandboxSecret); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Delete(context.Background(), &sandboxSecret); err != nil {
+		t.Fatal(err)
+	}
+	sandboxSecret.ResourceVersion = ""
+	sandboxSecret.UID = "sandbox-secret-uid"
+	sandboxSecret.Annotations[sandboxdauth.PodUIDAnnotation] = ""
+	if err := c.Create(context.Background(), &sandboxSecret); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Get(context.Background(), types.NamespacedName{Namespace: env.Namespace, Name: envPodName(env)}, &persistedPod); err != nil {
+		t.Fatal(err)
+	}
+	persistedPod.Annotations[sandboxdauth.SecretUIDAnnotation] = string(sandboxSecret.UID)
+	if err := c.Update(context.Background(), &persistedPod); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Get(context.Background(), client.ObjectKeyFromObject(env), &current); err != nil {
+		t.Fatal(err)
+	}
+	if current.Annotations == nil {
+		current.Annotations = map[string]string{}
+	}
+	current.Annotations[repositoryProvisioningAnnotation] = string(record)
+	if err := c.Update(context.Background(), &current); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Get(context.Background(), client.ObjectKeyFromObject(env), &current); err != nil {
+		t.Fatal(err)
+	}
+	recoveredPod, err := r.ensurePodForProject(context.Background(), &current, tmpl, project, "", tenancy.Claim{})
+	if err != nil || recoveredPod == nil || recoveredPod.UID != persistedPod.UID {
+		t.Fatalf("created Pod recovery = %#v, %v", recoveredPod, err)
+	}
+	if err := c.Get(context.Background(), types.NamespacedName{Namespace: env.Namespace, Name: envCredentialName(env)}, &sandboxSecret); err != nil {
+		t.Fatal(err)
+	}
+	if sandboxSecret.Annotations[sandboxdauth.PodUIDAnnotation] != string(persistedPod.UID) {
+		t.Fatalf("recovered sandboxd Pod UID = %q", sandboxSecret.Annotations[sandboxdauth.PodUIDAnnotation])
+	}
+
+	// If that exact Pod later disappears while its provisioning record remains,
+	// absence cannot prove the token was never consumed. Require Run-side token
+	// rotation instead of recreating a Pod with the same lease.
+	if err := c.Delete(context.Background(), &persistedPod); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Get(context.Background(), client.ObjectKeyFromObject(env), &current); err != nil {
+		t.Fatal(err)
+	}
+	if current.Annotations == nil {
+		current.Annotations = map[string]string{}
+	}
+	current.Annotations[repositoryProvisioningAnnotation] = string(record)
+	if err := c.Update(context.Background(), &current); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.ensurePodForProject(context.Background(), &current, tmpl, project, "", tenancy.Claim{}); !stderrors.Is(err, errRepositoryCredentialPending) {
+		t.Fatalf("missing reserved Pod error = %v", err)
+	}
+	if current.Annotations[repositoryProvisioningAnnotation] != "" {
+		t.Fatalf("missing Pod retained provisioning record: %#v", current.Annotations)
+	}
+	if err := c.Get(context.Background(), types.NamespacedName{Namespace: env.Namespace, Name: envPodName(env)}, &persistedPod); !apierrors.IsNotFound(err) {
+		t.Fatalf("replacement Pod was created with consumed lease: %v", err)
+	}
 }
 
 func TestEnsurePodUsesOnlyNonSecretProjectValues(t *testing.T) {

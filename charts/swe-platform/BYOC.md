@@ -87,6 +87,13 @@ tenancy:
   namespaces: []
 ```
 
+GitHub App repository credentials are optional and disabled by default. When enabled, keep only
+the App client ID and administrator-owned private-key Secret reference in this file; create and
+back up the Secret out of band as described in
+[GitHub App repository credentials](README.md#github-app-repository-credentials). The BYOC
+renderer validates the required references, and installed validation catches a missing mount via
+workload readiness; it never reads or prints the App private key.
+
 ## Provider runbooks
 
 All providers require a default `ReadWriteOnce` StorageClass, an enforcing CNI for the chart's
