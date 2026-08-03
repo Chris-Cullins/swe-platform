@@ -9,6 +9,12 @@ import (
 // +kubebuilder:validation:Enum=Allocating;EnvironmentReady;AdapterAccepted;Running;NeedsInput;Paused;Succeeded;Failed;Cancelled
 type RunState string
 
+// RepositoryCredential selects administrator-provided repository authentication.
+// +kubebuilder:validation:Enum=GitHubApp
+type RepositoryCredential string
+
+const RepositoryCredentialGitHubApp RepositoryCredential = "GitHubApp"
+
 const (
 	RunStateAllocating       RunState = "Allocating"
 	RunStateEnvironmentReady RunState = "EnvironmentReady"
@@ -25,7 +31,7 @@ const (
 // A Run either claims environmentRef or asks the controller to allocate an
 // Environment from templateRef/projectRef.
 // +kubebuilder:validation:XValidation:rule="has(self.environmentRef) ? (!has(self.templateRef) && !has(self.projectRef)) : (has(self.templateRef) || has(self.projectRef))",message="set environmentRef or templateRef/projectRef, not both"
-// +kubebuilder:validation:XValidation:rule="self.agent == oldSelf.agent && self.prompt == oldSelf.prompt && ((!has(self.environmentRef) && !has(oldSelf.environmentRef)) || (has(self.environmentRef) && has(oldSelf.environmentRef) && self.environmentRef == oldSelf.environmentRef)) && ((!has(self.projectRef) && !has(oldSelf.projectRef)) || (has(self.projectRef) && has(oldSelf.projectRef) && self.projectRef == oldSelf.projectRef)) && ((!has(self.templateRef) && !has(oldSelf.templateRef)) || (has(self.templateRef) && has(oldSelf.templateRef) && self.templateRef == oldSelf.templateRef)) && ((!has(self.credentialProfileRef) && !has(oldSelf.credentialProfileRef)) || (has(self.credentialProfileRef) && has(oldSelf.credentialProfileRef) && self.credentialProfileRef == oldSelf.credentialProfileRef))",message="agent, prompt, environment selection, and credential profile are immutable"
+// +kubebuilder:validation:XValidation:rule="self.agent == oldSelf.agent && self.prompt == oldSelf.prompt && ((!has(self.environmentRef) && !has(oldSelf.environmentRef)) || (has(self.environmentRef) && has(oldSelf.environmentRef) && self.environmentRef == oldSelf.environmentRef)) && ((!has(self.projectRef) && !has(oldSelf.projectRef)) || (has(self.projectRef) && has(oldSelf.projectRef) && self.projectRef == oldSelf.projectRef)) && ((!has(self.templateRef) && !has(oldSelf.templateRef)) || (has(self.templateRef) && has(oldSelf.templateRef) && self.templateRef == oldSelf.templateRef)) && ((!has(self.credentialProfileRef) && !has(oldSelf.credentialProfileRef)) || (has(self.credentialProfileRef) && has(oldSelf.credentialProfileRef) && self.credentialProfileRef == oldSelf.credentialProfileRef)) && ((!has(self.repositoryCredential) && !has(oldSelf.repositoryCredential)) || (has(self.repositoryCredential) && has(oldSelf.repositoryCredential) && self.repositoryCredential == oldSelf.repositoryCredential))",message="agent, prompt, environment selection, credential profile, and repository credential are immutable"
 // +kubebuilder:validation:XValidation:rule="!has(oldSelf.cancel) || !oldSelf.cancel || (has(self.cancel) && self.cancel)",message="cancel cannot be unset"
 type RunSpec struct {
 	// EnvironmentRef claims an existing Environment. Claimed Environments are
@@ -51,6 +57,10 @@ type RunSpec struct {
 	// +kubebuilder:validation:MaxLength=253
 	// +kubebuilder:validation:Pattern=`^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$`
 	CredentialProfileRef string `json:"credentialProfileRef,omitempty"`
+
+	// RepositoryCredential selects short-lived repository authentication.
+	// +optional
+	RepositoryCredential RepositoryCredential `json:"repositoryCredential,omitempty"`
 
 	// Agent names the agent adapter to use (e.g. claude-code, aider).
 	Agent string `json:"agent"`

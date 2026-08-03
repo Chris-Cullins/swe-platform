@@ -31,6 +31,8 @@ import (
 	"github.com/Chris-Cullins/swe-platform/internal/agent"
 	"github.com/Chris-Cullins/swe-platform/internal/controllers"
 	"github.com/Chris-Cullins/swe-platform/internal/controlplaneclient"
+	"github.com/Chris-Cullins/swe-platform/internal/repositorycredential"
+	"github.com/Chris-Cullins/swe-platform/internal/repositorycredential/githubapp"
 	"github.com/Chris-Cullins/swe-platform/internal/sandboxclient"
 	"github.com/Chris-Cullins/swe-platform/internal/tenancy"
 	"github.com/Chris-Cullins/swe-platform/internal/transcriptclient"
@@ -55,6 +57,8 @@ func main() {
 	var controlPlaneInstance string
 	var transcriptURL string
 	var transcriptTokenFile string
+	var githubAppClientID string
+	var githubAppPrivateKeyFile string
 	var tenancyModeValue string
 	var installationNamespace string
 	var installationName string
@@ -67,6 +71,8 @@ func main() {
 	flag.StringVar(&controlPlaneInstance, "control-plane-instance", "swe-platform", "app.kubernetes.io/instance label of the control plane.")
 	flag.StringVar(&transcriptURL, "transcript-url", "", "Control-plane base URL for adapter transcript events (disabled when empty).")
 	flag.StringVar(&transcriptTokenFile, "transcript-token-file", "", "Projected service-account token used to append adapter transcript events.")
+	flag.StringVar(&githubAppClientID, "github-app-client-id", "", "GitHub App client ID (requires private key file).")
+	flag.StringVar(&githubAppPrivateKeyFile, "github-app-private-key-file", "", "GitHub App PEM private key file.")
 	flag.StringVar(&tenancyModeValue, "tenancy-mode", "", "Required tenancy mode: scoped or trusted-admin.")
 	flag.StringVar(&installationNamespace, "installation-namespace", "", "System namespace containing this installation's Installation object.")
 	flag.StringVar(&installationName, "installation-name", "", "Name of this installation's Installation object.")
@@ -185,6 +191,24 @@ func main() {
 		}
 	}
 	var eventSink agent.AdapterEventSink
+	var repositoryCredentials repositorycredential.Provider
+	if (githubAppClientID == "") != (githubAppPrivateKeyFile == "") {
+		setupLog.Error(nil, "github-app-client-id and github-app-private-key-file must be set together")
+		os.Exit(1)
+	}
+	if githubAppClientID != "" {
+		privateKey, readErr := os.ReadFile(githubAppPrivateKeyFile)
+		if readErr != nil {
+			setupLog.Error(readErr, "read GitHub App private key")
+			os.Exit(1)
+		}
+		repositoryCredentials, err = githubapp.New(githubAppClientID, privateKey, nil)
+		clear(privateKey)
+		if err != nil {
+			setupLog.Error(err, "configure GitHub App")
+			os.Exit(1)
+		}
+	}
 	if transcriptURL != "" {
 		if transcriptTokenFile == "" {
 			setupLog.Error(nil, "transcript-token-file is required when transcript-url is set")
@@ -197,14 +221,15 @@ func main() {
 	}
 	if !(mode == tenancy.ModeScoped && len(tenancyNamespaces) == 0) {
 		if err := (&controllers.RunReconciler{
-			Client:    guardedClient,
-			APIReader: mgr.GetAPIReader(),
-			Scheme:    mgr.GetScheme(),
-			Scope:     scope,
-			Adapters:  adapters,
-			EventSink: eventSink,
-			Connector: connector,
-			Metrics:   operatorMetrics,
+			Client:                guardedClient,
+			APIReader:             mgr.GetAPIReader(),
+			Scheme:                mgr.GetScheme(),
+			Scope:                 scope,
+			Adapters:              adapters,
+			EventSink:             eventSink,
+			Connector:             connector,
+			Metrics:               operatorMetrics,
+			RepositoryCredentials: repositoryCredentials,
 		}).SetupWithManager(mgr); err != nil {
 			setupLog.Error(err, "unable to create controller", "controller", "Run")
 			os.Exit(1)

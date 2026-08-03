@@ -54,6 +54,10 @@ spec:
             - --transcript-url=http://{{ include "swe-platform.controlPlaneFullname" . }}
             - --transcript-token-file=/var/run/secrets/swe-platform/transcript-token
             {{- end }}
+            {{- if .Values.operator.githubApp.enabled }}
+            - --github-app-client-id={{ required "operator.githubApp.clientID is required" .Values.operator.githubApp.clientID }}
+            - --github-app-private-key-file=/var/run/secrets/swe-platform-github-app/private-key.pem
+            {{- end }}
           env:
             - name: POD_NAMESPACE
               valueFrom:
@@ -72,14 +76,22 @@ spec:
             {{- toYaml .Values.securityContext | nindent 12 }}
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
-          {{- if .Values.controlPlane.enabled }}
+          {{- if or .Values.controlPlane.enabled .Values.operator.githubApp.enabled }}
           volumeMounts:
+            {{- if .Values.controlPlane.enabled }}
             - name: transcript-token
               mountPath: /var/run/secrets/swe-platform
               readOnly: true
+            {{- end }}
+            {{- if .Values.operator.githubApp.enabled }}
+            - name: github-app
+              mountPath: /var/run/secrets/swe-platform-github-app
+              readOnly: true
+            {{- end }}
           {{- end }}
-      {{- if .Values.controlPlane.enabled }}
+      {{- if or .Values.controlPlane.enabled .Values.operator.githubApp.enabled }}
       volumes:
+        {{- if .Values.controlPlane.enabled }}
         - name: transcript-token
           projected:
             sources:
@@ -87,6 +99,15 @@ spec:
                   path: transcript-token
                   audience: {{ .Values.controlPlane.auth.tokenAudience | quote }}
                   expirationSeconds: 3600
+        {{- end }}
+        {{- if .Values.operator.githubApp.enabled }}
+        - name: github-app
+          secret:
+            secretName: {{ required "operator.githubApp.secretName is required" .Values.operator.githubApp.secretName }}
+            items:
+              - key: {{ .Values.operator.githubApp.privateKeyKey }}
+                path: private-key.pem
+        {{- end }}
       {{- end }}
       {{- with .Values.nodeSelector }}
       nodeSelector:

@@ -22,6 +22,7 @@ export interface CreateRun {
   agent: string
   prompt: string
   credentialProfile?: string
+	 repositoryCredential?: 'GitHubApp'
 }
 
 export interface Run {
@@ -34,6 +35,7 @@ export interface Run {
     agent: string
     prompt: string
     credentialProfile?: string
+		repositoryCredential?: 'GitHubApp'
   }
   cancelRequested: boolean
   state: string

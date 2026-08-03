@@ -24,6 +24,7 @@ func newRunCommand() *cobra.Command {
 		agent             string
 		name              string
 		credentialProfile string
+		gitCredential     string
 		wait              bool
 		timeout           time.Duration
 	)
@@ -34,7 +35,10 @@ func newRunCommand() *cobra.Command {
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			namespace, _ := cmd.Flags().GetString("namespace")
-			return runEnvironmentWithCredential(cmd.Context(), namespace, name, template, project, environment, agent, args[0], credentialProfile, wait, timeout)
+			if gitCredential != "" && gitCredential != "github-app" {
+				return fmt.Errorf("--git-credential must be github-app")
+			}
+			return runEnvironmentWithCredentials(cmd.Context(), namespace, name, template, project, environment, agent, args[0], credentialProfile, gitCredential, wait, timeout)
 		},
 	}
 
@@ -44,6 +48,7 @@ func newRunCommand() *cobra.Command {
 	cmd.Flags().StringVarP(&environment, "environment", "e", "", "Existing unclaimed Environment to reuse (exclusive with --template/--project)")
 	cmd.Flags().StringVar(&agent, "agent", "claude-code", "Agent adapter to run")
 	cmd.Flags().StringVar(&credentialProfile, "credential-profile", "", "AgentCredentialProfile to use")
+	cmd.Flags().StringVar(&gitCredential, "git-credential", "", "Repository credential provider (github-app)")
 	cmd.Flags().BoolVar(&wait, "wait", true, "Wait for the adapter to start or the Run to finish")
 	cmd.Flags().DurationVar(&timeout, "timeout", 5*time.Minute, "How long to wait for the Run")
 	return cmd
@@ -54,11 +59,15 @@ func runEnvironment(ctx context.Context, namespace, name, template, project, env
 }
 
 func runEnvironmentWithCredential(ctx context.Context, namespace, name, template, project, environment, agent, prompt, credentialProfile string, wait bool, timeout time.Duration) error {
+	return runEnvironmentWithCredentials(ctx, namespace, name, template, project, environment, agent, prompt, credentialProfile, "", wait, timeout)
+}
+
+func runEnvironmentWithCredentials(ctx context.Context, namespace, name, template, project, environment, agent, prompt, credentialProfile, gitCredential string, wait bool, timeout time.Duration) error {
 	clients, err := newKubeClients()
 	if err != nil {
 		return err
 	}
-	return createRunWithCredential(ctx, clients, namespace, name, template, project, environment, agent, prompt, credentialProfile, wait, timeout)
+	return createRunWithCredentials(ctx, clients, namespace, name, template, project, environment, agent, prompt, credentialProfile, gitCredential, wait, timeout)
 }
 
 func createRun(ctx context.Context, clients *kubeClients, namespace, name, template, project, environment, agent, prompt string, wait bool, timeout time.Duration) error {
@@ -66,6 +75,10 @@ func createRun(ctx context.Context, clients *kubeClients, namespace, name, templ
 }
 
 func createRunWithCredential(ctx context.Context, clients *kubeClients, namespace, name, template, project, environment, agent, prompt, credentialProfile string, wait bool, timeout time.Duration) error {
+	return createRunWithCredentials(ctx, clients, namespace, name, template, project, environment, agent, prompt, credentialProfile, "", wait, timeout)
+}
+
+func createRunWithCredentials(ctx context.Context, clients *kubeClients, namespace, name, template, project, environment, agent, prompt, credentialProfile, gitCredential string, wait bool, timeout time.Duration) error {
 	if credentialProfile != "" && len(validation.IsDNS1123Subdomain(credentialProfile)) != 0 {
 		return fmt.Errorf("--credential-profile must be a Kubernetes DNS subdomain")
 	}
@@ -89,6 +102,9 @@ func createRunWithCredential(ctx context.Context, clients *kubeClients, namespac
 			Prompt:               prompt,
 			CredentialProfileRef: credentialProfile,
 		},
+	}
+	if gitCredential == "github-app" {
+		run.Spec.RepositoryCredential = platformv1alpha1.RepositoryCredentialGitHubApp
 	}
 	if err := clients.Create(ctx, run); err != nil {
 		// A timeout may mean the API server persisted the object but its response

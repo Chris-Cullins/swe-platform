@@ -541,8 +541,11 @@ as write-only sandboxd launch material only to the selected child process:
 The key is absent from public process specifications, setup/resume hooks, sandboxd's ambient
 environment, and ordinary exec calls. The selected agent and descendants can still read or
 emit it; same-UID peers are not strongly isolated and transcript redaction is not guaranteed.
-OAuth/subscription credentials, refresh/writeback, per-user profiles, Git/setup/service
-credentials, and GitHub App token minting are not implemented.
+OAuth/subscription credentials, refresh/writeback, per-user profiles, and service
+credentials are not implemented. Run intent may select immutable
+`repositoryCredential: GitHubApp`; the provider-neutral boundary and GitHub exchange
+use repository-scoped `contents:write` installation tokens. Controller persistence,
+pod/process delivery, rotation, and finalizer cleanup remain open work.
 
 ### Terminal and operations console
 
