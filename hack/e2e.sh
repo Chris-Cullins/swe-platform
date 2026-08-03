@@ -1331,23 +1331,6 @@ PROJECT_REPO=""
 PROJECT_WORKTREE=""
 echo "==> creating project environment + run intent via swe"
 printf '%s' "$E2E_AGENT_API_KEY" | bin/swe --namespace "$PROJECT_NAMESPACE" credentials create e2e-claude --agent claude-code --api-key-stdin
-GIT_CREDENTIAL_DISABLED_RUN=e2e-github-app-disabled
-bin/swe --namespace "$PROJECT_NAMESPACE" run "disabled GitHub App status smoke test" \
-	--name "$GIT_CREDENTIAL_DISABLED_RUN" --project "$PROJECT_NAME" --git-credential github-app --wait=false
-kubectl wait --for=jsonpath='{.status.state}'=Failed run/"$GIT_CREDENTIAL_DISABLED_RUN" --timeout=2m
-GIT_CREDENTIAL_DISABLED_UID=$(kubectl get run "$GIT_CREDENTIAL_DISABLED_RUN" -o jsonpath='{.metadata.uid}')
-GIT_CREDENTIAL_DISABLED_SPEC=$(kubectl get run "$GIT_CREDENTIAL_DISABLED_RUN" -o jsonpath='{.spec.repositoryCredential}')
-GIT_CREDENTIAL_DISABLED_REASON=$(kubectl get run "$GIT_CREDENTIAL_DISABLED_RUN" -o json | \
-	jq -r '.status.conditions[] | select(.type == "RepositoryCredentialReady") | .reason')
-if [[ "$GIT_CREDENTIAL_DISABLED_SPEC" != "GitHubApp" || "$GIT_CREDENTIAL_DISABLED_REASON" != "ProviderDisabled" ]]; then
-	echo "FAIL: disabled GitHub App intent/status was ${GIT_CREDENTIAL_DISABLED_SPEC}/${GIT_CREDENTIAL_DISABLED_REASON}"
-	exit 1
-fi
-if kubectl get secret "run-repository-credential-${GIT_CREDENTIAL_DISABLED_UID}" >/dev/null 2>&1; then
-	echo "FAIL: disabled GitHub App Run persisted repository credential material"
-	exit 1
-fi
-kubectl delete run "$GIT_CREDENTIAL_DISABLED_RUN" --wait=true >/dev/null
 bin/swe --namespace "$PROJECT_NAMESPACE" run "end-to-end smoke test" --project "$PROJECT_NAME" --credential-profile e2e-claude --wait=false
 RUN_NAME=$(kubectl get runs -o jsonpath='{.items[0].metadata.name}')
 kubectl wait --for=jsonpath='{.status.state}'=Running run/"$RUN_NAME" --timeout=3m
@@ -1399,6 +1382,27 @@ fi
 kubectl wait --for=jsonpath='{.status.phase}'=Ready environment/"$RUN_ENV_NAME" --timeout=3m
 ENV_NAME=$RUN_ENV_NAME
 ENV_UID=$(kubectl get environment "$ENV_NAME" -o jsonpath='{.metadata.uid}')
+
+echo "==> verifying deterministic disabled GitHub App credential status"
+GIT_CREDENTIAL_DISABLED_RUN=e2e-github-app-disabled
+bin/swe --namespace "$PROJECT_NAMESPACE" run "disabled GitHub App status smoke test" \
+	--name "$GIT_CREDENTIAL_DISABLED_RUN" --environment "$ENV_NAME" --git-credential github-app --wait=false
+kubectl wait --for=jsonpath='{.status.state}'=Failed run/"$GIT_CREDENTIAL_DISABLED_RUN" --timeout=2m
+GIT_CREDENTIAL_DISABLED_UID=$(kubectl get run "$GIT_CREDENTIAL_DISABLED_RUN" -o jsonpath='{.metadata.uid}')
+GIT_CREDENTIAL_DISABLED_SPEC=$(kubectl get run "$GIT_CREDENTIAL_DISABLED_RUN" -o jsonpath='{.spec.repositoryCredential}')
+GIT_CREDENTIAL_DISABLED_REASON=$(kubectl get run "$GIT_CREDENTIAL_DISABLED_RUN" -o json | \
+	jq -r '.status.conditions[] | select(.type == "RepositoryCredentialReady") | .reason')
+if [[ "$GIT_CREDENTIAL_DISABLED_SPEC" != "GitHubApp" || "$GIT_CREDENTIAL_DISABLED_REASON" != "ProviderDisabled" ]]; then
+	echo "FAIL: disabled GitHub App intent/status was ${GIT_CREDENTIAL_DISABLED_SPEC}/${GIT_CREDENTIAL_DISABLED_REASON}"
+	exit 1
+fi
+if kubectl get secret "run-repository-credential-${GIT_CREDENTIAL_DISABLED_UID}" >/dev/null 2>&1; then
+	echo "FAIL: disabled GitHub App Run persisted repository credential material"
+	exit 1
+fi
+kubectl delete run "$GIT_CREDENTIAL_DISABLED_RUN" --wait=true >/dev/null
+kubectl wait --for=jsonpath='{.status.phase}'=Ready environment/"$ENV_NAME" --timeout=2m
+
 for _ in $(seq 1 60); do
 	REPLACEMENT_NAME=$(kubectl get environments -l swe.dev/warm-pool=small -o jsonpath='{range .items[*]}{.metadata.name}{end}' 2>/dev/null || true)
 	REPLACEMENT_PHASE=$(kubectl get environments -l swe.dev/warm-pool=small -o jsonpath='{range .items[*]}{.status.phase}{end}' 2>/dev/null || true)
