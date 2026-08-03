@@ -82,10 +82,12 @@ func (a *Adapter) spec(t agent.AdapterTask) *sandboxdv1.ProcessSpec {
 	return &sandboxdv1.ProcessSpec{Argv: []string{a.executable(), "--mode", "json", "--no-session", "-p", t.Prompt}, EnvMode: sandboxdv1.EnvironmentMode_ENVIRONMENT_MODE_INHERIT}
 }
 
-func (a *Adapter) EnsureAccepted(ctx context.Context, task agent.AdapterTask, sandbox agent.AdapterSandbox, credential *agent.AdapterCredential) error {
-	if credential != nil {
-		return fmt.Errorf("%w: Pi does not support credential profiles", agent.ErrAdapterTaskRejected)
+func (a *Adapter) EnsureAccepted(ctx context.Context, task agent.AdapterTask, sandbox agent.AdapterSandbox, material *agent.AdapterLaunchMaterial) error {
+	launch, cleanup, err := agent.PrepareLaunchMaterial(material, "", false)
+	if err != nil {
+		return err
 	}
+	defer cleanup()
 	if strings.HasPrefix(task.Prompt, "-") || strings.HasPrefix(task.Prompt, "@") {
 		return fmt.Errorf("%w: Pi prompt begins with unsupported parser prefix", agent.ErrAdapterTaskRejected)
 	}
@@ -94,7 +96,11 @@ func (a *Adapter) EnsureAccepted(ctx context.Context, task agent.AdapterTask, sa
 		return err
 	}
 	defer close()
-	_, err = c.Start(ctx, &sandboxdv1.StartProcessRequest{Key: key(task), Spec: a.spec(task)})
+	if launch != nil && len(launch.SecretEnv) != 0 {
+		_, err = c.StartWithLaunchMaterial(ctx, &sandboxdv1.StartProcessWithLaunchMaterialRequest{Key: key(task), Spec: a.spec(task), LaunchMaterial: launch})
+	} else {
+		_, err = c.Start(ctx, &sandboxdv1.StartProcessRequest{Key: key(task), Spec: a.spec(task)})
+	}
 	return err
 }
 func (a *Adapter) Observe(ctx context.Context, task agent.AdapterTask, sandbox agent.AdapterSandbox) (agent.AdapterObservation, string, error) {

@@ -47,7 +47,7 @@ type blockingObserveAdapter struct {
 	release     chan struct{}
 }
 
-func (*blockingObserveAdapter) EnsureAccepted(context.Context, agent.AdapterTask, agent.AdapterSandbox, *agent.AdapterCredential) error {
+func (*blockingObserveAdapter) EnsureAccepted(context.Context, agent.AdapterTask, agent.AdapterSandbox, *agent.AdapterLaunchMaterial) error {
 	return nil
 }
 
@@ -87,7 +87,7 @@ func (w *failAcceptedStatusWriter) Update(ctx context.Context, object client.Obj
 // outcome.
 type foregroundAdapter struct{ process agent.AdapterObservation }
 
-func (*foregroundAdapter) EnsureAccepted(context.Context, agent.AdapterTask, agent.AdapterSandbox, *agent.AdapterCredential) error {
+func (*foregroundAdapter) EnsureAccepted(context.Context, agent.AdapterTask, agent.AdapterSandbox, *agent.AdapterLaunchMaterial) error {
 	return nil
 }
 func (a *foregroundAdapter) Observe(context.Context, agent.AdapterTask, agent.AdapterSandbox) (agent.AdapterObservation, string, error) {
@@ -104,7 +104,7 @@ type serviceAdapter struct {
 	event          agent.AdapterObservation
 }
 
-func (a *serviceAdapter) EnsureAccepted(context.Context, agent.AdapterTask, agent.AdapterSandbox, *agent.AdapterCredential) error {
+func (a *serviceAdapter) EnsureAccepted(context.Context, agent.AdapterTask, agent.AdapterSandbox, *agent.AdapterLaunchMaterial) error {
 	a.serviceRunning = true
 	return nil
 }
@@ -116,7 +116,11 @@ func (a *serviceAdapter) Cancel(context.Context, agent.AdapterTask, agent.Adapte
 	return nil
 }
 
-func (a *scriptedAdapter) EnsureAccepted(_ context.Context, _ agent.AdapterTask, _ agent.AdapterSandbox, credential *agent.AdapterCredential) error {
+func (a *scriptedAdapter) EnsureAccepted(_ context.Context, _ agent.AdapterTask, _ agent.AdapterSandbox, material *agent.AdapterLaunchMaterial) error {
+	var credential *agent.AdapterCredential
+	if material != nil {
+		credential = material.AgentCredential
+	}
 	a.accepted++
 	if a.onAccept != nil {
 		a.onAccept()

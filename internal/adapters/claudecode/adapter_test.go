@@ -16,6 +16,21 @@ import (
 	sandboxdv1 "github.com/Chris-Cullins/swe-platform/sandboxd/gen/proto/sandboxd/v1"
 )
 
+func launchCredential(credential *agent.AdapterCredential) *agent.AdapterLaunchMaterial {
+	return &agent.AdapterLaunchMaterial{AgentCredential: credential}
+}
+
+func TestRepositoryOnlyLaunchMaterial(t *testing.T) {
+	client := &fakeProcessClient{}
+	material := &agent.AdapterLaunchMaterial{RepositorySecretEnv: map[string][]byte{"REPOSITORY_TOKEN": []byte("secret")}}
+	if err := (&Adapter{}).EnsureAccepted(context.Background(), agent.AdapterTask{ID: "run", Prompt: "task"}, sandboxFor(client), material); err != nil {
+		t.Fatal(err)
+	}
+	if client.launchCalls != 1 || client.startCalls != 0 || len(client.launchRequest.Spec.Env) != 0 {
+		t.Fatalf("repository launch = %#v", client.launchRequest)
+	}
+}
+
 type fakeProcessClient struct {
 	process       *sandboxdv1.Process
 	stdout        []byte
@@ -149,7 +164,7 @@ func TestPromptIsSeparatedFromClaudeFlags(t *testing.T) {
 func TestAPIKeyUsesLaunchMaterialOnly(t *testing.T) {
 	client := &fakeProcessClient{}
 	key := []byte("!!CLAUDE-API-KEY-FIXTURE!!")
-	err := (&Adapter{}).EnsureAccepted(context.Background(), agent.AdapterTask{ID: "run", Prompt: "task"}, sandboxFor(client), &agent.AdapterCredential{Type: platformv1alpha1.AgentCredentialTypeAPIKey, APIKey: key})
+	err := (&Adapter{}).EnsureAccepted(context.Background(), agent.AdapterTask{ID: "run", Prompt: "task"}, sandboxFor(client), launchCredential(&agent.AdapterCredential{Type: platformv1alpha1.AgentCredentialTypeAPIKey, APIKey: key}))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -166,7 +181,7 @@ func TestAPIKeyUsesLaunchMaterialOnly(t *testing.T) {
 
 func TestLaunchMaterialUnimplementedDoesNotFallback(t *testing.T) {
 	client := &fakeProcessClient{launchErr: status.Error(codes.Unimplemented, "old sandboxd")}
-	err := (&Adapter{}).EnsureAccepted(context.Background(), agent.AdapterTask{ID: "run"}, sandboxFor(client), &agent.AdapterCredential{Type: platformv1alpha1.AgentCredentialTypeAPIKey, APIKey: []byte("key")})
+	err := (&Adapter{}).EnsureAccepted(context.Background(), agent.AdapterTask{ID: "run"}, sandboxFor(client), launchCredential(&agent.AdapterCredential{Type: platformv1alpha1.AgentCredentialTypeAPIKey, APIKey: []byte("key")}))
 	if status.Code(err) != codes.Unimplemented || client.startCalls != 0 {
 		t.Fatalf("error/start calls = %v/%d", err, client.startCalls)
 	}
@@ -178,7 +193,7 @@ func TestUnsupportedCredentialTypeFailsBeforeDial(t *testing.T) {
 		dials++
 		return &fakeProcessClient{}, func() error { return nil }, nil
 	}}
-	err := (&Adapter{}).EnsureAccepted(context.Background(), agent.AdapterTask{ID: "run"}, sandbox, &agent.AdapterCredential{Type: "FutureType", APIKey: []byte("!!UNUSED-KEY-FIXTURE!!")})
+	err := (&Adapter{}).EnsureAccepted(context.Background(), agent.AdapterTask{ID: "run"}, sandbox, launchCredential(&agent.AdapterCredential{Type: "FutureType", APIKey: []byte("!!UNUSED-KEY-FIXTURE!!")}))
 	if err == nil || dials != 0 {
 		t.Fatalf("unsupported credential = error %v, dials %d", err, dials)
 	}

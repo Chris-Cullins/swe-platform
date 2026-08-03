@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 
 	platformv1alpha1 "github.com/Chris-Cullins/swe-platform/api/v1alpha1"
 	sandboxdv1 "github.com/Chris-Cullins/swe-platform/sandboxd/gen/proto/sandboxd/v1"
@@ -47,6 +48,47 @@ type AdapterCredential struct {
 	APIKey []byte
 }
 
+// AdapterLaunchMaterial is ephemeral, write-only material supplied only when
+// starting an adapter process. RepositorySecretEnv is provider-neutral; its
+// values must never be copied into the public ProcessSpec environment.
+type AdapterLaunchMaterial struct {
+	AgentCredential     *AdapterCredential
+	RepositorySecretEnv map[string][]byte
+}
+
+// PrepareLaunchMaterial validates and defensively copies launch secrets for an
+// adapter RPC. The returned cleanup must be called immediately after the RPC.
+func PrepareLaunchMaterial(material *AdapterLaunchMaterial, apiEnvName string, supportsCredential bool) (*sandboxdv1.LaunchMaterial, func(), error) {
+	if material == nil {
+		return nil, func() {}, nil
+	}
+	credential := material.AgentCredential
+	if credential != nil && !supportsCredential {
+		return nil, func() {}, fmt.Errorf("%w: adapter does not support credential profiles", ErrAdapterTaskRejected)
+	}
+	if credential != nil && credential.Type != platformv1alpha1.AgentCredentialTypeAPIKey {
+		return nil, func() {}, fmt.Errorf("%w: unsupported credential type %q", ErrAdapterTaskRejected, credential.Type)
+	}
+	if credential != nil {
+		if _, exists := material.RepositorySecretEnv[apiEnvName]; exists {
+			return nil, func() {}, fmt.Errorf("%w: duplicate adapter API secret environment name", ErrAdapterTaskRejected)
+		}
+	}
+	secretEnv := make(map[string][]byte, len(material.RepositorySecretEnv)+1)
+	for name, value := range material.RepositorySecretEnv {
+		secretEnv[name] = append([]byte(nil), value...)
+	}
+	if credential != nil {
+		secretEnv[apiEnvName] = append([]byte(nil), credential.APIKey...)
+	}
+	cleanup := func() {
+		for _, value := range secretEnv {
+			clear(value)
+		}
+	}
+	return &sandboxdv1.LaunchMaterial{SecretEnv: secretEnv}, cleanup, nil
+}
+
 // AdapterEvent is an adapter-owned transcript event carried by the platform's
 // generic transcript transport. Data is opaque to the controller.
 type AdapterEvent struct {
@@ -85,7 +127,7 @@ type AdapterSandbox struct {
 // work is already absent or terminal and returns
 // ErrAdapterCancellationPending while its execution tree is still stopping.
 type AdapterLifecycle interface {
-	EnsureAccepted(context.Context, AdapterTask, AdapterSandbox, *AdapterCredential) error
+	EnsureAccepted(context.Context, AdapterTask, AdapterSandbox, *AdapterLaunchMaterial) error
 	Observe(context.Context, AdapterTask, AdapterSandbox) (AdapterObservation, string, error)
 	Cancel(context.Context, AdapterTask, AdapterSandbox) error
 }

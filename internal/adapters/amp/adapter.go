@@ -13,7 +13,6 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
-	platformv1alpha1 "github.com/Chris-Cullins/swe-platform/api/v1alpha1"
 	"github.com/Chris-Cullins/swe-platform/internal/agent"
 	sandboxdv1 "github.com/Chris-Cullins/swe-platform/sandboxd/gen/proto/sandboxd/v1"
 )
@@ -83,24 +82,24 @@ func (a *Adapter) spec(task agent.AdapterTask) *sandboxdv1.ProcessSpec {
 }
 
 // EnsureAccepted duplicate-safely starts (or recovers) the Run-keyed process.
-func (a *Adapter) EnsureAccepted(ctx context.Context, task agent.AdapterTask, sandbox agent.AdapterSandbox, credential *agent.AdapterCredential) error {
-	if credential != nil && credential.Type != platformv1alpha1.AgentCredentialTypeAPIKey {
-		return fmt.Errorf("%w: unsupported credential type %q", agent.ErrAdapterTaskRejected, credential.Type)
+func (a *Adapter) EnsureAccepted(ctx context.Context, task agent.AdapterTask, sandbox agent.AdapterSandbox, material *agent.AdapterLaunchMaterial) error {
+	launch, cleanup, err := agent.PrepareLaunchMaterial(material, "AMP_API_KEY", true)
+	if err != nil {
+		return err
 	}
+	defer cleanup()
 	client, closeConnection, err := sandbox.DialProcess(ctx)
 	if err != nil {
 		return err
 	}
 	defer closeConnection()
-	if credential == nil {
+	if launch == nil || len(launch.SecretEnv) == 0 {
 		_, err = client.Start(ctx, &sandboxdv1.StartProcessRequest{Key: key(task), Spec: a.spec(task)})
 		return err
 	}
-	apiKey := append([]byte(nil), credential.APIKey...)
-	defer clear(apiKey)
 	_, err = client.StartWithLaunchMaterial(ctx, &sandboxdv1.StartProcessWithLaunchMaterialRequest{
 		Key: key(task), Spec: a.spec(task),
-		LaunchMaterial: &sandboxdv1.LaunchMaterial{SecretEnv: map[string][]byte{"AMP_API_KEY": apiKey}},
+		LaunchMaterial: launch,
 	})
 	return err
 }

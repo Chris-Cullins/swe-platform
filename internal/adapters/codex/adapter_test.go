@@ -18,6 +18,21 @@ import (
 	sandboxdv1 "github.com/Chris-Cullins/swe-platform/sandboxd/gen/proto/sandboxd/v1"
 )
 
+func launchCredential(credential *agent.AdapterCredential) *agent.AdapterLaunchMaterial {
+	return &agent.AdapterLaunchMaterial{AgentCredential: credential}
+}
+
+func TestRepositoryOnlyLaunchMaterial(t *testing.T) {
+	client, dials := &launchClient{}, 0
+	material := &agent.AdapterLaunchMaterial{RepositorySecretEnv: map[string][]byte{"REPOSITORY_TOKEN": []byte("secret")}}
+	if err := (&Adapter{}).EnsureAccepted(context.Background(), agent.AdapterTask{ID: "run", Prompt: "task"}, sandboxFor(client, &dials), material); err != nil {
+		t.Fatal(err)
+	}
+	if client.launches != 1 || client.starts != 0 || len(client.launchRequest.Spec.Env) != 0 {
+		t.Fatalf("repository launch = %#v", client.launchRequest)
+	}
+}
+
 type launchClient struct {
 	sandboxdv1.ProcessServiceClient
 	starts        int
@@ -67,7 +82,7 @@ func TestAcceptancePromptAndCredentialSafety(t *testing.T) {
 		t.Fatalf("spec/start = %#v/%d", c.spec, c.starts)
 	}
 	credential := &agent.AdapterCredential{Type: platformv1alpha1.AgentCredentialTypeAPIKey, APIKey: []byte("secret")}
-	if err := a.EnsureAccepted(context.Background(), task, sandboxFor(c, &dials), credential); err != nil {
+	if err := a.EnsureAccepted(context.Background(), task, sandboxFor(c, &dials), launchCredential(credential)); err != nil {
 		t.Fatal(err)
 	}
 	if c.launches != 1 || string(c.material.SecretEnv["CODEX_API_KEY"]) != "secret" || string(credential.APIKey) != "secret" {
@@ -81,7 +96,7 @@ func TestAcceptancePromptAndCredentialSafety(t *testing.T) {
 		task agent.AdapterTask
 		cred *agent.AdapterCredential
 	}{{task: agent.AdapterTask{Prompt: "-"}}, {task: task, cred: &agent.AdapterCredential{Type: "OAuth"}}} {
-		if err := a.EnsureAccepted(context.Background(), rejected.task, sandboxFor(c, &dials), rejected.cred); !errors.Is(err, agent.ErrAdapterTaskRejected) {
+		if err := a.EnsureAccepted(context.Background(), rejected.task, sandboxFor(c, &dials), launchCredential(rejected.cred)); !errors.Is(err, agent.ErrAdapterTaskRejected) {
 			t.Fatalf("rejection = %v", err)
 		}
 	}
@@ -93,7 +108,7 @@ func TestAcceptancePromptAndCredentialSafety(t *testing.T) {
 func TestLaunchMaterialFailureDoesNotFallbackToAmbientStart(t *testing.T) {
 	dials := 0
 	client := &launchClient{launchErr: status.Error(codes.Unimplemented, "old sandboxd")}
-	err := (&Adapter{}).EnsureAccepted(context.Background(), agent.AdapterTask{ID: "run", Prompt: "task"}, sandboxFor(client, &dials), &agent.AdapterCredential{Type: platformv1alpha1.AgentCredentialTypeAPIKey, APIKey: []byte("secret")})
+	err := (&Adapter{}).EnsureAccepted(context.Background(), agent.AdapterTask{ID: "run", Prompt: "task"}, sandboxFor(client, &dials), launchCredential(&agent.AdapterCredential{Type: platformv1alpha1.AgentCredentialTypeAPIKey, APIKey: []byte("secret")}))
 	if status.Code(err) != codes.Unimplemented || client.starts != 0 || client.launches != 1 {
 		t.Fatalf("EnsureAccepted = %v, starts/launches %d/%d", err, client.starts, client.launches)
 	}

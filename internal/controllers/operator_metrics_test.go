@@ -33,7 +33,7 @@ type dialAfterMutationAdapter struct {
 	mutate func()
 }
 
-func (a *dialAfterMutationAdapter) EnsureAccepted(ctx context.Context, _ agent.AdapterTask, sandbox agent.AdapterSandbox, _ *agent.AdapterCredential) error {
+func (a *dialAfterMutationAdapter) EnsureAccepted(ctx context.Context, _ agent.AdapterTask, sandbox agent.AdapterSandbox, _ *agent.AdapterLaunchMaterial) error {
 	a.mutate()
 	_, _, err := sandbox.DialProcess(ctx)
 	return err
