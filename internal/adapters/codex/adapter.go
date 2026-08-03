@@ -13,7 +13,6 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
-	platformv1alpha1 "github.com/Chris-Cullins/swe-platform/api/v1alpha1"
 	"github.com/Chris-Cullins/swe-platform/internal/agent"
 	sandboxdv1 "github.com/Chris-Cullins/swe-platform/sandboxd/gen/proto/sandboxd/v1"
 )
@@ -82,25 +81,25 @@ func (a *Adapter) spec(t agent.AdapterTask) *sandboxdv1.ProcessSpec {
 	return &sandboxdv1.ProcessSpec{Argv: []string{a.executable(), "exec", "--json", "--ephemeral", "--ignore-user-config", "--ignore-rules", "--sandbox", "workspace-write", "--color", "never", "--skip-git-repo-check", "--", t.Prompt}, EnvMode: sandboxdv1.EnvironmentMode_ENVIRONMENT_MODE_INHERIT}
 }
 
-func (a *Adapter) EnsureAccepted(ctx context.Context, task agent.AdapterTask, sandbox agent.AdapterSandbox, credential *agent.AdapterCredential) error {
+func (a *Adapter) EnsureAccepted(ctx context.Context, task agent.AdapterTask, sandbox agent.AdapterSandbox, material *agent.AdapterLaunchMaterial) error {
 	if task.Prompt == "-" {
 		return fmt.Errorf("%w: Codex prompt '-' requires managed stdin", agent.ErrAdapterTaskRejected)
 	}
-	if credential != nil && credential.Type != platformv1alpha1.AgentCredentialTypeAPIKey {
-		return fmt.Errorf("%w: unsupported credential type %q", agent.ErrAdapterTaskRejected, credential.Type)
+	launch, cleanup, err := agent.PrepareLaunchMaterial(material, "CODEX_API_KEY", true)
+	if err != nil {
+		return err
 	}
+	defer cleanup()
 	client, closeConnection, err := sandbox.DialProcess(ctx)
 	if err != nil {
 		return err
 	}
 	defer closeConnection()
-	if credential == nil {
+	if launch == nil || len(launch.SecretEnv) == 0 {
 		_, err = client.Start(ctx, &sandboxdv1.StartProcessRequest{Key: key(task), Spec: a.spec(task)})
 		return err
 	}
-	apiKey := append([]byte(nil), credential.APIKey...)
-	defer clear(apiKey)
-	_, err = client.StartWithLaunchMaterial(ctx, &sandboxdv1.StartProcessWithLaunchMaterialRequest{Key: key(task), Spec: a.spec(task), LaunchMaterial: &sandboxdv1.LaunchMaterial{SecretEnv: map[string][]byte{"CODEX_API_KEY": apiKey}}})
+	_, err = client.StartWithLaunchMaterial(ctx, &sandboxdv1.StartProcessWithLaunchMaterialRequest{Key: key(task), Spec: a.spec(task), LaunchMaterial: launch})
 	return err
 }
 

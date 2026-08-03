@@ -17,19 +17,36 @@ import (
 	sandboxdv1 "github.com/Chris-Cullins/swe-platform/sandboxd/gen/proto/sandboxd/v1"
 )
 
+func launchCredential(credential *agent.AdapterCredential) *agent.AdapterLaunchMaterial {
+	return &agent.AdapterLaunchMaterial{AgentCredential: credential}
+}
+
 type startClient struct {
 	sandboxdv1.ProcessServiceClient
-	requests []*sandboxdv1.StartProcessRequest
-	launches int
+	requests      []*sandboxdv1.StartProcessRequest
+	launches      int
+	launchRequest *sandboxdv1.StartProcessWithLaunchMaterialRequest
 }
 
 func (c *startClient) Start(_ context.Context, r *sandboxdv1.StartProcessRequest, _ ...grpc.CallOption) (*sandboxdv1.Process, error) {
 	c.requests = append(c.requests, r)
 	return &sandboxdv1.Process{}, nil
 }
-func (c *startClient) StartWithLaunchMaterial(context.Context, *sandboxdv1.StartProcessWithLaunchMaterialRequest, ...grpc.CallOption) (*sandboxdv1.Process, error) {
+func (c *startClient) StartWithLaunchMaterial(_ context.Context, request *sandboxdv1.StartProcessWithLaunchMaterialRequest, _ ...grpc.CallOption) (*sandboxdv1.Process, error) {
 	c.launches++
-	return nil, errors.New("unexpected launch material")
+	c.launchRequest = request
+	return &sandboxdv1.Process{}, nil
+}
+
+func TestRepositoryLaunchMaterialAccepted(t *testing.T) {
+	client, dials := &startClient{}, 0
+	material := &agent.AdapterLaunchMaterial{RepositorySecretEnv: map[string][]byte{"REPOSITORY_TOKEN": []byte("secret")}}
+	if err := (&Adapter{}).EnsureAccepted(context.Background(), agent.AdapterTask{ID: "run", Prompt: "task"}, acceptanceSandbox(client, &dials), material); err != nil {
+		t.Fatal(err)
+	}
+	if client.launches != 1 || client.launchRequest.Spec.Env != nil || client.launchRequest.LaunchMaterial == nil {
+		t.Fatalf("repository launch request = %#v", client.launchRequest)
+	}
 }
 
 func acceptanceSandbox(client sandboxdv1.ProcessServiceClient, dials *int) agent.AdapterSandbox {
@@ -58,7 +75,7 @@ func TestAcceptanceArgvAndPreDialRejections(t *testing.T) {
 			t.Fatalf("prompt %q: %v", prompt, err)
 		}
 	}
-	if err := adapter.EnsureAccepted(context.Background(), task, sandbox, &agent.AdapterCredential{}); !errors.Is(err, agent.ErrAdapterTaskRejected) {
+	if err := adapter.EnsureAccepted(context.Background(), task, sandbox, launchCredential(&agent.AdapterCredential{})); !errors.Is(err, agent.ErrAdapterTaskRejected) {
 		t.Fatalf("credential rejection = %v", err)
 	}
 	if dials != 1 {

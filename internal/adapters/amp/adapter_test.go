@@ -18,6 +18,21 @@ import (
 	sandboxdv1 "github.com/Chris-Cullins/swe-platform/sandboxd/gen/proto/sandboxd/v1"
 )
 
+func launchCredential(credential *agent.AdapterCredential) *agent.AdapterLaunchMaterial {
+	return &agent.AdapterLaunchMaterial{AgentCredential: credential}
+}
+
+func TestRepositoryOnlyLaunchMaterial(t *testing.T) {
+	client := &fakeClient{}
+	material := &agent.AdapterLaunchMaterial{RepositorySecretEnv: map[string][]byte{"REPOSITORY_TOKEN": []byte("secret")}}
+	if err := (&Adapter{}).EnsureAccepted(context.Background(), agent.AdapterTask{ID: "run", Prompt: "task"}, testSandbox(client), material); err != nil {
+		t.Fatal(err)
+	}
+	if client.launchCalls != 1 || client.starts != 0 || client.launchRequest.Spec.Env["REPOSITORY_TOKEN"] != "" {
+		t.Fatalf("repository launch = %#v", client.launchRequest)
+	}
+}
+
 type fakeClient struct {
 	process         *sandboxdv1.Process
 	stdout          []byte
@@ -176,7 +191,7 @@ func TestAPIKeyUsesLaunchMaterialOnlyAndClearsTemporaryCopy(t *testing.T) {
 	client := &fakeClient{}
 	key := []byte("!!AMP-API-KEY-FIXTURE!!")
 	credential := &agent.AdapterCredential{Type: platformv1alpha1.AgentCredentialTypeAPIKey, APIKey: key}
-	if err := (&Adapter{}).EnsureAccepted(context.Background(), agent.AdapterTask{ID: "run", Prompt: "task"}, testSandbox(client), credential); err != nil {
+	if err := (&Adapter{}).EnsureAccepted(context.Background(), agent.AdapterTask{ID: "run", Prompt: "task"}, testSandbox(client), launchCredential(credential)); err != nil {
 		t.Fatal(err)
 	}
 	if client.launchCalls != 1 || client.starts != 0 || string(client.launchValue) != string(key) || string(credential.APIKey) != string(key) {
@@ -199,7 +214,7 @@ func TestUnsupportedCredentialTypeFailsBeforeDial(t *testing.T) {
 		dials++
 		return nil, nil, nil
 	}}
-	err := (&Adapter{}).EnsureAccepted(context.Background(), agent.AdapterTask{}, sandbox, &agent.AdapterCredential{Type: "OAuth", APIKey: []byte("!!UNUSED-KEY-FIXTURE!!")})
+	err := (&Adapter{}).EnsureAccepted(context.Background(), agent.AdapterTask{}, sandbox, launchCredential(&agent.AdapterCredential{Type: "OAuth", APIKey: []byte("!!UNUSED-KEY-FIXTURE!!")}))
 	if !errors.Is(err, agent.ErrAdapterTaskRejected) || dials != 0 {
 		t.Fatalf("error/dials = %v/%d", err, dials)
 	}
@@ -208,7 +223,7 @@ func TestUnsupportedCredentialTypeFailsBeforeDial(t *testing.T) {
 func TestLaunchMaterialFailureDoesNotFallbackOrExposeKey(t *testing.T) {
 	key := []byte("!!AMP-FAILURE-KEY-FIXTURE!!")
 	client := &fakeClient{beforeLaunchErr: status.Error(codes.Unimplemented, "old sandboxd")}
-	err := (&Adapter{}).EnsureAccepted(context.Background(), agent.AdapterTask{ID: "run", Prompt: "task"}, testSandbox(client), &agent.AdapterCredential{Type: platformv1alpha1.AgentCredentialTypeAPIKey, APIKey: key})
+	err := (&Adapter{}).EnsureAccepted(context.Background(), agent.AdapterTask{ID: "run", Prompt: "task"}, testSandbox(client), launchCredential(&agent.AdapterCredential{Type: platformv1alpha1.AgentCredentialTypeAPIKey, APIKey: key}))
 	if status.Code(err) != codes.Unimplemented || client.starts != 0 || client.launchCalls != 1 || client.launches != 0 || strings.Contains(err.Error(), string(key)) {
 		t.Fatalf("error/start/calls/launches = %v/%d/%d/%d", err, client.starts, client.launchCalls, client.launches)
 	}
@@ -220,7 +235,7 @@ func TestKeyedAcceptancePreservesDuplicateRotationAndFreshEpochSemantics(t *test
 	first := &fakeClient{}
 	for _, value := range []string{"first-key", "rotated-key"} {
 		credential := &agent.AdapterCredential{Type: platformv1alpha1.AgentCredentialTypeAPIKey, APIKey: []byte(value)}
-		if err := adapter.EnsureAccepted(context.Background(), task, testSandbox(first), credential); err != nil {
+		if err := adapter.EnsureAccepted(context.Background(), task, testSandbox(first), launchCredential(credential)); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -229,7 +244,7 @@ func TestKeyedAcceptancePreservesDuplicateRotationAndFreshEpochSemantics(t *test
 	}
 	second := &fakeClient{}
 	credential := &agent.AdapterCredential{Type: platformv1alpha1.AgentCredentialTypeAPIKey, APIKey: []byte("current-key")}
-	if err := adapter.EnsureAccepted(context.Background(), task, testSandbox(second), credential); err != nil {
+	if err := adapter.EnsureAccepted(context.Background(), task, testSandbox(second), launchCredential(credential)); err != nil {
 		t.Fatal(err)
 	}
 	if second.launches != 1 || string(second.launchValue) != "current-key" || second.startedKey.OwnerId != task.ID {
@@ -241,12 +256,12 @@ func TestUncertainKeyedStartRetryDoesNotUsePlainStart(t *testing.T) {
 	client := &fakeClient{afterLaunchErr: status.Error(codes.Unavailable, "response lost")}
 	credential := &agent.AdapterCredential{Type: platformv1alpha1.AgentCredentialTypeAPIKey, APIKey: []byte("first-key")}
 	task := agent.AdapterTask{ID: "run", Prompt: "task"}
-	if err := (&Adapter{}).EnsureAccepted(context.Background(), task, testSandbox(client), credential); status.Code(err) != codes.Unavailable {
+	if err := (&Adapter{}).EnsureAccepted(context.Background(), task, testSandbox(client), launchCredential(credential)); status.Code(err) != codes.Unavailable {
 		t.Fatalf("first start error = %v", err)
 	}
 	client.afterLaunchErr = nil
 	credential.APIKey = []byte("rotated-key")
-	if err := (&Adapter{}).EnsureAccepted(context.Background(), task, testSandbox(client), credential); err != nil {
+	if err := (&Adapter{}).EnsureAccepted(context.Background(), task, testSandbox(client), launchCredential(credential)); err != nil {
 		t.Fatal(err)
 	}
 	if client.launchCalls != 2 || client.launches != 1 || client.starts != 0 || string(client.launchValue) != "first-key" || string(client.submittedValue) != "rotated-key" {

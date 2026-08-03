@@ -313,7 +313,7 @@ func (r *RunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.R
 			return ctrl.Result{Requeue: true}, nil
 		}
 		started := time.Now()
-		acceptErr := adapter.EnsureAccepted(ctx, adapterTask(&run), r.adapterSandbox(&run, env, executionFence, fenceRejections), credential)
+		acceptErr := adapter.EnsureAccepted(ctx, adapterTask(&run), r.adapterSandbox(&run, env, executionFence, fenceRejections), &agent.AdapterLaunchMaterial{AgentCredential: credential})
 		r.Metrics.observeAdapter(run.Spec.Agent, adapterOperationEnsureAccepted, started, acceptErr)
 		current, err = r.allocatedExecutionCurrent(ctx, &run, env, execution, fenceRejections)
 		if err != nil {
