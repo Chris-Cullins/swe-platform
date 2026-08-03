@@ -1532,7 +1532,7 @@ rules:
     verbs: ["get"]
   - apiGroups: ["swe.dev"]
     resources: ["environmentservices/portal"]
-    resourceNames: ["${ENV_NAME}.web", "${ENV_NAME}.repository-web"]
+    resourceNames: ["${ENV_NAME}.web", "${ENV_NAME}.manual-api", "${ENV_NAME}.repository-web"]
     verbs: ["get"]
   - apiGroups: ["swe.dev"]
     resources: ["projects"]
