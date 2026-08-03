@@ -17,8 +17,10 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/util/retry"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -83,6 +85,25 @@ type staticPortalEnumerator struct{ environment platformv1alpha1.Environment }
 
 func (e staticPortalEnumerator) ListPortalEnvironments(context.Context) ([]platformv1alpha1.Environment, error) {
 	return []platformv1alpha1.Environment{*e.environment.DeepCopy()}, nil
+}
+
+type statusDenyingPortalResolver struct {
+	client.Client
+	updates atomic.Int64
+}
+
+func (r *statusDenyingPortalResolver) Status() client.StatusWriter {
+	return statusDenyingWriter{StatusWriter: r.Client.Status(), updates: &r.updates}
+}
+
+type statusDenyingWriter struct {
+	client.StatusWriter
+	updates *atomic.Int64
+}
+
+func (w statusDenyingWriter) Update(context.Context, client.Object, ...client.SubResourceUpdateOption) error {
+	w.updates.Add(1)
+	return apierrors.NewForbidden(schema.GroupResource{Group: platformv1alpha1.GroupVersion.Group, Resource: "environments/status"}, "env", errors.New("status update denied"))
 }
 
 type headerPortalAccess struct {
@@ -165,6 +186,17 @@ type idempotentCloseConn struct {
 	net.Conn
 	closes atomic.Int64
 	once   sync.Once
+}
+
+type countingReader struct {
+	reader io.Reader
+	read   int
+}
+
+func (r *countingReader) Read(p []byte) (int, error) {
+	n, err := r.reader.Read(p)
+	r.read += n
+	return n, err
 }
 
 func (c *idempotentCloseConn) Close() error {
@@ -419,6 +451,52 @@ func TestRunPortalListFiltersExactServiceAuthorizationAndReportsCurrentState(t *
 	}
 }
 
+func TestDisabledRunPortalListIsReadOnlyThroughTypedAPI(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := platformv1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	controller := true
+	run := &platformv1alpha1.Run{
+		ObjectMeta: metav1.ObjectMeta{Name: "run", Namespace: "ns", UID: "run-uid"},
+		Status: platformv1alpha1.RunStatus{EnvironmentRef: &platformv1alpha1.RunEnvironmentReference{
+			Name: "env", UID: "env-uid", Ownership: platformv1alpha1.EnvironmentOwnershipOwned,
+		}},
+	}
+	environment := &platformv1alpha1.Environment{
+		ObjectMeta: metav1.ObjectMeta{Name: "env", Namespace: "ns", UID: "env-uid", OwnerReferences: []metav1.OwnerReference{{
+			APIVersion: platformv1alpha1.GroupVersion.String(), Kind: "Run", Name: "run", UID: "run-uid", Controller: &controller,
+		}}},
+		Spec: platformv1alpha1.EnvironmentSpec{Services: []platformv1alpha1.EnvironmentServiceDeclaration{{
+			Name: "web", InstanceID: "wwwwwwwwwwwwwwwwwwww", Revision: 1, Protocol: platformv1alpha1.EnvironmentServiceProtocolHTTP,
+			TargetPort: 8080, Visibility: platformv1alpha1.EnvironmentServiceVisibilityProject, Readiness: platformv1alpha1.EnvironmentServiceReadinessTCPConnect,
+		}}},
+		Status: platformv1alpha1.EnvironmentStatus{PortalRoutes: []platformv1alpha1.EnvironmentPortalRoute{{
+			Name: "web", DeclarationInstanceID: "wwwwwwwwwwwwwwwwwwww", DeclarationRevision: 1, Locator: "llllllllllllllllllll", Generation: 1, Active: true,
+		}}},
+	}
+	base := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(environment).WithObjects(run, environment).Build()
+	resolver := &statusDenyingPortalResolver{Client: base}
+	resources := &fakeResources{terminalAssociation: RunTerminalAssociation{
+		RunName: "run", RunUID: "run-uid", EnvironmentName: "env", EnvironmentUID: "env-uid", EnvironmentOwnership: string(platformv1alpha1.EnvironmentOwnershipOwned),
+	}}
+	server := NewServer(nil, ServerOptions{Access: filteringPortalAccess{}, Resources: resources, PortalResolver: resolver})
+	response := resourceRequest(server, http.MethodGet, "/api/v1/namespaces/ns/runs/run/portals/run-uid/env-uid", "", "")
+	if response.Code != http.StatusOK {
+		t.Fatalf("disabled portal list = %d: %s", response.Code, response.Body.String())
+	}
+	var result RunPortalServiceList
+	if err := json.Unmarshal(response.Body.Bytes(), &result); err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Items) != 1 || result.Items[0].Name != "web" || result.Items[0].URL != "" || result.Items[0].OpenURL != "" {
+		t.Fatalf("disabled portal list = %#v", result)
+	}
+	if resolver.updates.Load() != 0 {
+		t.Fatalf("disabled portal list attempted %d status updates", resolver.updates.Load())
+	}
+}
+
 func TestPortalServiceStateHonorsLifecycleAndFreshness(t *testing.T) {
 	now := time.Now()
 	execution := int64(2)
@@ -468,22 +546,93 @@ func TestPortalServiceStateHonorsLifecycleAndFreshness(t *testing.T) {
 }
 
 func TestPortalSessionHandoffIsHostBoundOneTimeAndKeepsSessionOutOfURL(t *testing.T) {
-	gateway := &portalGateway{server: &Server{allowInsecureSessions: true}, handoffs: make(map[string]portalSessionHandoff)}
-	gateway.handoffs["one-time-code"] = portalSessionHandoff{sessionID: "console-session", locator: "abcdefghijklmnopqrst", origin: "http://console.test", expiresAt: time.Now().Add(time.Minute)}
-	request := httptest.NewRequest(http.MethodPost, "http://abcdefghijklmnopqrst.portal.example/.swe/session-handoff", strings.NewReader("code=one-time-code"))
-	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	request.Header.Set("Origin", "http://console.test")
+	const code = "abcdefghijklmnopqrstuvwxyz234567"
+	gateway := &portalGateway{server: &Server{allowInsecureSessions: true}, suffix: "portal.example", scheme: "http", handoffs: make(map[string]portalSessionHandoff)}
+	handler := gateway.wrap(http.NotFoundHandler())
+	installCode := func() {
+		gateway.handoffs[code] = portalSessionHandoff{sessionID: "console-session", locator: "abcdefghijklmnopqrst", origin: "http://console.test", expiresAt: time.Now().Add(time.Minute)}
+	}
+	request := func(method, target string, body io.Reader) *http.Request {
+		r := httptest.NewRequest(method, target, body)
+		r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		r.Header.Set("Origin", "http://console.test")
+		return r
+	}
+	for _, name := range []string{"content length", "chunked"} {
+		installCode()
+		body := &countingReader{reader: strings.NewReader("code=" + code + strings.Repeat("x", 128))}
+		oversized := request(http.MethodPost, "http://abcdefghijklmnopqrst.portal.example/.swe/session-handoff", body)
+		if name == "chunked" {
+			oversized.ContentLength = -1
+			oversized.TransferEncoding = []string{"chunked"}
+		}
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, oversized)
+		if response.Code != http.StatusNotFound || response.Body.String() != portalNotFoundBody || response.Header().Get("Cache-Control") != "private, no-store" {
+			t.Fatalf("%s oversized handoff = %d %q", name, response.Code, response.Body.String())
+		}
+		if int64(body.read) > portalSessionHandoffBodyLimit+1 {
+			t.Fatalf("%s oversized handoff read %d bytes, want at most %d", name, body.read, portalSessionHandoffBodyLimit+1)
+		}
+		if _, ok := gateway.handoffs[code]; !ok {
+			t.Fatalf("%s oversized handoff consumed the one-time code", name)
+		}
+	}
+
+	installCode()
+	queryBody := &countingReader{reader: strings.NewReader("code=" + code)}
+	largeQuery := request(http.MethodPost, "http://abcdefghijklmnopqrst.portal.example/.swe/session-handoff?padding="+strings.Repeat("x", 1<<20), queryBody)
+	largeQueryResponse := httptest.NewRecorder()
+	handler.ServeHTTP(largeQueryResponse, largeQuery)
+	if largeQueryResponse.Code != http.StatusNotFound || queryBody.read != 0 {
+		t.Fatalf("large-query handoff = %d with %d body bytes read", largeQueryResponse.Code, queryBody.read)
+	}
+	if _, ok := gateway.handoffs[code]; !ok {
+		t.Fatal("large-query handoff consumed the one-time code")
+	}
+
+	wrongMethodBody := &countingReader{reader: strings.NewReader("code=" + code)}
+	wrongMethod := request(http.MethodGet, "http://abcdefghijklmnopqrst.portal.example/.swe/session-handoff", wrongMethodBody)
+	wrongMethodResponse := httptest.NewRecorder()
+	handler.ServeHTTP(wrongMethodResponse, wrongMethod)
+	if wrongMethodResponse.Code != http.StatusNotFound || wrongMethodBody.read != 0 {
+		t.Fatalf("wrong-method handoff = %d with %d body bytes read", wrongMethodResponse.Code, wrongMethodBody.read)
+	}
+
+	wrongContentType := request(http.MethodPost, "http://abcdefghijklmnopqrst.portal.example/.swe/session-handoff", strings.NewReader("code="+code))
+	wrongContentType.Header.Set("Content-Type", "text/plain")
+	wrongContentTypeResponse := httptest.NewRecorder()
+	handler.ServeHTTP(wrongContentTypeResponse, wrongContentType)
+	if wrongContentTypeResponse.Code != http.StatusNotFound {
+		t.Fatalf("wrong-content-type handoff = %d", wrongContentTypeResponse.Code)
+	}
+	if _, ok := gateway.handoffs[code]; !ok {
+		t.Fatal("wrong-content-type handoff consumed the one-time code")
+	}
+
+	wrongOrigin := request(http.MethodPost, "http://abcdefghijklmnopqrst.portal.example/.swe/session-handoff", strings.NewReader("code="+code))
+	wrongOrigin.Header.Set("Origin", "http://attacker.test")
+	wrongOriginResponse := httptest.NewRecorder()
+	handler.ServeHTTP(wrongOriginResponse, wrongOrigin)
+	if wrongOriginResponse.Code != http.StatusNotFound || wrongOriginResponse.Body.String() != portalNotFoundBody {
+		t.Fatalf("wrong-origin handoff = %d %q", wrongOriginResponse.Code, wrongOriginResponse.Body.String())
+	}
+
+	installCode()
 	response := httptest.NewRecorder()
-	gateway.consumeSessionHandoff(response, request, "abcdefghijklmnopqrst")
+	handler.ServeHTTP(response, request(http.MethodPost, "http://abcdefghijklmnopqrst.portal.example/.swe/session-handoff", strings.NewReader("code="+code)))
 	if response.Code != http.StatusOK || response.Header().Get("Location") != "" || !strings.Contains(response.Body.String(), `location.replace("/")`) {
 		t.Fatalf("handoff = %d headers=%v", response.Code, response.Header())
+	}
+	if response.Header().Get("Cache-Control") != "private, no-store" || response.Header().Get("Referrer-Policy") != "no-referrer" {
+		t.Fatalf("handoff cache/referrer headers = %v", response.Header())
 	}
 	cookies := response.Result().Cookies()
 	if len(cookies) != 1 || cookies[0].Value != "console-session" || !cookies[0].HttpOnly || cookies[0].Domain != "" || cookies[0].SameSite != http.SameSiteStrictMode {
 		t.Fatalf("handoff cookie = %#v", cookies)
 	}
 	replay := httptest.NewRecorder()
-	gateway.consumeSessionHandoff(replay, request, "abcdefghijklmnopqrst")
+	handler.ServeHTTP(replay, request(http.MethodPost, "http://abcdefghijklmnopqrst.portal.example/.swe/session-handoff", strings.NewReader("code="+code)))
 	if replay.Code != http.StatusNotFound {
 		t.Fatalf("handoff replay = %d", replay.Code)
 	}

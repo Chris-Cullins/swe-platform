@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"html"
 	"io"
+	"mime"
 	"net"
 	"net/http"
 	"net/http/httputil"
@@ -28,7 +29,11 @@ import (
 	"github.com/Chris-Cullins/swe-platform/internal/sandboxclient"
 )
 
-const portalNotFoundBody = "not found\n"
+const (
+	portalNotFoundBody             = "not found\n"
+	portalSessionHandoffCodeLength = 32
+	portalSessionHandoffBodyLimit  = int64(len("code=") + portalSessionHandoffCodeLength)
+)
 const (
 	maxPortalResponseBytes   int64 = 64 << 20
 	portalAdmissionTimeout         = 2 * time.Minute
@@ -319,13 +324,6 @@ func (g *portalGateway) listRunPortals(w http.ResponseWriter, r *http.Request, n
 				return
 			}
 			changed = cleaned
-		} else {
-			for i := range env.Status.PortalRoutes {
-				if env.Status.PortalRoutes[i].Active {
-					env.Status.PortalRoutes[i].Active = false
-					changed = true
-				}
-			}
 		}
 		for _, declaration := range declarations {
 			decl, eligible := exactPortalDeclaration(&env, declaration.Name)
@@ -339,15 +337,16 @@ func (g *portalGateway) listRunPortals(w http.ResponseWriter, r *http.Request, n
 				writeRESTAccessError(w, err)
 				return
 			}
-			route, routeChanged, err := g.routeForDeclaration(&env, decl)
-			if err != nil {
-				g.server.writeResourceError(w, "generate portal route", namespace, env.Name, err)
-				return
-			}
-			changed = changed || routeChanged
 			state, reason := portalServiceState(&env, decl, time.Now())
 			item := RunPortalService{Name: decl.Name, TargetPort: decl.TargetPort, Status: state, Reason: reason}
-			if discovered := g.portalRoute(&env, decl, route); !discovered.Disabled {
+			if g.enabled() {
+				route, routeChanged, err := g.routeForDeclaration(&env, decl)
+				if err != nil {
+					g.server.writeResourceError(w, "generate portal route", namespace, env.Name, err)
+					return
+				}
+				changed = changed || routeChanged
+				discovered := g.portalRoute(&env, decl, route)
 				item.URL = discovered.URL
 				item.OpenURL = fmt.Sprintf("/api/v1/namespaces/%s/runs/%s/portals/%s/%s/%s/open", url.PathEscape(namespace), url.PathEscape(association.RunName), url.PathEscape(association.RunUID), url.PathEscape(association.EnvironmentUID), url.PathEscape(decl.Name))
 			}
@@ -502,11 +501,31 @@ func (g *portalGateway) openRunPortal(w http.ResponseWriter, r *http.Request, na
 }
 
 func (g *portalGateway) consumeSessionHandoff(w http.ResponseWriter, r *http.Request, locator string) {
-	if r.Method != http.MethodPost || r.ParseForm() != nil {
+	if r.Method != http.MethodPost || r.URL.RawQuery != "" {
 		portal404(w)
 		return
 	}
-	code := r.PostForm.Get("code")
+	mediaType, _, contentTypeErr := mime.ParseMediaType(r.Header.Get("Content-Type"))
+	if contentTypeErr != nil || mediaType != "application/x-www-form-urlencoded" {
+		portal404(w)
+		return
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, portalSessionHandoffBodyLimit)
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		portal404(w)
+		return
+	}
+	form, err := url.ParseQuery(string(body))
+	if err != nil || len(form) != 1 || len(form["code"]) != 1 {
+		portal404(w)
+		return
+	}
+	code := form["code"][0]
+	if len(code) != portalSessionHandoffCodeLength || !validLocator(code) || string(body) != "code="+code {
+		portal404(w)
+		return
+	}
 	g.handoffsMu.Lock()
 	handoff, ok := g.handoffs[code]
 	delete(g.handoffs, code)
