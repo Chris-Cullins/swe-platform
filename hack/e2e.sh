@@ -2645,6 +2645,12 @@ RESUME_RUN_UID=$(kubectl get run "$RESUME_RUN_NAME" -o jsonpath='{.metadata.uid}
 RESUME_ENV_UID=$(kubectl get run "$RESUME_RUN_NAME" -o jsonpath='{.status.environmentRef.uid}')
 manage_observation_listener service-start "$POD_NAME" "$OBSERVATION_OWNER" console-portal-listener 3999
 wait_service_observation "$ENV_NAME" manual-api 1 Healthy
+CONSOLE_SESSION_REFRESH_STATUS=$(curl --silent --output /dev/null --write-out '%{http_code}' -X POST \
+	-H "Authorization: Bearer ${CONSOLE_TOKEN}" --cookie-jar "$COOKIE_JAR" http://127.0.0.1:18080/api/v1/session)
+if [[ "$CONSOLE_SESSION_REFRESH_STATUS" != "200" ]]; then
+	echo "FAIL: console session refresh returned ${CONSOLE_SESSION_REFRESH_STATUS}, expected 200"
+	exit 1
+fi
 CONSOLE_PORTAL_URL=$(SWE_CONTROL_PLANE_URL=http://127.0.0.1:18080 SWE_CONTROL_PLANE_TOKEN="$CONSOLE_TOKEN" \
 	bin/swe --namespace "$PROJECT_NAMESPACE" portal "$ENV_NAME" manual-api)
 CONSOLE_PORTAL_HOST=${CONSOLE_PORTAL_URL#http://}
