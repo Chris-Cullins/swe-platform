@@ -7,9 +7,12 @@
 #
 # Prerequisites: go, docker, kind, kubectl, helm.
 # Env: KIND_CLUSTER (default swe-e2e), KEEP_CLUSTER=true to skip teardown,
-# E2E_USE_EXISTING_CLUSTER=true to test a bootstrapped cluster, and
-# E2E_RUNTIME_CLASS (for example gvisor) to select its environment runtime. Existing
-# cluster mode expects a fresh `make kind-up` cluster without an installed platform.
+# E2E_USE_EXISTING_CLUSTER=true to test a bootstrapped cluster,
+# E2E_RUNTIME_CLASS (for example gvisor) to select its environment runtime, and
+# E2E_ENFORCING_CNI to assert the sandboxd ingress policy on a separately installed,
+# known-enforcing CNI. CNI assertions also require E2E_EXPECTED_CLUSTER_UID to bind
+# acceptance to that exact cluster. Existing cluster mode expects a fresh `make
+# kind-up` cluster without an installed platform.
 set -euo pipefail
 
 CLUSTER="${KIND_CLUSTER:-swe-e2e}"
@@ -100,6 +103,9 @@ cleanup() {
 	if [[ -n "$E2E_SESSION_FIXTURE" ]]; then
 		rm -rf "$E2E_SESSION_FIXTURE"
 	fi
+	kubectl -n "$SYSTEM_NAMESPACE" delete pod swe-ingress-allowed --ignore-not-found --wait=false >/dev/null 2>&1 || true
+	kubectl -n "$SYSTEM_NAMESPACE" delete pod swe-sandboxd-relay --ignore-not-found --wait=false >/dev/null 2>&1 || true
+	kubectl -n "$PROJECT_NAMESPACE" delete pod swe-ingress-denied --ignore-not-found --wait=false >/dev/null 2>&1 || true
 	rm -f /tmp/swe-platform-sandboxd-cert-"$$" /tmp/swe-platform-sandboxd-token-"$$" \
 		/tmp/swe-platform-observation-cert-"$$" /tmp/swe-platform-observation-process-token-"$$"
 	if [[ "${KEEP_CLUSTER:-false}" != "true" && "${E2E_USE_EXISTING_CLUSTER:-false}" != "true" ]]; then
@@ -185,25 +191,52 @@ check_sandboxd_process() {
 	local pod_name="$1"
 	local run_uid="$2"
 	local expected_key="$3"
-	local secret_name identity
+	local secret_name identity checked=false forward_namespace="$PROJECT_NAMESPACE" forward_pod="$pod_name"
 	secret_name=$(kubectl -n "$PROJECT_NAMESPACE" get pod "$pod_name" -o jsonpath='{.metadata.annotations.swe\.dev/sandboxd-secret-name}')
 	identity=$(kubectl -n "$PROJECT_NAMESPACE" get pod "$pod_name" -o jsonpath='{.metadata.annotations.swe\.dev/sandboxd-identity}')
 	kubectl -n "$PROJECT_NAMESPACE" get secret "$secret_name" -o jsonpath='{.data.tls\.crt}' | base64 --decode > /tmp/swe-platform-sandboxd-cert-"$$"
 	kubectl -n "$PROJECT_NAMESPACE" get secret "$secret_name" -o jsonpath='{.data.process-token}' | base64 --decode > /tmp/swe-platform-sandboxd-token-"$$"
-	kubectl -n "$PROJECT_NAMESPACE" port-forward pod/"$pod_name" 15051:50051 >/tmp/swe-platform-sandboxd-port-forward.log 2>&1 &
-	SANDBOXD_PORT_FORWARD_PID=$!
-	for _ in $(seq 1 30); do
-		if grep -q 'Forwarding from' /tmp/swe-platform-sandboxd-port-forward.log; then
-			break
+	if [[ -n "${E2E_ENFORCING_CNI:-}" ]]; then
+		# Exercise the exact authenticated RPC through the policy-authorized path;
+		# a runner-to-Environment port-forward is correctly denied by Calico.
+		local pod_ip
+		pod_ip=$(kubectl -n "$PROJECT_NAMESPACE" get pod "$pod_name" -o jsonpath='{.status.podIP}')
+		kubectl -n "$SYSTEM_NAMESPACE" delete pod swe-sandboxd-relay --ignore-not-found --wait=true >/dev/null
+		kubectl -n "$SYSTEM_NAMESPACE" run swe-sandboxd-relay \
+			--image=busybox:1.36.1 --restart=Never \
+			--labels='app.kubernetes.io/name=swe-platform,app.kubernetes.io/instance=swe-platform,app.kubernetes.io/component=control-plane' \
+			-- sh -c "exec nc -ll -p 50051 -e nc '$pod_ip' 50051"
+		kubectl -n "$SYSTEM_NAMESPACE" wait --for=condition=Ready pod/swe-sandboxd-relay --timeout=30s
+		forward_namespace="$SYSTEM_NAMESPACE"
+		forward_pod="swe-sandboxd-relay"
+	fi
+	for _ in $(seq 1 5); do
+		: > /tmp/swe-platform-sandboxd-port-forward.log
+		kubectl -n "$forward_namespace" port-forward pod/"$forward_pod" 15051:50051 >/tmp/swe-platform-sandboxd-port-forward.log 2>&1 &
+		SANDBOXD_PORT_FORWARD_PID=$!
+		for _ in $(seq 1 30); do
+			if kill -0 "$SANDBOXD_PORT_FORWARD_PID" >/dev/null 2>&1 && \
+				grep -q 'Forwarding from' /tmp/swe-platform-sandboxd-port-forward.log; then
+				break
+			fi
+			sleep 1
+		done
+		if kill -0 "$SANDBOXD_PORT_FORWARD_PID" >/dev/null 2>&1 && \
+			printf '%s' "$expected_key" | go run ./hack/e2e-process-check \
+			127.0.0.1:15051 "$identity" /tmp/swe-platform-sandboxd-cert-"$$" /tmp/swe-platform-sandboxd-token-"$$" "$run_uid"; then
+			checked=true
 		fi
+		kill "$SANDBOXD_PORT_FORWARD_PID" >/dev/null 2>&1 || true
+		wait "$SANDBOXD_PORT_FORWARD_PID" >/dev/null 2>&1 || true
+		SANDBOXD_PORT_FORWARD_PID=""
+		[[ "$checked" == "true" ]] && break
 		sleep 1
 	done
-	printf '%s' "$expected_key" | go run ./hack/e2e-process-check \
-		127.0.0.1:15051 "$identity" /tmp/swe-platform-sandboxd-cert-"$$" /tmp/swe-platform-sandboxd-token-"$$" "$run_uid"
-	kill "$SANDBOXD_PORT_FORWARD_PID" >/dev/null 2>&1 || true
-	wait "$SANDBOXD_PORT_FORWARD_PID" >/dev/null 2>&1 || true
-	SANDBOXD_PORT_FORWARD_PID=""
 	rm -f /tmp/swe-platform-sandboxd-cert-"$$" /tmp/swe-platform-sandboxd-token-"$$"
+	if [[ -n "${E2E_ENFORCING_CNI:-}" ]]; then
+		kubectl -n "$SYSTEM_NAMESPACE" delete pod swe-sandboxd-relay --ignore-not-found --wait=true >/dev/null
+	fi
+	[[ "$checked" == "true" ]]
 }
 
 manage_observation_listener() {
@@ -212,12 +245,24 @@ manage_observation_listener() {
 	local owner="$3"
 	local role="$4"
 	local port="${5:-}"
-	local secret_name identity
+	local secret_name identity forward_namespace="$PROJECT_NAMESPACE" forward_pod="$pod_name"
 	secret_name=$(kubectl -n "$PROJECT_NAMESPACE" get pod "$pod_name" -o jsonpath='{.metadata.annotations.swe\.dev/sandboxd-secret-name}')
 	identity=$(kubectl -n "$PROJECT_NAMESPACE" get pod "$pod_name" -o jsonpath='{.metadata.annotations.swe\.dev/sandboxd-identity}')
 	kubectl -n "$PROJECT_NAMESPACE" get secret "$secret_name" -o jsonpath='{.data.tls\.crt}' | base64 --decode > /tmp/swe-platform-observation-cert-"$$"
 	kubectl -n "$PROJECT_NAMESPACE" get secret "$secret_name" -o jsonpath='{.data.process-token}' | base64 --decode > /tmp/swe-platform-observation-process-token-"$$"
-	kubectl -n "$PROJECT_NAMESPACE" port-forward pod/"$pod_name" 15052:50051 >/tmp/swe-platform-observation-port-forward.log 2>&1 &
+	if [[ -n "${E2E_ENFORCING_CNI:-}" ]]; then
+		local pod_ip
+		pod_ip=$(kubectl -n "$PROJECT_NAMESPACE" get pod "$pod_name" -o jsonpath='{.status.podIP}')
+		kubectl -n "$SYSTEM_NAMESPACE" delete pod swe-sandboxd-relay --ignore-not-found --wait=true >/dev/null
+		kubectl -n "$SYSTEM_NAMESPACE" run swe-sandboxd-relay \
+			--image=busybox:1.36.1 --restart=Never \
+			--labels='app.kubernetes.io/name=swe-platform,app.kubernetes.io/instance=swe-platform,app.kubernetes.io/component=control-plane' \
+			-- sh -c "exec nc -ll -p 50051 -e nc '$pod_ip' 50051"
+		kubectl -n "$SYSTEM_NAMESPACE" wait --for=condition=Ready pod/swe-sandboxd-relay --timeout=30s
+		forward_namespace="$SYSTEM_NAMESPACE"
+		forward_pod="swe-sandboxd-relay"
+	fi
+	kubectl -n "$forward_namespace" port-forward pod/"$forward_pod" 15052:50051 >/tmp/swe-platform-observation-port-forward.log 2>&1 &
 	SANDBOXD_PORT_FORWARD_PID=$!
 	for _ in $(seq 1 30); do
 		if grep -q 'Forwarding from' /tmp/swe-platform-observation-port-forward.log; then
@@ -239,6 +284,9 @@ manage_observation_listener() {
 	wait "$SANDBOXD_PORT_FORWARD_PID" >/dev/null 2>&1 || true
 	SANDBOXD_PORT_FORWARD_PID=""
 	rm -f /tmp/swe-platform-observation-cert-"$$" /tmp/swe-platform-observation-process-token-"$$"
+	if [[ -n "${E2E_ENFORCING_CNI:-}" ]]; then
+		kubectl -n "$SYSTEM_NAMESPACE" delete pod swe-sandboxd-relay --ignore-not-found --wait=true >/dev/null
+	fi
 }
 
 wait_service_observation() {
@@ -284,6 +332,35 @@ else
 	echo "==> creating kind cluster '$CLUSTER'"
 	kind delete cluster --name "$CLUSTER" >/dev/null 2>&1 || true
 	kind create cluster --name "$CLUSTER"
+fi
+if [[ -n "${E2E_ENFORCING_CNI:-}" && -z "${E2E_EXPECTED_CLUSTER_UID:-}" ]]; then
+	echo "FAIL: E2E_ENFORCING_CNI requires E2E_EXPECTED_CLUSTER_UID to prevent testing a replacement cluster" >&2
+	exit 1
+fi
+if [[ -n "${E2E_EXPECTED_CLUSTER_UID:-}" ]]; then
+	ACTUAL_CLUSTER_UID=$(kubectl get namespace kube-system -o jsonpath='{.metadata.uid}')
+	if [[ "$ACTUAL_CLUSTER_UID" != "$E2E_EXPECTED_CLUSTER_UID" ]]; then
+		echo "FAIL: selected cluster UID '$ACTUAL_CLUSTER_UID' differs from expected fixture '$E2E_EXPECTED_CLUSTER_UID'" >&2
+		exit 1
+	fi
+	echo "==> verified existing cluster fixture UID $ACTUAL_CLUSTER_UID"
+fi
+if [[ -n "${E2E_ENFORCING_CNI:-}" ]]; then
+	case "$E2E_ENFORCING_CNI" in
+	calico-v3.32.1)
+		if ! kubectl -n kube-system get daemonset calico-node -o json | jq -e '
+			.status.desiredNumberScheduled > 0 and
+			.status.numberReady == .status.desiredNumberScheduled and
+			any(.spec.template.spec.containers[]; .name == "calico-node" and (.image | endswith("/calico/node:v3.32.1")))' >/dev/null; then
+			echo "FAIL: selected cluster does not have the ready pinned Calico v3.32.1 fixture" >&2
+			exit 1
+		fi
+		;;
+	*)
+		echo "FAIL: unsupported E2E_ENFORCING_CNI fixture '$E2E_ENFORCING_CNI'" >&2
+		exit 1
+		;;
+	esac
 fi
 
 echo "==> building platform images"
@@ -883,6 +960,8 @@ metadata:
   name: env-$legacy_env
   labels:
     swe.dev/environment: $legacy_env
+  annotations:
+    swe.dev/sandboxd-security-revision: "4"
   ownerReferences:
   - apiVersion: swe.dev/v1alpha1
     kind: Environment
@@ -894,7 +973,8 @@ spec:
   containers:
   - name: environment
     image: $E2E_ENV_IMAGE
-    command: [sh, -c, 'git -C /workspace init -q; git -C /workspace config --local swe.setup-complete true; printf "%s\\n" "$legacy_env" > /workspace/pre-164-marker; exec sleep 3600']
+    command: [sh, -ec, 'chmod 0750 /workspace; git -C /workspace init -q; git -C /workspace config --local swe.setup-complete true; printf "%s\\n" "$legacy_env" > /workspace/pre-164-marker; exec sleep 3600']
+    securityContext: {runAsUser: 0}
     resources:
       requests: {cpu: 100m, memory: 128Mi}
     volumeMounts:
@@ -906,7 +986,14 @@ EOF
 	kubectl -n "$PROJECT_NAMESPACE" annotate environment "$legacy_env" \
 		swe.dev/e2e-legacy-pvc-uid="$(kubectl -n "$PROJECT_NAMESPACE" get pvc "env-$legacy_env" -o jsonpath='{.metadata.uid}')" \
 		swe.dev/e2e-legacy-policy-uid="$(kubectl -n "$PROJECT_NAMESPACE" get networkpolicy "env-$legacy_env-sandboxd" -o jsonpath='{.metadata.uid}')" >/dev/null
-	kubectl -n "$PROJECT_NAMESPACE" wait --for=condition=Ready pod/"env-$legacy_env" --timeout=2m
+	if ! kubectl -n "$PROJECT_NAMESPACE" wait --for=condition=Ready pod/"env-$legacy_env" --timeout=2m; then
+		echo "FAIL: legacy fixture $legacy_env did not become Ready" >&2
+		kubectl -n "$PROJECT_NAMESPACE" get pod "env-$legacy_env" -o yaml >&2 || true
+		kubectl -n "$PROJECT_NAMESPACE" logs "env-$legacy_env" --all-containers=true >&2 || true
+		exit 1
+	fi
+	kubectl -n "$PROJECT_NAMESPACE" exec "env-$legacy_env" -- sh -ec \
+		"test \"\$(git -C /workspace config --local swe.setup-complete)\" = true; grep -qx '$legacy_env' /workspace/pre-164-marker; setpriv --reuid=10001 --regid=10001 --clear-groups sh -ec 'test ! -w /workspace'"
 	kubectl -n "$PROJECT_NAMESPACE" patch environment "$legacy_env" --subresource=status --type=merge \
 		-p "{\"status\":{\"phase\":\"Ready\",\"executionGeneration\":1,\"podName\":\"env-${legacy_env}\"}}" >/dev/null
 done
@@ -1066,20 +1153,52 @@ for legacy_env in "$LEGACY_ACTIVE" "$LEGACY_HELD"; do
 		exit 1
 	}
 done
-kubectl wait --for=jsonpath='{.status.phase}'=Ready environment/"$LEGACY_ACTIVE" --timeout=2m
+if ! kubectl wait --for=jsonpath='{.status.phase}'=Ready environment/"$LEGACY_ACTIVE" --timeout=2m; then
+	echo "FAIL: active legacy Environment did not become Ready" >&2
+	kubectl get environment "$LEGACY_ACTIVE" -o yaml >&2 || true
+	kubectl get pod "env-$LEGACY_ACTIVE" -o yaml >&2 || true
+	kubectl get events --sort-by=.lastTimestamp >&2 || true
+	kubectl -n "$SYSTEM_NAMESPACE" logs deployment/"$INSTALLATION_NAME" --tail=200 >&2 || true
+	exit 1
+fi
 kubectl wait --for=condition=Ready pod/"env-$LEGACY_ACTIVE" --timeout=2m
 if [[ "$(kubectl get pod "env-$LEGACY_ACTIVE" -o jsonpath='{.metadata.creationTimestamp}')" == "" ]] || \
 	! kubectl exec "env-$LEGACY_ACTIVE" -- grep -qx "$LEGACY_ACTIVE" /workspace/pre-164-marker; then
 	echo "FAIL: active legacy Environment did not resume on its durable workspace"
 	exit 1
 fi
+kubectl exec "env-$LEGACY_ACTIVE" -- sh -ec \
+	'test "$(id -u)" -ne 0; test -w /workspace; printf "%s\n" group-writable > /workspace/revision-5-write; grep -qx group-writable /workspace/revision-5-write'
 if [[ "$(kubectl get environment "$LEGACY_HELD" -o jsonpath='{.status.phase}')" != "Paused" ]] || \
 	kubectl get pod "env-$LEGACY_HELD" >/dev/null 2>&1; then
 	echo "FAIL: held legacy Environment did not remain Paused and podless after migration"
 	exit 1
 fi
+if [[ -n "${E2E_ENFORCING_CNI:-}" ]]; then
+	# Calico and the full CSI/snapshot stack share one kind node with the warm
+	# pool. The active migration path is proven above; pause it before releasing
+	# the held fixture so this assertion tests migration rather than node size.
+	bin/swe --namespace "$PROJECT_NAMESPACE" environment hold "$LEGACY_ACTIVE"
+	kubectl wait --for=jsonpath='{.status.phase}'=Paused environment/"$LEGACY_ACTIVE" --timeout=2m
+	for _ in $(seq 1 120); do
+		if ! kubectl get pod "env-$LEGACY_ACTIVE" >/dev/null 2>&1; then
+			break
+		fi
+		sleep 1
+	done
+	if kubectl get pod "env-$LEGACY_ACTIVE" >/dev/null 2>&1; then
+		echo "FAIL: active legacy Environment did not free enforcing-CNI fixture capacity" >&2
+		exit 1
+	fi
+fi
 bin/swe --namespace "$PROJECT_NAMESPACE" environment release "$LEGACY_HELD"
-kubectl wait --for=jsonpath='{.status.phase}'=Ready environment/"$LEGACY_HELD" --timeout=2m
+if ! kubectl wait --for=jsonpath='{.status.phase}'=Ready environment/"$LEGACY_HELD" --timeout=2m; then
+	echo "FAIL: held legacy Environment did not become Ready after release" >&2
+	kubectl get environment "$LEGACY_HELD" -o yaml >&2 || true
+	kubectl get pod "env-$LEGACY_HELD" -o yaml >&2 || true
+	kubectl get events --sort-by=.lastTimestamp >&2 || true
+	exit 1
+fi
 kubectl wait --for=condition=Ready pod/"env-$LEGACY_HELD" --timeout=2m
 if ! kubectl exec "env-$LEGACY_HELD" -- grep -qx "$LEGACY_HELD" /workspace/pre-164-marker; then
 	echo "FAIL: released legacy Environment did not retain its durable workspace marker"
@@ -1108,6 +1227,17 @@ if [[ "$(kubectl get pod "env-${WARM_ENV_NAME}" -o jsonpath='{.spec.serviceAccou
 	echo "FAIL: Environment pod did not use the tokenless onboarding ServiceAccount"
 	exit 1
 fi
+if ! kubectl get pod "env-${WARM_ENV_NAME}" -o json | jq -e '
+	.spec.securityContext.fsGroup == 10001 and
+	.spec.securityContext.fsGroupChangePolicy == "OnRootMismatch" and
+	.spec.securityContext.runAsUser == null and .spec.securityContext.runAsGroup == null and
+	.spec.securityContext.seccompProfile.type == "RuntimeDefault" and
+	.metadata.annotations["swe.dev/sandboxd-security-revision"] == "5" and
+	(.spec.containers[] | select(.name == "environment") |
+		.securityContext.allowPrivilegeEscalation == false and .securityContext.capabilities.drop == ["ALL"])' >/dev/null; then
+	echo "FAIL: Environment pod did not apply revision 5 supplementary workspace access without forcing image identity" >&2
+	exit 1
+fi
 if [[ -n "${E2E_RUNTIME_CLASS:-}" ]]; then
 	WARM_RUNTIME_CLASS=$(kubectl get pod "env-${WARM_ENV_NAME}" -o jsonpath='{.spec.runtimeClassName}')
 	if [[ "$WARM_RUNTIME_CLASS" != "$E2E_RUNTIME_CLASS" ]]; then
@@ -1120,6 +1250,52 @@ if [[ -n "${E2E_RUNTIME_CLASS:-}" ]]; then
 		echo "FAIL: warm Environment pins RuntimeClass UID '$WARM_RUNTIME_CLASS_UID', expected '$EXPECTED_RUNTIME_CLASS_UID'"
 		exit 1
 	fi
+fi
+if [[ -n "${E2E_ENFORCING_CNI:-}" ]]; then
+	echo "==> verifying sandboxd ingress policy on $E2E_ENFORCING_CNI"
+	WARM_POD_IP=$(kubectl get pod "env-${WARM_ENV_NAME}" -o jsonpath='{.status.podIP}')
+	if [[ -z "$WARM_POD_IP" ]]; then
+		echo "FAIL: warm Environment has no Pod IP for ingress policy verification"
+		exit 1
+	fi
+	# The successful connection is a positive control: the denied probe cannot
+	# pass merely because sandboxd is absent or the target is unreachable.
+	cat <<EOF | kubectl -n "$SYSTEM_NAMESPACE" create -f -
+apiVersion: v1
+kind: Pod
+metadata:
+  name: swe-ingress-allowed
+  labels:
+    app.kubernetes.io/name: swe-platform
+    app.kubernetes.io/instance: swe-platform
+    app.kubernetes.io/component: control-plane
+spec:
+  restartPolicy: Never
+  containers:
+    - name: probe
+      image: busybox:1.36.1
+      command: [sh, -c, "nc -w 5 '$WARM_POD_IP' 50051 </dev/null"]
+      resources:
+        requests: {cpu: 10m, memory: 16Mi}
+EOF
+	kubectl -n "$SYSTEM_NAMESPACE" wait --for=jsonpath='{.status.phase}'=Succeeded pod/swe-ingress-allowed --timeout=30s
+	cat <<EOF | kubectl -n "$PROJECT_NAMESPACE" create -f -
+apiVersion: v1
+kind: Pod
+metadata:
+  name: swe-ingress-denied
+spec:
+  restartPolicy: Never
+  containers:
+    - name: probe
+      image: busybox:1.36.1
+      command: [sh, -c, "if nc -w 5 '$WARM_POD_IP' 50051 </dev/null; then echo 'unexpected sandboxd access' >&2; exit 1; fi"]
+      resources:
+        requests: {cpu: 10m, memory: 16Mi}
+EOF
+	kubectl -n "$PROJECT_NAMESPACE" wait --for=jsonpath='{.status.phase}'=Succeeded pod/swe-ingress-denied --timeout=30s
+	kubectl -n "$SYSTEM_NAMESPACE" delete pod swe-ingress-allowed --wait=true >/dev/null
+	kubectl -n "$PROJECT_NAMESPACE" delete pod swe-ingress-denied --wait=true >/dev/null
 fi
 if [[ "${E2E_USE_EXISTING_CLUSTER:-false}" == "true" ]]; then
 	WARM_PVC_NAME=$(kubectl get pod "env-${WARM_ENV_NAME}" -o jsonpath='{.spec.volumes[?(@.name=="workspace")].persistentVolumeClaim.claimName}')
@@ -1333,7 +1509,14 @@ echo "==> creating project environment + run intent via swe"
 printf '%s' "$E2E_AGENT_API_KEY" | bin/swe --namespace "$PROJECT_NAMESPACE" credentials create e2e-claude --agent claude-code --api-key-stdin
 bin/swe --namespace "$PROJECT_NAMESPACE" run "end-to-end smoke test" --project "$PROJECT_NAME" --credential-profile e2e-claude --wait=false
 RUN_NAME=$(kubectl get runs -o jsonpath='{.items[0].metadata.name}')
-kubectl wait --for=jsonpath='{.status.state}'=Running run/"$RUN_NAME" --timeout=3m
+if ! kubectl wait --for=jsonpath='{.status.state}'=Running run/"$RUN_NAME" --timeout=3m; then
+	echo "FAIL: Run did not reach Running" >&2
+	kubectl get run "$RUN_NAME" -o yaml >&2 || true
+	kubectl get environments,pods -o wide >&2 || true
+	kubectl get events --sort-by=.lastTimestamp >&2 || true
+	kubectl -n "$SYSTEM_NAMESPACE" logs deployment/"$INSTALLATION_NAME" --tail=200 >&2 || true
+	exit 1
+fi
 kubectl wait --for=jsonpath='{.status.state}'=Succeeded run/"$RUN_NAME" --timeout=3m
 RUN_UID=$(kubectl get run "$RUN_NAME" -o jsonpath='{.metadata.uid}')
 PROFILE_UID=$(kubectl get agentcredentialprofile e2e-claude -o jsonpath='{.metadata.uid}')
@@ -2205,6 +2388,51 @@ if [[ "$PROVISIONING_SNAPSHOT" == "null" ]] || ! jq -e \
 	kubectl get environment "$ENV_NAME" -o yaml >&2
 	exit 1
 fi
+if ! kubectl exec "$POD_NAME" -- sh -c 'test ! -e /workspace/resume-result'; then
+	echo "FAIL: project promotion ran the resume hook before active Pod recreation" >&2
+	kubectl exec "$POD_NAME" -- sh -c 'wc -l /workspace/resume-result; cat /workspace/resume-result' >&2 || true
+	echo "--- project-hooks resume marker ---" >&2
+	kubectl get pod "$POD_NAME" -o json | jq -r '.spec.initContainers[] | select(.name == "project-hooks") | [.env[]? | select(.name == "SWE_RESUMING") | "\(.name)=\(.value)"] | if length == 0 then "<absent>" else .[] end' >&2 || true
+	kubectl get environment "$ENV_NAME" -o yaml >&2 || true
+	kubectl -n "$SYSTEM_NAMESPACE" logs deployment/"$INSTALLATION_NAME" --tail=300 >&2 || true
+	exit 1
+fi
+
+if [[ -n "${E2E_ENFORCING_CNI:-}" ]]; then
+	# The pinned Calico + CSI + gVisor fixture has already proven warm-pool
+	# replenishment above, but its single node cannot schedule both that standby
+	# and this active replacement. Drain only the unclaimed pool before testing
+	# recreation; this is explicit fixture capacity management, not a longer
+	# readiness timeout or a relaxation of the replacement contract.
+	if [[ -n "$(kubectl get environment "$ENV_NAME" -o jsonpath='{.metadata.labels.swe\.dev/warm-pool}')" ]]; then
+		echo "FAIL: claimed active Environment still has the warm-pool label; refusing fixture drain" >&2
+		exit 1
+	fi
+	kubectl patch environmenttemplate small --type=merge -p '{"spec":{"warmPool":{"min":0}}}' >/dev/null
+	for _ in $(seq 1 60); do
+		DRAIN_WARM_MEMBERS=$(kubectl get environments -l swe.dev/warm-pool=small -o json)
+		if [[ "$(jq '.items | length' <<<"$DRAIN_WARM_MEMBERS")" == "0" ]]; then
+			break
+		fi
+		while IFS=$'\t' read -r warm_env warm_uid; do
+			if [[ "$warm_env" == "$ENV_NAME" || "$(kubectl get environment "$warm_env" -o jsonpath='{.metadata.uid}')" != "$warm_uid" ]]; then
+				echo "FAIL: warm fixture drain crossed active or UID identity boundary for $warm_env" >&2
+				exit 1
+			fi
+			kubectl delete environment "$warm_env" --wait=true --timeout=2m >/dev/null
+			if kubectl get pod "env-$warm_env" >/dev/null 2>&1; then
+				echo "FAIL: deleted warm Environment $warm_env retained its Pod" >&2
+				exit 1
+			fi
+		done < <(jq -r '.items[] | [.metadata.name, .metadata.uid] | @tsv' <<<"$DRAIN_WARM_MEMBERS")
+		sleep 1
+	done
+	if [[ -n "$(kubectl get environments -l swe.dev/warm-pool=small -o name)" ]]; then
+		echo "FAIL: enforcing-CNI fixture did not drain unclaimed warm capacity" >&2
+		kubectl get environments,pods -o wide >&2 || true
+		exit 1
+	fi
+fi
 
 echo "==> verifying setup runs only once when the pod is recreated"
 kubectl delete pod "$POD_NAME" --wait=true >/dev/null
@@ -2214,23 +2442,45 @@ for _ in $(seq 1 30); do
 	fi
 	sleep 1
 done
-kubectl wait --for=condition=Ready pod/"$POD_NAME" --timeout=2m
+if ! kubectl wait --for=condition=Ready pod/"$POD_NAME" --timeout=2m; then
+	echo "FAIL: recreated Environment pod did not become Ready" >&2
+	kubectl get environment "$ENV_NAME" -o yaml >&2 || true
+	kubectl get pod "$POD_NAME" -o yaml >&2 || true
+	kubectl describe pod "$POD_NAME" >&2 || true
+	for container in repository-clone project-hooks environment; do
+		echo "--- $POD_NAME/$container logs ---" >&2
+		kubectl logs "$POD_NAME" -c "$container" >&2 || true
+	done
+	kubectl get events --sort-by=.lastTimestamp >&2 || true
+	kubectl -n "$SYSTEM_NAMESPACE" logs deployment/"$INSTALLATION_NAME" --tail=300 >&2 || true
+	exit 1
+fi
 if [[ "$(kubectl get environment "$ENV_NAME" -o json | jq -cS '.status.provisioning')" != "$PROVISIONING_SNAPSHOT" ]]; then
 	echo "FAIL: active Pod recreation changed the provisioning snapshot"
 	exit 1
 fi
 RECREATED_POD=$(kubectl get pod "$POD_NAME" -o json)
 if ! jq -e --argjson snapshot "$PROVISIONING_SNAPSHOT" '
+	(.spec.securityContext.fsGroup == 10001 and
+	 .spec.securityContext.fsGroupChangePolicy == "OnRootMismatch" and
+	 .spec.securityContext.runAsUser == null and .spec.securityContext.runAsGroup == null) and
 	([.spec.containers[] | select(.name == "environment")] | length == 1 and
 	 .[0].image == $snapshot.image and .[0].resources.requests == $snapshot.resources and
-	 .[0].resources.limits == $snapshot.resources) and
+	 .[0].resources.limits == $snapshot.resources and
+	 ([.[0].env[]? | select(.name == "SWE_REPOSITORY_TOKEN")] | length) == 0) and
 	([.spec.initContainers[] | select(.name == "repository-clone")] | length == 1 and
 	 .[0].image == $snapshot.image and .[0].resources.requests == $snapshot.resources and
 	 .[0].resources.limits == $snapshot.resources and
-	 ([.[0].env[] | select(.name == "SWE_REPOSITORY") | .value] | first) == $snapshot.project.repository) and
+	 .[0].securityContext.runAsUser == null and .[0].securityContext.runAsGroup == null and
+	 .[0].securityContext.allowPrivilegeEscalation == false and .[0].securityContext.capabilities.drop == ["ALL"] and
+	 ([.[0].env[] | select(.name == "SWE_REPOSITORY") | .value] | first) == $snapshot.project.repository and
+	 ([.[0].env[] | select(.name == "SWE_REPOSITORY_TOKEN")] | length) == 0) and
 	([.spec.initContainers[] | select(.name == "project-hooks")] | length == 1 and
 	 .[0].image == $snapshot.image and .[0].resources.requests == $snapshot.resources and
 	 .[0].resources.limits == $snapshot.resources and
+	 .[0].securityContext.runAsUser == null and .[0].securityContext.runAsGroup == null and
+	 .[0].securityContext.allowPrivilegeEscalation == false and .[0].securityContext.capabilities.drop == ["ALL"] and
+	 ([.[0].env[] | select(.name == "SWE_RESUMING") | .value] | first) == "true" and
 	 ([.[0].env[] | select(.name == "SWE_REPOSITORY_TOKEN")] | length) == 0)' <<<"$RECREATED_POD" >/dev/null ||
 	[[ "$(jq -r '.spec.runtimeClassName // ""' <<<"$RECREATED_POD")" != "$(jq -r '.runtimeClassName' <<<"$PROVISIONING_SNAPSHOT")" ]]; then
 	echo "FAIL: recreated Pod does not match the provisioning image/runtime/resources/repository"
@@ -2242,9 +2492,17 @@ if ! kubectl exec "$POD_NAME" -- sh -c 'test "$(wc -l < /workspace/setup-result)
 fi
 if ! kubectl exec "$POD_NAME" -- sh -c \
 	'test "$(wc -l < /workspace/resume-result)" -eq 1 && ! grep -vx credential-absent /workspace/resume-result'; then
-	echo "FAIL: active Pod recreation did not run exactly one credential-free resume hook"
+	echo "FAIL: active Pod recreation did not run exactly one credential-free resume hook" >&2
+	echo "--- project-hooks resume marker ---" >&2
+	jq -r '.spec.initContainers[] | select(.name == "project-hooks") | [.env[]? | select(.name == "SWE_RESUMING") | "\(.name)=\(.value)"] | if length == 0 then "<absent>" else .[] end' <<<"$RECREATED_POD" >&2
+	echo "--- /workspace/resume-result ---" >&2
+	kubectl exec "$POD_NAME" -- sh -c 'if [ -e /workspace/resume-result ]; then wc -l /workspace/resume-result; cat /workspace/resume-result; else echo "<absent>"; fi' >&2 || true
+	kubectl logs "$POD_NAME" -c project-hooks >&2 || true
+	kubectl get environment "$ENV_NAME" -o yaml >&2 || true
+	kubectl -n "$SYSTEM_NAMESPACE" logs deployment/"$INSTALLATION_NAME" --tail=300 >&2 || true
 	exit 1
 fi
+echo "verified active Pod recreation ran one resume hook for its retained-workspace episode"
 
 echo "==> verifying repository service ingestion, supervision, and authenticated portal"
 bin/swe --namespace "$PROJECT_NAMESPACE" environment services declare "$ENV_NAME" manual-api --target-port 3999

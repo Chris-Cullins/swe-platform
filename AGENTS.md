@@ -138,7 +138,8 @@ runs both via `make` targets:
 - **Regenerate protobuf:** `make proto` (requires `protoc`; plugins install locally)
 - **Dev cluster:** `make kind-up` creates/reuses `swe-dev`, installs the pinned gVisor
   `gvisor` RuntimeClass plus the CSI hostpath driver and VolumeSnapshot controller, and
-  verifies both with smoke resources. Build/load the images, then install
+  configures the fixture driver's `fsGroupPolicy: File` and verifies non-root group-writable
+  snapshot/restore behavior with smoke resources. Build/load the images, then install
   `charts/swe-platform` with `values-kind.yaml` and the gVisor override printed by the
   script. Run the full acceptance suite against it with
   `KIND_CLUSTER=swe-dev E2E_USE_EXISTING_CLUSTER=true E2E_RUNTIME_CLASS=gvisor ./hack/e2e.sh`.
@@ -169,6 +170,9 @@ runs both via `make` targets:
   system-namespace installation plus CLI onboarding of a distinct scoped Project namespace,
   exact claims, managed catalog copies, explicit baseline quota/RBAC/policy, scoped denial,
   same-named two-release isolation, and retained offboarding,
+  sandboxd ingress NetworkPolicy allow/deny behavior on CI's exact-UID-pinned, fully bootstrapped
+  Calico kind fixture, including group-writable fresh and retained CSI workspaces under gVisor
+  (without claiming production CNI, CSI, or runtime attestation),
   control-plane TokenReview/SAR scoping, memory and durable encrypted PostgreSQL browser session
   exchange/logout/revocation, capacity and CSRF,
   the embedded console entry point/SPA fallback/static assets, typed Run

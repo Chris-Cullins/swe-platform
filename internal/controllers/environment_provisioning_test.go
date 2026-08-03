@@ -180,22 +180,49 @@ func TestProvisioningSnapshotAtomicPublicationAndFailClosedInputs(t *testing.T) 
 		scheme, env, tmpl := fixture(t)
 		c := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(env).WithObjects(env, tmpl).Build()
 		r := &EnvironmentReconciler{Client: c, Scheme: scheme}
-		for i := 0; i < 2; i++ {
+		var warmPod corev1.Pod
+		for i := 0; i < 20; i++ {
 			if _, err := r.Reconcile(context.Background(), provisioningRequest(env)); err != nil {
 				t.Fatal(err)
 			}
+			if err := c.Get(context.Background(), client.ObjectKey{Namespace: env.Namespace, Name: envPodName(env)}, &warmPod); err == nil {
+				break
+			} else if !apierrors.IsNotFound(err) {
+				t.Fatal(err)
+			}
+		}
+		if warmPod.Name == "" || warmPod.Annotations[projectAnnotation] != "" {
+			t.Fatalf("generic warm Pod = %#v", warmPod)
 		}
 		var promoted platformv1alpha1.Environment
 		if err := c.Get(context.Background(), client.ObjectKeyFromObject(env), &promoted); err != nil {
 			t.Fatal(err)
 		}
+		if promoted.Status.ExecutionGeneration <= 0 {
+			t.Fatalf("generic warm execution generation = %d", promoted.Status.ExecutionGeneration)
+		}
+		for _, child := range []client.Object{
+			&corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: envPVCName(env), Namespace: env.Namespace}},
+			&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: envCredentialName(env), Namespace: env.Namespace}},
+		} {
+			if err := c.Get(context.Background(), client.ObjectKeyFromObject(child), child); err != nil {
+				t.Fatalf("get warm %T: %v", child, err)
+			}
+		}
 		original := promoted.Status.Provisioning.DeepCopy()
+		applyEnvironmentStatus(&promoted, platformv1alpha1.EnvironmentPhaseReady, warmPod.Name, "10.0.0.1:50051", "SandboxdReady", "generic warm environment is ready", nil)
+		if err := c.Status().Update(context.Background(), &promoted); err != nil {
+			t.Fatal(err)
+		}
 		promoted.Spec.ProjectRef = "project"
 		if err := c.Update(context.Background(), &promoted); err != nil {
 			t.Fatal(err)
 		}
 		project := &platformv1alpha1.Project{ObjectMeta: metav1.ObjectMeta{Name: "project", Namespace: env.Namespace, UID: "project-uid", Generation: 1}, Spec: platformv1alpha1.ProjectSpec{Repositories: []string{"https://example.test/repository"}}}
 		if err := c.Create(context.Background(), project); err != nil {
+			t.Fatal(err)
+		}
+		if err := c.Delete(context.Background(), &warmPod); err != nil {
 			t.Fatal(err)
 		}
 		if _, err := r.Reconcile(context.Background(), provisioningRequest(env)); err != nil {
@@ -207,8 +234,60 @@ func TestProvisioningSnapshotAtomicPublicationAndFailClosedInputs(t *testing.T) 
 		if promoted.Status.Provisioning.Project == nil || !equality.Semantic.DeepEqual(promoted.Status.Provisioning.Template, original.Template) {
 			t.Fatalf("promotion changed template snapshot or omitted project: before=%#v after=%#v", original, promoted.Status.Provisioning)
 		}
+		if promoted.Status.Phase != platformv1alpha1.EnvironmentPhaseSetup || promoted.Status.PodName != "" || promoted.Status.Endpoints.Sandboxd != "" {
+			t.Fatalf("promotion retained stale published warm status: %#v", promoted.Status)
+		}
 		if err := c.Get(context.Background(), client.ObjectKey{Namespace: env.Namespace, Name: envPodName(env)}, &corev1.Pod{}); !apierrors.IsNotFound(err) {
 			t.Fatalf("project Pod existed before project snapshot extension: %v", err)
+		}
+
+		var setupPod corev1.Pod
+		for i := 0; i < 20; i++ {
+			if _, err := r.Reconcile(context.Background(), provisioningRequest(env)); err != nil {
+				t.Fatalf("project setup reconcile %d: %v", i+1, err)
+			}
+			if err := c.Get(context.Background(), client.ObjectKey{Namespace: env.Namespace, Name: envPodName(env)}, &setupPod); err == nil {
+				break
+			} else if !apierrors.IsNotFound(err) {
+				t.Fatal(err)
+			}
+		}
+		if setupPod.Name == "" || podIsResume(&setupPod) {
+			t.Fatalf("promoted Project setup Pod = %#v, want no resume marker", setupPod)
+		}
+		setupGeneration := setupPod.Annotations[executionGenerationAnnotation]
+		setupIdentity := setupPod.Annotations[sandboxdauth.IdentityAnnotation]
+
+		if err := c.Get(context.Background(), client.ObjectKeyFromObject(env), &promoted); err != nil {
+			t.Fatal(err)
+		}
+		applyEnvironmentStatus(&promoted, platformv1alpha1.EnvironmentPhaseReady, setupPod.Name, "10.0.0.2:50051", "SandboxdReady", "project environment is ready", nil)
+		if err := c.Status().Update(context.Background(), &promoted); err != nil {
+			t.Fatal(err)
+		}
+		if err := c.Delete(context.Background(), &setupPod); err != nil {
+			t.Fatal(err)
+		}
+		var replacement corev1.Pod
+		observedResuming := false
+		for i := 0; i < 20; i++ {
+			if _, err := r.Reconcile(context.Background(), provisioningRequest(env)); err != nil {
+				t.Fatalf("resume reconcile %d: %v", i+1, err)
+			}
+			if err := c.Get(context.Background(), client.ObjectKeyFromObject(env), &promoted); err != nil {
+				t.Fatal(err)
+			}
+			observedResuming = observedResuming || promoted.Status.Phase == platformv1alpha1.EnvironmentPhaseResuming
+			if err := c.Get(context.Background(), client.ObjectKey{Namespace: env.Namespace, Name: envPodName(env)}, &replacement); err == nil {
+				break
+			} else if !apierrors.IsNotFound(err) {
+				t.Fatal(err)
+			}
+		}
+		if replacement.Name == "" || !observedResuming || !podIsResume(&replacement) ||
+			replacement.Annotations[executionGenerationAnnotation] == setupGeneration ||
+			replacement.Annotations[sandboxdauth.IdentityAnnotation] == setupIdentity {
+			t.Fatalf("established Project replacement = %#v, status = %#v", replacement, promoted.Status)
 		}
 	})
 

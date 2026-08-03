@@ -186,6 +186,21 @@ missing named RuntimeClass fails before child creation. PVC expansion is not sup
 requested storage remains the snapshotted `diskSize`; changing a Template cannot resize an
 existing workspace, and a larger disk requires a new Environment.
 
+`/workspace` must be writable by the Environment image's execution identity before sandboxd is
+usable and after every pause/resume. The Linux Pod backend supplies fixed supplementary group
+10001 with `fsGroupChangePolicy: OnRootMismatch`; it does not override the image's UID or primary
+GID. The storage implementation must grant that supplementary group access, whether through
+kubelet ownership changes (`fsGroupPolicy: File`, or `ReadWriteOnceWithFSType` when its access-mode
+and filesystem conditions hold), correct CSI `VOLUME_MOUNT_GROUP` delegation, or equivalent
+non-CSI volume behavior. `OnRootMismatch` controls only kubelet-side ownership changes and is not
+applied when CSI performs the delegation. Drivers that declare `None` without effective delegated
+mount-group handling, root-squashed storage that cannot grant the group, and non-POSIX storage
+without an equivalent access mechanism are unsupported. This is a required storage contract, not
+runtime or CSI capability attestation. Other backends, including a future Windows backend, must
+provide equivalent ACL or workspace preparation semantics rather than reproducing a numeric GID.
+Security revision 5 replaces older Environment Pods to apply this contract while retaining the
+exact workspace PVC and frozen provisioning inputs.
+
 ### Tenancy and Project namespace lifecycle
 
 The chart installs one empty-spec `Installation` in its system namespace. The object's

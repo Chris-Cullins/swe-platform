@@ -83,8 +83,7 @@ done
 
 for node in "${NODES[@]}"; do
 	for binary in runsc containerd-shim-runsc-v1; do
-		docker cp "$TMP_DIR/$binary" "$node:/tmp/$binary"
-		docker exec "$node" install -m 0755 "/tmp/$binary" "/usr/local/bin/$binary"
+		docker exec -i "$node" sh -c "cat > '/usr/local/bin/$binary' && chmod 0755 '/usr/local/bin/$binary'" < "$TMP_DIR/$binary"
 	done
 	if ! docker exec "$node" grep -Fq 'containerd.runtimes.runsc]' /etc/containerd/config.toml; then
 		if docker exec "$node" grep -Eq '^[[:space:]]*version[[:space:]]*=[[:space:]]*2[[:space:]]*$' /etc/containerd/config.toml; then
@@ -159,6 +158,9 @@ export REAL_KUBECTL KUBE_CONTEXT="$CONTEXT"
 PATH="$TMP_DIR/bin:$PATH" "$TMP_DIR/csi-driver-host-path/deploy/$HOSTPATH_DEPLOYMENT/deploy.sh"
 kubectl --context "$CONTEXT" apply -f "$TMP_DIR/csi-driver-host-path/examples/csi-storageclass.yaml"
 kubectl --context "$CONTEXT" rollout status statefulset/csi-hostpathplugin --timeout=3m
+kubectl --context "$CONTEXT" patch csidriver hostpath.csi.k8s.io --type=merge \
+	-p '{"spec":{"fsGroupPolicy":"File"}}' >/dev/null
+[[ "$(kubectl --context "$CONTEXT" get csidriver hostpath.csi.k8s.io -o jsonpath='{.spec.fsGroupPolicy}')" == "File" ]]
 kubectl --context "$CONTEXT" annotate storageclass standard \
 	storageclass.kubernetes.io/is-default-class- --overwrite >/dev/null
 kubectl --context "$CONTEXT" annotate storageclass csi-hostpath-sc \
@@ -185,10 +187,17 @@ metadata:
   namespace: $SMOKE_NAMESPACE
 spec:
   restartPolicy: Never
+  securityContext:
+    fsGroup: 10001
+    fsGroupChangePolicy: OnRootMismatch
   containers:
     - name: writer
       image: busybox:1.36.1
       command: [sh, -c, "echo snapshot-ready > /data/marker && sleep 300"]
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
       volumeMounts:
         - name: data
           mountPath: /data
@@ -236,10 +245,17 @@ metadata:
   namespace: $SMOKE_NAMESPACE
 spec:
   restartPolicy: Never
+  securityContext:
+    fsGroup: 10001
+    fsGroupChangePolicy: OnRootMismatch
   containers:
     - name: reader
       image: busybox:1.36.1
-      command: [sh, -c, "grep -qx snapshot-ready /data/marker"]
+      command: [sh, -c, "grep -qx snapshot-ready /data/marker && echo restore-writable > /data/restored-marker && grep -qx restore-writable /data/restored-marker"]
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
       volumeMounts:
         - name: data
           mountPath: /data

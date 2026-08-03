@@ -96,10 +96,13 @@ workload readiness; it never reads or prints the App private key.
 
 ## Provider runbooks
 
-All providers require a default `ReadWriteOnce` StorageClass, an enforcing CNI for the chart's
-ingress NetworkPolicies, outbound access to GHCR for image pulls, and workload outbound access
-needed by Git, setup/package managers, and the selected agent provider. That outbound access is
-not constrained by the platform today.
+All providers require a default `ReadWriteOnce` StorageClass whose volume implementation grants
+supplementary group 10001 write access to the mounted workspace. This can use kubelet ownership
+changes (`fsGroupPolicy: File`, or `ReadWriteOnceWithFSType` when its conditions hold), correct CSI
+`VOLUME_MOUNT_GROUP` delegation, or equivalent non-CSI behavior. They also require an enforcing
+CNI for the chart's ingress NetworkPolicies, outbound access to GHCR for image pulls, and workload
+outbound access needed by Git, setup/package managers, and the selected agent provider. That
+outbound access is not constrained by the platform today.
 
 ### k3s
 
@@ -186,7 +189,8 @@ keyring disclosure can recover encrypted browser bearer credentials.
 `preflight` reads Secret keys only to confirm that non-empty data exists; it never prints or
 decodes their values. It checks Kubernetes version, the NetworkPolicy API, a default
 StorageClass, and GKE's named RuntimeClass. It cannot prove that a CNI or runtime enforces the
-advertised isolation.
+advertised isolation, or that the storage implementation applies the required filesystem-group
+access. Validate all three behaviors independently before admitting untrusted workloads.
 
 ```sh
 ./hack/validate-byoc.sh preflight "$PROVIDER"

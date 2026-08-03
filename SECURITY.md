@@ -92,6 +92,10 @@ while protocol authentication remains the durable boundary on clusters without N
 enforcement. Environment pods do not receive a Kubernetes service-account token by default.
 NetworkPolicies are additive, destination-node traffic may be exempt, and Kubernetes API
 port-forwarding is governed by `pods/portforward` RBAC rather than this policy.
+CI verifies this ingress rule's allow and deny dataplane behavior only on its pinned Calico
+kind fixture, with an allowed connection as a positive control. The operator does not attest
+that a production cluster's CNI enforces NetworkPolicy, and Environment status does not claim
+effective CNI enforcement.
 
 Default-deny egress and the per-project egress proxy are not implemented. The
 `Project.spec.egressAllowlist` field is reserved for that future contract; the operator rejects
@@ -129,6 +133,20 @@ intentionally uses the cluster default runtime.
    from the prior incarnation.
 4. **Storage:** credentials are held in a Kubernetes Secret volume, never the retained workspace
    PVC. Pausing retains `/workspace` but removes the credential source and pod.
+
+The workspace itself has a separate availability and access contract: it must be writable by the
+Environment image's execution identity before sandboxd becomes usable and remain writable across
+pause/resume. Linux Environment Pods receive supplementary group 10001 with
+`fsGroupChangePolicy: OnRootMismatch`; the platform does not force the image's UID or primary GID,
+and keeps seccomp RuntimeDefault, dropped capabilities, and no-privilege-escalation controls.
+Production storage must grant that group access through kubelet ownership changes (CSI
+`fsGroupPolicy: File`, or `ReadWriteOnceWithFSType` when its conditions hold), correct CSI
+`VOLUME_MOUNT_GROUP` delegation, or equivalent non-CSI volume behavior. `OnRootMismatch` applies
+only to kubelet-side ownership changes, not delegated CSI mounts. `None` without effective
+delegated mount-group handling, root-squashed storage that cannot grant the group, and storage
+without equivalent POSIX access are unsupported. The operator does not attest that a driver or
+runtime honors this contract. A future Windows or non-Pod backend must establish equivalent
+ACL/preparation behavior without assuming a Unix GID.
 
 Certificates are valid for one year to avoid expiring a continuously running pod; normal pod
 recreation rotates them much earlier. Operators should recreate any pod approaching that limit.
