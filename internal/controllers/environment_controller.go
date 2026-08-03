@@ -125,9 +125,10 @@ func terminalEnvironment(err error) error {
 
 const (
 	sandboxdCredentialMount    = "/var/run/swe-platform/sandboxd"
-	sandboxdSecurityRevision   = "4"
+	sandboxdSecurityRevision   = "5"
 	sandboxdRevisionAnnotation = "swe.dev/sandboxd-security-revision"
 	environmentFinalizer       = "swe.dev/environment-security"
+	workspaceAccessGroup       = int64(10001)
 )
 
 const hookRunnerScript = `set -eu
@@ -934,14 +935,51 @@ func (r *EnvironmentReconciler) backendCreationSourcesCurrent(ctx context.Contex
 	return true, nil
 }
 
+func isResumeReplacement(env *platformv1alpha1.Environment) bool {
+	if !projectProvisioningCurrent(env) {
+		return false
+	}
+	if env.Status.Phase == platformv1alpha1.EnvironmentPhaseResuming {
+		return true
+	}
+	if env.Status.Phase == platformv1alpha1.EnvironmentPhaseCreating && env.Status.PodName != "" && env.Status.LastActiveAt != nil {
+		return true
+	}
+	if env.Status.PodName == "" || env.Status.Endpoints.Sandboxd == "" {
+		return false
+	}
+	switch env.Status.Phase {
+	case platformv1alpha1.EnvironmentPhaseReady, platformv1alpha1.EnvironmentPhaseRunning, platformv1alpha1.EnvironmentPhaseIdle:
+		return true
+	default:
+		return false
+	}
+}
+
+func projectProvisioningCurrent(env *platformv1alpha1.Environment) bool {
+	if env.Spec.ProjectRef == "" {
+		return env.Status.Provisioning == nil || env.Status.Provisioning.Project == nil
+	}
+	return env.Status.Provisioning != nil && env.Status.Provisioning.Project != nil &&
+		env.Status.Provisioning.Project.Name == env.Spec.ProjectRef && env.Status.Provisioning.ProjectVerified
+}
+
+func projectSetupPending(env *platformv1alpha1.Environment) bool {
+	return env.Spec.ProjectRef != "" && !projectProvisioningCurrent(env)
+}
+
 func (r *EnvironmentReconciler) ensurePodForProject(ctx context.Context, env *platformv1alpha1.Environment, tmpl *platformv1alpha1.EnvironmentTemplate, project *platformv1alpha1.Project, runtimeClassUID types.UID, claim tenancy.Claim) (*corev1.Pod, error) {
 	podName := envPodName(env)
 	resuming := env.Status.Phase == platformv1alpha1.EnvironmentPhaseResuming
+	resumeReplacement := isResumeReplacement(env)
+	projectSetup := projectSetupPending(env)
 	var pod corev1.Pod
 	err := r.apiReader().Get(ctx, types.NamespacedName{Namespace: env.Namespace, Name: podName}, &pod)
 	if err == nil {
+		resumeReplacement = resumeReplacement || podIsResume(&pod)
 		if metav1.IsControlledBy(&pod, env) && !pod.DeletionTimestamp.IsZero() {
-			if pod.Status.Phase == corev1.PodFailed || pod.Status.Phase == corev1.PodSucceeded {
+			projectSetup = projectSetup || pod.Annotations[projectAnnotation] != env.Spec.ProjectRef
+			if !projectSetup && (pod.Status.Phase == corev1.PodFailed || pod.Status.Phase == corev1.PodSucceeded) {
 				secure, err := r.currentSandboxdPod(ctx, env, &pod)
 				if err != nil {
 					return nil, err
@@ -953,7 +991,13 @@ func (r *EnvironmentReconciler) ensurePodForProject(ctx context.Context, env *pl
 			if err := r.clearRepositoryProvisioning(ctx, env); err != nil {
 				return nil, err
 			}
-			if err := r.setEnvironmentStatus(ctx, env, platformv1alpha1.EnvironmentPhaseCreating, "", "", "PodTerminating", "the previous environment pod is terminating"); err != nil {
+			phase := platformv1alpha1.EnvironmentPhaseCreating
+			if projectSetup {
+				phase = platformv1alpha1.EnvironmentPhaseSetup
+			} else if resumeReplacement {
+				phase = platformv1alpha1.EnvironmentPhaseResuming
+			}
+			if err := r.setEnvironmentStatus(ctx, env, phase, "", "", "PodTerminating", "the previous environment pod is terminating"); err != nil {
 				return nil, err
 			}
 			if env.Status.PodName != "" || env.Status.Endpoints.Sandboxd != "" {
@@ -995,7 +1039,11 @@ func (r *EnvironmentReconciler) ensurePodForProject(ctx context.Context, env *pl
 		if !metav1.IsControlledBy(&pod, env) {
 			return nil, &childOwnershipCollisionError{kind: "Pod", name: podName}
 		}
-		if err := r.setEnvironmentStatus(ctx, env, platformv1alpha1.EnvironmentPhaseCreating, "", "", "PodReplacing", "the environment pod is being replaced before readiness can be restored"); err != nil {
+		phase := platformv1alpha1.EnvironmentPhaseCreating
+		if resumeReplacement {
+			phase = platformv1alpha1.EnvironmentPhaseResuming
+		}
+		if err := r.setEnvironmentStatus(ctx, env, phase, "", "", "PodReplacing", "the environment pod is being replaced before readiness can be restored"); err != nil {
 			return nil, err
 		}
 		if env.Status.PodName != "" || env.Status.Endpoints.Sandboxd != "" {
@@ -1011,6 +1059,24 @@ func (r *EnvironmentReconciler) ensurePodForProject(ctx context.Context, env *pl
 	}
 	if !errors.IsNotFound(err) {
 		return nil, err
+	}
+	if projectSetup {
+		if env.Status.Phase != platformv1alpha1.EnvironmentPhaseSetup || env.Status.PodName != "" || env.Status.Endpoints.Sandboxd != "" {
+			if err := r.setPhase(ctx, env, platformv1alpha1.EnvironmentPhaseSetup, "", ""); err != nil {
+				return nil, err
+			}
+		}
+		return nil, errPodReplacing
+	}
+	// A previously published Pod disappearing is a backend restart over the
+	// retained workspace, not a fresh creation. Persist resume intent before
+	// reserving the replacement execution so Project resume hooks cannot be
+	// skipped if creation races another reconcile or controller restart.
+	if resumeReplacement && !resuming {
+		if err := r.setEnvironmentStatus(ctx, env, platformv1alpha1.EnvironmentPhaseResuming, "", "", "PodMissing", "the environment pod disappeared and is being resumed on its retained workspace"); err != nil {
+			return nil, err
+		}
+		return nil, errPodReplacing
 	}
 	// A persisted provisioning record means this exact execution may already
 	// have created a Pod and exposed the repository token. Without that Pod's
@@ -1141,7 +1207,9 @@ func (r *EnvironmentReconciler) ensurePodForProject(ctx context.Context, env *pl
 			AutomountServiceAccountToken: ptr(false),
 			ServiceAccountName:           r.EnvironmentServiceAccountName,
 			SecurityContext: &corev1.PodSecurityContext{
-				SeccompProfile: &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault},
+				FSGroup:             ptr(workspaceAccessGroup),
+				FSGroupChangePolicy: ptr(corev1.FSGroupChangeOnRootMismatch),
+				SeccompProfile:      &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault},
 			},
 			Containers: []corev1.Container{{
 				Name:            "environment",

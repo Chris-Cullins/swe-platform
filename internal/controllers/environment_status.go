@@ -32,9 +32,17 @@ func (r *EnvironmentReconciler) syncStatus(ctx context.Context, env *platformv1a
 		}
 	}
 	executionChanged := false
+	projectChanged := false
 	err := r.updateEnvironmentStatus(ctx, env, func(current *platformv1alpha1.Environment) {
 		if current.Status.ExecutionGeneration != executionGeneration {
 			executionChanged = true
+			return
+		}
+		if pod.Annotations[projectAnnotation] != current.Spec.ProjectRef {
+			projectChanged = true
+			reason, message := phaseReadiness(platformv1alpha1.EnvironmentPhaseSetup)
+			applyEnvironmentStatus(current, platformv1alpha1.EnvironmentPhaseSetup, "", "", reason, message, current.Status.LastActiveAt)
+			clearChildOwnershipCollision(current)
 			return
 		}
 		applyEnvironmentStatus(current, phase, pod.Name, sandboxdEndpoint, reason, message, env.Status.LastActiveAt)
@@ -51,7 +59,7 @@ func (r *EnvironmentReconciler) syncStatus(ctx context.Context, env *platformv1a
 	if err != nil {
 		return err
 	}
-	if executionChanged {
+	if executionChanged || projectChanged {
 		return errEnvironmentExecutionChanged
 	}
 	return nil
@@ -66,8 +74,13 @@ func environmentImageID(pod *corev1.Pod) string {
 	return ""
 }
 
-func environmentPodState(env *platformv1alpha1.Environment, pod *corev1.Pod) (platformv1alpha1.EnvironmentPhase, string, string) {
+func environmentPodState(env *platformv1alpha1.Environment, pod *corev1.Pod) (phase platformv1alpha1.EnvironmentPhase, reason, message string) {
 	resuming := podIsResume(pod) || env.Status.Phase == platformv1alpha1.EnvironmentPhaseResuming
+	defer func() {
+		if resuming && phase != platformv1alpha1.EnvironmentPhaseReady {
+			phase = platformv1alpha1.EnvironmentPhaseResuming
+		}
+	}()
 	for _, condition := range pod.Status.Conditions {
 		if condition.Type == corev1.PodScheduled && condition.Status == corev1.ConditionFalse && condition.Reason == corev1.PodReasonUnschedulable {
 			return platformv1alpha1.EnvironmentPhaseCreating, "Unschedulable", messageOr(condition.Message, "the scheduler cannot currently place the environment pod")
@@ -201,7 +214,11 @@ func (r *EnvironmentReconciler) fail(ctx context.Context, env *platformv1alpha1.
 		reason = "ResourceCollision"
 	}
 	statusErr := r.updateEnvironmentStatus(ctx, env, func(current *platformv1alpha1.Environment) {
-		applyEnvironmentStatus(current, phase, "", "", reason, err.Error(), env.Status.LastActiveAt)
+		currentPhase := phase
+		if reason == "OperationalError" && isResumeReplacement(current) {
+			currentPhase = platformv1alpha1.EnvironmentPhaseResuming
+		}
+		applyEnvironmentStatus(current, currentPhase, "", "", reason, err.Error(), env.Status.LastActiveAt)
 		if stderrors.As(err, &collision) {
 			apimeta.SetStatusCondition(&current.Status.Conditions, metav1.Condition{
 				Type:               "ChildOwnershipConflict",

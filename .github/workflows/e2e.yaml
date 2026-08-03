@@ -37,6 +37,33 @@ jobs:
       - uses: helm/kind-action@v1
         with:
           cluster_name: swe-e2e
+          config: hack/kind-calico.yaml
+          # Nodes remain NotReady until the pinned CNI is installed below.
+          wait: 0s
+
+      - name: Install enforcing CNI
+        run: |
+          kubectl create -f https://raw.githubusercontent.com/projectcalico/calico/v3.32.1/manifests/calico.yaml
+          kubectl -n kube-system rollout status daemonset/calico-node --timeout=3m
+          kubectl -n kube-system rollout status deployment/calico-kube-controllers --timeout=3m
+          kubectl wait --for=condition=Ready nodes --all --timeout=2m
+          echo "E2E_EXPECTED_CLUSTER_UID=$(kubectl get namespace kube-system -o jsonpath='{.metadata.uid}')" >> "$GITHUB_ENV"
+
+      - name: Install kind acceptance prerequisites
+        env:
+          KIND_CLUSTER: swe-e2e
+        run: |
+          ./hack/kind-up.sh
+          test "$(kubectl get namespace kube-system -o jsonpath='{.metadata.uid}')" = "$E2E_EXPECTED_CLUSTER_UID"
+          echo "Reused Calico cluster fixture $E2E_EXPECTED_CLUSTER_UID for gVisor/CSI bootstrap"
+          kubectl -n kube-system rollout status daemonset/calico-node --timeout=3m
+          kubectl -n kube-system rollout status deployment/calico-kube-controllers --timeout=3m
 
       - name: Run e2e acceptance
+        env:
+          # Enables the narrow ingress dataplane assertion. This is evidence
+          # for this pinned CI fixture, not production CNI attestation.
+          E2E_USE_EXISTING_CLUSTER: "true"
+          E2E_RUNTIME_CLASS: gvisor
+          E2E_ENFORCING_CNI: calico-v3.32.1
         run: ./hack/e2e.sh

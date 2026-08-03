@@ -158,6 +158,58 @@ func TestSyncStatusRejectsReadyObservationAfterExecutionChanges(t *testing.T) {
 	}
 }
 
+func TestSyncStatusCannotRepublishWarmPodAfterProjectPromotion(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	if err := platformv1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	lastActive := metav1.Now()
+	stored := &platformv1alpha1.Environment{
+		ObjectMeta: metav1.ObjectMeta{Name: "warm", Namespace: "default", UID: "environment-uid", Generation: 2},
+		Spec:       platformv1alpha1.EnvironmentSpec{ProjectRef: "project"},
+		Status: platformv1alpha1.EnvironmentStatus{
+			ExecutionGeneration: 2,
+			Phase:               platformv1alpha1.EnvironmentPhaseSetup,
+			LastActiveAt:        &lastActive,
+		},
+	}
+	stale := stored.DeepCopy()
+	stale.Spec.ProjectRef = ""
+	stale.Status.Phase = platformv1alpha1.EnvironmentPhaseReady
+	stale.Status.PodName = "env-warm"
+	stale.Status.Endpoints.Sandboxd = "10.0.0.2:50051"
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "env-warm", Namespace: "default",
+			Annotations: map[string]string{executionGenerationAnnotation: "2", projectAnnotation: ""},
+		},
+		Status: corev1.PodStatus{
+			Phase: corev1.PodRunning, PodIP: "10.0.0.2",
+			Conditions: []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}},
+		},
+	}
+	reconciler := &EnvironmentReconciler{
+		Client: fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(stored).WithObjects(stored).Build(),
+		Scheme: scheme,
+	}
+
+	if err := reconciler.syncStatus(context.Background(), stale, pod); !stderrors.Is(err, errEnvironmentExecutionChanged) {
+		t.Fatalf("stale warm-pod observation error = %v, want requeue", err)
+	}
+	var retained platformv1alpha1.Environment
+	if err := reconciler.Get(context.Background(), client.ObjectKeyFromObject(stored), &retained); err != nil {
+		t.Fatal(err)
+	}
+	ready := apimeta.FindStatusCondition(retained.Status.Conditions, platformv1alpha1.EnvironmentConditionReady)
+	if retained.Status.Phase != platformv1alpha1.EnvironmentPhaseSetup || retained.Status.PodName != "" || retained.Status.Endpoints.Sandboxd != "" ||
+		ready == nil || ready.Status != metav1.ConditionFalse || ready.Reason != "SetupInProgress" || retained.Status.LastActiveAt == nil {
+		t.Fatalf("stale warm Pod republished after promotion: %#v", retained.Status)
+	}
+}
+
 func TestEnvironmentPodStateSurfacesReadinessFailures(t *testing.T) {
 	waiting := func(reason, message string) corev1.ContainerState {
 		return corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{Reason: reason, Message: message}}
@@ -202,7 +254,7 @@ func TestEnvironmentPodStateSurfacesReadinessFailures(t *testing.T) {
 					Name: "project-setup", State: waiting("CrashLoopBackOff", "retrying"), LastTerminationState: terminated(124, ""),
 				}}},
 			},
-			wantPhase: platformv1alpha1.EnvironmentPhaseFailed, wantReason: "ResumeHookTimedOut",
+			wantPhase: platformv1alpha1.EnvironmentPhaseResuming, wantReason: "ResumeHookTimedOut",
 		},
 		{
 			name: "image pull",
@@ -314,6 +366,7 @@ func TestEnsurePodMarksProjectInitializationAsResume(t *testing.T) {
 	tmpl := &platformv1alpha1.EnvironmentTemplate{
 		Spec: platformv1alpha1.EnvironmentTemplateSpec{Image: "example/environment:latest", Size: "small"},
 	}
+	setTestProvisioningSnapshot(env, tmpl, project)
 
 	pod, err := reconciler.ensurePod(context.Background(), env, tmpl)
 	if err != nil {

@@ -207,7 +207,12 @@ func reconcileEnvironmentProvisioningFenceGate(r *EnvironmentReconciler, ctx con
 func reconcileEnvironmentLegacyProvisioningMigrationGate(r *EnvironmentReconciler, ctx context.Context, state *environmentReconcileState) environmentPhaseOutcome {
 	env := &state.env
 	if env.Status.Provisioning != nil && env.Status.Provisioning.TemplateVerified &&
-		(env.Status.Provisioning.Project == nil || env.Status.Provisioning.ProjectVerified) {
+		(env.Status.Provisioning.Project == nil || env.Status.Provisioning.ProjectVerified ||
+			env.Status.Phase == platformv1alpha1.EnvironmentPhaseSetup && env.Status.Provisioning.Project.Name == env.Spec.ProjectRef) {
+		// Setup with an exact pending Project snapshot is the modern warm-pool
+		// promotion handshake. The Template gate verifies that captured Project
+		// before provisioning continues; it is not a pre-snapshot execution that
+		// needs legacy teardown merely because its execution generation is positive.
 		return phaseContinue()
 	}
 	// Recovery deadlines and exhaustion were persisted by an earlier controller
@@ -370,6 +375,12 @@ func (r *EnvironmentReconciler) publishProvisioningSnapshot(ctx context.Context,
 		}
 		before := env.DeepCopy()
 		env.Status.Provisioning = next
+		// Binding a Project changes generic warm-pool initialization into Project
+		// setup. Withdraw any stale published warm execution in the same status
+		// write that freezes the Project identity, so a reconcile between the Run
+		// spec patch and its best-effort Setup status update cannot classify a
+		// missing generic Pod as a Project resume.
+		applyEnvironmentStatus(env, platformv1alpha1.EnvironmentPhaseSetup, "", "", "SetupInProgress", "warm environment is being configured for its project", env.Status.LastActiveAt)
 		if err := r.Status().Patch(ctx, env, client.MergeFromWithOptions(before, client.MergeFromWithOptimisticLock{})); err != nil {
 			if errors.IsConflict(err) {
 				return true, nil

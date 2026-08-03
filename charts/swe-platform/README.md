@@ -431,6 +431,19 @@ recover. RuntimeClass identity is pinned by UID, so the first operator upgrade c
 check also replaces existing pods that use a named RuntimeClass; their workspace PVCs are
 retained. The chart does not create or manage provider RuntimeClasses.
 
+Every Linux Environment Pod also receives supplementary workspace access group `10001` with
+`fsGroupChangePolicy: OnRootMismatch`. This makes `/workspace` writable without overriding the
+image's UID or primary GID and remains in force after pause/resume. The selected StorageClass and
+volume implementation must grant that group access using kubelet ownership changes (CSI
+`fsGroupPolicy: File`, or `ReadWriteOnceWithFSType` when its conditions hold), correct CSI
+`VOLUME_MOUNT_GROUP` delegation, or equivalent non-CSI behavior. `OnRootMismatch` applies only to
+kubelet-side ownership changes, not delegated CSI mounts. Drivers declaring `None` without
+effective delegated mount-group handling, root-squashed volumes that cannot grant the group, and
+non-POSIX volumes without equivalent access semantics are unsupported. The chart cannot attest
+this behavior; operators must validate it for their production storage and runtime. Future
+Windows or non-Pod backends require equivalent ACL/preparation semantics rather than the numeric
+Linux GID.
+
 This existence check does not prove that the runtime handler works or that eligible nodes can
 run it. Cluster operators must still install and test the handler on every eligible environment
 node; unsupported scheduling or handler failures may leave pods Pending. `make kind-up` performs
@@ -442,7 +455,9 @@ environment's sandboxd port only from this release's control-plane- and operator
 in the configured control-plane namespace. The cluster CNI must enforce
 Kubernetes NetworkPolicy for this defense in depth; TLS identity and capability authorization
 remain mandatory regardless. See [the security model](../../SECURITY.md) for credential
-lifecycle and backend requirements.
+lifecycle and backend requirements. CI exercises the allow and deny paths on its pinned Calico
+kind fixture, but the operator does not detect or attest production CNI enforcement and
+Environment status does not report it as effective isolation.
 
 The chart does not install default-deny egress or an egress allowlist proxy. Project
 `egressAllowlist` values are reserved and rejected when non-empty; empty or omitted values leave

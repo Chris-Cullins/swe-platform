@@ -86,7 +86,7 @@ func (r *EnvironmentReconciler) reconcilePendingPodRecovery(ctx context.Context,
 	if now.Before(nextAttemptAt.Time) {
 		if ready == nil || ready.ObservedGeneration != env.Generation || ready.Status != metav1.ConditionFalse || ready.Reason != "PodRecoveryPending" {
 			message := fmt.Sprintf("terminal pod recovery attempt %d of %d is scheduled for %s", recovery.Attempts+1, podRecoveryLimit, nextAttemptAt.Time.UTC().Format(time.RFC3339))
-			if err := r.setEnvironmentStatus(ctx, env, platformv1alpha1.EnvironmentPhaseCreating, "", "", "PodRecoveryPending", message); err != nil {
+			if err := r.setEnvironmentStatus(ctx, env, podRecoveryPhase(env, nil), "", "", "PodRecoveryPending", message); err != nil {
 				return ctrl.Result{}, true, err
 			}
 		}
@@ -96,7 +96,7 @@ func (r *EnvironmentReconciler) reconcilePendingPodRecovery(ctx context.Context,
 	attempts := recovery.Attempts + 1
 	message := fmt.Sprintf("replacing terminal environment pod (recovery attempt %d of %d)", attempts, podRecoveryLimit)
 	if err := r.updatePodRecoveryStatus(ctx, env, func(current *platformv1alpha1.Environment) {
-		applyEnvironmentStatus(current, platformv1alpha1.EnvironmentPhaseCreating, "", "", "PodRecovering", message, env.Status.LastActiveAt)
+		applyEnvironmentStatus(current, podRecoveryPhase(current, nil), "", "", "PodRecovering", message, env.Status.LastActiveAt)
 		current.Status.Recovery.Attempts = attempts
 		current.Status.Recovery.ExecutionGeneration = recovery.ExecutionGeneration
 		current.Status.Recovery.NextAttemptAt = nil
@@ -152,7 +152,7 @@ func (r *EnvironmentReconciler) reconcileTerminalPod(ctx context.Context, env *p
 		next := metav1.NewTime(now.Add(podRecoveryBackoff(attempts)))
 		message := fmt.Sprintf("environment pod %s; recovery attempt %d of %d is scheduled for %s", strings.ToLower(string(pod.Status.Phase)), attempts+1, podRecoveryLimit, next.Time.UTC().Format(time.RFC3339))
 		if err := r.updatePodRecoveryStatus(ctx, env, func(current *platformv1alpha1.Environment) {
-			applyEnvironmentStatus(current, platformv1alpha1.EnvironmentPhaseCreating, "", "", "PodRecoveryPending", message, env.Status.LastActiveAt)
+			applyEnvironmentStatus(current, podRecoveryPhase(current, pod), "", "", "PodRecoveryPending", message, env.Status.LastActiveAt)
 			current.Status.Recovery.Attempts = attempts
 			current.Status.Recovery.Exhausted = false
 			current.Status.Recovery.ExecutionGeneration = executionGeneration
@@ -179,6 +179,13 @@ func (r *EnvironmentReconciler) reconcileTerminalPod(ctx context.Context, env *p
 	}
 	log.FromContext(ctx).Info("replacing terminal environment pod", "environment", env.Name, "pod", pod.Name, "attempt", attempts, "maxAttempts", podRecoveryLimit)
 	return ctrl.Result{Requeue: true}, nil
+}
+
+func podRecoveryPhase(env *platformv1alpha1.Environment, pod *corev1.Pod) platformv1alpha1.EnvironmentPhase {
+	if isResumeReplacement(env) || pod != nil && podIsResume(pod) {
+		return platformv1alpha1.EnvironmentPhaseResuming
+	}
+	return platformv1alpha1.EnvironmentPhaseCreating
 }
 
 func podRecoveryBackoff(attempts int32) time.Duration {

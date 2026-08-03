@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -280,12 +281,14 @@ func TestEnsurePodUsesOnlyNonSecretProjectValues(t *testing.T) {
 			TemplateRef: "small",
 		},
 	}
-	reconciler := &EnvironmentReconciler{
-		Client: fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(env).WithObjects(project, env).Build(),
-		Scheme: scheme,
-	}
 	tmpl := &platformv1alpha1.EnvironmentTemplate{
-		Spec: platformv1alpha1.EnvironmentTemplateSpec{Image: "example/environment:latest", Size: "small"},
+		ObjectMeta: metav1.ObjectMeta{Name: env.Spec.TemplateRef, Namespace: env.Namespace},
+		Spec:       platformv1alpha1.EnvironmentTemplateSpec{Image: "example/environment:latest", Size: "small"},
+	}
+	setTestProvisioningSnapshot(env, tmpl, project)
+	reconciler := &EnvironmentReconciler{
+		Client: fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(env).WithObjects(project, env, tmpl).Build(),
+		Scheme: scheme,
 	}
 
 	pod, err := reconciler.ensurePod(context.Background(), env, tmpl)
@@ -311,6 +314,13 @@ func TestEnsurePodUsesOnlyNonSecretProjectValues(t *testing.T) {
 	clone, setup := pod.Spec.InitContainers[0], pod.Spec.InitContainers[1]
 	if clone.Name != "repository-clone" || setup.Name != "project-hooks" {
 		t.Errorf("init container order = %q, %q", clone.Name, setup.Name)
+	}
+	for _, init := range []corev1.Container{clone, setup} {
+		if init.SecurityContext == nil || init.SecurityContext.AllowPrivilegeEscalation == nil || *init.SecurityContext.AllowPrivilegeEscalation ||
+			init.SecurityContext.Capabilities == nil || len(init.SecurityContext.Capabilities.Drop) != 1 || init.SecurityContext.Capabilities.Drop[0] != "ALL" ||
+			init.SecurityContext.RunAsUser != nil || init.SecurityContext.RunAsGroup != nil {
+			t.Errorf("%s security context = %#v, want image identity, no escalation, and drop ALL", init.Name, init.SecurityContext)
+		}
 	}
 	envValues := make(map[string]string, len(clone.Env))
 	for _, envVar := range clone.Env {
@@ -430,13 +440,17 @@ func TestEnsurePodCreatesAndRotatesEphemeralSandboxdCredentials(t *testing.T) {
 	}
 	env := &platformv1alpha1.Environment{
 		ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default", UID: "environment-uid"},
+		Spec:       platformv1alpha1.EnvironmentSpec{TemplateRef: "small", ProjectRef: "project"},
 	}
-	reconciler := &EnvironmentReconciler{
-		Client: fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(env).WithObjects(env).Build(),
-		Scheme: scheme,
-	}
+	project := &platformv1alpha1.Project{ObjectMeta: metav1.ObjectMeta{Name: "project", Namespace: env.Namespace}, Spec: platformv1alpha1.ProjectSpec{Repositories: []string{"https://github.com/example/repo"}}}
 	tmpl := &platformv1alpha1.EnvironmentTemplate{
-		Spec: platformv1alpha1.EnvironmentTemplateSpec{Image: "example/environment:latest", Size: "small"},
+		ObjectMeta: metav1.ObjectMeta{Name: "small", Namespace: env.Namespace},
+		Spec:       platformv1alpha1.EnvironmentTemplateSpec{Image: "example/environment:latest", Size: "small"},
+	}
+	setTestProvisioningSnapshot(env, tmpl, project)
+	reconciler := &EnvironmentReconciler{
+		Client: fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(env).WithObjects(env, project, tmpl).Build(),
+		Scheme: scheme,
 	}
 
 	pod, err := reconciler.ensurePod(context.Background(), env, tmpl)
@@ -450,7 +464,21 @@ func TestEnsurePodCreatesAndRotatesEphemeralSandboxdCredentials(t *testing.T) {
 	if pod.Spec.AutomountServiceAccountToken == nil || *pod.Spec.AutomountServiceAccountToken {
 		t.Fatal("environment pod must not mount a Kubernetes service account token")
 	}
+	if pod.Spec.SecurityContext == nil || pod.Spec.SecurityContext.FSGroup == nil || *pod.Spec.SecurityContext.FSGroup != workspaceAccessGroup ||
+		pod.Spec.SecurityContext.FSGroupChangePolicy == nil || *pod.Spec.SecurityContext.FSGroupChangePolicy != corev1.FSGroupChangeOnRootMismatch {
+		t.Fatalf("pod workspace access security context = %#v", pod.Spec.SecurityContext)
+	}
+	if pod.Spec.SecurityContext.RunAsUser != nil || pod.Spec.SecurityContext.RunAsGroup != nil {
+		t.Fatalf("pod forces image identity: runAsUser=%v runAsGroup=%v", pod.Spec.SecurityContext.RunAsUser, pod.Spec.SecurityContext.RunAsGroup)
+	}
+	if pod.Spec.SecurityContext.SeccompProfile == nil || pod.Spec.SecurityContext.SeccompProfile.Type != corev1.SeccompProfileTypeRuntimeDefault {
+		t.Fatalf("pod seccomp profile = %#v, want RuntimeDefault", pod.Spec.SecurityContext.SeccompProfile)
+	}
 	container := pod.Spec.Containers[0]
+	if container.SecurityContext == nil || container.SecurityContext.AllowPrivilegeEscalation == nil || *container.SecurityContext.AllowPrivilegeEscalation ||
+		container.SecurityContext.Capabilities == nil || len(container.SecurityContext.Capabilities.Drop) != 1 || container.SecurityContext.Capabilities.Drop[0] != "ALL" {
+		t.Fatalf("sandboxd security context = %#v, want no escalation and drop ALL", container.SecurityContext)
+	}
 	for name, probe := range map[string]*corev1.Probe{"startup": container.StartupProbe, "readiness": container.ReadinessProbe, "liveness": container.LivenessProbe} {
 		if probe == nil || probe.Exec == nil || len(probe.Exec.Command) < 2 || probe.Exec.Command[1] != "healthcheck" {
 			t.Errorf("%s probe = %#v, want authenticated sandboxd health RPC", name, probe)
@@ -541,10 +569,41 @@ func TestEnsurePodCreatesAndRotatesEphemeralSandboxdCredentials(t *testing.T) {
 		t.Fatal("pod specification or metadata exposes a raw operator token")
 	}
 
+	var readyEnv platformv1alpha1.Environment
+	if err := reconciler.Get(context.Background(), client.ObjectKeyFromObject(env), &readyEnv); err != nil {
+		t.Fatal(err)
+	}
+	readyEnv.Status.Phase = platformv1alpha1.EnvironmentPhaseReady
+	readyEnv.Status.PodName = pod.Name
+	readyEnv.Status.Endpoints.Sandboxd = "10.0.0.1:50051"
+	if err := reconciler.Status().Update(context.Background(), &readyEnv); err != nil {
+		t.Fatal(err)
+	}
+	pod.Finalizers = []string{"test/hold"}
+	if err := reconciler.Update(context.Background(), pod); err != nil {
+		t.Fatal(err)
+	}
 	if err := reconciler.Delete(context.Background(), pod); err != nil {
 		t.Fatal(err)
 	}
-	recreated, err := reconciler.ensurePod(context.Background(), env, tmpl)
+	if recreated, err := reconciler.ensurePod(context.Background(), &readyEnv, tmpl); recreated != nil || err != nil {
+		t.Fatalf("begin terminating Pod resume = (%#v, %v)", recreated, err)
+	}
+	if err := reconciler.Get(context.Background(), client.ObjectKeyFromObject(env), &readyEnv); err != nil {
+		t.Fatal(err)
+	}
+	if readyEnv.Status.Phase != platformv1alpha1.EnvironmentPhaseResuming || readyEnv.Status.PodName != "" {
+		t.Fatalf("terminating Pod status = %#v, want unpublished Resuming", readyEnv.Status)
+	}
+	var terminating corev1.Pod
+	if err := reconciler.Get(context.Background(), client.ObjectKeyFromObject(pod), &terminating); err != nil {
+		t.Fatal(err)
+	}
+	terminating.Finalizers = nil
+	if err := reconciler.Update(context.Background(), &terminating); err != nil {
+		t.Fatal(err)
+	}
+	recreated, err := reconciler.ensurePod(context.Background(), &readyEnv, tmpl)
 	if err != nil {
 		t.Fatalf("recreate ensurePod() error = %v", err)
 	}
@@ -557,6 +616,11 @@ func TestEnsurePodCreatesAndRotatesEphemeralSandboxdCredentials(t *testing.T) {
 	}
 	if recreated.Annotations[sandboxdauth.TokenAnnotation] == firstToken {
 		t.Fatal("pod recreation did not rotate terminal capability")
+	}
+	if len(recreated.Spec.InitContainers) != 2 || !slices.ContainsFunc(recreated.Spec.InitContainers[1].Env, func(variable corev1.EnvVar) bool {
+		return variable.Name == "SWE_RESUMING" && variable.Value == "true"
+	}) {
+		t.Fatalf("replacement project hooks = %#v, want SWE_RESUMING=true", recreated.Spec.InitContainers)
 	}
 }
 
@@ -608,7 +672,10 @@ func TestFailedPodCreateLeavesGenerationGap(t *testing.T) {
 		Spec:       platformv1alpha1.EnvironmentSpec{TemplateRef: "small", ProjectRef: "project"},
 		Status:     platformv1alpha1.EnvironmentStatus{Phase: platformv1alpha1.EnvironmentPhaseResuming},
 	}
-	baseClient := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(env).WithObjects(env).Build()
+	template := &platformv1alpha1.EnvironmentTemplate{Spec: platformv1alpha1.EnvironmentTemplateSpec{Image: "example/environment:latest", Size: "small"}}
+	project := &platformv1alpha1.Project{ObjectMeta: metav1.ObjectMeta{Name: "project", Namespace: env.Namespace}, Spec: platformv1alpha1.ProjectSpec{Repositories: []string{"https://github.com/example/repo"}}}
+	setTestProvisioningSnapshot(env, template, project)
+	baseClient := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(env).WithObjects(env, template, project).Build()
 	failCreate := true
 	transientErr := stderrors.New("transient Pod create failure")
 	intercepted := interceptor.NewClient(baseClient, interceptor.Funcs{
@@ -621,8 +688,6 @@ func TestFailedPodCreateLeavesGenerationGap(t *testing.T) {
 		},
 	})
 	reconciler := &EnvironmentReconciler{Client: intercepted, Scheme: scheme}
-	template := &platformv1alpha1.EnvironmentTemplate{Spec: platformv1alpha1.EnvironmentTemplateSpec{Image: "example/environment:latest", Size: "small"}}
-	project := &platformv1alpha1.Project{ObjectMeta: metav1.ObjectMeta{Name: "project", Namespace: env.Namespace}, Spec: platformv1alpha1.ProjectSpec{Repositories: []string{"https://github.com/example/repo"}}}
 
 	if pod, err := reconciler.ensurePodForProject(context.Background(), env, template, project, "", tenancy.Claim{}); pod != nil || !stderrors.Is(err, transientErr) {
 		t.Fatalf("first create = (%#v, %v), want transient error", pod, err)
@@ -678,7 +743,7 @@ func TestCurrentSandboxdPodRejectsRestartableLegacyPod(t *testing.T) {
 	}
 }
 
-func TestEnsurePodReplacesLegacyOnFailureExecution(t *testing.T) {
+func TestEnsurePodReplacesRevision4AndRetainsWorkspace(t *testing.T) {
 	scheme := runtime.NewScheme()
 	if err := corev1.AddToScheme(scheme); err != nil {
 		t.Fatal(err)
@@ -691,26 +756,41 @@ func TestEnsurePodReplacesLegacyOnFailureExecution(t *testing.T) {
 		Spec:       platformv1alpha1.EnvironmentSpec{TemplateRef: "small"},
 		Status:     platformv1alpha1.EnvironmentStatus{ExecutionGeneration: 1},
 	}
+	template := &platformv1alpha1.EnvironmentTemplate{Spec: platformv1alpha1.EnvironmentTemplateSpec{Image: "example/environment:latest", Size: "small"}}
+	setTestProvisioningSnapshot(env, template, nil)
+	originalSnapshot := env.Status.Provisioning.DeepCopy()
 	pod := &corev1.Pod{
-		ObjectMeta: metav1.ObjectMeta{Name: envPodName(env), Namespace: env.Namespace, UID: "legacy-pod", Annotations: map[string]string{executionGenerationAnnotation: "1"}},
-		Spec:       corev1.PodSpec{RestartPolicy: corev1.RestartPolicyOnFailure},
+		ObjectMeta: metav1.ObjectMeta{Name: envPodName(env), Namespace: env.Namespace, UID: "legacy-pod", Annotations: map[string]string{
+			executionGenerationAnnotation: "1", sandboxdRevisionAnnotation: "4",
+		}},
+		Spec: corev1.PodSpec{RestartPolicy: corev1.RestartPolicyNever},
 	}
 	if err := controllerutil.SetControllerReference(env, pod, scheme); err != nil {
 		t.Fatal(err)
 	}
-	kubeClient := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(env).WithObjects(env, pod).Build()
+	pvc := &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: envPVCName(env), Namespace: env.Namespace, UID: "retained-pvc"}}
+	if err := controllerutil.SetControllerReference(env, pvc, scheme); err != nil {
+		t.Fatal(err)
+	}
+	kubeClient := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(env).WithObjects(env, template, pod, pvc).Build()
 	reconciler := &EnvironmentReconciler{Client: kubeClient, Scheme: scheme}
-	template := &platformv1alpha1.EnvironmentTemplate{Spec: platformv1alpha1.EnvironmentTemplateSpec{Image: "example/environment:latest", Size: "small"}}
 
 	if current, err := reconciler.ensurePod(context.Background(), env, template); err != nil || current != nil {
 		t.Fatalf("legacy replacement step = (%#v, %v)", current, err)
 	}
 	if err := reconciler.Get(context.Background(), client.ObjectKeyFromObject(pod), &corev1.Pod{}); !apierrors.IsNotFound(err) {
-		t.Fatalf("legacy OnFailure Pod remains: %v", err)
+		t.Fatalf("revision 4 Pod remains: %v", err)
+	}
+	var retainedPVC corev1.PersistentVolumeClaim
+	if err := reconciler.Get(context.Background(), client.ObjectKeyFromObject(pvc), &retainedPVC); err != nil || retainedPVC.UID != pvc.UID {
+		t.Fatalf("revision replacement changed retained PVC: uid=%q err=%v", retainedPVC.UID, err)
 	}
 	var replacing platformv1alpha1.Environment
 	if err := reconciler.Get(context.Background(), client.ObjectKeyFromObject(env), &replacing); err != nil {
 		t.Fatal(err)
+	}
+	if !platformv1alpha1.ProvisioningSnapshotsEqual(replacing.Status.Provisioning, originalSnapshot) {
+		t.Fatalf("revision replacement changed frozen provisioning inputs: %#v", replacing.Status.Provisioning)
 	}
 	replacement, err := reconciler.ensurePod(context.Background(), &replacing, template)
 	if err != nil {
@@ -718,6 +798,9 @@ func TestEnsurePodReplacesLegacyOnFailureExecution(t *testing.T) {
 	}
 	if replacement.Spec.RestartPolicy != corev1.RestartPolicyNever || replacement.Annotations[executionGenerationAnnotation] != "2" {
 		t.Fatalf("replacement execution = restart %q, generation %q", replacement.Spec.RestartPolicy, replacement.Annotations[executionGenerationAnnotation])
+	}
+	if replacement.Spec.SecurityContext == nil || replacement.Spec.SecurityContext.FSGroup == nil || *replacement.Spec.SecurityContext.FSGroup != workspaceAccessGroup {
+		t.Fatalf("replacement workspace access = %#v", replacement.Spec.SecurityContext)
 	}
 }
 
@@ -813,6 +896,7 @@ func TestEnsurePodRetainsCurrentPodWhenSecretReadFails(t *testing.T) {
 		Name: envPodName(env), Namespace: env.Namespace,
 		Annotations: map[string]string{
 			executionGenerationAnnotation:     "1",
+			projectAnnotation:                 env.Spec.ProjectRef,
 			sandboxdRevisionAnnotation:        sandboxdSecurityRevision,
 			sandboxdauth.IdentityAnnotation:   "current.sandboxd.swe.dev",
 			sandboxdauth.TrustAnnotation:      "public trust bundle",
@@ -1217,21 +1301,22 @@ func TestTerminatingFailedPodPersistsRecoveryBeforeReplacement(t *testing.T) {
 	deletedAt := metav1.NewTime(now.Add(-time.Second))
 	env := &platformv1alpha1.Environment{
 		ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default", UID: "env-uid", Generation: 2, Finalizers: []string{environmentFinalizer}},
-		Spec:       platformv1alpha1.EnvironmentSpec{TemplateRef: "small"},
+		Spec:       platformv1alpha1.EnvironmentSpec{TemplateRef: "small", ProjectRef: "project"},
 		Status: platformv1alpha1.EnvironmentStatus{
-			ObservedGeneration: 1, ExecutionGeneration: 1, Phase: platformv1alpha1.EnvironmentPhaseReady, PodName: "env-test",
-			Endpoints: platformv1alpha1.EnvironmentEndpoints{Sandboxd: "10.0.0.1:50051"},
-			Conditions: []metav1.Condition{{Type: platformv1alpha1.EnvironmentConditionReady, Status: metav1.ConditionTrue,
-				ObservedGeneration: 1, Reason: "SandboxdReady", Message: "sandboxd is ready"}},
+			ObservedGeneration: 1, ExecutionGeneration: 1, Phase: platformv1alpha1.EnvironmentPhaseCreating, PodName: "env-test",
+			Conditions: []metav1.Condition{{Type: platformv1alpha1.EnvironmentConditionReady, Status: metav1.ConditionFalse,
+				ObservedGeneration: 1, Reason: "ResumeHookTimedOut", Message: "resume hook failed before readiness"}},
 		},
 	}
-	template := &platformv1alpha1.EnvironmentTemplate{ObjectMeta: metav1.ObjectMeta{Name: "small", Namespace: env.Namespace}}
-	setTestProvisioningSnapshot(env, template, nil)
+	template := &platformv1alpha1.EnvironmentTemplate{ObjectMeta: metav1.ObjectMeta{Name: "small", Namespace: env.Namespace}, Spec: platformv1alpha1.EnvironmentTemplateSpec{Image: "example/environment:latest", Size: "small"}}
+	project := &platformv1alpha1.Project{ObjectMeta: metav1.ObjectMeta{Name: "project", Namespace: env.Namespace, UID: "project-uid"}, Spec: platformv1alpha1.ProjectSpec{Repositories: []string{"https://github.com/example/repo"}}}
+	setTestProvisioningSnapshot(env, template, project)
 	pvc := &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: envPVCName(env), Namespace: env.Namespace, UID: "workspace-pvc"}}
 	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
 		Name: envPodName(env), Namespace: env.Namespace, UID: "dead-pod", DeletionTimestamp: &deletedAt, Finalizers: []string{"test/hold"},
 		Annotations: map[string]string{
 			executionGenerationAnnotation:     "1",
+			projectAnnotation:                 env.Spec.ProjectRef,
 			sandboxdRevisionAnnotation:        sandboxdSecurityRevision,
 			sandboxdauth.IdentityAnnotation:   "sandboxd.test",
 			sandboxdauth.TrustAnnotation:      "trust",
@@ -1239,7 +1324,7 @@ func TestTerminatingFailedPodPersistsRecoveryBeforeReplacement(t *testing.T) {
 			sandboxdauth.SecretNameAnnotation: envCredentialName(env),
 			sandboxdauth.SecretUIDAnnotation:  "secret-uid",
 		},
-	}, Spec: corev1.PodSpec{RestartPolicy: corev1.RestartPolicyNever}, Status: corev1.PodStatus{Phase: corev1.PodFailed}}
+	}, Spec: corev1.PodSpec{RestartPolicy: corev1.RestartPolicyNever, InitContainers: []corev1.Container{{Name: "project-hooks", Env: []corev1.EnvVar{{Name: "SWE_RESUMING", Value: "true"}}}}}, Status: corev1.PodStatus{Phase: corev1.PodFailed}}
 	secret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{
 		Name: envCredentialName(env), Namespace: env.Namespace, UID: "secret-uid",
 		Annotations: map[string]string{sandboxdauth.IdentityAnnotation: "sandboxd.test", sandboxdauth.PodUIDAnnotation: string(pod.UID)},
@@ -1253,7 +1338,7 @@ func TestTerminatingFailedPodPersistsRecoveryBeforeReplacement(t *testing.T) {
 		}
 	}
 	reconciler := &EnvironmentReconciler{
-		Client: fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(env).WithObjects(env, template, pvc, pod, secret).Build(),
+		Client: fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(env).WithObjects(env, template, project, pvc, pod, secret).Build(),
 		Scheme: scheme, Now: func() time.Time { return now },
 	}
 	request := ctrl.Request{NamespacedName: client.ObjectKeyFromObject(env)}
@@ -1268,6 +1353,9 @@ func TestTerminatingFailedPodPersistsRecoveryBeforeReplacement(t *testing.T) {
 	}
 	if pending.Status.Recovery.ExecutionGeneration != 1 || pending.Status.Recovery.NextAttemptAt == nil || pending.Status.PodName != "" || pending.Status.Endpoints.Sandboxd != "" {
 		t.Fatalf("terminating failed Pod recovery status = %#v", pending.Status)
+	}
+	if pending.Status.Phase != platformv1alpha1.EnvironmentPhaseResuming {
+		t.Fatalf("terminating failed Pod phase = %q, want Resuming", pending.Status.Phase)
 	}
 	var disappearing corev1.Pod
 	if err := reconciler.Get(context.Background(), client.ObjectKeyFromObject(pod), &disappearing); err != nil {
@@ -1305,6 +1393,85 @@ func TestTerminatingFailedPodPersistsRecoveryBeforeReplacement(t *testing.T) {
 	}
 	if err := reconciler.Get(context.Background(), client.ObjectKeyFromObject(pod), &corev1.Pod{}); !apierrors.IsNotFound(err) {
 		t.Fatalf("replacement Pod created in the same reconcile as attempt persistence: %v", err)
+	}
+	replacement, err := reconciler.ensurePodForProject(context.Background(), &due, template, project, "", tenancy.Claim{})
+	if err != nil {
+		t.Fatalf("create recovery replacement: %v", err)
+	}
+	if due.Status.ExecutionGeneration != 2 || replacement.Annotations[executionGenerationAnnotation] != "2" {
+		t.Fatalf("replacement generation = status %d pod %q, want exactly 2", due.Status.ExecutionGeneration, replacement.Annotations[executionGenerationAnnotation])
+	}
+	if replacement.Annotations[sandboxdauth.IdentityAnnotation] == pod.Annotations[sandboxdauth.IdentityAnnotation] || replacement.Annotations[sandboxdauth.TokenAnnotation] == pod.Annotations[sandboxdauth.TokenAnnotation] {
+		t.Fatal("terminal recovery replacement did not rotate sandboxd credentials")
+	}
+	if len(replacement.Spec.InitContainers) != 2 || !slices.ContainsFunc(replacement.Spec.InitContainers[1].Env, func(variable corev1.EnvVar) bool {
+		return variable.Name == "SWE_RESUMING" && variable.Value == "true"
+	}) {
+		t.Fatalf("terminal recovery project hooks = %#v, want SWE_RESUMING=true", replacement.Spec.InitContainers)
+	}
+}
+
+func TestTerminatingWarmPodPreservesProjectSetupBeforeReplacement(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	if err := platformv1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	deletedAt := metav1.Now()
+	env := &platformv1alpha1.Environment{
+		ObjectMeta: metav1.ObjectMeta{Name: "warm", Namespace: "default", UID: "env-uid", Generation: 2},
+		Spec:       platformv1alpha1.EnvironmentSpec{TemplateRef: "small", ProjectRef: "project"},
+		Status: platformv1alpha1.EnvironmentStatus{
+			ExecutionGeneration: 1, Phase: platformv1alpha1.EnvironmentPhaseReady, PodName: "env-warm",
+			Endpoints: platformv1alpha1.EnvironmentEndpoints{Sandboxd: "10.0.0.1:50051"},
+		},
+	}
+	template := &platformv1alpha1.EnvironmentTemplate{ObjectMeta: metav1.ObjectMeta{Name: "small", Namespace: env.Namespace, UID: "template-uid", Generation: 1}, Spec: platformv1alpha1.EnvironmentTemplateSpec{Image: "example/environment:latest", Size: "small"}}
+	project := &platformv1alpha1.Project{ObjectMeta: metav1.ObjectMeta{Name: "project", Namespace: env.Namespace, UID: "project-uid", Generation: 1}, Spec: platformv1alpha1.ProjectSpec{Repositories: []string{"https://github.com/example/repo"}}}
+	setTestProvisioningSnapshot(env, template, project)
+	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
+		Name: envPodName(env), Namespace: env.Namespace, UID: "warm-pod", DeletionTimestamp: &deletedAt, Finalizers: []string{"test/hold"},
+		Annotations: map[string]string{executionGenerationAnnotation: "1", projectAnnotation: ""},
+	}, Spec: corev1.PodSpec{RestartPolicy: corev1.RestartPolicyNever}, Status: corev1.PodStatus{Phase: corev1.PodFailed}}
+	if err := controllerutil.SetControllerReference(env, pod, scheme); err != nil {
+		t.Fatal(err)
+	}
+	reconciler := &EnvironmentReconciler{
+		Client: fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(env).WithObjects(env, template, project, pod).Build(),
+		Scheme: scheme,
+	}
+
+	created, err := reconciler.ensurePodForProject(context.Background(), env, template, project, "", tenancy.Claim{})
+	if err != nil || created != nil {
+		t.Fatalf("terminating warm Pod = (%#v, %v), want setup barrier", created, err)
+	}
+	var setup platformv1alpha1.Environment
+	if err := reconciler.Get(context.Background(), client.ObjectKeyFromObject(env), &setup); err != nil {
+		t.Fatal(err)
+	}
+	if setup.Status.Phase != platformv1alpha1.EnvironmentPhaseSetup || setup.Status.PodName != "" || setup.Status.Endpoints.Sandboxd != "" || nestedRecoveryMeaningful(setup.Status.Recovery) {
+		t.Fatalf("terminating warm Pod status = %#v, want unpublished Setup without recovery", setup.Status)
+	}
+	var terminating corev1.Pod
+	if err := reconciler.Get(context.Background(), client.ObjectKeyFromObject(pod), &terminating); err != nil {
+		t.Fatal(err)
+	}
+	terminating.Finalizers = nil
+	if err := reconciler.Update(context.Background(), &terminating); err != nil && !apierrors.IsNotFound(err) {
+		t.Fatal(err)
+	}
+	if err := reconciler.Get(context.Background(), client.ObjectKeyFromObject(env), &setup); err != nil {
+		t.Fatal(err)
+	}
+	replacement, err := reconciler.ensurePodForProject(context.Background(), &setup, template, project, "", tenancy.Claim{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if replacement.Annotations[executionGenerationAnnotation] != "2" || len(replacement.Spec.InitContainers) != 2 ||
+		slices.ContainsFunc(replacement.Spec.InitContainers[1].Env, func(variable corev1.EnvVar) bool { return variable.Name == "SWE_RESUMING" }) {
+		t.Fatalf("project setup replacement = %#v, want generation 2 without resume hook", replacement)
 	}
 }
 
@@ -2172,43 +2339,81 @@ func TestOperationalFailureRetriesAndRecoversReadiness(t *testing.T) {
 	}
 	env := &platformv1alpha1.Environment{
 		ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default", UID: "environment-uid", Generation: 2, Finalizers: []string{environmentFinalizer}},
-		Spec:       platformv1alpha1.EnvironmentSpec{TemplateRef: "small"},
-		Status:     platformv1alpha1.EnvironmentStatus{ExecutionGeneration: 1},
+		Spec:       platformv1alpha1.EnvironmentSpec{TemplateRef: "small", ProjectRef: "project"},
+		Status:     platformv1alpha1.EnvironmentStatus{ExecutionGeneration: 1, Phase: platformv1alpha1.EnvironmentPhaseResuming},
 	}
-	template := &platformv1alpha1.EnvironmentTemplate{ObjectMeta: metav1.ObjectMeta{Name: "small", Namespace: "default"}}
-	setTestProvisioningSnapshot(env, template, nil)
-	baseClient := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(env).WithObjects(env, template).Build()
-	transient := apierrors.NewServiceUnavailable("temporary template API failure")
-	failTemplateGet := true
+	template := &platformv1alpha1.EnvironmentTemplate{ObjectMeta: metav1.ObjectMeta{Name: "small", Namespace: "default", UID: "template-uid", Generation: 1}, Spec: platformv1alpha1.EnvironmentTemplateSpec{Image: "example/environment:test", Size: "small"}}
+	project := &platformv1alpha1.Project{ObjectMeta: metav1.ObjectMeta{Name: "project", Namespace: env.Namespace, UID: "project-uid", Generation: 1}, Spec: platformv1alpha1.ProjectSpec{Repositories: []string{"https://github.com/example/repo"}}}
+	setTestProvisioningSnapshot(env, template, project)
+	baseClient := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(env).WithObjects(env, template, project).Build()
+	transient := apierrors.NewServiceUnavailable("temporary Pod create failure")
+	failPodCreate := true
 	interceptedClient := interceptor.NewClient(baseClient, interceptor.Funcs{
-		Get: func(ctx context.Context, underlying client.WithWatch, key client.ObjectKey, object client.Object, options ...client.GetOption) error {
-			if failTemplateGet && key == client.ObjectKeyFromObject(template) {
-				failTemplateGet = false
+		Create: func(ctx context.Context, underlying client.WithWatch, object client.Object, options ...client.CreateOption) error {
+			if _, ok := object.(*corev1.Pod); ok && failPodCreate {
+				failPodCreate = false
 				return transient
 			}
-			return underlying.Get(ctx, key, object, options...)
+			return underlying.Create(ctx, object, options...)
 		},
 	})
 	reconciler := &EnvironmentReconciler{Client: interceptedClient, Scheme: scheme}
 	request := ctrl.Request{NamespacedName: client.ObjectKeyFromObject(env)}
-	if _, err := reconciler.Reconcile(context.Background(), request); !stderrors.Is(err, transient) {
-		t.Fatalf("Reconcile() error = %v, want transient retry", err)
+	observedTransient := false
+	for i := 0; i < 20; i++ {
+		if _, err := reconciler.Reconcile(context.Background(), request); stderrors.Is(err, transient) {
+			observedTransient = true
+			break
+		} else if err != nil {
+			t.Fatalf("initial Reconcile() %d: %v", i+1, err)
+		}
+	}
+	if !observedTransient {
+		t.Fatal("top-level reconciliation did not reach transient Pod create failure")
 	}
 	var retrying platformv1alpha1.Environment
 	if err := baseClient.Get(context.Background(), client.ObjectKeyFromObject(env), &retrying); err != nil {
 		t.Fatal(err)
 	}
 	condition := apimeta.FindStatusCondition(retrying.Status.Conditions, platformv1alpha1.EnvironmentConditionReady)
-	if retrying.Status.Phase != platformv1alpha1.EnvironmentPhaseCreating || condition == nil || condition.Status != metav1.ConditionFalse || condition.Reason != "OperationalError" {
+	if retrying.Status.Phase != platformv1alpha1.EnvironmentPhaseResuming || condition == nil || condition.Status != metav1.ConditionFalse || condition.Reason != "OperationalError" {
 		t.Fatalf("transient failure status = phase %q, condition %#v", retrying.Status.Phase, condition)
 	}
-	if result, err := reconciler.Reconcile(context.Background(), request); err != nil {
-		t.Fatalf("recovery Reconcile() = (%#v, %v), want provisioning to resume", result, err)
+	var failedCreateCredentials corev1.Secret
+	if err := baseClient.Get(context.Background(), client.ObjectKey{Namespace: env.Namespace, Name: envCredentialName(env)}, &failedCreateCredentials); err != nil {
+		t.Fatal(err)
+	}
+	var replacement corev1.Pod
+	for i := 0; i < 20; i++ {
+		if _, err := reconciler.Reconcile(context.Background(), request); err != nil {
+			t.Fatalf("recovery Reconcile() %d: %v", i+1, err)
+		}
+		if err := baseClient.Get(context.Background(), client.ObjectKey{Namespace: env.Namespace, Name: envPodName(env)}, &replacement); err == nil {
+			break
+		} else if !apierrors.IsNotFound(err) {
+			t.Fatal(err)
+		}
 	}
 	if err := baseClient.Get(context.Background(), client.ObjectKeyFromObject(env), &retrying); err != nil {
 		t.Fatal(err)
 	}
-	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "pod", Annotations: map[string]string{executionGenerationAnnotation: strconv.FormatInt(retrying.Status.ExecutionGeneration, 10)}}, Status: corev1.PodStatus{
+	if replacement.Name == "" || retrying.Status.ExecutionGeneration != 3 || replacement.Annotations[executionGenerationAnnotation] != "3" ||
+		len(replacement.Spec.InitContainers) != 2 || !slices.ContainsFunc(replacement.Spec.InitContainers[1].Env, func(variable corev1.EnvVar) bool {
+		return variable.Name == "SWE_RESUMING" && variable.Value == "true"
+	}) {
+		t.Fatalf("replacement = %#v, status = %#v", replacement, retrying.Status)
+	}
+	var replacementCredentials corev1.Secret
+	if err := baseClient.Get(context.Background(), client.ObjectKey{Namespace: env.Namespace, Name: envCredentialName(env)}, &replacementCredentials); err != nil {
+		t.Fatal(err)
+	}
+	if replacementCredentials.Annotations[sandboxdauth.IdentityAnnotation] == failedCreateCredentials.Annotations[sandboxdauth.IdentityAnnotation] ||
+		string(replacementCredentials.Data[sandboxdauth.ProcessTokenKey]) == string(failedCreateCredentials.Data[sandboxdauth.ProcessTokenKey]) {
+		t.Fatal("retry after transient Pod create failure did not rotate sandboxd credentials")
+	}
+	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "pod", Annotations: map[string]string{
+		executionGenerationAnnotation: strconv.FormatInt(retrying.Status.ExecutionGeneration, 10), projectAnnotation: env.Spec.ProjectRef,
+	}}, Status: corev1.PodStatus{
 		Phase: corev1.PodRunning,
 		PodIP: "10.0.0.1",
 		Conditions: []corev1.PodCondition{{
@@ -2224,6 +2429,108 @@ func TestOperationalFailureRetriesAndRecoversReadiness(t *testing.T) {
 	condition = apimeta.FindStatusCondition(retrying.Status.Conditions, platformv1alpha1.EnvironmentConditionReady)
 	if !platformv1alpha1.IsEnvironmentReady(&retrying) || condition == nil || condition.Reason != "SandboxdReady" {
 		t.Fatalf("recovered status = %#v", retrying.Status)
+	}
+}
+
+func TestPublishedPodAbsencePreservesResumeAcrossPrePodGateFailure(t *testing.T) {
+	scheme := runtime.NewScheme()
+	for _, add := range []func(*runtime.Scheme) error{corev1.AddToScheme, networkingv1.AddToScheme, platformv1alpha1.AddToScheme} {
+		if err := add(scheme); err != nil {
+			t.Fatal(err)
+		}
+	}
+	lastActive := metav1.NewTime(time.Date(2026, 8, 3, 12, 0, 0, 0, time.UTC))
+	env := &platformv1alpha1.Environment{
+		ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default", UID: "environment-uid", Generation: 2, Finalizers: []string{environmentFinalizer}},
+		Spec:       platformv1alpha1.EnvironmentSpec{TemplateRef: "small", ProjectRef: "project"},
+		Status: platformv1alpha1.EnvironmentStatus{ExecutionGeneration: 1, Phase: platformv1alpha1.EnvironmentPhaseReady, PodName: "env-test",
+			Endpoints: platformv1alpha1.EnvironmentEndpoints{Sandboxd: "10.0.0.1:50051"}, LastActiveAt: &lastActive},
+	}
+	template := &platformv1alpha1.EnvironmentTemplate{ObjectMeta: metav1.ObjectMeta{Name: "small", Namespace: env.Namespace, UID: "template-uid", Generation: 1}, Spec: platformv1alpha1.EnvironmentTemplateSpec{Image: "example/environment:test", Size: "small"}}
+	project := &platformv1alpha1.Project{ObjectMeta: metav1.ObjectMeta{Name: "project", Namespace: env.Namespace, UID: "project-uid", Generation: 1}, Spec: platformv1alpha1.ProjectSpec{Repositories: []string{"https://github.com/example/repo"}}}
+	setTestProvisioningSnapshot(env, template, project)
+	oldCredentials := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: envCredentialName(env), Namespace: env.Namespace, UID: "old-secret", Annotations: map[string]string{sandboxdauth.IdentityAnnotation: "old.sandboxd.swe.dev"}}, Data: map[string][]byte{sandboxdauth.ProcessTokenKey: []byte("old-process-token")}}
+	if err := controllerutil.SetControllerReference(env, oldCredentials, scheme); err != nil {
+		t.Fatal(err)
+	}
+	baseClient := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(env).WithObjects(env, template, project, oldCredentials).Build()
+	transient := apierrors.NewServiceUnavailable("temporary Template gate failure")
+	failTemplateGet := true
+	intercepted := interceptor.NewClient(baseClient, interceptor.Funcs{Get: func(ctx context.Context, underlying client.WithWatch, key client.ObjectKey, object client.Object, options ...client.GetOption) error {
+		if failTemplateGet && key == client.ObjectKeyFromObject(template) {
+			failTemplateGet = false
+			return transient
+		}
+		return underlying.Get(ctx, key, object, options...)
+	}})
+	reconciler := &EnvironmentReconciler{Client: intercepted, Scheme: scheme}
+	request := ctrl.Request{NamespacedName: client.ObjectKeyFromObject(env)}
+	degradedPod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: envPodName(env), Namespace: env.Namespace, Annotations: map[string]string{executionGenerationAnnotation: "1", projectAnnotation: env.Spec.ProjectRef}}, Status: corev1.PodStatus{
+		Phase: corev1.PodRunning, PodIP: "10.0.0.1", Conditions: []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionFalse}},
+	}}
+	if err := reconciler.syncStatus(context.Background(), env, degradedPod); err != nil {
+		t.Fatal(err)
+	}
+	var current platformv1alpha1.Environment
+	if err := baseClient.Get(context.Background(), client.ObjectKeyFromObject(env), &current); err != nil {
+		t.Fatal(err)
+	}
+	if current.Status.Phase != platformv1alpha1.EnvironmentPhaseCreating || current.Status.PodName != envPodName(env) || current.Status.Endpoints.Sandboxd != "" || current.Status.LastActiveAt == nil {
+		t.Fatalf("degraded established execution status = %#v", current.Status)
+	}
+	if _, err := reconciler.Reconcile(context.Background(), request); !stderrors.Is(err, transient) {
+		t.Fatalf("pre-Pod gate Reconcile() error = %v, want transient", err)
+	}
+	if err := baseClient.Get(context.Background(), client.ObjectKeyFromObject(env), &current); err != nil {
+		t.Fatal(err)
+	}
+	if current.Status.Phase != platformv1alpha1.EnvironmentPhaseResuming || current.Status.PodName != "" || current.Status.Endpoints.Sandboxd != "" {
+		t.Fatalf("pre-Pod gate failure status = %#v, want unpublished Resuming", current.Status)
+	}
+	var replacement corev1.Pod
+	for i := 0; i < 20; i++ {
+		if _, err := reconciler.Reconcile(context.Background(), request); err != nil {
+			t.Fatalf("replacement Reconcile() %d: %v", i+1, err)
+		}
+		if err := baseClient.Get(context.Background(), client.ObjectKey{Namespace: env.Namespace, Name: envPodName(env)}, &replacement); err == nil {
+			break
+		} else if !apierrors.IsNotFound(err) {
+			t.Fatal(err)
+		}
+	}
+	if err := baseClient.Get(context.Background(), client.ObjectKeyFromObject(env), &current); err != nil {
+		t.Fatal(err)
+	}
+	var rotated corev1.Secret
+	if err := baseClient.Get(context.Background(), client.ObjectKeyFromObject(oldCredentials), &rotated); err != nil {
+		t.Fatal(err)
+	}
+	if replacement.Name == "" || current.Status.ExecutionGeneration != 2 || replacement.Annotations[executionGenerationAnnotation] != "2" ||
+		len(replacement.Spec.InitContainers) != 2 || !slices.ContainsFunc(replacement.Spec.InitContainers[1].Env, func(variable corev1.EnvVar) bool { return variable.Name == "SWE_RESUMING" && variable.Value == "true" }) ||
+		rotated.Annotations[sandboxdauth.IdentityAnnotation] == oldCredentials.Annotations[sandboxdauth.IdentityAnnotation] || string(rotated.Data[sandboxdauth.ProcessTokenKey]) == "old-process-token" {
+		t.Fatalf("replacement = %#v, status = %#v, credentials = %#v", replacement, current.Status, rotated.ObjectMeta)
+	}
+}
+
+func TestResumeReplacementRequiresEstablishedActiveExecution(t *testing.T) {
+	lastActive := metav1.Now()
+	for _, test := range []struct {
+		name  string
+		phase platformv1alpha1.EnvironmentPhase
+		pod   string
+		last  *metav1.Time
+		want  bool
+	}{
+		{name: "degraded established execution", phase: platformv1alpha1.EnvironmentPhaseCreating, pod: "env-test", last: &lastActive, want: true},
+		{name: "never ready creating", phase: platformv1alpha1.EnvironmentPhaseCreating, pod: "env-test"},
+		{name: "project promotion setup", phase: platformv1alpha1.EnvironmentPhaseSetup, pod: "env-test", last: &lastActive},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			env := &platformv1alpha1.Environment{Status: platformv1alpha1.EnvironmentStatus{Phase: test.phase, PodName: test.pod, LastActiveAt: test.last}}
+			if got := isResumeReplacement(env); got != test.want {
+				t.Fatalf("isResumeReplacement() = %t, want %t", got, test.want)
+			}
+		})
 	}
 }
 
