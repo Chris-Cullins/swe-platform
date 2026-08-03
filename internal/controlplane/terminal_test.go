@@ -889,7 +889,14 @@ func TestTerminalHeartbeatRevokesConnectionForReplacementUID(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("replacement Environment UID did not revoke the live terminal connection")
 	}
-	if got := testutil.ToFloat64(metrics.terminalRevocations.WithLabelValues("environment_changed")); got != 1 {
+	var got float64
+	for deadline := time.Now().Add(time.Second); time.Now().Before(deadline); time.Sleep(time.Millisecond) {
+		got = testutil.ToFloat64(metrics.terminalRevocations.WithLabelValues("environment_changed"))
+		if got == 1 {
+			break
+		}
+	}
+	if got != 1 {
 		t.Fatalf("environment-change revocations = %v, want 1", got)
 	}
 	if got := testutil.ToFloat64(metrics.terminalRevocations.WithLabelValues("execution_changed")); got != 0 {
