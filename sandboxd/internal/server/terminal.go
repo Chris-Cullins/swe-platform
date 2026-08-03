@@ -51,7 +51,7 @@ type TerminalServer struct {
 
 func NewTerminalServer(workspace string) *TerminalServer {
 	return &TerminalServer{
-		backend: newTmuxTerminalBackend(workspace, defaultTmuxSocket, nil),
+		backend: newPlatformTerminalBackend(workspace),
 	}
 }
 

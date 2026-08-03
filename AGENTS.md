@@ -125,8 +125,9 @@ runs both via `make` targets:
   image performs both stages in one multi-stage build. The ESLint flat config deliberately
   enables only `rules-of-hooks` and `exhaustive-deps` from the React Hooks plugin; treat
   enabling that plugin's expanding recommended preset as a lint-policy change.
-- **Windows portability:** CI runs focused sandboxd process, launch-material, Exec, and
-  filesystem tests on `windows-latest`; keep OS-specific tests behind build tags.
+- **Windows portability:** CI runs focused sandboxd process, launch-material, Exec,
+  filesystem, and terminal-backend-selection tests on `windows-latest`; keep OS-specific
+  tests behind build tags. Native terminal selection fails closed until ConPTY is implemented.
 - **Regenerate deepcopy:** `make generate` · **CRDs + RBAC:** `make manifests`
   (`manifests` synchronizes chart CRDs; CI fails on a diff). Use `make check-chart-crds`
   to verify the checked-in Helm CRDs independently.

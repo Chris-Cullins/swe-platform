@@ -310,8 +310,9 @@ message Entry {
 }
 
 // TerminalService multiplexes the environment's shared terminal session.
-// The agent and the human attach to the same session (tmux on Linux,
-// ConPTY on Windows).
+// The agent and the human attach to the same session. The current backend is
+// tmux on non-Windows systems; a native Windows backend requires ConPTY and is
+// not implemented.
 service TerminalService {
   rpc Terminal(stream TerminalMessage) returns (stream TerminalMessage);
 }

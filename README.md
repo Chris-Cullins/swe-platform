@@ -523,6 +523,8 @@ environment is created. If the repository contains `.agents/setup`, the hook run
 after checkout. `swe environment hold ENVIRONMENT` deletes the pod while retaining its
 workspace PVC, and `swe environment release ENVIRONMENT` publishes the next policy revision
 to create a fresh pod; `.agents/resume` runs after the volume is reattached.
+These hooks currently run through `/bin/sh` in the Pod backend; `.ps1` hooks and native Windows
+Environment lifecycle are not implemented.
 Setup and resume hooks receive only the controller's
 non-secret repository and timeout values. They are limited to 30 minutes each. Failed or
 completed environment pods are replaced with bounded exponential

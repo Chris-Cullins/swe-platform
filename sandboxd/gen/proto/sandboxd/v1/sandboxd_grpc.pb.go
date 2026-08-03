@@ -627,8 +627,9 @@ const (
 // For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
 //
 // TerminalService multiplexes the environment's shared terminal session.
-// The agent and the human attach to the same session (tmux on Linux,
-// ConPTY on Windows).
+// The agent and the human attach to the same session. The current backend is
+// tmux on non-Windows systems; a native Windows backend requires ConPTY and is
+// not implemented.
 type TerminalServiceClient interface {
 	Terminal(ctx context.Context, opts ...grpc.CallOption) (grpc.BidiStreamingClient[TerminalMessage, TerminalMessage], error)
 }
@@ -659,8 +660,9 @@ type TerminalService_TerminalClient = grpc.BidiStreamingClient[TerminalMessage, 
 // for forward compatibility.
 //
 // TerminalService multiplexes the environment's shared terminal session.
-// The agent and the human attach to the same session (tmux on Linux,
-// ConPTY on Windows).
+// The agent and the human attach to the same session. The current backend is
+// tmux on non-Windows systems; a native Windows backend requires ConPTY and is
+// not implemented.
 type TerminalServiceServer interface {
 	Terminal(grpc.BidiStreamingServer[TerminalMessage, TerminalMessage]) error
 	mustEmbedUnimplementedTerminalServiceServer()
