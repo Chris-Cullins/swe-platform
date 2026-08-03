@@ -25,6 +25,13 @@ if SWE_IMAGE_TAG=latest "$VALIDATOR" render k3s >/dev/null 2>&1; then
 	fail "mutable latest image override was accepted"
 fi
 SWE_IMAGE_TAG=sha-0123456 "$VALIDATOR" render k3s >/dev/null 2>&1 || fail "traceable main SHA override was rejected"
+mapfile -t fallback_args < <(SWE_IMAGE_TAG=sha-0123456 "$VALIDATOR" image-args k3s)
+[[ ${#fallback_args[@]} -eq 6 ]] || fail "fallback did not emit three Helm image overrides"
+fallback_render="$(helm template swe-platform "$ROOT/charts/swe-platform" --namespace swe-platform-system \
+	--values "$ROOT/charts/swe-platform/values-k3s.yaml" "${fallback_args[@]}")"
+for image in operator control-plane env-base; do
+	grep -q "ghcr.io/chris-cullins/swe-platform/$image:sha-0123456" <<<"$fallback_render" || fail "fallback install args did not select $image SHA tag"
+done
 
 digest="sha256:$(printf 'a%.0s' {1..64})"
 jq -n --arg digest "$digest" '{images:{operator:{repository:"ghcr.io/chris-cullins/swe-platform/operator",digest:$digest},"control-plane":{repository:"ghcr.io/chris-cullins/swe-platform/control-plane",digest:$digest},"env-base":{repository:"ghcr.io/chris-cullins/swe-platform/env-base",digest:$digest}}}' >"$TEST_ROOT/release-manifest.json"
@@ -36,6 +43,49 @@ tenancy:
 EOF
 if SWE_PRIVATE_VALUES="$TEST_ROOT/unsafe-values.yaml" "$VALIDATOR" render eks >/dev/null 2>&1; then
 	fail "trusted-admin private values were accepted by BYOC validation"
+fi
+
+cat >"$TEST_ROOT/zero-templates.yaml" <<'EOF'
+environmentTemplates: []
+EOF
+SWE_PRIVATE_VALUES="$TEST_ROOT/zero-templates.yaml" "$VALIDATOR" render k3s >/dev/null 2>&1 || fail "zero catalog templates were rejected"
+SWE_PRIVATE_VALUES="$TEST_ROOT/zero-templates.yaml" SWE_RELEASE_MANIFEST="$TEST_ROOT/release-manifest.json" \
+	"$VALIDATOR" render k3s >/dev/null 2>&1 || fail "zero templates were rejected with digest pinning"
+
+cat >"$TEST_ROOT/multiple-gvisor-templates.yaml" <<'EOF'
+environmentTemplates:
+  - name: medium
+    spec:
+      size: medium
+      runtimeClass: gvisor
+      idleTimeout: 15m
+      diskSize: 40Gi
+  - name: large
+    spec:
+      size: large
+      runtimeClass: gvisor
+      idleTimeout: 15m
+      diskSize: 80Gi
+EOF
+SWE_PRIVATE_VALUES="$TEST_ROOT/multiple-gvisor-templates.yaml" "$VALIDATOR" render gke >/dev/null 2>&1 || fail "multiple valid GKE templates were rejected"
+SWE_PRIVATE_VALUES="$TEST_ROOT/multiple-gvisor-templates.yaml" SWE_RELEASE_MANIFEST="$TEST_ROOT/release-manifest.json" \
+	"$VALIDATOR" render gke >/dev/null 2>&1 || fail "repeated digest-pinned environment images were rejected"
+
+cat >"$TEST_ROOT/missing-gvisor-template.yaml" <<'EOF'
+environmentTemplates:
+  - name: medium
+    spec:
+      size: medium
+      idleTimeout: 15m
+      diskSize: 40Gi
+EOF
+if SWE_PRIVATE_VALUES="$TEST_ROOT/missing-gvisor-template.yaml" "$VALIDATOR" render gke >/dev/null 2>&1; then
+	fail "GKE template without runtimeClass was accepted"
+fi
+
+sed 's/runtimeClass: gvisor/runtimeClass: runc/' "$TEST_ROOT/multiple-gvisor-templates.yaml" >"$TEST_ROOT/changed-gvisor-templates.yaml"
+if SWE_PRIVATE_VALUES="$TEST_ROOT/changed-gvisor-templates.yaml" "$VALIDATOR" render gke >/dev/null 2>&1; then
+	fail "GKE template with a changed RuntimeClass was accepted"
 fi
 
 mkdir -p "$TEST_ROOT/bin"

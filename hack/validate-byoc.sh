@@ -8,8 +8,9 @@ RELEASE="${SWE_RELEASE:-swe-platform}"
 
 usage() {
 	cat <<'EOF'
-Usage: hack/validate-byoc.sh <render|preflight|installed> <k3s|gke|eks>
+Usage: hack/validate-byoc.sh <image-args|render|preflight|installed> <k3s|gke|eks>
 
+  image-args  print the validated image override arguments, one array element per line
   render      lint and render the selected production preset without a cluster
   preflight   render, then validate the current cluster's supported prerequisites
   installed   preflight, then validate the installed Helm release and workloads
@@ -41,10 +42,25 @@ contracts remain open in issues #68, #9, and #10.
 EOF
 }
 
+deployment_image() {
+	local component="$1"
+	awk -v RS='---' -v component="$component" '
+		/kind: Deployment/ && $0 ~ "app.kubernetes.io/component: " component {
+			for (i = 1; i <= NF; i++) if ($i == "image:") {gsub(/"/, "", $(i + 1)); print $(i + 1)}
+		}
+	'
+}
+
+template_images() {
+	awk -v RS='---' '/kind: EnvironmentTemplate/ {
+		for (i = 1; i <= NF; i++) if ($i == "image:") {gsub(/"/, "", $(i + 1)); print $(i + 1)}
+	}'
+}
+
 mode="${1:-}"
 provider="${2:-}"
 [[ $# -eq 2 ]] || { usage >&2; exit 2; }
-[[ "$mode" =~ ^(render|preflight|installed)$ ]] || fail "unknown mode: $mode"
+[[ "$mode" =~ ^(image-args|render|preflight|installed)$ ]] || fail "unknown mode: $mode"
 [[ "$provider" =~ ^(k3s|gke|eks)$ ]] || fail "unsupported provider preset: $provider"
 
 need helm
@@ -52,6 +68,7 @@ values="$CHART/values-$provider.yaml"
 [[ -r "$values" ]] || fail "preset not found: $values"
 
 helm_args=(--namespace "$SYSTEM_NAMESPACE" --values "$values")
+image_args=()
 if [[ -n "${SWE_PRIVATE_VALUES:-}" ]]; then
 	[[ -r "$SWE_PRIVATE_VALUES" ]] || fail "private values not found: $SWE_PRIVATE_VALUES"
 	helm_args+=(--values "$SWE_PRIVATE_VALUES")
@@ -64,18 +81,23 @@ if [[ -n "${SWE_RELEASE_MANIFEST:-}" ]]; then
 		digest="$(jq -er --arg image "$image" '.images[$image].digest | select(test("^sha256:[0-9a-f]{64}$"))' "$SWE_RELEASE_MANIFEST")" || fail "release manifest has no valid $image digest"
 		[[ "$repository" == "ghcr.io/chris-cullins/swe-platform/$image" ]] || fail "unexpected $image repository in release manifest: $repository"
 		case "$image" in
-		operator) helm_args+=(--set-string "image.digest=$digest") ;;
-		control-plane) helm_args+=(--set-string "controlPlane.image.digest=$digest") ;;
-		env-base) helm_args+=(--set-string "environmentImage.digest=$digest") ;;
+		operator) image_args+=(--set-string "image.digest=$digest") ;;
+		control-plane) image_args+=(--set-string "controlPlane.image.digest=$digest") ;;
+		env-base) image_args+=(--set-string "environmentImage.digest=$digest") ;;
 		esac
 	done
 elif [[ -n "${SWE_IMAGE_TAG:-}" ]]; then
 	[[ "$SWE_IMAGE_TAG" =~ ^sha-[0-9a-f]{7}$ ]] || fail "SWE_IMAGE_TAG must match sha-<7 lowercase hex>; use SWE_RELEASE_MANIFEST for immutable digest pinning"
-	helm_args+=(
+	image_args+=(
 		--set-string "image.tag=$SWE_IMAGE_TAG"
 		--set-string "controlPlane.image.tag=$SWE_IMAGE_TAG"
 		--set-string "environmentImage.tag=$SWE_IMAGE_TAG"
 	)
+fi
+helm_args+=("${image_args[@]}")
+if [[ "$mode" == image-args ]]; then
+	((${#image_args[@]} == 0)) || printf '%s\n' "${image_args[@]}"
+	exit 0
 fi
 
 helm lint "$CHART" --values "$values" >/dev/null
@@ -89,15 +111,26 @@ keyring_secret="$(awk '/secretName:/{gsub(/[" ]/, "", $2); print $2; exit}' <<<"
 keyring_key="$(awk '/secretName:/{found=1; next} found && /key:/{value=($1 == "-" ? $3 : $2); gsub(/[" ]/, "", value); print value; exit}' <<<"$rendered")"
 [[ -n "$postgres_secret" && -n "$postgres_key" && -n "$keyring_secret" && -n "$keyring_key" ]] || fail "cannot resolve effective PostgreSQL/keyring Secret references"
 
-mapfile -t images < <(awk '$1 == "image:" {gsub(/"/, "", $2); print $2}' <<<"$rendered")
-[[ ${#images[@]} -eq 3 ]] || fail "expected exactly three coordinated images, found ${#images[@]}"
-for image in "${images[@]}"; do
+operator_image="$(deployment_image operator <<<"$rendered")"
+control_plane_image="$(deployment_image control-plane <<<"$rendered")"
+[[ -n "$operator_image" && "$operator_image" != *$'\n'* ]] || fail "expected exactly one operator image"
+[[ -n "$control_plane_image" && "$control_plane_image" != *$'\n'* ]] || fail "expected exactly one control-plane image"
+mapfile -t environment_images < <(template_images <<<"$rendered")
+for image in "$operator_image" "$control_plane_image" "${environment_images[@]}"; do
 	[[ "$image" != *:latest && "$image" != *:dev ]] || fail "mutable image rendered: $image"
 done
+if [[ "$provider" == gke ]]; then
+	bad_gke_templates="$(awk -v RS='---' '/kind: EnvironmentTemplate/ && $0 !~ /runtimeClass: gvisor([[:space:]]|$)/ {count++} END {print count+0}' <<<"$rendered")"
+	((bad_gke_templates == 0)) || fail "every effective GKE EnvironmentTemplate must select runtimeClass gvisor"
+fi
 if [[ -n "${SWE_RELEASE_MANIFEST:-}" ]]; then
-	for image in operator control-plane env-base; do
-		digest="$(jq -r --arg image "$image" '.images[$image].digest' "$SWE_RELEASE_MANIFEST")"
-		grep -q "ghcr.io/chris-cullins/swe-platform/$image@$digest" <<<"$rendered" || fail "$image is not pinned to its release-manifest digest"
+	operator_digest="$(jq -r '.images.operator.digest' "$SWE_RELEASE_MANIFEST")"
+	control_plane_digest="$(jq -r '.images["control-plane"].digest' "$SWE_RELEASE_MANIFEST")"
+	environment_digest="$(jq -r '.images["env-base"].digest' "$SWE_RELEASE_MANIFEST")"
+	[[ "$operator_image" == "ghcr.io/chris-cullins/swe-platform/operator@$operator_digest" ]] || fail "operator is not pinned to its release-manifest digest"
+	[[ "$control_plane_image" == "ghcr.io/chris-cullins/swe-platform/control-plane@$control_plane_digest" ]] || fail "control plane is not pinned to its release-manifest digest"
+	for image in "${environment_images[@]}"; do
+		[[ "$image" == "ghcr.io/chris-cullins/swe-platform/env-base@$environment_digest" ]] || fail "EnvironmentTemplate image is not pinned to the env-base release-manifest digest"
 	done
 fi
 
@@ -152,11 +185,14 @@ installed_keyring_secret="$(awk '/secretName:/{gsub(/[" ]/, "", $2); print $2; e
 installed_keyring_key="$(awk '/secretName:/{found=1; next} found && /key:/{value=($1 == "-" ? $3 : $2); gsub(/[" ]/, "", value); print value; exit}' <<<"$installed_manifest")"
 [[ "$installed_postgres_secret:$installed_postgres_key" == "$postgres_secret:$postgres_key" ]] || fail "installed PostgreSQL Secret reference differs from effective values"
 [[ "$installed_keyring_secret:$installed_keyring_key" == "$keyring_secret:$keyring_key" ]] || fail "installed keyring Secret reference differs from effective values"
-for image in "${images[@]}"; do
-	grep -Fq "$image" <<<"$installed_manifest" || fail "installed manifest does not use expected image $image"
-done
+installed_operator_image="$(deployment_image operator <<<"$installed_manifest")"
+installed_control_plane_image="$(deployment_image control-plane <<<"$installed_manifest")"
+mapfile -t installed_environment_images < <(template_images <<<"$installed_manifest")
+[[ "$installed_operator_image" == "$operator_image" ]] || fail "installed operator image differs from effective values"
+[[ "$installed_control_plane_image" == "$control_plane_image" ]] || fail "installed control-plane image differs from effective values"
+[[ "$(printf '%s\n' "${installed_environment_images[@]}" | sort)" == "$(printf '%s\n' "${environment_images[@]}" | sort)" ]] || fail "installed EnvironmentTemplate images differ from effective values"
 live_deployments="$(kubectl -n "$SYSTEM_NAMESPACE" get deployments -l "app.kubernetes.io/instance=$RELEASE" -o json)"
-expected_workload_images="$(printf '%s\n' "${images[@]}" | grep -E '/(operator|control-plane)(@|:)' | sort)"
+expected_workload_images="$(printf '%s\n' "$operator_image" "$control_plane_image" | sort)"
 live_workload_images="$(jq -r '.items[].spec.template.spec.containers[].image' <<<"$live_deployments" | sort)"
 [[ "$live_workload_images" == "$expected_workload_images" ]] || fail "live workload images differ from effective values"
 live_namespaces="$(jq -r '.items[].spec.template.spec.containers[].args[]? | select(startswith("--tenancy-namespace="))' <<<"$live_deployments" | sort)"
