@@ -199,6 +199,21 @@ func (r *countingReader) Read(p []byte) (int, error) {
 	return n, err
 }
 
+type deadlineRecorder struct {
+	*httptest.ResponseRecorder
+	deadlines []time.Time
+	err       error
+}
+
+func newDeadlineRecorder() *deadlineRecorder {
+	return &deadlineRecorder{ResponseRecorder: httptest.NewRecorder()}
+}
+
+func (r *deadlineRecorder) SetReadDeadline(deadline time.Time) error {
+	r.deadlines = append(r.deadlines, deadline)
+	return r.err
+}
+
 func (c *idempotentCloseConn) Close() error {
 	var err error
 	c.once.Do(func() {
@@ -428,7 +443,7 @@ func TestRunPortalListFiltersExactServiceAuthorizationAndReportsCurrentState(t *
 	request := httptest.NewRequest(http.MethodGet, "https://console.example/api/v1/namespaces/ns/runs/run/portals/run-uid/env-uid", nil)
 	response := httptest.NewRecorder()
 	gateway.listRunPortals(response, request, "ns", RunTerminalAssociation{RunName: "run", RunUID: "run-uid", EnvironmentName: "env", EnvironmentUID: "env-uid", EnvironmentOwnership: "Owned"})
-	if response.Code != http.StatusOK {
+	if response.Code != http.StatusOK || response.Header().Get("Cache-Control") != "private, no-store" {
 		t.Fatalf("portal list = %d: %s", response.Code, response.Body.String())
 	}
 	var result RunPortalServiceList
@@ -482,7 +497,7 @@ func TestDisabledRunPortalListIsReadOnlyThroughTypedAPI(t *testing.T) {
 	}}
 	server := NewServer(nil, ServerOptions{Access: filteringPortalAccess{}, Resources: resources, PortalResolver: resolver})
 	response := resourceRequest(server, http.MethodGet, "/api/v1/namespaces/ns/runs/run/portals/run-uid/env-uid", "", "")
-	if response.Code != http.StatusOK {
+	if response.Code != http.StatusOK || response.Header().Get("Cache-Control") != "private, no-store" {
 		t.Fatalf("disabled portal list = %d: %s", response.Code, response.Body.String())
 	}
 	var result RunPortalServiceList
@@ -547,7 +562,7 @@ func TestPortalServiceStateHonorsLifecycleAndFreshness(t *testing.T) {
 
 func TestPortalSessionHandoffIsHostBoundOneTimeAndKeepsSessionOutOfURL(t *testing.T) {
 	const code = "abcdefghijklmnopqrstuvwxyz234567"
-	gateway := &portalGateway{server: &Server{allowInsecureSessions: true}, suffix: "portal.example", scheme: "http", handoffs: make(map[string]portalSessionHandoff)}
+	gateway := &portalGateway{server: &Server{allowInsecureSessions: true}, suffix: "portal.example", scheme: "http", handoffReads: make(chan struct{}, 1), handoffs: make(map[string]portalSessionHandoff)}
 	handler := gateway.wrap(http.NotFoundHandler())
 	installCode := func() {
 		gateway.handoffs[code] = portalSessionHandoff{sessionID: "console-session", locator: "abcdefghijklmnopqrst", origin: "http://console.test", expiresAt: time.Now().Add(time.Minute)}
@@ -566,7 +581,7 @@ func TestPortalSessionHandoffIsHostBoundOneTimeAndKeepsSessionOutOfURL(t *testin
 			oversized.ContentLength = -1
 			oversized.TransferEncoding = []string{"chunked"}
 		}
-		response := httptest.NewRecorder()
+		response := newDeadlineRecorder()
 		handler.ServeHTTP(response, oversized)
 		if response.Code != http.StatusNotFound || response.Body.String() != portalNotFoundBody || response.Header().Get("Cache-Control") != "private, no-store" {
 			t.Fatalf("%s oversized handoff = %d %q", name, response.Code, response.Body.String())
@@ -582,7 +597,7 @@ func TestPortalSessionHandoffIsHostBoundOneTimeAndKeepsSessionOutOfURL(t *testin
 	installCode()
 	queryBody := &countingReader{reader: strings.NewReader("code=" + code)}
 	largeQuery := request(http.MethodPost, "http://abcdefghijklmnopqrst.portal.example/.swe/session-handoff?padding="+strings.Repeat("x", 1<<20), queryBody)
-	largeQueryResponse := httptest.NewRecorder()
+	largeQueryResponse := newDeadlineRecorder()
 	handler.ServeHTTP(largeQueryResponse, largeQuery)
 	if largeQueryResponse.Code != http.StatusNotFound || queryBody.read != 0 {
 		t.Fatalf("large-query handoff = %d with %d body bytes read", largeQueryResponse.Code, queryBody.read)
@@ -590,10 +605,16 @@ func TestPortalSessionHandoffIsHostBoundOneTimeAndKeepsSessionOutOfURL(t *testin
 	if _, ok := gateway.handoffs[code]; !ok {
 		t.Fatal("large-query handoff consumed the one-time code")
 	}
+	bareQueryBody := &countingReader{reader: strings.NewReader("code=" + code)}
+	bareQueryResponse := newDeadlineRecorder()
+	handler.ServeHTTP(bareQueryResponse, request(http.MethodPost, "http://abcdefghijklmnopqrst.portal.example/.swe/session-handoff?", bareQueryBody))
+	if bareQueryResponse.Code != http.StatusNotFound || bareQueryBody.read != 0 {
+		t.Fatalf("bare-query handoff = %d with %d body bytes read", bareQueryResponse.Code, bareQueryBody.read)
+	}
 
 	wrongMethodBody := &countingReader{reader: strings.NewReader("code=" + code)}
 	wrongMethod := request(http.MethodGet, "http://abcdefghijklmnopqrst.portal.example/.swe/session-handoff", wrongMethodBody)
-	wrongMethodResponse := httptest.NewRecorder()
+	wrongMethodResponse := newDeadlineRecorder()
 	handler.ServeHTTP(wrongMethodResponse, wrongMethod)
 	if wrongMethodResponse.Code != http.StatusNotFound || wrongMethodBody.read != 0 {
 		t.Fatalf("wrong-method handoff = %d with %d body bytes read", wrongMethodResponse.Code, wrongMethodBody.read)
@@ -601,7 +622,7 @@ func TestPortalSessionHandoffIsHostBoundOneTimeAndKeepsSessionOutOfURL(t *testin
 
 	wrongContentType := request(http.MethodPost, "http://abcdefghijklmnopqrst.portal.example/.swe/session-handoff", strings.NewReader("code="+code))
 	wrongContentType.Header.Set("Content-Type", "text/plain")
-	wrongContentTypeResponse := httptest.NewRecorder()
+	wrongContentTypeResponse := newDeadlineRecorder()
 	handler.ServeHTTP(wrongContentTypeResponse, wrongContentType)
 	if wrongContentTypeResponse.Code != http.StatusNotFound {
 		t.Fatalf("wrong-content-type handoff = %d", wrongContentTypeResponse.Code)
@@ -610,16 +631,46 @@ func TestPortalSessionHandoffIsHostBoundOneTimeAndKeepsSessionOutOfURL(t *testin
 		t.Fatal("wrong-content-type handoff consumed the one-time code")
 	}
 
+	saturatedBody := &countingReader{reader: strings.NewReader("code=" + code)}
+	gateway.handoffReads <- struct{}{}
+	saturatedResponse := newDeadlineRecorder()
+	handler.ServeHTTP(saturatedResponse, request(http.MethodPost, "http://abcdefghijklmnopqrst.portal.example/.swe/session-handoff", saturatedBody))
+	if saturatedResponse.Code != http.StatusNotFound || saturatedBody.read != 0 {
+		t.Fatalf("saturated handoff = %d with %d body bytes read", saturatedResponse.Code, saturatedBody.read)
+	}
+	if _, ok := gateway.handoffs[code]; !ok {
+		t.Fatal("saturated handoff consumed the one-time code")
+	}
+	<-gateway.handoffReads
+
+	deadlineFailureBody := &countingReader{reader: strings.NewReader("code=" + code)}
+	deadlineFailureResponse := newDeadlineRecorder()
+	deadlineFailureResponse.err = errors.New("deadlines unsupported")
+	func() {
+		defer func() {
+			if recovered := recover(); recovered != http.ErrAbortHandler {
+				t.Fatalf("unsupported-deadline panic = %v", recovered)
+			}
+		}()
+		handler.ServeHTTP(deadlineFailureResponse, request(http.MethodPost, "http://abcdefghijklmnopqrst.portal.example/.swe/session-handoff", deadlineFailureBody))
+	}()
+	if deadlineFailureBody.read != 0 || len(gateway.handoffReads) != 0 {
+		t.Fatalf("unsupported-deadline handoff read %d body bytes and retained %d slots", deadlineFailureBody.read, len(gateway.handoffReads))
+	}
+	if _, ok := gateway.handoffs[code]; !ok {
+		t.Fatal("unsupported-deadline handoff consumed the one-time code")
+	}
+
 	wrongOrigin := request(http.MethodPost, "http://abcdefghijklmnopqrst.portal.example/.swe/session-handoff", strings.NewReader("code="+code))
 	wrongOrigin.Header.Set("Origin", "http://attacker.test")
-	wrongOriginResponse := httptest.NewRecorder()
+	wrongOriginResponse := newDeadlineRecorder()
 	handler.ServeHTTP(wrongOriginResponse, wrongOrigin)
 	if wrongOriginResponse.Code != http.StatusNotFound || wrongOriginResponse.Body.String() != portalNotFoundBody {
 		t.Fatalf("wrong-origin handoff = %d %q", wrongOriginResponse.Code, wrongOriginResponse.Body.String())
 	}
 
 	installCode()
-	response := httptest.NewRecorder()
+	response := newDeadlineRecorder()
 	handler.ServeHTTP(response, request(http.MethodPost, "http://abcdefghijklmnopqrst.portal.example/.swe/session-handoff", strings.NewReader("code="+code)))
 	if response.Code != http.StatusOK || response.Header().Get("Location") != "" || !strings.Contains(response.Body.String(), `location.replace("/")`) {
 		t.Fatalf("handoff = %d headers=%v", response.Code, response.Header())
@@ -627,14 +678,119 @@ func TestPortalSessionHandoffIsHostBoundOneTimeAndKeepsSessionOutOfURL(t *testin
 	if response.Header().Get("Cache-Control") != "private, no-store" || response.Header().Get("Referrer-Policy") != "no-referrer" {
 		t.Fatalf("handoff cache/referrer headers = %v", response.Header())
 	}
+	if len(response.deadlines) != 2 || response.deadlines[0].IsZero() || !response.deadlines[1].IsZero() {
+		t.Fatalf("handoff read deadlines = %v", response.deadlines)
+	}
 	cookies := response.Result().Cookies()
 	if len(cookies) != 1 || cookies[0].Value != "console-session" || !cookies[0].HttpOnly || cookies[0].Domain != "" || cookies[0].SameSite != http.SameSiteStrictMode {
 		t.Fatalf("handoff cookie = %#v", cookies)
 	}
-	replay := httptest.NewRecorder()
+	replay := newDeadlineRecorder()
 	handler.ServeHTTP(replay, request(http.MethodPost, "http://abcdefghijklmnopqrst.portal.example/.swe/session-handoff", strings.NewReader("code="+code)))
 	if replay.Code != http.StatusNotFound {
 		t.Fatalf("handoff replay = %d", replay.Code)
+	}
+}
+
+func TestPortalSessionHandoffBoundsConcurrentRealServerReads(t *testing.T) {
+	const code = "abcdefghijklmnopqrstuvwxyz234567"
+	gateway := &portalGateway{
+		server:             &Server{allowInsecureSessions: true},
+		suffix:             "portal.example",
+		scheme:             "http",
+		handoffReadTimeout: 500 * time.Millisecond,
+		handoffReads:       make(chan struct{}, 1),
+		handoffs: map[string]portalSessionHandoff{code: {
+			sessionID: "console-session", locator: "abcdefghijklmnopqrst", origin: "http://console.test", expiresAt: time.Now().Add(time.Minute),
+		}},
+	}
+	server := httptest.NewServer(gateway.wrap(http.NotFoundHandler()))
+	t.Cleanup(server.Close)
+
+	openConnection := func() net.Conn {
+		connection, err := net.Dial("tcp", server.Listener.Addr().String())
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = connection.Close() })
+		return connection
+	}
+	readResponse := func(connection net.Conn) *http.Response {
+		t.Helper()
+		if err := connection.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+			t.Fatal(err)
+		}
+		response, err := http.ReadResponse(bufio.NewReader(connection), &http.Request{Method: http.MethodPost})
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = response.Body.Close() })
+		return response
+	}
+
+	stalled := openConnection()
+	if _, err := io.WriteString(stalled, "POST /.swe/session-handoff HTTP/1.1\r\nHost: abcdefghijklmnopqrst.portal.example\r\nContent-Type: application/x-www-form-urlencoded\r\nOrigin: http://console.test\r\nTransfer-Encoding: chunked\r\n\r\n5\r\ncode=\r\n"); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(time.Second)
+	for len(gateway.handoffReads) != 1 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if len(gateway.handoffReads) != 1 {
+		t.Fatal("stalled handoff did not occupy its read slot")
+	}
+
+	malformed := openConnection()
+	if _, err := io.WriteString(malformed, "POST /.swe/session-handoff HTTP/1.1\r\nHost: abcdefghijklmnopqrst.portal.example\r\nContent-Type: text/plain\r\nOrigin: http://console.test\r\nContent-Length: 37\r\n\r\n"); err != nil {
+		t.Fatal(err)
+	}
+	malformedResponse := readResponse(malformed)
+	if malformedResponse.StatusCode != http.StatusNotFound || !malformedResponse.Close {
+		t.Fatalf("malformed handoff status = %d, close = %v", malformedResponse.StatusCode, malformedResponse.Close)
+	}
+	if _, ok := gateway.handoffs[code]; !ok {
+		t.Fatal("malformed handoff consumed the one-time code")
+	}
+
+	excess := openConnection()
+	if _, err := io.WriteString(excess, "POST /.swe/session-handoff HTTP/1.1\r\nHost: abcdefghijklmnopqrst.portal.example\r\nContent-Type: application/x-www-form-urlencoded\r\nOrigin: http://console.test\r\nContent-Length: 37\r\n\r\n"); err != nil {
+		t.Fatal(err)
+	}
+	if response := readResponse(excess); response.StatusCode != http.StatusNotFound {
+		t.Fatalf("excess handoff status = %d", response.StatusCode)
+	}
+	if _, ok := gateway.handoffs[code]; !ok {
+		t.Fatal("excess handoff consumed the one-time code")
+	}
+
+	if response := readResponse(stalled); response.StatusCode != http.StatusNotFound {
+		t.Fatalf("stalled handoff status = %d", response.StatusCode)
+	}
+	if len(gateway.handoffReads) != 0 {
+		t.Fatalf("stalled handoff retained %d read slots after its deadline", len(gateway.handoffReads))
+	}
+	if _, ok := gateway.handoffs[code]; !ok {
+		t.Fatal("timed-out handoff consumed the one-time code")
+	}
+
+	validRequest, err := http.NewRequest(http.MethodPost, server.URL+"/.swe/session-handoff", strings.NewReader("code="+code))
+	if err != nil {
+		t.Fatal(err)
+	}
+	validRequest.Host = "abcdefghijklmnopqrst.portal.example"
+	validRequest.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	validRequest.Header.Set("Origin", "http://console.test")
+	validResponse, err := server.Client().Do(validRequest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer validResponse.Body.Close()
+	if validResponse.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(validResponse.Body)
+		t.Fatalf("handoff after stalled slot release = %d: %s", validResponse.StatusCode, body)
+	}
+	if _, ok := gateway.handoffs[code]; ok {
+		t.Fatal("successful handoff did not consume the one-time code")
 	}
 }
 
