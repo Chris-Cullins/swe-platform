@@ -158,6 +158,11 @@ func waitForRun(ctx context.Context, clients *kubeClients, namespace, name strin
 			}
 			return nil
 		case platformv1alpha1.RunStateFailed:
+			for _, condition := range run.Status.Conditions {
+				if condition.Status == metav1.ConditionFalse && (condition.Type == "RepositoryCredentialReady" || condition.Type == "AdapterAccepted") && condition.Reason != "" {
+					return fmt.Errorf("run failed: %s", condition.Reason)
+				}
+			}
 			return fmt.Errorf("run failed")
 		case platformv1alpha1.RunStateCancelled:
 			return fmt.Errorf("run was cancelled")

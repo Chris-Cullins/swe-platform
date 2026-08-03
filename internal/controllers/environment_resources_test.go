@@ -122,22 +122,22 @@ func TestEnsurePodUsesOnlyNonSecretProjectValues(t *testing.T) {
 	if len(pod.Spec.Containers[0].EnvFrom) != 0 {
 		t.Fatalf("environment EnvFrom = %#v, want no ambient project secrets", pod.Spec.Containers[0].EnvFrom)
 	}
-	if len(pod.Spec.InitContainers) != 1 {
-		t.Fatalf("InitContainers length = %d, want 1", len(pod.Spec.InitContainers))
+	if len(pod.Spec.InitContainers) != 2 {
+		t.Fatalf("InitContainers length = %d, want 2", len(pod.Spec.InitContainers))
 	}
-	setup := pod.Spec.InitContainers[0]
-	if setup.Name != "project-setup" {
-		t.Errorf("init container name = %q, want project-setup", setup.Name)
+	clone, setup := pod.Spec.InitContainers[0], pod.Spec.InitContainers[1]
+	if clone.Name != "repository-clone" || setup.Name != "project-hooks" {
+		t.Errorf("init container order = %q, %q", clone.Name, setup.Name)
 	}
-	envValues := make(map[string]string, len(setup.Env))
-	for _, envVar := range setup.Env {
+	envValues := make(map[string]string, len(clone.Env))
+	for _, envVar := range clone.Env {
 		envValues[envVar.Name] = envVar.Value
 	}
-	if len(setup.Env) != 3 || envValues["SWE_REPOSITORY"] != "https://github.com/example/repo" ||
-		envValues["SWE_HOOK_TIMEOUT"] != projectHookTimeout || envValues["SWE_HOOK_KILL_AFTER"] != hookKillAfter {
-		t.Errorf("init container Env = %#v, want repository and bounded hook timeout", setup.Env)
+	if len(clone.Env) != 3 || envValues["SWE_REPOSITORY"] != "https://github.com/example/repo" ||
+		envValues["SWE_CLONE_TIMEOUT"] != repositoryCloneTimeout || envValues["SWE_CLONE_KILL_AFTER"] != hookKillAfter {
+		t.Errorf("clone Env = %#v, want repository and bounded clone timeout", clone.Env)
 	}
-	if len(setup.EnvFrom) != 0 {
+	if len(setup.Env) != 2 || setup.Env[0].Name != "SWE_HOOK_TIMEOUT" || setup.Env[1].Name != "SWE_HOOK_KILL_AFTER" || len(setup.EnvFrom) != 0 {
 		t.Errorf("init container EnvFrom = %#v, want no ambient project secrets", setup.EnvFrom)
 	}
 	if len(setup.VolumeMounts) != 1 || setup.VolumeMounts[0].MountPath != "/workspace" {
@@ -462,11 +462,11 @@ func TestFailedPodCreateLeavesGenerationGap(t *testing.T) {
 		t.Fatalf("retry reused failed generation: %#v", replacement.Annotations)
 	}
 	resume := false
-	for _, variable := range replacement.Spec.InitContainers[0].Env {
+	for _, variable := range replacement.Spec.InitContainers[1].Env {
 		resume = resume || variable.Name == "SWE_RESUMING" && variable.Value == "true"
 	}
 	if !resume {
-		t.Fatalf("retry omitted resume hook intent: %#v", replacement.Spec.InitContainers[0].Env)
+		t.Fatalf("retry omitted resume hook intent: %#v", replacement.Spec.InitContainers[1].Env)
 	}
 }
 

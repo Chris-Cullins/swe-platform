@@ -23,6 +23,17 @@
     {{- fail (printf "%s.digest must be a sha256 digest" $name) -}}
   {{- end -}}
 {{- end -}}
+{{- if .Values.operator.githubApp.enabled -}}
+  {{- if not .Values.operator.githubApp.clientID -}}
+    {{- fail "operator.githubApp.enabled requires operator.githubApp.clientID" -}}
+  {{- end -}}
+  {{- if not .Values.operator.githubApp.secretName -}}
+    {{- fail "operator.githubApp.enabled requires operator.githubApp.secretName" -}}
+  {{- end -}}
+  {{- if not .Values.operator.githubApp.privateKeyKey -}}
+    {{- fail "operator.githubApp.enabled requires operator.githubApp.privateKeyKey" -}}
+  {{- end -}}
+{{- end -}}
 {{- $operatorMetricsPort := int .Values.operator.metrics.port -}}
 {{- $operatorHealthPort := int .Values.operator.health.port -}}
 {{- if or (lt $operatorMetricsPort 1) (gt $operatorMetricsPort 65535) -}}

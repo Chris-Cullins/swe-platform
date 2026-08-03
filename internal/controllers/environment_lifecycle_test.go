@@ -319,8 +319,8 @@ func TestEnsurePodMarksProjectInitializationAsResume(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ensurePod() error = %v", err)
 	}
-	setup := pod.Spec.InitContainers[0]
-	if len(setup.Env) != 4 || setup.Env[3].Name != "SWE_RESUMING" || setup.Env[3].Value != "true" {
+	setup := pod.Spec.InitContainers[1]
+	if len(setup.Env) != 3 || setup.Env[2].Name != "SWE_RESUMING" || setup.Env[2].Value != "true" {
 		t.Fatalf("init container Env = %#v, want SWE_RESUMING=true", setup.Env)
 	}
 }
@@ -1225,7 +1225,7 @@ func TestWakeAndHoldReleaseWaitForBackendFence(t *testing.T) {
 			if replacementPod.Annotations[executionGenerationAnnotation] != "8" || fencing.Status.ExecutionGeneration != 8 {
 				t.Fatalf("resume execution generation = status %d, Pod %q, want 8", fencing.Status.ExecutionGeneration, replacementPod.Annotations[executionGenerationAnnotation])
 			}
-			setup := replacementPod.Spec.InitContainers[0]
+			setup := replacementPod.Spec.InitContainers[1]
 			resuming := false
 			for _, variable := range setup.Env {
 				if variable.Name == "SWE_RESUMING" && variable.Value == "true" {

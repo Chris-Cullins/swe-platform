@@ -26,6 +26,42 @@ The stock image contains no Pi authentication. Ambient auth or configuration int
 custom image, attached user, hooks/repository code, or the process environment is outside the
 supported process-scoped credential contract and should not be added to chart values.
 
+## GitHub App repository credentials
+
+Per-Run private repository access is disabled by default. To enable
+`swe run --git-credential github-app`, create a GitHub App whose installation can access the
+intended repositories and whose repository permissions include **Contents: Read and write**.
+Do not grant pull-request or administration permissions for this platform contract. Install the
+App on each repository that Runs may select, then create the private-key Secret out of band:
+
+```sh
+kubectl -n swe-platform-system create secret generic swe-platform-github-app \
+  --from-file=private-key.pem=/secure/path/to/github-app-private-key.pem
+```
+
+Configure the App client ID and Secret reference in an administrator-owned values file:
+
+```yaml
+operator:
+  githubApp:
+    enabled: true
+    clientID: Iv1.example
+    secretName: swe-platform-github-app
+    privateKeyKey: private-key.pem
+```
+
+The chart references but never creates or copies this Secret, and mounts its sole selected key
+only into the operator. The operator accepts only canonical
+`https://github.com/<owner>/<repo>[.git]` repositories and requests one short-lived installation
+token scoped to the exact frozen repository with only `contents:write`. Tokens are held in
+finalizer-managed, Run-UID-named lease Secrets in the Project namespace, delivered only to the
+clone init container and selected agent process, refreshed through an execution fence, and
+revoked on terminal cleanup. They are not projected into hooks, sandboxd, or other containers.
+Removing or disabling the App configuration while live credentialed Runs exist prevents new
+issuance and leaves terminal revocation pending until the provider is restored or each token's
+fixed expiry proves it inactive. Never place an App key or installation token in values, Project
+configuration, prompts, or repository URLs.
+
 This chart installs the swe-platform CRDs, operator, first control-plane API, and one
 system-namespaced `Installation` identity. Configured `environmentTemplates` are inert catalog
 sources in that system namespace; Helm never creates a Project tenancy there.

@@ -37,6 +37,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
 	platformv1alpha1 "github.com/Chris-Cullins/swe-platform/api/v1alpha1"
+	"github.com/Chris-Cullins/swe-platform/internal/repositorycredential"
 	"github.com/Chris-Cullins/swe-platform/internal/tenancy"
 	sandboxdauth "github.com/Chris-Cullins/swe-platform/sandboxd/auth"
 )
@@ -50,19 +51,21 @@ var sizePresets = map[string]corev1.ResourceList{
 }
 
 const (
-	defaultDiskSize               = "40Gi"
-	defaultIdleTimeout            = 15 * time.Minute
-	projectHookTimeout            = "30m"
-	hookKillAfter                 = "5s"
-	podRecoveryLimit              = int32(3)
-	podRecoveryDelay              = 5 * time.Second
-	templateRefField              = "spec.templateRef"
-	projectRefField               = "spec.projectRef"
-	provisioningRuntimeClassField = "status.provisioning.runtimeClassName"
-	warmPoolLabel                 = "swe.dev/warm-pool"
-	projectAnnotation             = "swe.dev/project"
-	runtimeClassUIDAnnotation     = "swe.dev/runtime-class-uid"
-	executionGenerationAnnotation = "swe.dev/execution-generation"
+	defaultDiskSize                  = "40Gi"
+	defaultIdleTimeout               = 15 * time.Minute
+	projectHookTimeout               = "30m"
+	repositoryCloneTimeout           = "30m"
+	repositoryCredentialRequeueDelay = 5 * time.Second
+	hookKillAfter                    = "5s"
+	podRecoveryLimit                 = int32(3)
+	podRecoveryDelay                 = 5 * time.Second
+	templateRefField                 = "spec.templateRef"
+	projectRefField                  = "spec.projectRef"
+	provisioningRuntimeClassField    = "status.provisioning.runtimeClassName"
+	warmPoolLabel                    = "swe.dev/warm-pool"
+	projectAnnotation                = "swe.dev/project"
+	runtimeClassUIDAnnotation        = "swe.dev/runtime-class-uid"
+	executionGenerationAnnotation    = "swe.dev/execution-generation"
 )
 
 var (
@@ -70,6 +73,7 @@ var (
 	errPodRecoveryChanged            = stderrors.New("environment pod recovery state changed")
 	errEnvironmentIncarnationChanged = stderrors.New("environment incarnation changed")
 	errEnvironmentExecutionChanged   = stderrors.New("environment execution changed")
+	errRepositoryCredentialPending   = stderrors.New("repository credential is not yet available for environment provisioning")
 )
 
 type childOwnershipCollisionError struct {
@@ -114,10 +118,24 @@ run_hook() {
 }
 `
 
-const projectSetupScript = hookRunnerScript + `
+const repositoryCloneScript = `set -eu
 if [ ! -d /workspace/.git ]; then
-	git clone -- "$SWE_REPOSITORY" /workspace
+	if [ -n "${SWE_REPOSITORY_TOKEN:-}" ]; then
+		authorization="AUTHORIZATION: basic $(printf '%s' "x-access-token:$SWE_REPOSITORY_TOKEN" | base64 | tr -d '\n')"
+		unset SWE_REPOSITORY_TOKEN
+		export GIT_CONFIG_COUNT=1
+		export GIT_CONFIG_KEY_0=http.https://github.com/.extraheader
+		export GIT_CONFIG_VALUE_0="$authorization"
+		unset authorization
+		timeout --kill-after="$SWE_CLONE_KILL_AFTER" "$SWE_CLONE_TIMEOUT" git clone -- "$SWE_REPOSITORY" /workspace
+		unset GIT_CONFIG_COUNT GIT_CONFIG_KEY_0 GIT_CONFIG_VALUE_0
+	else
+		timeout --kill-after="$SWE_CLONE_KILL_AFTER" "$SWE_CLONE_TIMEOUT" git clone -- "$SWE_REPOSITORY" /workspace
+	fi
 fi
+`
+
+const projectHooksScript = hookRunnerScript + `
 if ! git -c safe.directory=/workspace -C /workspace config --local --get swe.setup-complete >/dev/null 2>&1; then
 	if [ -f /workspace/.agents/setup ]; then
 		run_hook /workspace/.agents/setup
@@ -725,6 +743,86 @@ func validateEnvironmentProject(project *platformv1alpha1.Project) error {
 	return nil
 }
 
+// repositoryCloneCredential validates the complete uncached association and lease.
+func (r *EnvironmentReconciler) repositoryCloneCredential(ctx context.Context, env *platformv1alpha1.Environment) (*repositorycredential.Lease, error) {
+	var ref *platformv1alpha1.RunReference
+	var ownership platformv1alpha1.EnvironmentOwnership
+	if owner := metav1.GetControllerOf(env); owner != nil && owner.APIVersion == platformv1alpha1.GroupVersion.String() && owner.Kind == "Run" {
+		ref = &platformv1alpha1.RunReference{Name: owner.Name, UID: owner.UID}
+		ownership = platformv1alpha1.EnvironmentOwnershipOwned
+	} else if env.Status.ClaimedBy != nil {
+		ref = env.Status.ClaimedBy.DeepCopy()
+		ownership = platformv1alpha1.EnvironmentOwnershipClaimed
+	}
+	if ref == nil {
+		return nil, nil
+	}
+	var run platformv1alpha1.Run
+	if err := r.apiReader().Get(ctx, types.NamespacedName{Namespace: env.Namespace, Name: ref.Name}, &run); err != nil {
+		if errors.IsNotFound(err) {
+			return nil, errRepositoryCredentialPending
+		}
+		return nil, err
+	}
+	if run.UID != ref.UID || !run.DeletionTimestamp.IsZero() || terminalRunState(run.Status.State) {
+		return nil, terminalEnvironment(stderrors.New("associated Run is foreign or inactive"))
+	}
+	if run.Status.EnvironmentRef == nil {
+		return nil, errRepositoryCredentialPending
+	}
+	if run.Status.EnvironmentRef.Name != env.Name || run.Status.EnvironmentRef.UID != env.UID || run.Status.EnvironmentRef.Ownership != ownership {
+		return nil, terminalEnvironment(stderrors.New("associated Run environment reference is invalid"))
+	}
+	if run.Spec.RepositoryCredential == "" {
+		return nil, nil
+	}
+	if run.Spec.RepositoryCredential != platformv1alpha1.RepositoryCredentialGitHubApp || env.Status.Provisioning == nil || env.Status.Provisioning.Project == nil {
+		return nil, terminalEnvironment(stderrors.New("associated Run repository credential selection is invalid"))
+	}
+	credentialCondition := apimeta.FindStatusCondition(run.Status.Conditions, runConditionRepositoryCredentialReady)
+	if (credentialCondition == nil || credentialCondition.Status != metav1.ConditionTrue || credentialCondition.Reason != "Ready") && run.Annotations[repositoryRefreshAnnotation] == "" {
+		return nil, errRepositoryCredentialPending
+	}
+	name := repositorycredential.SecretName(run.UID)
+	key := types.NamespacedName{Namespace: env.Namespace, Name: name}
+	metadata := &metav1.PartialObjectMetadata{TypeMeta: metav1.TypeMeta{APIVersion: corev1.SchemeGroupVersion.String(), Kind: "Secret"}}
+	if err := r.apiReader().Get(ctx, key, metadata); err != nil {
+		if errors.IsNotFound(err) {
+			return nil, errRepositoryCredentialPending
+		}
+		return nil, err
+	}
+	var secret corev1.Secret
+	if err := r.apiReader().Get(ctx, key, &secret); err != nil {
+		if errors.IsNotFound(err) {
+			return nil, errRepositoryCredentialPending
+		}
+		return nil, err
+	}
+	defer func() {
+		for _, value := range secret.Data {
+			clear(value)
+		}
+	}()
+	if secret.UID != metadata.UID || secret.ResourceVersion != metadata.ResourceVersion {
+		return nil, errRepositoryCredentialPending
+	}
+	lease, err := repositorycredential.Parse(&secret, run.Name, run.UID)
+	if err != nil {
+		return nil, terminalEnvironment(stderrors.New("repository credential Secret is invalid"))
+	}
+	if lease.Provider != string(platformv1alpha1.RepositoryCredentialGitHubApp) || env.Status.Provisioning.Project == nil || lease.SourceRepository != env.Status.Provisioning.Project.Repository || !lease.ExpiresAt.After(r.now().Add(repositorycredential.MinimumValidity)) {
+		repositorycredential.ClearLease(lease)
+		return nil, terminalEnvironment(stderrors.New("repository credential Secret does not match provisioning authority"))
+	}
+	nextExecution := env.Status.ExecutionGeneration + 1
+	if lease.EnvironmentUID != "" && (lease.EnvironmentUID != env.UID || lease.ExecutionGeneration != nextExecution) {
+		repositorycredential.ClearLease(lease)
+		return nil, errRepositoryCredentialPending
+	}
+	return lease, nil
+}
+
 func unsupportedEgressAllowlistMessage(projectName string) string {
 	return fmt.Sprintf("project %q has a non-empty egressAllowlist, which is unsupported until GitHub issue #68 is implemented", projectName)
 }
@@ -864,6 +962,13 @@ func (r *EnvironmentReconciler) ensurePodForProject(ctx context.Context, env *pl
 	if !errors.IsNotFound(err) {
 		return nil, err
 	}
+	repositoryLease, err := r.repositoryCloneCredential(ctx, env)
+	if err != nil {
+		return nil, err
+	}
+	if repositoryLease != nil {
+		defer repositorycredential.ClearLease(repositoryLease)
+	}
 	var existingCredentials corev1.Secret
 	err = r.Get(ctx, types.NamespacedName{Namespace: env.Namespace, Name: envCredentialName(env)}, &existingCredentials)
 	if err == nil {
@@ -886,6 +991,23 @@ func (r *EnvironmentReconciler) ensurePodForProject(ctx context.Context, env *pl
 	executionGeneration, err := r.reserveExecutionGeneration(ctx, env)
 	if err != nil {
 		return nil, fmt.Errorf("reserve execution generation: %w", err)
+	}
+	repositoryCredentialSecret := ""
+	if repositoryLease != nil {
+		var secret corev1.Secret
+		key := types.NamespacedName{Namespace: env.Namespace, Name: repositorycredential.SecretName(repositoryLease.RunUID)}
+		if err := r.apiReader().Get(ctx, key, &secret); err != nil {
+			return nil, err
+		}
+		if secret.UID != repositoryLease.SecretUID || secret.ResourceVersion != repositoryLease.ResourceVersion {
+			return nil, errRepositoryCredentialPending
+		}
+		secret.Annotations[repositorycredential.AnnotationEnvironmentUID] = string(env.UID)
+		secret.Annotations[repositorycredential.AnnotationExecutionGeneration] = strconv.FormatInt(executionGeneration, 10)
+		if err := r.Update(ctx, &secret); err != nil {
+			return nil, err
+		}
+		repositoryCredentialSecret = secret.Name
 	}
 
 	resources, ok := sizePresets[tmpl.Spec.Size]
@@ -1006,21 +1128,25 @@ func (r *EnvironmentReconciler) ensurePodForProject(ctx context.Context, env *pl
 		if repository == "" {
 			repository = project.Spec.Repositories[0]
 		}
-		projectEnv := []corev1.EnvVar{
+		cloneEnv := []corev1.EnvVar{
 			{Name: "SWE_REPOSITORY", Value: repository},
+			{Name: "SWE_CLONE_TIMEOUT", Value: repositoryCloneTimeout},
+			{Name: "SWE_CLONE_KILL_AFTER", Value: hookKillAfter},
+		}
+		if repositoryCredentialSecret != "" {
+			cloneEnv = append(cloneEnv, corev1.EnvVar{Name: "SWE_REPOSITORY_TOKEN", ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{LocalObjectReference: corev1.LocalObjectReference{Name: repositoryCredentialSecret}, Key: repositorycredential.TokenKey}}})
+		}
+		hooksEnv := []corev1.EnvVar{
 			{Name: "SWE_HOOK_TIMEOUT", Value: projectHookTimeout},
 			{Name: "SWE_HOOK_KILL_AFTER", Value: hookKillAfter},
 		}
 		if resuming {
-			projectEnv = append(projectEnv, corev1.EnvVar{Name: "SWE_RESUMING", Value: "true"})
+			hooksEnv = append(hooksEnv, corev1.EnvVar{Name: "SWE_RESUMING", Value: "true"})
 		}
-		pod.Spec.InitContainers = []corev1.Container{{
-			Name:                     "project-setup",
+		baseInit := corev1.Container{
 			Image:                    image,
 			ImagePullPolicy:          envImagePullPolicy(image),
-			Command:                  []string{"/bin/sh", "-c", projectSetupScript},
-			Env:                      projectEnv,
-			TerminationMessagePolicy: corev1.TerminationMessageFallbackToLogsOnError,
+			TerminationMessagePolicy: corev1.TerminationMessageReadFile,
 			Resources: corev1.ResourceRequirements{
 				Requests: resources,
 				Limits:   resources,
@@ -1030,7 +1156,12 @@ func (r *EnvironmentReconciler) ensurePodForProject(ctx context.Context, env *pl
 				Capabilities:             &corev1.Capabilities{Drop: []corev1.Capability{"ALL"}},
 			},
 			VolumeMounts: []corev1.VolumeMount{{Name: "workspace", MountPath: "/workspace"}},
-		}}
+		}
+		clone := baseInit.DeepCopy()
+		clone.Name, clone.Command, clone.Env = "repository-clone", []string{"/bin/sh", "-c", repositoryCloneScript}, cloneEnv
+		hooks := baseInit.DeepCopy()
+		hooks.Name, hooks.Command, hooks.Env = "project-hooks", []string{"/bin/sh", "-c", projectHooksScript}, hooksEnv
+		pod.Spec.InitContainers = []corev1.Container{*clone, *hooks}
 	}
 	if err := controllerutil.SetControllerReference(env, &pod, r.Scheme); err != nil {
 		return nil, err

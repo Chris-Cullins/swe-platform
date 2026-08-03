@@ -30,9 +30,12 @@ control-plane bearer credential; interactive terminal attach is intentionally no
 The control plane also provides the authenticated declared-service portal gateway, with fenced
 wake/currentness checks and a purpose-scoped sandboxd tunnel. Remaining gaps are tracked in
 `ARCHITECTURE.md`, code comments, and linked issues — most notably additional credential forms,
-additional agent adapters, GitHub App–scoped git tokens, and egress networking. Repository
+additional agent adapters, and egress networking. Repository
 `.swe/services.yaml` ingestion and supervised service launch with
-gateway-discovered `PUBLIC_URL` are implemented. The `claude-code` (default), `amp`, `codex`, and `pi` adapters are
+gateway-discovered `PUBLIC_URL` are implemented. GitHub App repository credentials use
+short-lived, exact-repository `contents:write` installation tokens for authenticated clone and
+process-scoped Git/GitHub CLI access, with execution-fenced refresh and terminal cleanup.
+The `claude-code` (default), `amp`, `codex`, and `pi` adapters are
 registered and use sandboxd managed processes. API-key profiles use process-scoped launch
 material as `ANTHROPIC_API_KEY`,
 `AMP_API_KEY`, or `CODEX_API_KEY`; tests use fake process services and no provider credentials.
