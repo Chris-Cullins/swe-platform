@@ -246,7 +246,9 @@ Platform consumers receive a backend-neutral connector or adapter sandbox and do
 containers, PIDs, tmux, or OS signals. The protobuf uses logical paths, process owner/role keys,
 portable process controls, and opaque execution IDs. The sandboxd module is separate and has
 Windows coverage for process containment and filesystem behavior; the current shared terminal
-backend is tmux, not ConPTY.
+backend is tmux on non-Windows systems. Windows selects an explicit fail-closed backend rather
+than trying to invoke tmux; native Windows terminal sessions remain blocked on a real ConPTY
+implementation with shared-session and per-attachment semantics.
 
 Only the Kubernetes **Pod backend** is implemented. The connector currently resolves an exact
 owned Pod, Pod IP, Pod UID, execution-generation annotation, restart policy, and per-Pod
@@ -649,7 +651,8 @@ path forcing ship together after Project namespace claims.
 
 Repository service ingestion and process URL injection from authenticated discovery are
 implemented. Portal UI work (#95) remains unimplemented. Other unimplemented areas include inbox and child-run semantics, changes
-publication, transcript garbage collection, additional credential forms, ConPTY, non-Pod
+publication, transcript garbage collection, additional credential forms, ConPTY, Windows
+setup/resume hook semantics and node-pool/provider requirements, non-Pod
 backends, and control-plane HA. Their detailed contracts remain issue work unless and until a
 maintainer decision is recorded. In particular, schema placeholders or portable interfaces do
 not by themselves make these features implemented.
