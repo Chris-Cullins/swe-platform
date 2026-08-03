@@ -2650,14 +2650,25 @@ CONSOLE_PORTAL_URL=$(SWE_CONTROL_PLANE_URL=http://127.0.0.1:18080 SWE_CONTROL_PL
 CONSOLE_PORTAL_HOST=${CONSOLE_PORTAL_URL#http://}
 echo "==> verifying authenticated console portal discovery and host-local session handoff"
 PORTAL_LIST_PATH="/api/v1/namespaces/${PROJECT_NAMESPACE}/runs/${RESUME_RUN_NAME}/portals/${RESUME_RUN_UID}/${RESUME_ENV_UID}"
-PORTAL_LIST=$(curl --silent --fail --cookie "$COOKIE_JAR" "http://127.0.0.1:18080${PORTAL_LIST_PATH}")
+PORTAL_LIST_STATUS=$(curl --silent --output /tmp/swe-platform-console-portals.json --write-out '%{http_code}' \
+	--cookie "$COOKIE_JAR" "http://127.0.0.1:18080${PORTAL_LIST_PATH}")
+PORTAL_LIST=$(cat /tmp/swe-platform-console-portals.json)
+if [[ "$PORTAL_LIST_STATUS" != "200" ]]; then
+	echo "FAIL: console portal list returned ${PORTAL_LIST_STATUS}: $PORTAL_LIST"
+	exit 1
+fi
 PORTAL_OPEN_PATH=$(jq -r '.items[] | select(.name == "manual-api" and .targetPort == 3999 and .status == "Ready") | .openURL' <<<"$PORTAL_LIST")
 if [[ "$PORTAL_OPEN_PATH" != "${PORTAL_LIST_PATH}/manual-api/open" ]] || ! jq -e --arg url "$CONSOLE_PORTAL_URL" 'any(.items[]; .name == "manual-api" and .url == $url)' <<<"$PORTAL_LIST" >/dev/null; then
 	echo "FAIL: console portal list was not exact, ready, and stable: $PORTAL_LIST"
 	exit 1
 fi
-PORTAL_HANDOFF_HTML=$(curl --silent --fail --cookie "$COOKIE_JAR" -X POST \
-	-H 'Origin: http://127.0.0.1:18080' "http://127.0.0.1:18080${PORTAL_OPEN_PATH}")
+PORTAL_HANDOFF_STATUS=$(curl --silent --output /tmp/swe-platform-console-portal-handoff.html --write-out '%{http_code}' \
+	--cookie "$COOKIE_JAR" -X POST -H 'Origin: http://127.0.0.1:18080' "http://127.0.0.1:18080${PORTAL_OPEN_PATH}")
+PORTAL_HANDOFF_HTML=$(cat /tmp/swe-platform-console-portal-handoff.html)
+if [[ "$PORTAL_HANDOFF_STATUS" != "200" ]]; then
+	echo "FAIL: console portal opener returned ${PORTAL_HANDOFF_STATUS}: $PORTAL_HANDOFF_HTML"
+	exit 1
+fi
 PORTAL_HANDOFF_CODE=$(sed -n 's/.*name="code" value="\([^"]*\)".*/\1/p' <<<"$PORTAL_HANDOFF_HTML")
 if [[ -z "$PORTAL_HANDOFF_CODE" ]] || grep -Fq "$CONSOLE_TOKEN" <<<"$PORTAL_HANDOFF_HTML"; then
 	echo "FAIL: console portal opener did not return a credential-free one-time handoff"
@@ -2673,9 +2684,14 @@ if [[ "$HANDOFF_STATUS" != "200" ]]; then
 	echo "FAIL: portal host-local session handoff returned ${HANDOFF_STATUS}, expected 200"
 	exit 1
 fi
-PORTAL_SESSION_BODY=$(curl --silent --fail --resolve "${CONSOLE_PORTAL_HOST}:18080:127.0.0.1" \
-	--cookie "$PORTAL_COOKIE_JAR" -H 'X-Portal-Check: browser-session' \
-	"http://${CONSOLE_PORTAL_HOST}:18080/portal-check")
+PORTAL_SESSION_STATUS=$(curl --silent --output /tmp/swe-platform-console-portal-session.json --write-out '%{http_code}' \
+	--resolve "${CONSOLE_PORTAL_HOST}:18080:127.0.0.1" --cookie "$PORTAL_COOKIE_JAR" \
+	-H 'X-Portal-Check: browser-session' "http://${CONSOLE_PORTAL_HOST}:18080/portal-check")
+PORTAL_SESSION_BODY=$(cat /tmp/swe-platform-console-portal-session.json)
+if [[ "$PORTAL_SESSION_STATUS" != "200" ]]; then
+	echo "FAIL: authorized console portal request returned ${PORTAL_SESSION_STATUS}: $PORTAL_SESSION_BODY"
+	exit 1
+fi
 if ! jq -e '.marker == "portal-listener" and .authorization == "" and .portalHeader == "browser-session"' <<<"$PORTAL_SESSION_BODY" >/dev/null; then
 	echo "FAIL: console portal handoff did not establish an authorized host-local session: $PORTAL_SESSION_BODY"
 	exit 1

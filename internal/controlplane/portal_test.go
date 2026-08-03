@@ -409,6 +409,14 @@ func TestRunPortalListFiltersExactServiceAuthorizationAndReportsCurrentState(t *
 	if strings.Contains(response.Body.String(), "denied") {
 		t.Fatalf("portal list disclosed denied service: %s", response.Body.String())
 	}
+	openRequest := httptest.NewRequest(http.MethodPost, "https://console.example"+result.Items[0].OpenURL, nil)
+	openRequest.Header.Set("Origin", "https://console.example")
+	openRequest.AddCookie(&http.Cookie{Name: sessionCookieName, Value: "browser-session"})
+	openResponse := httptest.NewRecorder()
+	gateway.openRunPortal(openResponse, openRequest, "ns", RunTerminalAssociation{RunName: "run", RunUID: "run-uid", EnvironmentName: "env", EnvironmentUID: "env-uid", EnvironmentOwnership: "Owned"}, "web")
+	if openResponse.Code != http.StatusOK || !strings.Contains(openResponse.Body.String(), `<form method="post" action="https://`) || !strings.Contains(openResponse.Body.String(), `name="code" value="`) {
+		t.Fatalf("portal opener = %d: %s", openResponse.Code, openResponse.Body.String())
+	}
 }
 
 func TestPortalServiceStateHonorsLifecycleAndFreshness(t *testing.T) {
