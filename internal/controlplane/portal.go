@@ -30,9 +30,11 @@ import (
 )
 
 const (
-	portalNotFoundBody             = "not found\n"
-	portalSessionHandoffCodeLength = 32
-	portalSessionHandoffBodyLimit  = int64(len("code=") + portalSessionHandoffCodeLength)
+	portalNotFoundBody              = "not found\n"
+	portalSessionHandoffCodeLength  = 32
+	portalSessionHandoffBodyLimit   = int64(len("code=") + portalSessionHandoffCodeLength)
+	portalSessionHandoffReadLimit   = 8
+	portalSessionHandoffReadTimeout = 2 * time.Second
 )
 const (
 	maxPortalResponseBytes   int64 = 64 << 20
@@ -63,6 +65,8 @@ type portalGateway struct {
 	requests           chan struct{}
 	admissionHeartbeat time.Duration
 	leasePoll          time.Duration
+	handoffReadTimeout time.Duration
+	handoffReads       chan struct{}
 	handoffsMu         sync.Mutex
 	handoffs           map[string]portalSessionHandoff
 }
@@ -91,7 +95,7 @@ func newPortalGateway(s *Server, o ServerOptions) *portalGateway {
 		return nil
 	}
 	if suffix == "" {
-		return &portalGateway{server: s, resolver: o.PortalResolver, suffix: suffix, scheme: scheme, requests: make(chan struct{}, 64), handoffs: make(map[string]portalSessionHandoff)}
+		return &portalGateway{server: s, resolver: o.PortalResolver, suffix: suffix, scheme: scheme, requests: make(chan struct{}, 64), handoffReads: make(chan struct{}, portalSessionHandoffReadLimit), handoffs: make(map[string]portalSessionHandoff)}
 	}
 	if o.PortalDialer == nil {
 		return nil
@@ -105,7 +109,7 @@ func newPortalGateway(s *Server, o ServerOptions) *portalGateway {
 	if o.PortalEnvironmentEnumerator == nil {
 		return nil
 	}
-	return &portalGateway{server: s, resolver: o.PortalResolver, enumerator: o.PortalEnvironmentEnumerator, dialer: o.PortalDialer, suffix: suffix, scheme: scheme, requests: make(chan struct{}, 64), handoffs: make(map[string]portalSessionHandoff)}
+	return &portalGateway{server: s, resolver: o.PortalResolver, enumerator: o.PortalEnvironmentEnumerator, dialer: o.PortalDialer, suffix: suffix, scheme: scheme, requests: make(chan struct{}, 64), handoffReads: make(chan struct{}, portalSessionHandoffReadLimit), handoffs: make(map[string]portalSessionHandoff)}
 }
 
 func (g *portalGateway) enabled() bool { return g != nil && g.suffix != "" }
@@ -369,6 +373,7 @@ func (g *portalGateway) listRunPortals(w http.ResponseWriter, r *http.Request, n
 			g.server.writeResourceError(w, "revalidate Run portal association", namespace, association.RunName, err)
 			return
 		}
+		w.Header().Set("Cache-Control", "private, no-store")
 		writeJSON(w, http.StatusOK, result)
 		return
 	}
@@ -501,16 +506,33 @@ func (g *portalGateway) openRunPortal(w http.ResponseWriter, r *http.Request, na
 }
 
 func (g *portalGateway) consumeSessionHandoff(w http.ResponseWriter, r *http.Request, locator string) {
-	if r.Method != http.MethodPost || r.URL.RawQuery != "" {
-		portal404(w)
+	if r.Method != http.MethodPost || r.URL.RawQuery != "" || r.URL.ForceQuery {
+		rejectUnreadHandoff(w, r)
 		return
 	}
 	mediaType, _, contentTypeErr := mime.ParseMediaType(r.Header.Get("Content-Type"))
 	if contentTypeErr != nil || mediaType != "application/x-www-form-urlencoded" {
-		portal404(w)
+		rejectUnreadHandoff(w, r)
 		return
 	}
+	select {
+	case g.handoffReads <- struct{}{}:
+		defer func() { <-g.handoffReads }()
+	default:
+		rejectUnreadHandoff(w, r)
+		return
+	}
+	readTimeout := g.handoffReadTimeout
+	if readTimeout <= 0 {
+		readTimeout = portalSessionHandoffReadTimeout
+	}
+	controller := http.NewResponseController(w)
+	if err := controller.SetReadDeadline(time.Now().Add(readTimeout)); err != nil {
+		panic(http.ErrAbortHandler)
+	}
+	defer func() { _ = controller.SetReadDeadline(time.Time{}) }()
 	r.Body = http.MaxBytesReader(w, r.Body, portalSessionHandoffBodyLimit)
+	defer r.Body.Close()
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		portal404(w)
@@ -541,6 +563,18 @@ func (g *portalGateway) consumeSessionHandoff(w http.ResponseWriter, r *http.Req
 	w.Header().Set("Referrer-Policy", "no-referrer")
 	w.Header().Set("Content-Security-Policy", "default-src 'none'; script-src 'unsafe-inline'; frame-ancestors 'none'")
 	_, _ = io.WriteString(w, `<!doctype html><title>Portal ready</title><p><a href="/">Continue to portal</a></p><script>location.replace("/")</script>`)
+}
+
+func rejectUnreadHandoff(w http.ResponseWriter, r *http.Request) {
+	// Prevent net/http from draining an unread HTTP/1 request body before
+	// writing the rejection, and bound its post-handler close attempt.
+	if r.ProtoMajor == 1 {
+		w.Header().Set("Connection", "close")
+	}
+	if err := http.NewResponseController(w).SetReadDeadline(time.Now()); err != nil {
+		panic(http.ErrAbortHandler)
+	}
+	portal404(w)
 }
 
 func reconcileDisabledPortalRoute(env *platformv1alpha1.Environment, want, instanceID string, revision int64, presentationID string) (bool, platformv1alpha1.EnvironmentPortalRoute, error) {
