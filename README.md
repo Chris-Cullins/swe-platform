@@ -379,16 +379,30 @@ its default template:
 > not upgrade files in a chart's `crds/` directory, and then run `helm upgrade`. The operator
 > upgrade replaces existing Environment pods so previously injected ambient Secret values are
 > removed. Private repository clones and `.agents/setup` or `.agents/resume` hooks that relied
-> on those values will break. There is no fallback; purpose-scoped Git and setup credentials
-> remain future work.
+> on those values will break. There is no ambient fallback. GitHub App repository credentials
+> are available only through explicit per-Run selection; setup/resume credentials remain
+> unsupported.
 
 ```sh
 swe --namespace my-project run --template small "Fix the flaky test"
 swe --namespace my-project run --project org-repo "Fix the flaky test"
 swe --namespace my-project run --name fix-flaky-42 --project org-repo "Fix the flaky test"
 swe --namespace my-project run --environment warm-env-1 "Fix the flaky test"
+swe --namespace my-project run --project private-org-repo \
+  --git-credential github-app "Fix and push the flaky test"
 swe --namespace my-project cancel fix-flaky-42
 ```
+
+`--git-credential github-app` requires an administrator-configured GitHub App and an exact
+`https://github.com/<owner>/<repo>[.git]` Project repository. It mints a short-lived installation
+token for that repository with only `contents:write`, uses it for the initial clone, and supplies
+authenticated Git and `gh` access only to the selected agent process. The token is refreshed
+through an execution fence on resume or before expiry and revoked when the Run completes. It is
+not supplied to setup/resume hooks, sandboxd's ambient environment, status, transcripts,
+repository URLs, or persistent workspace configuration. Public repositories continue to clone
+without credentials when the flag is omitted. See the
+[chart configuration](charts/swe-platform/README.md#github-app-repository-credentials) for the
+administrator-owned Secret contract.
 
 ### Claude Code adapter
 
@@ -434,8 +448,9 @@ output. Transcript redaction is not guaranteed. Anyone authorized to create Runs
 can initially select any profile there; profile creation and rotation additionally require
 Secret and CRD administration. Subscription/OAuth credentials, refresh and writeback, leases,
 Amp login persistence, per-user profiles, Git/setup/service credentials, hard same-user
-isolation, and stronger redaction remain deferred to issue #9. Never place credentials in a Run
-prompt or Project configuration.
+isolation, and stronger redaction remain deferred to issue #9. GitHub App repository tokens use
+the separate per-Run contract above. Never place credentials in a Run prompt or Project
+configuration.
 
 Current limitations: Claude print mode has no live input continuation channel, so an exit-zero
 successful result remains `Succeeded` even when its history contains permission denials.
@@ -537,7 +552,9 @@ the `Ready` condition and nested backend-neutral `status.recovery` fields. Envir
 is reported by
 the current-generation `Ready` condition only after initialization completes and the sandboxd
 startup/readiness probes pass; `status.phase` is a display summary rather than the scheduling
-contract. GitHub App token minting is not implemented yet.
+contract. When a Run explicitly selects `--git-credential github-app`, repository clone occurs
+in a separate preceding init container with an exact Run lease Secret; the later project-hook
+container receives no repository token or temporary Git header.
 
 Upgrade compatibility: the deprecated flat `status.podRecovery*` fields remain in the CRD for
 one rollout. An early phase after deletion handling and before lifecycle or dependency gates

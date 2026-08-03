@@ -26,7 +26,242 @@ import (
 	platformv1alpha1 "github.com/Chris-Cullins/swe-platform/api/v1alpha1"
 	"github.com/Chris-Cullins/swe-platform/internal/agent"
 	"github.com/Chris-Cullins/swe-platform/internal/lifecycle"
+	"github.com/Chris-Cullins/swe-platform/internal/repositorycredential"
 )
+
+type fakeRepositoryCredentialProvider struct {
+	canonical string
+	issued    []string
+	revoked   [][]byte
+	issueErr  error
+	revokeErr error
+	now       time.Time
+	token     []byte
+}
+
+func (f *fakeRepositoryCredentialProvider) CanonicalRepository(repository string) (string, error) {
+	if f.canonical == "" {
+		return "", &repositorycredential.Error{Operation: "repository", Reason: "RepositoryUnsupported"}
+	}
+	return f.canonical, nil
+}
+func (f *fakeRepositoryCredentialProvider) Issue(_ context.Context, repository string) (*repositorycredential.Credential, error) {
+	f.issued = append(f.issued, repository)
+	if f.issueErr != nil {
+		return nil, f.issueErr
+	}
+	if f.token == nil {
+		f.token = []byte("fake-token")
+	}
+	return &repositorycredential.Credential{Token: f.token, Repository: f.canonical, InstallationID: 7, ExpiresAt: f.now.Add(time.Hour)}, nil
+}
+func (f *fakeRepositoryCredentialProvider) Revoke(_ context.Context, credential *repositorycredential.Credential) error {
+	f.revoked = append(f.revoked, append([]byte(nil), credential.Token...))
+	return f.revokeErr
+}
+
+func TestRepositoryCredentialIssueCanonicalizesAndClearsProviderToken(t *testing.T) {
+	now := time.Date(2026, 8, 3, 12, 0, 0, 0, time.UTC)
+	project := &platformv1alpha1.Project{ObjectMeta: metav1.ObjectMeta{Name: "p", Namespace: "ns", UID: "project-uid", Generation: 1}, Spec: platformv1alpha1.ProjectSpec{Repositories: []string{"https://github.com/acme/repo.git"}}}
+	env, tmpl := frozenRepositoryEnvironment(project)
+	run := &platformv1alpha1.Run{ObjectMeta: metav1.ObjectMeta{Name: "r", Namespace: "ns", UID: "run-uid"}, Spec: platformv1alpha1.RunSpec{ProjectRef: "p", RepositoryCredential: platformv1alpha1.RepositoryCredentialGitHubApp}, Status: platformv1alpha1.RunStatus{EnvironmentRef: &platformv1alpha1.RunEnvironmentReference{Name: env.Name, UID: env.UID, Ownership: platformv1alpha1.EnvironmentOwnershipOwned}}}
+	r := reconciler(t, &scriptedAdapter{}, run, project, env, tmpl)
+	provider := &fakeRepositoryCredentialProvider{canonical: "https://github.com/acme/repo", now: now, token: []byte("fake-token")}
+	r.RepositoryCredentials, r.Now = provider, func() time.Time { return now }
+	var current platformv1alpha1.Run
+	if err := r.Get(context.Background(), client.ObjectKeyFromObject(run), &current); err != nil {
+		t.Fatal(err)
+	}
+	if _, done, err := r.ensureRepositoryCredential(context.Background(), &current); err != nil || !done {
+		t.Fatalf("mark issuing = done %v, err %v", done, err)
+	}
+	if err := r.Get(context.Background(), client.ObjectKeyFromObject(run), &current); err != nil {
+		t.Fatal(err)
+	}
+	if _, done, err := r.ensureRepositoryCredential(context.Background(), &current); err != nil || !done {
+		t.Fatalf("issue = done %v, err %v", done, err)
+	}
+	if len(provider.issued) != 1 || provider.issued[0] != provider.canonical {
+		t.Fatalf("issued repositories = %v", provider.issued)
+	}
+	if string(provider.token) != strings.Repeat("\x00", len(provider.token)) {
+		t.Fatalf("provider token was not defensively cleared: %v", provider.token)
+	}
+	var secret corev1.Secret
+	if err := r.Get(context.Background(), types.NamespacedName{Namespace: "ns", Name: repositorycredential.SecretName(run.UID)}, &secret); err != nil {
+		t.Fatal(err)
+	}
+	if got := secret.Annotations[repositorycredential.AnnotationRepository]; got != provider.canonical {
+		t.Fatalf("lease repository = %q", got)
+	}
+}
+
+func TestRepositoryCredentialUsesFrozenRepositoryAfterProjectChanges(t *testing.T) {
+	now := time.Date(2026, 8, 3, 12, 0, 0, 0, time.UTC)
+	project := &platformv1alpha1.Project{ObjectMeta: metav1.ObjectMeta{Name: "p", Namespace: "ns", UID: "project-uid", Generation: 1}, Spec: platformv1alpha1.ProjectSpec{Repositories: []string{"https://github.com/acme/old"}}}
+	env, tmpl := frozenRepositoryEnvironment(project)
+	project.Generation, project.Spec.Repositories[0] = 2, "https://github.com/acme/new"
+	run := &platformv1alpha1.Run{ObjectMeta: metav1.ObjectMeta{Name: "r", Namespace: "ns", UID: "run-uid", Finalizers: []string{runFinalizer}}, Spec: platformv1alpha1.RunSpec{ProjectRef: "p", RepositoryCredential: platformv1alpha1.RepositoryCredentialGitHubApp}, Status: platformv1alpha1.RunStatus{EnvironmentRef: &platformv1alpha1.RunEnvironmentReference{Name: env.Name, UID: env.UID, Ownership: platformv1alpha1.EnvironmentOwnershipOwned}}}
+	credential := &repositorycredential.Credential{Token: []byte("old"), Repository: "https://github.com/acme/old", InstallationID: 7, ExpiresAt: now.Add(time.Hour)}
+	secret, err := repositorycredential.NewSecret("ns", run.Name, run.UID, string(run.Spec.RepositoryCredential), "https://github.com/acme/old", credential, 1, "", 0, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := reconciler(t, &scriptedAdapter{}, run, project, env, tmpl, secret)
+	r.RepositoryCredentials, r.Now = &fakeRepositoryCredentialProvider{canonical: "https://github.com/acme/old", now: now}, func() time.Time { return now }
+	var current platformv1alpha1.Run
+	if err := r.Get(context.Background(), client.ObjectKeyFromObject(run), &current); err != nil {
+		t.Fatal(err)
+	}
+	if _, done, err := r.ensureRepositoryCredential(context.Background(), &current); err != nil || done {
+		t.Fatalf("frozen repository = done %v, err %v", done, err)
+	}
+	condition := apiMeta.FindStatusCondition(current.Status.Conditions, runConditionRepositoryCredentialReady)
+	if condition == nil || condition.Reason != "Ready" {
+		t.Fatalf("condition = %#v", condition)
+	}
+}
+
+func TestRepositoryRotationRecordStrictJSON(t *testing.T) {
+	valid := `{"oldSecretUID":"old-uid","targetGeneration":2,"wake":true}`
+	if record, err := parseRepositoryRotationRecord(valid); err != nil || record.OldSecretUID != "old-uid" || record.TargetGeneration != 2 || !record.Wake {
+		t.Fatalf("valid record = %#v, %v", record, err)
+	}
+	for _, value := range []string{"", `{}`, `{"oldSecretUID":"","targetGeneration":2,"wake":false}`, `{"oldSecretUID":"x","targetGeneration":1,"wake":false}`, valid + `{}`, `{"oldSecretUID":"x","targetGeneration":2,"wake":false,"extra":1}`} {
+		if _, err := parseRepositoryRotationRecord(value); err == nil {
+			t.Errorf("parseRepositoryRotationRecord(%q) succeeded", value)
+		}
+	}
+}
+
+func TestRepositoryCredentialRefreshFencesAfterOldSecretDisappears(t *testing.T) {
+	now := time.Date(2026, 8, 3, 12, 0, 0, 0, time.UTC)
+	project := &platformv1alpha1.Project{ObjectMeta: metav1.ObjectMeta{Name: "p", Namespace: "ns", UID: "project-uid", Generation: 1}, Spec: platformv1alpha1.ProjectSpec{Repositories: []string{"https://github.com/acme/repo"}}}
+	env, tmpl := frozenRepositoryEnvironment(project)
+	env.Status.ExecutionGeneration = 1
+	run := &platformv1alpha1.Run{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "r", Namespace: "ns", UID: "run-uid", Finalizers: []string{runFinalizer},
+			Annotations: map[string]string{repositoryRefreshAnnotation: `{"oldSecretUID":"old-secret-uid","targetGeneration":2,"wake":true}`},
+		},
+		Spec: platformv1alpha1.RunSpec{ProjectRef: "p", RepositoryCredential: platformv1alpha1.RepositoryCredentialGitHubApp},
+		Status: platformv1alpha1.RunStatus{EnvironmentRef: &platformv1alpha1.RunEnvironmentReference{
+			Name: env.Name, UID: env.UID, Ownership: platformv1alpha1.EnvironmentOwnershipOwned,
+		}},
+	}
+	credential := &repositorycredential.Credential{Token: []byte("fresh-token"), Repository: "https://github.com/acme/repo", InstallationID: 7, ExpiresAt: now.Add(time.Hour)}
+	secret, err := repositorycredential.NewSecret("ns", run.Name, run.UID, string(run.Spec.RepositoryCredential), project.Spec.Repositories[0], credential, 2, "", 0, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secret.UID = "fresh-secret-uid"
+	r := reconciler(t, &scriptedAdapter{}, run, project, env, tmpl, secret)
+	r.RepositoryCredentials, r.Now = &fakeRepositoryCredentialProvider{canonical: credential.Repository, now: now}, func() time.Time { return now }
+
+	var current platformv1alpha1.Run
+	if err := r.Get(context.Background(), client.ObjectKeyFromObject(run), &current); err != nil {
+		t.Fatal(err)
+	}
+	result, done, err := r.ensureRepositoryCredential(context.Background(), &current)
+	if err != nil || !done || result.RequeueAfter != adapterPollInterval {
+		t.Fatalf("refresh recovery = (%#v, %t, %v)", result, done, err)
+	}
+	var fenced platformv1alpha1.Environment
+	if err := r.Get(context.Background(), client.ObjectKeyFromObject(env), &fenced); err != nil {
+		t.Fatal(err)
+	}
+	if fenced.Spec.Lifecycle.Suspend == nil || fenced.Spec.Lifecycle.Wake != nil {
+		t.Fatalf("refresh lifecycle intent = %#v, want suspend without wake", fenced.Spec.Lifecycle)
+	}
+	var retained platformv1alpha1.Run
+	if err := r.Get(context.Background(), client.ObjectKeyFromObject(run), &retained); err != nil {
+		t.Fatal(err)
+	}
+	if retained.Annotations[repositoryRefreshAnnotation] == "" {
+		t.Fatal("refresh record was cleared before the old execution was fenced")
+	}
+}
+
+func TestRepositoryCredentialPendingFrozenSnapshotIsBounded(t *testing.T) {
+	now := time.Date(2026, 8, 3, 12, 0, 0, 0, time.UTC)
+	project := &platformv1alpha1.Project{ObjectMeta: metav1.ObjectMeta{Name: "p", Namespace: "ns", UID: "project-uid", Generation: 1}, Spec: platformv1alpha1.ProjectSpec{Repositories: []string{"https://github.com/acme/repo"}}}
+	env, tmpl := frozenRepositoryEnvironment(project)
+	env.Status.Provisioning.ProjectVerified = false
+	run := &platformv1alpha1.Run{ObjectMeta: metav1.ObjectMeta{Name: "r", Namespace: "ns", UID: "run-uid"}, Spec: platformv1alpha1.RunSpec{ProjectRef: "p", RepositoryCredential: platformv1alpha1.RepositoryCredentialGitHubApp}, Status: platformv1alpha1.RunStatus{EnvironmentRef: &platformv1alpha1.RunEnvironmentReference{Name: env.Name, UID: env.UID, Ownership: platformv1alpha1.EnvironmentOwnershipOwned}}}
+	r := reconciler(t, &scriptedAdapter{}, run, project, env, tmpl)
+	r.RepositoryCredentials, r.Now = &fakeRepositoryCredentialProvider{canonical: "https://github.com/acme/repo", now: now}, func() time.Time { return now }
+	var current platformv1alpha1.Run
+	if err := r.Get(context.Background(), client.ObjectKeyFromObject(run), &current); err != nil {
+		t.Fatal(err)
+	}
+	result, done, err := r.ensureRepositoryCredential(context.Background(), &current)
+	if err != nil || !done || result.RequeueAfter != repositoryCredentialRequeueDelay {
+		t.Fatalf("pending ensure = (%#v, %t, %v)", result, done, err)
+	}
+	condition := apiMeta.FindStatusCondition(current.Status.Conditions, runConditionRepositoryCredentialReady)
+	if condition == nil || condition.Reason != "Issuing" || condition.Status != metav1.ConditionFalse {
+		t.Fatalf("pending condition = %#v", condition)
+	}
+}
+
+func TestExpiredMalformedRepositoryCredentialCleanupRequiresExactIdentity(t *testing.T) {
+	now := time.Date(2026, 8, 3, 12, 0, 0, 0, time.UTC)
+	mutations := map[string]func(*corev1.Secret){
+		"foreign owner":   func(s *corev1.Secret) { s.OwnerReferences = []metav1.OwnerReference{{Name: "foreign"}} },
+		"wrong type":      func(s *corev1.Secret) { s.Type = corev1.SecretTypeOpaque },
+		"wrong run name":  func(s *corev1.Secret) { s.Annotations[repositorycredential.AnnotationRunName] = "other" },
+		"wrong provider":  func(s *corev1.Secret) { s.Annotations[repositorycredential.AnnotationProvider] = "other" },
+		"wrong source":    func(s *corev1.Secret) { s.Annotations[repositorycredential.AnnotationSourceRepository] = "other" },
+		"wrong canonical": func(s *corev1.Secret) { s.Annotations[repositorycredential.AnnotationRepository] = "other" },
+	}
+	for name, mutate := range mutations {
+		t.Run(name, func(t *testing.T) { testExpiredMalformedCleanup(t, now, mutate, false) })
+	}
+	t.Run("exact expired malformed token", func(t *testing.T) { testExpiredMalformedCleanup(t, now, func(*corev1.Secret) {}, true) })
+}
+
+func testExpiredMalformedCleanup(t *testing.T, now time.Time, mutate func(*corev1.Secret), wantDeleted bool) {
+	project := &platformv1alpha1.Project{ObjectMeta: metav1.ObjectMeta{Name: "p", Namespace: "ns", UID: "project-uid", Generation: 1}, Spec: platformv1alpha1.ProjectSpec{Repositories: []string{"https://github.com/acme/repo"}}}
+	env, tmpl := frozenRepositoryEnvironment(project)
+	run := &platformv1alpha1.Run{ObjectMeta: metav1.ObjectMeta{Name: "r", Namespace: "ns", UID: "run-uid"}, Spec: platformv1alpha1.RunSpec{RepositoryCredential: platformv1alpha1.RepositoryCredentialGitHubApp}, Status: platformv1alpha1.RunStatus{EnvironmentRef: &platformv1alpha1.RunEnvironmentReference{Name: env.Name, UID: env.UID, Ownership: platformv1alpha1.EnvironmentOwnershipOwned}}}
+	credential := &repositorycredential.Credential{Token: []byte("token"), Repository: "https://github.com/acme/repo", InstallationID: 7, ExpiresAt: now.Add(time.Hour)}
+	secret, err := repositorycredential.NewSecret("ns", run.Name, run.UID, string(run.Spec.RepositoryCredential), project.Spec.Repositories[0], credential, 1, "", 0, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secret.UID = "secret-uid"
+	secret.Annotations[repositorycredential.AnnotationExpiry] = now.Add(-time.Minute).Format(time.RFC3339Nano)
+	secret.Data[repositorycredential.TokenKey] = nil
+	mutate(secret)
+	r := reconciler(t, &scriptedAdapter{}, run, project, env, tmpl, secret)
+	r.RepositoryCredentials, r.Now = &fakeRepositoryCredentialProvider{canonical: credential.Repository, now: now}, func() time.Time { return now }
+	var current platformv1alpha1.Run
+	if err := r.Get(context.Background(), client.ObjectKeyFromObject(run), &current); err != nil {
+		t.Fatal(err)
+	}
+	done, _, cleanupErr := r.cleanupRepositoryCredential(context.Background(), &current, nil)
+	if wantDeleted {
+		if cleanupErr != nil || !done {
+			t.Fatalf("cleanup = done %t, err %v", done, cleanupErr)
+		}
+	} else if cleanupErr == nil || done {
+		t.Fatalf("foreign cleanup = done %t, err %v", done, cleanupErr)
+	}
+	var retained corev1.Secret
+	err = r.Get(context.Background(), client.ObjectKeyFromObject(secret), &retained)
+	if wantDeleted != apierrors.IsNotFound(err) {
+		t.Fatalf("Secret get error = %v, wantDeleted %t", err, wantDeleted)
+	}
+}
+
+func frozenRepositoryEnvironment(project *platformv1alpha1.Project) (*platformv1alpha1.Environment, *platformv1alpha1.EnvironmentTemplate) {
+	tmpl := &platformv1alpha1.EnvironmentTemplate{ObjectMeta: metav1.ObjectMeta{Name: "tmpl", Namespace: "ns", UID: "template-uid", Generation: 1}, Spec: platformv1alpha1.EnvironmentTemplateSpec{Image: "image", Size: "tiny"}}
+	env := &platformv1alpha1.Environment{ObjectMeta: metav1.ObjectMeta{Name: "env", Namespace: "ns", UID: "env-uid", Generation: 1}, Spec: platformv1alpha1.EnvironmentSpec{TemplateRef: tmpl.Name, ProjectRef: project.Name}}
+	env.Status.Provisioning = platformv1alpha1.ResolveEnvironmentProvisioning(env, tmpl, project)
+	env.Status.Provisioning.TemplateVerified = true
+	env.Status.Provisioning.ProjectVerified = true
+	return env, tmpl
+}
 
 type scriptedAdapter struct {
 	observations          []agent.AdapterObservation

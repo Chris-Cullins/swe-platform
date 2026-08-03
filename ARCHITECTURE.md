@@ -80,7 +80,7 @@ All current CRDs are namespaced:
 | `Project` | One repository URL (represented as a one-item list), a same-namespace default Template reference, changes-workflow metadata, and a reserved egress allowlist. A non-empty allowlist is rejected when an Environment uses the Project. |
 | `EnvironmentTemplate` | Pod image, size/resources, disk, runtime class, idle timeout, warm-pool minimum, and backend. Admission currently permits only the `pod` backend. Chart-owned system-namespace objects are inert catalog sources; execution accepts only installation-managed same-namespace copies bound to exact Installation, source, and Project identities. |
 | `Environment` | Immutable Template selection, an immutable optional backend override, one-way empty-to-nonempty Project binding, explicit hold policy, bounded wake/suspend/activity intents, and up to 32 API- or Repository-owned service declarations. New declarations have an immutable-per-incarnation random `instanceID`; upgrade-retained legacy declarations may omit it, receive no portal route, and can add it only with a higher revision. Omitted legacy service ownership defaults only to `API` and is immutable thereafter. Controller-owned status includes the immutable resolved `provisioning` snapshot, readiness, lifecycle/execution, claim, observations, activity, and nested backend-neutral recovery state; recovery records attempts, exhaustion, the exact failed execution generation being accounted, and the next allowed attempt time, while generation zero means no recovery identity. The gateway owns bounded `portalRoutes` and monotonic `nextPortalRouteGeneration`; inactive routes are denial tombstones preserved by other status writers. |
-| `Run` | Immutable agent task and Environment/Project/Template/credential selection plus monotonic cancellation; status records normalized lifecycle, exact Environment name/UID and ownership, exact credential profile identity, accepted lifecycle epoch, and accepted execution generation. `notify` and `parentRef` are schema placeholders without an implemented inbox. |
+| `Run` | Immutable agent task and Environment/Project/Template/agent-credential/repository-credential selection plus monotonic cancellation; status records normalized lifecycle, exact Environment name/UID and ownership, exact credential profile identity, repository credential readiness, accepted lifecycle epoch, and accepted execution generation. `notify` and `parentRef` are schema placeholders without an implemented inbox. |
 | `AgentCredentialProfile` | Immutable adapter and `APIKey` type metadata. Key bytes live in an owner-linked Secret whose name is derived from the profile UID. |
 
 The current ownership/reference shape is:
@@ -115,6 +115,11 @@ AgentCredentialProfile --owner UID--> Secret
           ^
           | exact name + UID in Run status
           +---------------- Run
+
+GitHub App --short-lived exact-repository token--> Run UID lease Secret
+                                                       |
+                                                       +--> clone init container
+                                                       +--> selected agent process launch material
 ```
 
 The Run controller creates an owned Environment or exclusively claims a reusable one.
@@ -541,11 +546,28 @@ as write-only sandboxd launch material only to the selected child process:
 The key is absent from public process specifications, setup/resume hooks, sandboxd's ambient
 environment, and ordinary exec calls. The selected agent and descendants can still read or
 emit it; same-UID peers are not strongly isolated and transcript redaction is not guaranteed.
-OAuth/subscription credentials, refresh/writeback, per-user profiles, and service
-credentials are not implemented. Run intent may select immutable
-`repositoryCredential: GitHubApp`; the provider-neutral boundary and GitHub exchange
-use repository-scoped `contents:write` installation tokens. Controller persistence,
-pod/process delivery, rotation, and finalizer cleanup remain open work.
+OAuth/subscription credentials, refresh/writeback for agent profiles, per-user profiles, and
+service credentials are not implemented.
+
+Run intent may immutably select `repositoryCredential: GitHubApp`. The provider-neutral
+repository-credential boundary exchanges an administrator-owned GitHub App key for a
+short-lived installation token scoped to the exact frozen `github.com` repository with only
+`contents:write`. The Run finalizer is persisted before issuance. A deterministic Run-UID lease
+Secret records the exact frozen source, canonical repository, installation, expiry, token
+generation, Environment UID, and execution generation. The clone init container receives the
+Secret through one exact key reference and derives only a temporary Git extra header; setup and
+resume hooks receive no credential. The selected adapter process receives `GH_TOKEN` and the
+same process-scoped Git header through sandboxd write-only launch material. The token is absent
+from status, transcripts, repository URLs, command arguments, persistent Git config, workspace,
+sandboxd's environment, and public process specifications.
+
+Before expiry or after pod loss, a durable rotation record fences the prior execution, revokes
+and deletes its exact lease, issues a replacement, and wakes or resumes with the next execution
+generation. Terminal cleanup cancels a reachable adapter where applicable, fences the
+Environment, revokes/deletes the token, then releases a claim and removes the finalizer.
+Provider failures produce stable secret-free conditions and retry without releasing the
+finalizer. GitHub Enterprise, SSH repository URLs, broader App permissions, and credentials for
+non-GitHub repositories remain unsupported.
 
 ### Terminal and operations console
 

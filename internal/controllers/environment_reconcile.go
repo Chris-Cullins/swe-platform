@@ -583,6 +583,9 @@ func reconcileEnvironmentProvisioningGate(r *EnvironmentReconciler, ctx context.
 	if stderrors.Is(err, errPodReplacing) {
 		return phaseHandled(ctrl.Result{Requeue: true}, nil)
 	}
+	if stderrors.Is(err, errRepositoryCredentialPending) {
+		return phaseHandled(ctrl.Result{RequeueAfter: repositoryCredentialRequeueDelay}, nil)
+	}
 	if err != nil {
 		return phaseHandled(ctrl.Result{}, r.fail(ctx, env, fmt.Errorf("ensure pod: %w", err)))
 	}

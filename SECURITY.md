@@ -12,6 +12,13 @@ repository URLs, or persistent git config. Cleanup fences the Environment before
 revocation. GitHub's fixed one-hour maximum expiry bounds a crash between issuance
 and persistence, where no token exists locally to revoke.
 
+Repository initialization is split into ordered clone and project-hook init
+containers. After uncached exact Run, Environment, frozen repository, and lease
+validation, kubelet injects the token from the deterministic Run Secret only into
+the clone container. That shell derives a temporary Git extra header for the
+`git clone` process and clears the token and header variables; the hook and main
+containers receive no reference to the repository credential Secret.
+
 Only `https://github.com/<owner>/<repo>[.git]` is accepted. SSH, userinfo,
 ports, query/fragment components, redirects, enterprise hosts, and alternate API
 hosts are rejected.
