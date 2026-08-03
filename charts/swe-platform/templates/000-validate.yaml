@@ -18,6 +18,11 @@
 {{- else if .Values.controlPlane.sessions.keyringSecret.name -}}
   {{- fail "controlPlane.sessions.backend=memory must not set controlPlane.sessions.keyringSecret.name" -}}
 {{- end -}}
+{{- range $name, $image := dict "image" .Values.image "controlPlane.image" .Values.controlPlane.image "environmentImage" .Values.environmentImage -}}
+  {{- if and $image.digest (not (regexMatch "^sha256:[0-9a-f]{64}$" $image.digest)) -}}
+    {{- fail (printf "%s.digest must be a sha256 digest" $name) -}}
+  {{- end -}}
+{{- end -}}
 {{- $operatorMetricsPort := int .Values.operator.metrics.port -}}
 {{- $operatorHealthPort := int .Values.operator.health.port -}}
 {{- if or (lt $operatorMetricsPort 1) (gt $operatorMetricsPort 65535) -}}

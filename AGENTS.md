@@ -113,10 +113,11 @@ runs both via `make` targets:
 - **Local operator:** `make run` requires explicit `RUN_TENANCY_MODE`,
   `RUN_SYSTEM_NAMESPACE`, and `RUN_INSTALLATION_NAME`; scoped mode also takes a
   space-separated `RUN_TENANCY_NAMESPACES` list.
-- **Unit tests:** `make test` (including rendered Helm RBAC and Argo port-forward checks) · **Vet:** `make vet`. PostgreSQL transcript/session integration tests
+- **Unit tests:** `make test` (including rendered Helm RBAC, Argo port-forward, and BYOC
+  production-preset checks) · **Vet:** `make vet`. PostgreSQL transcript/session integration tests
   run when `SWE_TEST_POSTGRES_URL` points to a disposable database; CI supplies PostgreSQL 17.
   The required `build-test` CI job runs the root and sandboxd Go suites plus
-  `./hack/argocd-port-forward_test.sh` and `./hack/helm-rbac_test.sh`, mirroring `make test`.
+  the three shell checks above, mirroring `make test`.
 - **Operations console:** from `ui/`, install with `npm ci`; use `npm run lint`,
   `npm run typecheck`, `npm test -- --run`, and `npm run build`. Start the standalone
   Vite development server with `npm run dev`. Production uses `make ui-build`

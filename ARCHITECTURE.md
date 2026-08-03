@@ -581,10 +581,13 @@ multi-replica or control-plane HA claim is made.
   `appVersion` images, explicitly select PostgreSQL sessions, require out-of-band PostgreSQL
   and session-keyring Secrets, and default to scoped mode with no Project namespaces. GKE
   selects `gvisor`; k3s and EKS use the cluster default runtime unless explicitly overridden.
+  Each coordinated image also accepts a validated `sha256:` manifest digest that takes
+  precedence over its tag, allowing a publish workflow release manifest to pin exact images.
 
 CI builds, vets, and tests both Go modules, runs PostgreSQL transcript/session integration tests,
 checks UI lint/type/tests/build, exercises focused sandboxd Windows portability, verifies
-generated CRDs/chart copies, and lints/renders every preset. The kind acceptance workflow
+generated CRDs/chart copies, lints/renders every preset, and exercises the BYOC production-preset
+validator's render, preflight, and installed contracts. The kind acceptance workflow
 builds and loads local images and covers CRD upgrade, scoped system/Project topology,
 onboarding claims/catalog/baseline, two-release isolation, retained offboarding,
 Runs/warm pools/lifecycle, adapters and process-scoped credentials, TokenReview/SAR and browser
