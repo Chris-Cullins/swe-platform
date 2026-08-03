@@ -2224,10 +2224,14 @@ if ! jq -e --argjson snapshot "$PROVISIONING_SNAPSHOT" '
 	([.spec.containers[] | select(.name == "environment")] | length == 1 and
 	 .[0].image == $snapshot.image and .[0].resources.requests == $snapshot.resources and
 	 .[0].resources.limits == $snapshot.resources) and
-	([.spec.initContainers[] | select(.name == "project-setup")] | length == 1 and
+	([.spec.initContainers[] | select(.name == "repository-clone")] | length == 1 and
 	 .[0].image == $snapshot.image and .[0].resources.requests == $snapshot.resources and
 	 .[0].resources.limits == $snapshot.resources and
-	 ([.[0].env[] | select(.name == "SWE_REPOSITORY") | .value] | first) == $snapshot.project.repository)' <<<"$RECREATED_POD" >/dev/null ||
+	 ([.[0].env[] | select(.name == "SWE_REPOSITORY") | .value] | first) == $snapshot.project.repository) and
+	([.spec.initContainers[] | select(.name == "project-hooks")] | length == 1 and
+	 .[0].image == $snapshot.image and .[0].resources.requests == $snapshot.resources and
+	 .[0].resources.limits == $snapshot.resources and
+	 ([.[0].env[] | select(.name == "SWE_REPOSITORY_TOKEN")] | length) == 0)' <<<"$RECREATED_POD" >/dev/null ||
 	[[ "$(jq -r '.spec.runtimeClassName // ""' <<<"$RECREATED_POD")" != "$(jq -r '.runtimeClassName' <<<"$PROVISIONING_SNAPSHOT")" ]]; then
 	echo "FAIL: recreated Pod does not match the provisioning image/runtime/resources/repository"
 	exit 1
