@@ -4,6 +4,8 @@ image:
   repository: ghcr.io/chris-cullins/swe-platform/operator
   # Defaults to Chart.appVersion so released charts select their coordinated release.
   tag: ""
+  # When set, takes precedence over tag and pins the exact published manifest.
+  digest: ""
   pullPolicy: IfNotPresent
 
 operator:
@@ -46,6 +48,7 @@ controlPlane:
     repository: ghcr.io/chris-cullins/swe-platform/control-plane
     # Defaults to Chart.appVersion.
     tag: ""
+    digest: ""
     pullPolicy: IfNotPresent
   auth:
     tokenAudience: swe-platform
@@ -121,6 +124,7 @@ affinity: {}
 environmentImage:
   repository: ghcr.io/chris-cullins/swe-platform/env-base
   tag: ""
+  digest: ""
 
 # Inert EnvironmentTemplate catalog sources created in the system/release
 # namespace. `swe project onboard` copies selected sources into a claimed

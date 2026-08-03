@@ -107,6 +107,9 @@ jobs:
       - name: Rendered Helm RBAC boundaries
         run: ./hack/helm-rbac_test.sh
 
+      - name: BYOC preset validation
+        run: ./hack/validate-byoc_test.sh
+
       - name: Generated code is current
         run: |
           make generate manifests

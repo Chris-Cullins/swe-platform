@@ -294,8 +294,14 @@ The production presets create a `medium` catalog source using the published `env
 onboarding creates each runnable Project-local Template copy. Operator, control-plane, and
 env-base tags default to the chart
 `appVersion`, keeping a released chart on one tested version set and making Helm rollback
-restore that set. Override all three tags with immutable release or SHA tags when testing
-a different coordinated set; `latest` and `dev` are development-only choices.
+restore that set. Override all three tags with a coordinated release or traceable SHA tag when
+testing a different set; `latest` and `dev` are development-only choices. Use digests below when
+the registry reference must be immutable.
+
+For an exact published build, set `image.digest`, `controlPlane.image.digest`, and
+`environmentImage.digest` to the three `sha256:` values in the publish workflow's release
+manifest. A digest takes precedence over its corresponding tag. The
+[`BYOC runbook`](BYOC.md#choose-and-pin-an-input) downloads and validates this artifact.
 
 Each image publish run emits a `swe-platform-release-*` artifact containing the chart
 version, app version, and the registry digest of every image for incident diagnosis and
@@ -583,6 +589,11 @@ and networking requirements that a BYOC operator needs beyond the [install](#ins
 [upgrade](#upgrade) procedures above. The acceptance criteria track
 [#79](https://github.com/Chris-Cullins/swe-platform/issues/79); the hosted offering alpha is
 out of scope here and requires separate maintainer product input.
+
+The executable, provider-specific procedures are in the
+[`BYOC operator runbooks`](BYOC.md). They pin latest-main images to an exact successful publish,
+run the checked-in validator, preserve scoped-tenancy ordering, and cover PostgreSQL backup,
+restore, and incident response without claiming production isolation.
 
 ### Active Run capacity
 

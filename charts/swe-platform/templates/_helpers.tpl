@@ -43,7 +43,11 @@ app.kubernetes.io/managed-by: {{ .Release.Service }}
 {{- end }}
 
 {{- define "swe-platform.environmentImage" -}}
+{{- if .Values.environmentImage.digest -}}
+{{- printf "%s@%s" .Values.environmentImage.repository .Values.environmentImage.digest -}}
+{{- else -}}
 {{- printf "%s:%s" .Values.environmentImage.repository (.Values.environmentImage.tag | default .Chart.AppVersion) -}}
+{{- end -}}
 {{- end }}
 
 {{- define "swe-platform.tenancyMode" -}}
