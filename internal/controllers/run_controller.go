@@ -262,11 +262,14 @@ func (r *RunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.R
 		}
 		return ctrl.Result{Requeue: true}, nil
 	}
-	result, done, err := r.ensureRepositoryCredential(ctx, &run)
-	if done || err != nil {
-		return result, err
+	repositoryRefreshAfter := time.Duration(0)
+	if !run.Spec.Cancel {
+		result, done, err := r.ensureRepositoryCredential(ctx, &run)
+		if done || err != nil {
+			return result, err
+		}
+		repositoryRefreshAfter = result.RequeueAfter
 	}
-	repositoryRefreshAfter := result.RequeueAfter
 
 	env, err := r.getAllocatedEnvironment(ctx, &run)
 	if err != nil {
@@ -722,14 +725,16 @@ func (r *RunReconciler) cleanupPendingRepositoryRevocation(ctx context.Context, 
 		return false, ctrl.Result{}, err
 	}
 	defer repositorycredential.ClearLease(pending)
-	if r.RepositoryCredentials == nil {
+	if r.RepositoryCredentials == nil && r.now().Before(pending.ExpiresAt) {
 		return false, ctrl.Result{RequeueAfter: repositorycredential.DefaultRetryDelay}, r.setRepositoryCredentialCondition(ctx, run, metav1.ConditionFalse, "RevocationPending", "repository credential revocation is pending")
 	}
-	if revokeErr := r.RepositoryCredentials.Revoke(ctx, &pending.Credential); revokeErr != nil && r.now().Before(pending.ExpiresAt) {
-		if statusErr := r.setRepositoryCredentialCondition(ctx, run, metav1.ConditionFalse, "RevocationPending", "repository credential revocation is pending"); statusErr != nil {
-			return false, ctrl.Result{}, statusErr
+	if r.RepositoryCredentials != nil {
+		if revokeErr := r.RepositoryCredentials.Revoke(ctx, &pending.Credential); revokeErr != nil && r.now().Before(pending.ExpiresAt) {
+			if statusErr := r.setRepositoryCredentialCondition(ctx, run, metav1.ConditionFalse, "RevocationPending", "repository credential revocation is pending"); statusErr != nil {
+				return false, ctrl.Result{}, statusErr
+			}
+			return false, ctrl.Result{RequeueAfter: repositorycredential.RetryDelay(revokeErr)}, nil
 		}
-		return false, ctrl.Result{RequeueAfter: repositorycredential.RetryDelay(revokeErr)}, nil
 	}
 	active, activeErr := r.readRepositoryLease(ctx, run)
 	if activeErr == nil {
@@ -1612,9 +1617,6 @@ func (r *RunReconciler) cleanupRepositoryCredential(ctx context.Context, run *pl
 		if getErr := r.apiReader().Get(ctx, key, &secret); getErr != nil {
 			return false, ctrl.Result{}, getErr
 		}
-		if r.RepositoryCredentials == nil {
-			return false, ctrl.Result{}, errors.New("repository credential cleanup provider is unavailable")
-		}
 		source, identityErr := r.repositoryForRun(ctx, run)
 		if identityErr != nil {
 			if !apierrors.IsNotFound(identityErr) {
@@ -1622,9 +1624,13 @@ func (r *RunReconciler) cleanupRepositoryCredential(ctx context.Context, run *pl
 			}
 			source = secret.Annotations[repositorycredential.AnnotationSourceRepository]
 		}
-		canonical, canonicalErr := r.RepositoryCredentials.CanonicalRepository(source)
-		if canonicalErr != nil {
-			return false, ctrl.Result{}, fmt.Errorf("repository credential cleanup canonical identity unavailable: %w", canonicalErr)
+		canonical := secret.Annotations[repositorycredential.AnnotationRepository]
+		if r.RepositoryCredentials != nil {
+			var canonicalErr error
+			canonical, canonicalErr = r.RepositoryCredentials.CanonicalRepository(source)
+			if canonicalErr != nil {
+				return false, ctrl.Result{}, fmt.Errorf("repository credential cleanup canonical identity unavailable: %w", canonicalErr)
+			}
 		}
 		expires, parseErr := time.Parse(time.RFC3339Nano, secret.Annotations[repositorycredential.AnnotationExpiry])
 		if !repositorycredential.ExactManagedIdentity(&secret, run.Name, run.UID, string(run.Spec.RepositoryCredential), source, canonical) {
@@ -1640,15 +1646,14 @@ func (r *RunReconciler) cleanupRepositoryCredential(ctx context.Context, run *pl
 		return true, ctrl.Result{}, nil
 	}
 	defer repositorycredential.ClearLease(lease)
-	if r.RepositoryCredentials == nil {
+	if r.RepositoryCredentials == nil && r.now().Before(lease.ExpiresAt) {
 		_ = r.setRepositoryCredentialCondition(ctx, run, metav1.ConditionFalse, "RevocationPending", "repository credential revocation is pending")
 		return false, ctrl.Result{RequeueAfter: repositorycredential.DefaultRetryDelay}, nil
 	}
-	if err := r.RepositoryCredentials.Revoke(ctx, &lease.Credential); err != nil {
-		if r.now().After(lease.ExpiresAt) { /* expiry is proof */
-		} else {
+	if r.RepositoryCredentials != nil {
+		if revokeErr := r.RepositoryCredentials.Revoke(ctx, &lease.Credential); revokeErr != nil && r.now().Before(lease.ExpiresAt) {
 			_ = r.setRepositoryCredentialCondition(ctx, run, metav1.ConditionFalse, "RevocationPending", "repository credential revocation is pending")
-			return false, ctrl.Result{RequeueAfter: repositorycredential.RetryDelay(err)}, nil
+			return false, ctrl.Result{RequeueAfter: repositorycredential.RetryDelay(revokeErr)}, nil
 		}
 	}
 	secret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Namespace: run.Namespace, Name: repositorycredential.SecretName(run.UID), UID: lease.SecretUID}}

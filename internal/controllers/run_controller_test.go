@@ -366,6 +366,46 @@ func TestExpiredMalformedRepositoryCredentialCleanupRequiresExactIdentity(t *tes
 	t.Run("exact expired malformed token", func(t *testing.T) { testExpiredMalformedCleanup(t, now, func(*corev1.Secret) {}, true) })
 }
 
+func TestExpiredRepositoryCredentialsCleanUpWithoutProvider(t *testing.T) {
+	now := time.Date(2026, 8, 3, 12, 0, 0, 0, time.UTC)
+	run := &platformv1alpha1.Run{ObjectMeta: metav1.ObjectMeta{Name: "r", Namespace: "ns", UID: "run-uid"}, Spec: platformv1alpha1.RunSpec{RepositoryCredential: platformv1alpha1.RepositoryCredentialGitHubApp}}
+	credential := &repositorycredential.Credential{Token: []byte("expired-token"), Repository: "https://github.com/acme/repo", InstallationID: 7, ExpiresAt: now.Add(time.Hour)}
+	active, err := repositorycredential.NewSecret(run.Namespace, run.Name, run.UID, string(run.Spec.RepositoryCredential), credential.Repository, credential, 1, "", 0, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	active.UID = "active-uid"
+	active.Annotations[repositorycredential.AnnotationExpiry] = now.Add(-time.Minute).Format(time.RFC3339Nano)
+	r := reconciler(t, &scriptedAdapter{}, run, active)
+	r.RepositoryCredentials, r.Now = nil, func() time.Time { return now }
+	var current platformv1alpha1.Run
+	if err := r.Get(context.Background(), client.ObjectKeyFromObject(run), &current); err != nil {
+		t.Fatal(err)
+	}
+	if done, _, err := r.cleanupRepositoryCredential(context.Background(), &current, nil); err != nil || !done {
+		t.Fatalf("expired cleanup = done %t, err %v", done, err)
+	}
+	if err := r.Get(context.Background(), client.ObjectKeyFromObject(active), &corev1.Secret{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("expired active Secret retained: %v", err)
+	}
+
+	pending, err := repositorycredential.NewPendingRevocationSecret(run.Namespace, run.Name, run.UID, string(run.Spec.RepositoryCredential), credential.Repository, credential, 1, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pending.UID = "pending-uid"
+	pending.Annotations[repositorycredential.AnnotationExpiry] = now.Add(-time.Minute).Format(time.RFC3339Nano)
+	if err := r.Create(context.Background(), pending); err != nil {
+		t.Fatal(err)
+	}
+	if done, result, err := r.cleanupPendingRepositoryRevocation(context.Background(), &current); err != nil || done || !result.Requeue {
+		t.Fatalf("expired pending cleanup = (%#v, done %t, err %v)", result, done, err)
+	}
+	if err := r.Get(context.Background(), client.ObjectKeyFromObject(pending), &corev1.Secret{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("expired pending Secret retained: %v", err)
+	}
+}
+
 func testExpiredMalformedCleanup(t *testing.T, now time.Time, mutate func(*corev1.Secret), wantDeleted bool) {
 	project := &platformv1alpha1.Project{ObjectMeta: metav1.ObjectMeta{Name: "p", Namespace: "ns", UID: "project-uid", Generation: 1}, Spec: platformv1alpha1.ProjectSpec{Repositories: []string{"https://github.com/acme/repo"}}}
 	env, tmpl := frozenRepositoryEnvironment(project)
@@ -1735,6 +1775,25 @@ func TestCancellationWhilePausedRequiresNoAdapterRPC(t *testing.T) {
 	}
 	if retained.Status.ClaimedBy != nil || adapter.cancelled != 0 {
 		t.Fatalf("claim = %#v, adapter cancellations = %d", retained.Status.ClaimedBy, adapter.cancelled)
+	}
+}
+
+func TestCancellationBypassesRepositoryCredentialIssuance(t *testing.T) {
+	run := &platformv1alpha1.Run{ObjectMeta: metav1.ObjectMeta{Name: "r", Namespace: "ns", UID: "run-uid", Finalizers: []string{runFinalizer}}, Spec: platformv1alpha1.RunSpec{Agent: "test", Cancel: true, RepositoryCredential: platformv1alpha1.RepositoryCredentialGitHubApp}, Status: platformv1alpha1.RunStatus{
+		State:          platformv1alpha1.RunStatePaused,
+		EnvironmentRef: &platformv1alpha1.RunEnvironmentReference{Name: "shared", UID: "env-uid", Ownership: platformv1alpha1.EnvironmentOwnershipClaimed},
+	}}
+	env := &platformv1alpha1.Environment{ObjectMeta: metav1.ObjectMeta{Name: "shared", Namespace: "ns", UID: "env-uid"}, Spec: platformv1alpha1.EnvironmentSpec{Paused: true}, Status: platformv1alpha1.EnvironmentStatus{
+		Phase: platformv1alpha1.EnvironmentPhasePaused, ClaimedBy: &platformv1alpha1.RunReference{Name: run.Name, UID: run.UID},
+	}}
+	provider := &fakeRepositoryCredentialProvider{canonical: "https://github.com/acme/repo", issueErr: &repositorycredential.Error{Operation: "issue", Reason: "ProviderUnavailable", RetryAfter: time.Minute}}
+	r := reconciler(t, &scriptedAdapter{}, run, env)
+	r.RepositoryCredentials = provider
+	if got := reconcileRun(t, r, run.Name); got.Status.State != platformv1alpha1.RunStateCancelled {
+		t.Fatalf("state = %s, want Cancelled", got.Status.State)
+	}
+	if len(provider.issued) != 0 {
+		t.Fatalf("cancellation issued repository credentials: %v", provider.issued)
 	}
 }
 
