@@ -218,7 +218,11 @@ SWE_CONTROL_PLANE_TOKEN="$(kubectl create token portal-user -n my-project --audi
 The printed stable URL is a host locator, not a credential. Open it with the same explicit
 bearer token, or exchange that token at the portal host's own `/api/v1/session` endpoint and
 then use its host-local session cookie. Cookies are deliberately host-only, never `Domain`
-cookies. In local kind/port-forward development, wildcard DNS is not implied: send the exact
+cookies. The operations console's per-Run **Portals** tab lists only services authorized for the
+current browser principal. Its **Open portal** action carries the existing console session to the
+exact locator through a bounded 30-second one-time form handoff, then removes the handoff before
+loading the stable URL; no bearer credential or reusable secret is placed in the URL or UI data.
+In local kind/port-forward development, wildcard DNS is not implied: send the exact
 printed Host to the forwarded control-plane address (for example with `curl --resolve` or an
 explicit `Host` header). In-Environment access uses the same authenticated gateway route, but
 wildcard DNS and an internal path to the gateway are cluster-operator prerequisites; the

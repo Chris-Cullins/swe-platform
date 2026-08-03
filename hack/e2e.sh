@@ -2643,6 +2643,44 @@ bin/swe --namespace "$PROJECT_NAMESPACE" run "resume credential smoke test" --na
 kubectl wait --for=jsonpath='{.status.state}'=Running run/"$RESUME_RUN_NAME" --timeout=3m
 RESUME_RUN_UID=$(kubectl get run "$RESUME_RUN_NAME" -o jsonpath='{.metadata.uid}')
 RESUME_ENV_UID=$(kubectl get run "$RESUME_RUN_NAME" -o jsonpath='{.status.environmentRef.uid}')
+manage_observation_listener service-start "$POD_NAME" "$OBSERVATION_OWNER" console-portal-listener 3999
+wait_service_observation "$ENV_NAME" manual-api 1 Healthy
+CONSOLE_PORTAL_URL=$(SWE_CONTROL_PLANE_URL=http://127.0.0.1:18080 SWE_CONTROL_PLANE_TOKEN="$CONSOLE_TOKEN" \
+	bin/swe --namespace "$PROJECT_NAMESPACE" portal "$ENV_NAME" manual-api)
+CONSOLE_PORTAL_HOST=${CONSOLE_PORTAL_URL#http://}
+echo "==> verifying authenticated console portal discovery and host-local session handoff"
+PORTAL_LIST_PATH="/api/v1/namespaces/${PROJECT_NAMESPACE}/runs/${RESUME_RUN_NAME}/portals/${RESUME_RUN_UID}/${RESUME_ENV_UID}"
+PORTAL_LIST=$(curl --silent --fail --cookie "$COOKIE_JAR" "http://127.0.0.1:18080${PORTAL_LIST_PATH}")
+PORTAL_OPEN_PATH=$(jq -r '.items[] | select(.name == "manual-api" and .targetPort == 3999 and .status == "Ready") | .openURL' <<<"$PORTAL_LIST")
+if [[ "$PORTAL_OPEN_PATH" != "${PORTAL_LIST_PATH}/manual-api/open" ]] || ! jq -e --arg url "$CONSOLE_PORTAL_URL" 'any(.items[]; .name == "manual-api" and .url == $url)' <<<"$PORTAL_LIST" >/dev/null; then
+	echo "FAIL: console portal list was not exact, ready, and stable: $PORTAL_LIST"
+	exit 1
+fi
+PORTAL_HANDOFF_HTML=$(curl --silent --fail --cookie "$COOKIE_JAR" -X POST \
+	-H 'Origin: http://127.0.0.1:18080' "http://127.0.0.1:18080${PORTAL_OPEN_PATH}")
+PORTAL_HANDOFF_CODE=$(sed -n 's/.*name="code" value="\([^"]*\)".*/\1/p' <<<"$PORTAL_HANDOFF_HTML")
+if [[ -z "$PORTAL_HANDOFF_CODE" ]] || grep -Fq "$CONSOLE_TOKEN" <<<"$PORTAL_HANDOFF_HTML"; then
+	echo "FAIL: console portal opener did not return a credential-free one-time handoff"
+	exit 1
+fi
+PORTAL_COOKIE_JAR=/tmp/swe-platform-portal-cookies
+rm -f "$PORTAL_COOKIE_JAR"
+HANDOFF_STATUS=$(curl --silent --output /dev/null --write-out '%{http_code}' \
+	--resolve "${CONSOLE_PORTAL_HOST}:18080:127.0.0.1" --cookie-jar "$PORTAL_COOKIE_JAR" \
+	-H 'Origin: http://127.0.0.1:18080' -X POST --data-urlencode "code=${PORTAL_HANDOFF_CODE}" \
+	"http://${CONSOLE_PORTAL_HOST}:18080/.swe/session-handoff")
+if [[ "$HANDOFF_STATUS" != "200" ]]; then
+	echo "FAIL: portal host-local session handoff returned ${HANDOFF_STATUS}, expected 200"
+	exit 1
+fi
+PORTAL_SESSION_BODY=$(curl --silent --fail --resolve "${CONSOLE_PORTAL_HOST}:18080:127.0.0.1" \
+	--cookie "$PORTAL_COOKIE_JAR" -H 'X-Portal-Check: browser-session' \
+	"http://${CONSOLE_PORTAL_HOST}:18080/portal-check")
+if ! jq -e '.marker == "portal-listener" and .authorization == "" and .portalHeader == "browser-session"' <<<"$PORTAL_SESSION_BODY" >/dev/null; then
+	echo "FAIL: console portal handoff did not establish an authorized host-local session: $PORTAL_SESSION_BODY"
+	exit 1
+fi
+manage_observation_listener service-stop "$POD_NAME" "$OBSERVATION_OWNER" console-portal-listener
 RUN_TERMINAL_PATH="/api/v1/namespaces/${PROJECT_NAMESPACE}/runs/${RESUME_RUN_NAME}/terminal/${RESUME_RUN_UID}/${RESUME_ENV_UID}"
 echo "==> verifying exact browser Run terminal through a same-origin session"
 "$WEB_TERMINAL_CLIENT" http://127.0.0.1:18080 "$CONSOLE_TOKEN" "$RUN_TERMINAL_PATH" \

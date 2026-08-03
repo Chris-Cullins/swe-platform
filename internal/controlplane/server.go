@@ -194,6 +194,22 @@ func (s *Server) handleNamespacedAPI(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
+	if namespace, run, runUID, environmentUID, ok := browserRunPortalPath(r.URL.EscapedPath()); ok {
+		if r.Method == http.MethodGet {
+			s.handleBrowserRunPortals(w, r, namespace, run, runUID, environmentUID)
+		} else {
+			writeResourceMethodError(w, "GET")
+		}
+		return
+	}
+	if namespace, run, runUID, environmentUID, service, ok := browserRunPortalOpenPath(r.URL.EscapedPath()); ok {
+		if r.Method == http.MethodPost {
+			s.handleBrowserRunPortalOpen(w, r, namespace, run, runUID, environmentUID, service)
+		} else {
+			writeResourceMethodError(w, "POST")
+		}
+		return
+	}
 	namespace, resource, name, subresource, ok := namespacedResource(r.URL.Path)
 	if !ok {
 		http.NotFound(w, r)
@@ -246,12 +262,37 @@ func (s *Server) handleNamespacedAPI(w http.ResponseWriter, r *http.Request) {
 // segment. It returns the UID segments undecoded so Run authorization can happen
 // before malformed identity is distinguished from stale identity.
 func browserRunTerminalPath(path string) (namespace, run, runUID, environmentUID string, ok bool) {
+	return browserRunIdentityPath(path, "terminal")
+}
+
+func browserRunPortalPath(path string) (namespace, run, runUID, environmentUID string, ok bool) {
+	return browserRunIdentityPath(path, "portals")
+}
+
+func browserRunPortalOpenPath(path string) (namespace, run, runUID, environmentUID, service string, ok bool) {
+	remainder := strings.TrimPrefix(path, namespacedPathPrefix)
+	parts := strings.Split(remainder, "/")
+	if remainder == path || len(parts) != 8 || parts[1] != "runs" || parts[3] != "portals" || parts[7] != "open" {
+		return "", "", "", "", "", false
+	}
+	values := make([]string, 5)
+	for i, part := range []string{parts[0], parts[2], parts[4], parts[5], parts[6]} {
+		decoded, err := url.PathUnescape(part)
+		if err != nil || decoded == "" || strings.Contains(decoded, "/") {
+			return "", "", "", "", "", false
+		}
+		values[i] = decoded
+	}
+	return values[0], values[1], values[2], values[3], values[4], true
+}
+
+func browserRunIdentityPath(path, subresource string) (namespace, run, runUID, environmentUID string, ok bool) {
 	remainder := strings.TrimPrefix(path, namespacedPathPrefix)
 	if remainder == path {
 		return "", "", "", "", false
 	}
 	parts := strings.Split(remainder, "/")
-	if len(parts) != 6 || parts[1] != "runs" || parts[3] != "terminal" {
+	if len(parts) != 6 || parts[1] != "runs" || parts[3] != subresource {
 		return "", "", "", "", false
 	}
 	decodedNamespace, err := url.PathUnescape(parts[0])

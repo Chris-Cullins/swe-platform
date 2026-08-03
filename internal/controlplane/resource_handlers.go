@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 
@@ -175,6 +176,67 @@ func (s *Server) handleGetEnvironment(w http.ResponseWriter, r *http.Request, na
 		return
 	}
 	writeJSON(w, http.StatusOK, environment)
+}
+
+func (s *Server) handleBrowserRunPortals(w http.ResponseWriter, r *http.Request, namespace, runName, encodedRunUID, encodedEnvironmentUID string) {
+	if s.access == nil {
+		writeRESTAccessError(w, errUnauthenticated)
+		return
+	}
+	if err := s.access.Authorize(r, ResourceAccess{Namespace: namespace, Verb: "get", Resource: "runs", Name: runName}, true); err != nil {
+		writeRESTAccessError(w, err)
+		return
+	}
+	runUID, err := url.PathUnescape(encodedRunUID)
+	if err == nil {
+		encodedEnvironmentUID, err = url.PathUnescape(encodedEnvironmentUID)
+	}
+	if err != nil || strings.TrimSpace(runUID) == "" || strings.TrimSpace(encodedEnvironmentUID) == "" || len(runUID) > maxRunUIDLength || len(encodedEnvironmentUID) > maxRunUIDLength {
+		writeProblem(w, http.StatusBadRequest, "portal-identity-required", "Portal identity required", "exact Run and Environment UIDs must be valid encoded path segments")
+		return
+	}
+	if s.resources == nil || s.portal == nil || s.portal.resolver == nil {
+		writeProblem(w, http.StatusServiceUnavailable, "portal-gateway-unavailable", "Portal gateway unavailable", "Run portal resources are not configured")
+		return
+	}
+	association, err := s.resources.ResolveRunTerminal(r.Context(), namespace, runName, runUID, encodedEnvironmentUID)
+	if err != nil {
+		if errors.Is(err, errRunUIDConflict) || errors.Is(err, errRunTerminalAssociation) {
+			writeRunTerminalAssociationConflict(w)
+			return
+		}
+		s.writeResourceError(w, "resolve Run portals", namespace, runName, err)
+		return
+	}
+	s.portal.listRunPortals(w, r, namespace, association)
+}
+
+func (s *Server) handleBrowserRunPortalOpen(w http.ResponseWriter, r *http.Request, namespace, runName, runUID, environmentUID, service string) {
+	if s.access == nil {
+		writeRESTAccessError(w, errUnauthenticated)
+		return
+	}
+	if err := s.access.Authorize(r, ResourceAccess{Namespace: namespace, Verb: "get", Resource: "runs", Name: runName}, true); err != nil {
+		writeRESTAccessError(w, err)
+		return
+	}
+	if !s.requireMutationOrigin(w, r) {
+		return
+	}
+	if s.resources == nil || s.portal == nil || s.portal.resolver == nil {
+		writeProblem(w, http.StatusServiceUnavailable, "portal-gateway-unavailable", "Portal gateway unavailable", "Run portal resources are not configured")
+		return
+	}
+	association, err := s.resources.ResolveRunTerminal(r.Context(), namespace, runName, runUID, environmentUID)
+	if err != nil {
+		if errors.Is(err, errRunUIDConflict) || errors.Is(err, errRunTerminalAssociation) {
+			writeRunTerminalAssociationConflict(w)
+			return
+		}
+		s.writeResourceError(w, "resolve Run portal", namespace, runName, err)
+		return
+	}
+	s.portal.openRunPortal(w, r, namespace, association, service)
 }
 
 func (s *Server) authorizeResource(w http.ResponseWriter, r *http.Request, access ResourceAccess, allowSession bool) bool {

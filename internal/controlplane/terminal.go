@@ -380,30 +380,11 @@ func (d KubernetesTerminalDialer) heartbeatActivity(ctx context.Context, key typ
 }
 
 func (d KubernetesTerminalDialer) validateRunTerminalAssociation(ctx context.Context, namespace string, association *RunTerminalAssociation, knownEnvironment *platformv1alpha1.Environment) error {
-	var environment platformv1alpha1.Environment
-	if knownEnvironment == nil {
-		if err := d.Client.Get(ctx, types.NamespacedName{Namespace: namespace, Name: association.EnvironmentName}, &environment); err != nil {
-			return err
-		}
-		knownEnvironment = &environment
-	}
-	if string(knownEnvironment.UID) != association.EnvironmentUID {
+	err := validateRunEnvironmentAssociation(ctx, d.Client, namespace, association, knownEnvironment)
+	if errors.Is(err, errRunTerminalAssociation) && knownEnvironment != nil && string(knownEnvironment.UID) != association.EnvironmentUID {
 		return fmt.Errorf("%w: %w", errRunTerminalAssociation, errTerminalEnvironmentIncarnationChanged)
 	}
-	var run platformv1alpha1.Run
-	if err := d.Client.Get(ctx, types.NamespacedName{Namespace: namespace, Name: association.RunName}, &run); err != nil {
-		if apierrors.IsNotFound(err) {
-			return fmt.Errorf("%w: Run no longer exists", errRunTerminalAssociation)
-		}
-		return err
-	}
-	if string(run.UID) != association.RunUID {
-		return errRunUIDConflict
-	}
-	if !runOwnsOrClaimsEnvironment(&run, knownEnvironment) || run.Status.EnvironmentRef == nil || string(run.Status.EnvironmentRef.Ownership) != association.EnvironmentOwnership {
-		return errRunTerminalAssociation
-	}
-	return nil
+	return err
 }
 
 func (d KubernetesTerminalDialer) holdPolicyPollInterval() time.Duration {

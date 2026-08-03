@@ -1,4 +1,4 @@
-import type { CreateRun, Environment, Problem, Run, RunList, RunSummaryList, Session } from './contracts'
+import type { CreateRun, Environment, PortalServiceList, Problem, Run, RunList, RunSummaryList, Session } from './contracts'
 
 export class ApiProblem extends Error {
   constructor(public readonly problem: Problem, public readonly status: number) {
@@ -85,6 +85,7 @@ export const api = {
   createRun: (namespace: string, value: CreateRun) => request<Run>(`${base(namespace)}/runs`, { method: 'POST', body: JSON.stringify(value) }),
   cancelRun: (namespace: string, name: string, runUID: string) => request<Run>(`${base(namespace)}/runs/${encodeURIComponent(name)}/cancel`, { method: 'POST', body: JSON.stringify({ runUID }) }),
   environment: (namespace: string, name: string) => request<Environment>(`${base(namespace)}/environments/${encodeURIComponent(name)}`),
+  portals: (namespace: string, run: string, runUID: string, environmentUID: string) => request<PortalServiceList>(`${base(namespace)}/runs/${encodeURIComponent(run)}/portals/${encodeURIComponent(runUID)}/${encodeURIComponent(environmentUID)}`),
   transcriptUrl: (namespace: string, name: string) => `${base(namespace)}/runs/${encodeURIComponent(name)}/transcript`,
   transcript: async (namespace: string, name: string, runUID: string, signal: AbortSignal, lastEventID?: string) => {
     const headers: Record<string, string> = { Accept: 'text/event-stream', 'SWE-Run-UID': runUID }
@@ -121,4 +122,5 @@ export const queryKeys = {
   runs: (namespace: string) => ['runs', namespace] as const,
   run: (namespace: string, name: string) => ['run', namespace, name] as const,
   environment: (namespace: string, name: string) => ['environment', namespace, name] as const,
+  portals: (namespace: string, run: string, runUID: string, environmentUID: string) => ['portals', namespace, run, runUID, environmentUID] as const,
 }

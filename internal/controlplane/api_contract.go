@@ -136,6 +136,23 @@ type RunTerminalAssociation struct {
 	EnvironmentOwnership string
 }
 
+// RunPortalService is one declared service the current principal may access
+// through the portal gateway. URL is a locator, never a credential.
+type RunPortalService struct {
+	Name       string `json:"name"`
+	TargetPort int32  `json:"targetPort"`
+	Status     string `json:"status"`
+	Reason     string `json:"reason,omitempty"`
+	URL        string `json:"url,omitempty"`
+	OpenURL    string `json:"openURL,omitempty"`
+}
+
+// RunPortalServiceList is the bounded, authorization-filtered portal view for
+// one exact Run-to-Environment association.
+type RunPortalServiceList struct {
+	Items []RunPortalService `json:"items"`
+}
+
 // EnvironmentClaim identifies the Run holding a reusable Environment. The UID
 // fences a same-name Run replacement.
 type EnvironmentClaim struct {
