@@ -270,6 +270,54 @@ describe('App frozen API integration', () => {
     expect(screen.queryByRole('link', { name: 'Terminal' })).not.toBeInTheDocument()
   })
 
+  it('lists authorized portals with honest state and a same-origin authenticated opener', async () => {
+    const portalPath = '/api/v1/namespaces/default/runs/repair-ui/portals/run-uid/env-uid'
+    const openPath = `${portalPath}/web/open`
+    const fetch = vi.spyOn(globalThis, 'fetch').mockImplementation(async path => {
+      if (path === '/api/v1/session') return response({ authenticated: true, username: 'alex' })
+      if (path === portalPath) return response({ items: [
+        { name: 'web', targetPort: 3000, status: 'Ready', url: 'https://locator.portal.test', openURL: openPath },
+        { name: 'docs', targetPort: 4173, status: 'Paused', reason: 'Opening the portal wakes this idle Environment', url: 'https://docs.portal.test', openURL: `${portalPath}/docs/open` },
+      ] })
+      return response(run)
+    })
+    show('/namespaces/default/runs/repair-ui/portals')
+    expect(await screen.findByText('web')).toBeInTheDocument()
+    expect(screen.getByText('3000')).toBeInTheDocument()
+    expect(screen.getByText('Ready')).toBeInTheDocument()
+    expect(screen.getByText('Paused')).toBeInTheDocument()
+    expect(screen.getByText('Opening the portal wakes this idle Environment')).toBeInTheDocument()
+    const openers = screen.getAllByRole('button', { name: 'Open portal' })
+    expect(openers[0].closest('form')).toHaveAttribute('action', openPath)
+    expect(openers[0].closest('form')).toHaveAttribute('method', 'post')
+    expect(openers[0].closest('form')).toHaveAttribute('target', '_blank')
+    expect(fetch).toHaveBeenCalledWith(portalPath, expect.objectContaining({ credentials: 'same-origin' }))
+  })
+
+  it('does not disclose unauthorized portals or open an untrusted returned URL', async () => {
+    const portalPath = '/api/v1/namespaces/default/runs/repair-ui/portals/run-uid/env-uid'
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async path => {
+      if (path === '/api/v1/session') return response({ authenticated: true, username: 'alex' })
+      if (path === portalPath) return response({ items: [{ name: 'bad', targetPort: 3000, status: 'Failed', url: 'javascript:alert(1)', openURL: '//evil.test/open' }] })
+      return response(run)
+    })
+    show('/namespaces/default/runs/repair-ui/portals')
+    expect(await screen.findByText('bad')).toBeInTheDocument()
+    expect(screen.getByText('Not configured')).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Open portal' })).not.toBeInTheDocument()
+  })
+
+  it('represents an authorization-filtered empty portal list without guessing service names', async () => {
+    const portalPath = '/api/v1/namespaces/default/runs/repair-ui/portals/run-uid/env-uid'
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async path => {
+      if (path === '/api/v1/session') return response({ authenticated: true, username: 'alex' })
+      if (path === portalPath) return response({ items: [] })
+      return response(run)
+    })
+    show('/namespaces/default/runs/repair-ui/portals')
+    expect(await screen.findByText('No authorized declared services.')).toHaveAttribute('role', 'status')
+  })
+
   it('clears login token after an error and never accesses browser storage', async () => {
     const localGet = vi.spyOn(Storage.prototype, 'getItem')
     const localSet = vi.spyOn(Storage.prototype, 'setItem')

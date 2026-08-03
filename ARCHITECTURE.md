@@ -554,9 +554,16 @@ revokes the lease.
 
 The embedded React console and terminal TUI are agent-neutral operations clients. They list,
 watch, create, inspect, and cancel Runs; show exact Environment detail and opaque transcripts;
-and attach only when the API returns exact terminal identities. They do not contact Kubernetes
-or sandboxd directly. Project/Template/credential administration is
-not implemented.
+and attach only when the API returns exact terminal identities. The console's per-Run Portal tab
+uses an exact Run UID and Environment UID to request a bounded service list. The control plane
+filters every declaration through the existing Environment, service, and current Run/Project
+portal authorization before returning its target port, freshness-qualified lifecycle state, and
+stable locator. Opening a locator uses a 30-second, bounded, one-time, locator-bound browser
+handoff: the opaque handoff travels only in a no-store form body, establishes the existing
+host-only session cookie on that portal host, and is consumed before redirecting to the clean
+stable URL. Neither reusable bearer credentials nor backend addresses enter UI state or URLs.
+They do not contact Kubernetes or sandboxd directly. Project/Template/credential administration
+is not implemented.
 
 ### Chart, presets, tests, and deployment topology
 
@@ -652,8 +659,8 @@ path forcing ship together after Project namespace claims.
 
 ## Remaining decisions and open work
 
-Repository service ingestion and process URL injection from authenticated discovery are
-implemented. Portal UI work (#95) remains unimplemented. Other unimplemented areas include inbox and child-run semantics, changes
+Repository service ingestion, process URL injection from authenticated discovery, and the
+authorization-filtered per-Run console Portal tab are implemented. Other unimplemented areas include inbox and child-run semantics, changes
 publication, transcript garbage collection, additional credential forms, ConPTY, Windows
 setup/resume hook semantics and node-pool/provider requirements, non-Pod
 backends, and control-plane HA. Their detailed contracts remain issue work unless and until a

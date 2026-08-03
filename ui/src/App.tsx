@@ -207,7 +207,7 @@ function Detail() {
   if (query.isPending) return <main><Busy label="Loading run" /></main>
   if (query.error) return <main><Failure error={query.error} /></main>
   return <main><div className="title"><div><Link to={`/namespaces/${encodeURIComponent(namespace)}/runs`}>← Runs</Link><h1>{run}</h1></div><span className="pill">{query.data.state}</span></div>
-    <nav aria-label="Run sections"><NavLink to="overview">Overview</NavLink><NavLink to="transcript">Transcript</NavLink>{query.data.terminalAvailable && query.data.environment?.uid && <NavLink to="terminal">Terminal</NavLink>}</nav>
+    <nav aria-label="Run sections"><NavLink to="overview">Overview</NavLink><NavLink to="transcript">Transcript</NavLink>{query.data.environment?.uid && <NavLink to="portals">Portals</NavLink>}{query.data.terminalAvailable && query.data.environment?.uid && <NavLink to="terminal">Terminal</NavLink>}</nav>
     <Outlet context={query.data} />
   </main>
 }
@@ -248,6 +248,38 @@ function Overview() {
 function TranscriptRoute() { const run = useOutletRun(); const { namespace = '' } = useParams(); return <Transcript key={`${namespace}/${run.name}/${run.uid}`} namespace={namespace} run={run.name} identity={run.uid} /> }
 function TerminalRoute() { const run = useOutletRun(); const { namespace = '' } = useParams(); return run.terminalAvailable && run.environment?.uid ? <Suspense fallback={<Busy label="Loading terminal" />}><Terminal key={`${namespace}/${run.name}/${run.uid}/${run.environment.uid}`} namespace={namespace} run={run.name} runUID={run.uid} environment={run.environment.name} environmentUID={run.environment.uid} /></Suspense> : <p role="status">Terminal unavailable for this Run identity.</p> }
 
+function safePortalURL(value?: string) {
+  if (!value) return undefined
+  try {
+    const url = new URL(value)
+    return url.protocol === 'https:' || url.protocol === 'http:' ? url.href : undefined
+  } catch { return undefined }
+}
+
+function Portals() {
+  const run = useOutletRun()
+  const { namespace = '' } = useParams()
+  const environmentUID = run.environment?.uid || ''
+  const query = useQuery({
+    queryKey: queryKeys.portals(namespace, run.name, run.uid, environmentUID),
+    queryFn: () => api.portals(namespace, run.name, run.uid, environmentUID),
+    enabled: !!environmentUID,
+    refetchInterval: 4000,
+  })
+  if (!environmentUID) return <p role="status">Portals unavailable for this Run identity.</p>
+  if (query.isPending) return <Busy label="Loading portals" />
+  if (query.error) return <Failure error={query.error} />
+  if (!query.data.items.length) return <p role="status">No authorized declared services.</p>
+  return <section>
+    <p className="hint">Links are stable gateway locators, not credentials. Opening an idle portal wakes its Environment. Portal sessions are host-local.</p>
+    <table><thead><tr><th>Service</th><th>Port</th><th>Status</th><th>Portal</th></tr></thead><tbody>{query.data.items.map(service => {
+      const url = safePortalURL(service.url)
+      const openURL = service.openURL?.startsWith('/') && !service.openURL.startsWith('//') ? service.openURL : undefined
+      return <tr key={service.name}><td>{service.name}</td><td>{service.targetPort}</td><td><span className={`service-status service-${service.status.toLowerCase()}`}>{service.status}</span>{service.reason && <small>{service.reason}</small>}</td><td>{url && openURL ? <><form className="portal-open" action={openURL} method="post" target="_blank" rel="noopener"><button>Open portal</button></form><small>{url}</small></> : 'Not configured'}</td></tr>
+    })}</tbody></table>
+  </section>
+}
+
 export function App() {
   return <Routes>
     <Route path="/login" element={<Login />} />
@@ -257,8 +289,8 @@ export function App() {
         <Route path="runs" element={<RunList />} /><Route path="runs/new" element={<NewRun />} />
         <Route path="runs/:run" element={<Detail />}>
           <Route index element={<Navigate to="overview" replace />} /><Route path="overview" element={<Overview />} />
-          <Route path="transcript" element={<TranscriptRoute />} /><Route path="terminal" element={<TerminalRoute />} />
-          <Route path="changes/*" element={<Navigate to="../overview" replace />} /><Route path="portals/*" element={<Navigate to="../overview" replace />} />
+          <Route path="transcript" element={<TranscriptRoute />} /><Route path="portals" element={<Portals />} /><Route path="terminal" element={<TerminalRoute />} />
+          <Route path="changes/*" element={<Navigate to="../overview" replace />} />
         </Route>
       </Route>
     </Route>

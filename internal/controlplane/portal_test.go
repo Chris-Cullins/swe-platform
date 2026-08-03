@@ -35,6 +35,22 @@ type recordingPrincipalAccess struct {
 	principal string
 }
 
+type filteringPortalAccess struct {
+	deniedService string
+}
+
+func (a filteringPortalAccess) Authorize(r *http.Request, access ResourceAccess, allowSession bool) error {
+	_, err := a.AuthorizePrincipal(r, access, allowSession)
+	return err
+}
+
+func (a filteringPortalAccess) AuthorizePrincipal(_ *http.Request, access ResourceAccess, _ bool) (string, error) {
+	if access.Resource == "environmentservices" && access.Name == a.deniedService {
+		return "", errForbidden
+	}
+	return "user", nil
+}
+
 func (a *recordingPrincipalAccess) Authorize(*http.Request, ResourceAccess, bool) error {
 	return a.err
 }
@@ -342,6 +358,126 @@ func TestReconcilePortalRoutesStableRevisionAndRemoval(t *testing.T) {
 	}
 	if third.Locator == second.Locator || third.Generation != 3 {
 		t.Fatalf("re-added route = %#v", third)
+	}
+}
+
+func TestRunPortalListFiltersExactServiceAuthorizationAndReportsCurrentState(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := platformv1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	now := metav1.Now()
+	execution := int64(3)
+	controller := true
+	run := &platformv1alpha1.Run{
+		ObjectMeta: metav1.ObjectMeta{Name: "run", Namespace: "ns", UID: "run-uid"},
+		Status:     platformv1alpha1.RunStatus{EnvironmentRef: &platformv1alpha1.RunEnvironmentReference{Name: "env", UID: "env-uid", Ownership: platformv1alpha1.EnvironmentOwnershipOwned}},
+	}
+	services := []platformv1alpha1.EnvironmentServiceDeclaration{
+		{Name: "denied", InstanceID: "dddddddddddddddddddd", Revision: 1, Protocol: platformv1alpha1.EnvironmentServiceProtocolHTTP, TargetPort: 9090, Visibility: platformv1alpha1.EnvironmentServiceVisibilityProject, Readiness: platformv1alpha1.EnvironmentServiceReadinessTCPConnect},
+		{Name: "web", InstanceID: "wwwwwwwwwwwwwwwwwwww", Revision: 2, Protocol: platformv1alpha1.EnvironmentServiceProtocolHTTP, TargetPort: 8080, Visibility: platformv1alpha1.EnvironmentServiceVisibilityProject, Readiness: platformv1alpha1.EnvironmentServiceReadinessTCPConnect},
+	}
+	environment := &platformv1alpha1.Environment{
+		ObjectMeta: metav1.ObjectMeta{Name: "env", Namespace: "ns", UID: "env-uid", Generation: 4, OwnerReferences: []metav1.OwnerReference{{APIVersion: platformv1alpha1.GroupVersion.String(), Kind: "Run", Name: "run", UID: "run-uid", Controller: &controller}}},
+		Spec:       platformv1alpha1.EnvironmentSpec{ProjectRef: "project", Services: services},
+		Status: platformv1alpha1.EnvironmentStatus{
+			ObservedGeneration: 4, ExecutionGeneration: execution, Lifecycle: platformv1alpha1.EnvironmentLifecycleStatus{Epoch: 2},
+			Conditions: []metav1.Condition{{Type: platformv1alpha1.EnvironmentConditionReady, Status: metav1.ConditionTrue, ObservedGeneration: 4}},
+			ServiceObservations: &platformv1alpha1.EnvironmentServiceObservations{ObservedGeneration: 4, ExecutionGeneration: &execution, LifecycleEpoch: 2, ObservedAt: now, Records: []platformv1alpha1.EnvironmentServiceObservation{
+				{Name: "denied", DeclarationRevision: 1, State: platformv1alpha1.EnvironmentServiceObservationHealthy, Reason: platformv1alpha1.EnvironmentServiceReasonConnectionAccepted},
+				{Name: "web", DeclarationRevision: 2, State: platformv1alpha1.EnvironmentServiceObservationHealthy, Reason: platformv1alpha1.EnvironmentServiceReasonConnectionAccepted},
+			}},
+		},
+	}
+	resolver := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(environment).WithObjects(run, environment).Build()
+	access := filteringPortalAccess{deniedService: "env.denied"}
+	server := &Server{access: access}
+	gateway := &portalGateway{server: server, resolver: resolver, suffix: "portal.example", scheme: "https", handoffs: make(map[string]portalSessionHandoff)}
+	request := httptest.NewRequest(http.MethodGet, "https://console.example/api/v1/namespaces/ns/runs/run/portals/run-uid/env-uid", nil)
+	response := httptest.NewRecorder()
+	gateway.listRunPortals(response, request, "ns", RunTerminalAssociation{RunName: "run", RunUID: "run-uid", EnvironmentName: "env", EnvironmentUID: "env-uid", EnvironmentOwnership: "Owned"})
+	if response.Code != http.StatusOK {
+		t.Fatalf("portal list = %d: %s", response.Code, response.Body.String())
+	}
+	var result RunPortalServiceList
+	if err := json.Unmarshal(response.Body.Bytes(), &result); err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Items) != 1 || result.Items[0].Name != "web" || result.Items[0].TargetPort != 8080 || result.Items[0].Status != "Ready" || result.Items[0].URL == "" || result.Items[0].OpenURL == "" {
+		t.Fatalf("portal list = %#v", result)
+	}
+	if strings.Contains(response.Body.String(), "denied") {
+		t.Fatalf("portal list disclosed denied service: %s", response.Body.String())
+	}
+}
+
+func TestPortalServiceStateHonorsLifecycleAndFreshness(t *testing.T) {
+	now := time.Now()
+	execution := int64(2)
+	declaration := platformv1alpha1.EnvironmentServiceDeclaration{Name: "web", Revision: 1}
+	base := platformv1alpha1.Environment{ObjectMeta: metav1.ObjectMeta{Generation: 1}, Status: platformv1alpha1.EnvironmentStatus{
+		ObservedGeneration: 1, ExecutionGeneration: execution,
+		Conditions:          []metav1.Condition{{Type: platformv1alpha1.EnvironmentConditionReady, Status: metav1.ConditionTrue, ObservedGeneration: 1}},
+		ServiceObservations: &platformv1alpha1.EnvironmentServiceObservations{ObservedGeneration: 1, ExecutionGeneration: &execution, ObservedAt: metav1.NewTime(now), Records: []platformv1alpha1.EnvironmentServiceObservation{{Name: "web", DeclarationRevision: 1, State: platformv1alpha1.EnvironmentServiceObservationHealthy}}},
+	}}
+	if state, _ := portalServiceState(&base, declaration, now); state != "Ready" {
+		t.Fatalf("healthy state = %q", state)
+	}
+	pending := base.DeepCopy()
+	pending.Status.Conditions = nil
+	pending.Status.ServiceObservations.ExecutionGeneration = nil
+	pending.Status.ServiceObservations.Records[0].State = platformv1alpha1.EnvironmentServiceObservationPending
+	if state, _ := portalServiceState(pending, declaration, now); state != "Waking" {
+		t.Fatalf("pending state = %q", state)
+	}
+	unhealthy := base.DeepCopy()
+	unhealthy.Status.ServiceObservations.Records[0].State = platformv1alpha1.EnvironmentServiceObservationUnhealthy
+	if state, _ := portalServiceState(unhealthy, declaration, now); state != "Unavailable" {
+		t.Fatalf("unhealthy state = %q", state)
+	}
+	failed := base.DeepCopy()
+	failed.Status.ServiceObservations.Records[0].State = platformv1alpha1.EnvironmentServiceObservationUnknown
+	if state, _ := portalServiceState(failed, declaration, now); state != "Failed" {
+		t.Fatalf("failed state = %q", state)
+	}
+	stale := base.DeepCopy()
+	stale.Status.ServiceObservations.ObservedAt = metav1.NewTime(now.Add(-16 * time.Second))
+	if state, _ := portalServiceState(stale, declaration, now); state != "Stale" {
+		t.Fatalf("stale state = %q", state)
+	}
+	idle := base.DeepCopy()
+	idle.Status.Lifecycle.Suspended = true
+	idle.Status.Lifecycle.SuspensionReason = platformv1alpha1.EnvironmentSuspensionReasonIdle
+	idle.Status.ServiceObservations = nil
+	if state, _ := portalServiceState(idle, declaration, now); state != "Paused" {
+		t.Fatalf("idle state = %q", state)
+	}
+	held := idle.DeepCopy()
+	held.Spec.Lifecycle.Hold = &platformv1alpha1.EnvironmentHoldPolicy{Enabled: true, Revision: 1}
+	if state, _ := portalServiceState(held, declaration, now); state != "Unavailable" {
+		t.Fatalf("held state = %q", state)
+	}
+}
+
+func TestPortalSessionHandoffIsHostBoundOneTimeAndKeepsSessionOutOfURL(t *testing.T) {
+	gateway := &portalGateway{server: &Server{allowInsecureSessions: true}, handoffs: make(map[string]portalSessionHandoff)}
+	gateway.handoffs["one-time-code"] = portalSessionHandoff{sessionID: "console-session", locator: "abcdefghijklmnopqrst", origin: "http://console.test", expiresAt: time.Now().Add(time.Minute)}
+	request := httptest.NewRequest(http.MethodPost, "http://abcdefghijklmnopqrst.portal.example/.swe/session-handoff", strings.NewReader("code=one-time-code"))
+	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	request.Header.Set("Origin", "http://console.test")
+	response := httptest.NewRecorder()
+	gateway.consumeSessionHandoff(response, request, "abcdefghijklmnopqrst")
+	if response.Code != http.StatusOK || response.Header().Get("Location") != "" || !strings.Contains(response.Body.String(), `location.replace("/")`) {
+		t.Fatalf("handoff = %d headers=%v", response.Code, response.Header())
+	}
+	cookies := response.Result().Cookies()
+	if len(cookies) != 1 || cookies[0].Value != "console-session" || !cookies[0].HttpOnly || cookies[0].Domain != "" || cookies[0].SameSite != http.SameSiteStrictMode {
+		t.Fatalf("handoff cookie = %#v", cookies)
+	}
+	replay := httptest.NewRecorder()
+	gateway.consumeSessionHandoff(replay, request, "abcdefghijklmnopqrst")
+	if replay.Code != http.StatusNotFound {
+		t.Fatalf("handoff replay = %d", replay.Code)
 	}
 }
 

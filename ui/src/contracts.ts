@@ -98,3 +98,16 @@ export interface Environment {
   claim?: { runName: string; runUID: string }
   lastActiveAt?: string
 }
+
+export interface PortalService {
+  name: string
+  targetPort: number
+  status: 'Ready' | 'Paused' | 'Waking' | 'Unavailable' | 'Failed' | 'Stale'
+  reason?: string
+  url?: string
+  openURL?: string
+}
+
+export interface PortalServiceList {
+  items: PortalService[]
+}

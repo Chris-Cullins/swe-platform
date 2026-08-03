@@ -206,6 +206,33 @@ func (s *KubernetesResourceService) ResolveRunTerminal(ctx context.Context, name
 	}, nil
 }
 
+func validateRunEnvironmentAssociation(ctx context.Context, reader client.Reader, namespace string, association *RunTerminalAssociation, knownEnvironment *platformv1alpha1.Environment) error {
+	var environment platformv1alpha1.Environment
+	if knownEnvironment == nil {
+		if err := reader.Get(ctx, types.NamespacedName{Namespace: namespace, Name: association.EnvironmentName}, &environment); err != nil {
+			return err
+		}
+		knownEnvironment = &environment
+	}
+	if string(knownEnvironment.UID) != association.EnvironmentUID {
+		return errRunTerminalAssociation
+	}
+	var run platformv1alpha1.Run
+	if err := reader.Get(ctx, types.NamespacedName{Namespace: namespace, Name: association.RunName}, &run); err != nil {
+		if apierrors.IsNotFound(err) {
+			return errRunTerminalAssociation
+		}
+		return err
+	}
+	if string(run.UID) != association.RunUID {
+		return errRunUIDConflict
+	}
+	if !runOwnsOrClaimsEnvironment(&run, knownEnvironment) || run.Status.EnvironmentRef == nil || string(run.Status.EnvironmentRef.Ownership) != association.EnvironmentOwnership {
+		return errRunTerminalAssociation
+	}
+	return nil
+}
+
 func runOwnsOrClaimsEnvironment(run *platformv1alpha1.Run, environment *platformv1alpha1.Environment) bool {
 	if run.Status.EnvironmentRef == nil || run.Status.EnvironmentRef.Name != environment.Name || run.Status.EnvironmentRef.UID != environment.UID {
 		return false

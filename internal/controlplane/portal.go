@@ -7,13 +7,16 @@ import (
 	"encoding/base32"
 	"errors"
 	"fmt"
+	"html"
 	"io"
 	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -55,6 +58,15 @@ type portalGateway struct {
 	requests           chan struct{}
 	admissionHeartbeat time.Duration
 	leasePoll          time.Duration
+	handoffsMu         sync.Mutex
+	handoffs           map[string]portalSessionHandoff
+}
+
+type portalSessionHandoff struct {
+	sessionID string
+	locator   string
+	origin    string
+	expiresAt time.Time
 }
 
 type PortalRoute struct {
@@ -74,7 +86,7 @@ func newPortalGateway(s *Server, o ServerOptions) *portalGateway {
 		return nil
 	}
 	if suffix == "" {
-		return &portalGateway{server: s, resolver: o.PortalResolver, suffix: suffix, scheme: scheme, requests: make(chan struct{}, 64)}
+		return &portalGateway{server: s, resolver: o.PortalResolver, suffix: suffix, scheme: scheme, requests: make(chan struct{}, 64), handoffs: make(map[string]portalSessionHandoff)}
 	}
 	if o.PortalDialer == nil {
 		return nil
@@ -88,7 +100,7 @@ func newPortalGateway(s *Server, o ServerOptions) *portalGateway {
 	if o.PortalEnvironmentEnumerator == nil {
 		return nil
 	}
-	return &portalGateway{server: s, resolver: o.PortalResolver, enumerator: o.PortalEnvironmentEnumerator, dialer: o.PortalDialer, suffix: suffix, scheme: scheme, requests: make(chan struct{}, 64)}
+	return &portalGateway{server: s, resolver: o.PortalResolver, enumerator: o.PortalEnvironmentEnumerator, dialer: o.PortalDialer, suffix: suffix, scheme: scheme, requests: make(chan struct{}, 64), handoffs: make(map[string]portalSessionHandoff)}
 }
 
 func (g *portalGateway) enabled() bool { return g != nil && g.suffix != "" }
@@ -135,6 +147,10 @@ func (g *portalGateway) wrap(next http.Handler) http.Handler {
 		locator, ok := g.locatorForRequest(r)
 		if !ok {
 			next.ServeHTTP(w, r)
+			return
+		}
+		if r.URL.Path == "/.swe/session-handoff" && locator != "" {
+			g.consumeSessionHandoff(w, r, locator)
 			return
 		}
 		if r.URL.Path == "/api/v1/session" && locator != "" {
@@ -235,25 +251,7 @@ func (g *portalGateway) discover(w http.ResponseWriter, r *http.Request, ns, nam
 			http.NotFound(w, r)
 			return
 		}
-		if !g.enabled() {
-			changed, route, err := reconcileDisabledPortalRoute(&env, service, decl.InstanceID, decl.Revision, g.presentationID())
-			if err != nil {
-				g.server.writeResourceError(w, "disable portal route", ns, name, err)
-				return
-			}
-			if changed {
-				if err := g.resolver.Status().Update(r.Context(), &env); err != nil {
-					if apierrors.IsConflict(err) {
-						continue
-					}
-					g.server.writeResourceError(w, "disable portal route", ns, name, err)
-					return
-				}
-			}
-			writeJSON(w, http.StatusOK, PortalRoute{Disabled: true, EnvironmentUID: string(env.UID), Service: service, Revision: decl.Revision, DeclarationInstanceID: decl.InstanceID, RouteGeneration: route.Generation})
-			return
-		}
-		changed, route, err := reconcilePortalRoutes(&env, service, decl.InstanceID, decl.Revision, g.presentationID())
+		route, changed, err := g.routeForDeclaration(&env, decl)
 		if err != nil {
 			g.server.writeResourceError(w, "generate portal route", ns, name, err)
 			return
@@ -267,10 +265,263 @@ func (g *portalGateway) discover(w http.ResponseWriter, r *http.Request, ns, nam
 				return
 			}
 		}
-		writeJSON(w, http.StatusOK, PortalRoute{URL: fmt.Sprintf("%s://%s.%s", g.scheme, route.Locator, g.suffix), EnvironmentUID: string(env.UID), Service: service, Revision: decl.Revision, DeclarationInstanceID: decl.InstanceID, RouteGeneration: route.Generation})
+		writeJSON(w, http.StatusOK, g.portalRoute(&env, decl, route))
 		return
 	}
 	writeProblem(w, 409, "conflict", "Conflict", "portal route changed concurrently")
+}
+
+func (g *portalGateway) routeForDeclaration(env *platformv1alpha1.Environment, decl platformv1alpha1.EnvironmentServiceDeclaration) (platformv1alpha1.EnvironmentPortalRoute, bool, error) {
+	if !g.enabled() {
+		changed, route, err := reconcileDisabledPortalRoute(env, decl.Name, decl.InstanceID, decl.Revision, g.presentationID())
+		return route, changed, err
+	}
+	changed, route, err := reconcilePortalRoutes(env, decl.Name, decl.InstanceID, decl.Revision, g.presentationID())
+	return route, changed, err
+}
+
+func (g *portalGateway) portalRoute(env *platformv1alpha1.Environment, decl platformv1alpha1.EnvironmentServiceDeclaration, route platformv1alpha1.EnvironmentPortalRoute) PortalRoute {
+	result := PortalRoute{Disabled: !g.enabled(), EnvironmentUID: string(env.UID), Service: decl.Name, Revision: decl.Revision, DeclarationInstanceID: decl.InstanceID, RouteGeneration: route.Generation}
+	if g.enabled() {
+		result.URL = fmt.Sprintf("%s://%s.%s", g.scheme, route.Locator, g.suffix)
+	}
+	return result
+}
+
+func (g *portalGateway) listRunPortals(w http.ResponseWriter, r *http.Request, namespace string, association RunTerminalAssociation) {
+	key := types.NamespacedName{Namespace: namespace, Name: association.EnvironmentName}
+	for attempt := 0; attempt < 5; attempt++ {
+		var env platformv1alpha1.Environment
+		if err := g.resolver.Get(r.Context(), key, &env); err != nil {
+			g.server.writeResourceError(w, "get portal environment", namespace, association.EnvironmentName, err)
+			return
+		}
+		if string(env.UID) != association.EnvironmentUID {
+			writeRunTerminalAssociationConflict(w)
+			return
+		}
+		if err := validateRunEnvironmentAssociation(r.Context(), g.resolver, namespace, &association, &env); err != nil {
+			if errors.Is(err, errRunUIDConflict) || errors.Is(err, errRunTerminalAssociation) {
+				writeRunTerminalAssociationConflict(w)
+				return
+			}
+			g.server.writeResourceError(w, "validate Run portal association", namespace, association.RunName, err)
+			return
+		}
+		declarations := append([]platformv1alpha1.EnvironmentServiceDeclaration(nil), env.Spec.Services...)
+		sort.Slice(declarations, func(i, j int) bool { return declarations[i].Name < declarations[j].Name })
+		result := RunPortalServiceList{Items: make([]RunPortalService, 0, len(declarations))}
+		changed := false
+		if g.enabled() {
+			cleaned, _, err := reconcilePortalRoutes(&env, "", "", 0, g.presentationID())
+			if err != nil {
+				g.server.writeResourceError(w, "clean portal routes", namespace, env.Name, err)
+				return
+			}
+			changed = cleaned
+		} else {
+			for i := range env.Status.PortalRoutes {
+				if env.Status.PortalRoutes[i].Active {
+					env.Status.PortalRoutes[i].Active = false
+					changed = true
+				}
+			}
+		}
+		for _, declaration := range declarations {
+			decl, eligible := exactPortalDeclaration(&env, declaration.Name)
+			if !eligible {
+				continue
+			}
+			if err := g.authorize(r, namespace, env.Name, decl.Name, &env); err != nil {
+				if errors.Is(err, errForbidden) {
+					continue
+				}
+				writeRESTAccessError(w, err)
+				return
+			}
+			route, routeChanged, err := g.routeForDeclaration(&env, decl)
+			if err != nil {
+				g.server.writeResourceError(w, "generate portal route", namespace, env.Name, err)
+				return
+			}
+			changed = changed || routeChanged
+			state, reason := portalServiceState(&env, decl, time.Now())
+			item := RunPortalService{Name: decl.Name, TargetPort: decl.TargetPort, Status: state, Reason: reason}
+			if discovered := g.portalRoute(&env, decl, route); !discovered.Disabled {
+				item.URL = discovered.URL
+				item.OpenURL = fmt.Sprintf("/api/v1/namespaces/%s/runs/%s/portals/%s/%s/%s/open", url.PathEscape(namespace), url.PathEscape(association.RunName), url.PathEscape(association.RunUID), url.PathEscape(association.EnvironmentUID), url.PathEscape(decl.Name))
+			}
+			result.Items = append(result.Items, item)
+		}
+		if changed {
+			if err := g.resolver.Status().Update(r.Context(), &env); err != nil {
+				if apierrors.IsConflict(err) {
+					continue
+				}
+				g.server.writeResourceError(w, "update portal routes", namespace, env.Name, err)
+				return
+			}
+		}
+		if err := validateRunEnvironmentAssociation(r.Context(), g.resolver, namespace, &association, nil); err != nil {
+			if errors.Is(err, errRunUIDConflict) || errors.Is(err, errRunTerminalAssociation) {
+				writeRunTerminalAssociationConflict(w)
+				return
+			}
+			g.server.writeResourceError(w, "revalidate Run portal association", namespace, association.RunName, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, result)
+		return
+	}
+	writeProblem(w, http.StatusConflict, "conflict", "Conflict", "portal routes changed concurrently")
+}
+
+func portalServiceState(env *platformv1alpha1.Environment, declaration platformv1alpha1.EnvironmentServiceDeclaration, now time.Time) (string, string) {
+	suspended := env.Spec.Paused || env.Status.Lifecycle.Suspended || env.Spec.Lifecycle.Hold != nil && env.Spec.Lifecycle.Hold.Enabled
+	idleWakeable := env.DeletionTimestamp.IsZero() && !env.Spec.Paused && (env.Spec.Lifecycle.Hold == nil || !env.Spec.Lifecycle.Hold.Enabled) && env.Status.Lifecycle.Suspended && env.Status.Lifecycle.SuspensionReason == platformv1alpha1.EnvironmentSuspensionReasonIdle
+	if !env.DeletionTimestamp.IsZero() || env.Spec.Paused || env.Spec.Lifecycle.Hold != nil && env.Spec.Lifecycle.Hold.Enabled || env.Status.Lifecycle.Suspended && !idleWakeable {
+		return "Unavailable", "Environment policy prevents portal access"
+	}
+	if env.Status.ServiceObservations == nil {
+		if idleWakeable {
+			return "Paused", "Opening the portal wakes this idle Environment"
+		}
+		return "Stale", "No current service observation"
+	}
+	observations := env.Status.ServiceObservations
+	for _, observation := range observations.Records {
+		if observation.Name != declaration.Name {
+			continue
+		}
+		classificationCurrent := false
+		switch observation.State {
+		case platformv1alpha1.EnvironmentServiceObservationPending:
+			classificationCurrent = observations.ExecutionGeneration == nil && !suspended && !platformv1alpha1.IsEnvironmentReady(env)
+		case platformv1alpha1.EnvironmentServiceObservationUnavailable:
+			classificationCurrent = observations.ExecutionGeneration == nil && suspended
+		default:
+			classificationCurrent = observations.ExecutionGeneration != nil && *observations.ExecutionGeneration == env.Status.ExecutionGeneration && platformv1alpha1.IsEnvironmentReady(env) && !suspended
+		}
+		age := now.Sub(observations.ObservedAt.Time)
+		current := env.DeletionTimestamp.IsZero() && observations.ObservedGeneration == env.Generation && observation.DeclarationRevision == declaration.Revision && observations.LifecycleEpoch == env.Status.Lifecycle.Epoch && observations.HoldRevision == lifecycle.HoldPolicyRevision(env) && classificationCurrent && age >= 0 && age <= 15*time.Second
+		if !current {
+			return "Stale", "Service observation is no longer current"
+		}
+		switch observation.State {
+		case platformv1alpha1.EnvironmentServiceObservationHealthy:
+			return "Ready", ""
+		case platformv1alpha1.EnvironmentServiceObservationPending:
+			return "Waking", "Environment is becoming ready"
+		case platformv1alpha1.EnvironmentServiceObservationUnavailable:
+			if idleWakeable {
+				return "Paused", "Opening the portal wakes this idle Environment"
+			}
+			return "Unavailable", "Environment is suspended"
+		case platformv1alpha1.EnvironmentServiceObservationUnhealthy:
+			return "Unavailable", "Declared port is not accepting connections"
+		default:
+			return "Failed", "Service observation failed"
+		}
+	}
+	return "Stale", "No observation for the current declaration"
+}
+
+func (g *portalGateway) openRunPortal(w http.ResponseWriter, r *http.Request, namespace string, association RunTerminalAssociation, service string) {
+	cookie, err := r.Cookie(sessionCookieName)
+	if err != nil || cookie.Value == "" {
+		writeProblem(w, http.StatusBadRequest, "browser-session-required", "Browser session required", "opening a portal from the console requires its current browser session")
+		return
+	}
+	var env platformv1alpha1.Environment
+	if err := g.resolver.Get(r.Context(), types.NamespacedName{Namespace: namespace, Name: association.EnvironmentName}, &env); err != nil {
+		g.server.writeResourceError(w, "get portal environment", namespace, association.EnvironmentName, err)
+		return
+	}
+	if err := validateRunEnvironmentAssociation(r.Context(), g.resolver, namespace, &association, &env); err != nil {
+		writeRunTerminalAssociationConflict(w)
+		return
+	}
+	decl, ok := exactPortalDeclaration(&env, service)
+	if !ok {
+		http.NotFound(w, r)
+		return
+	}
+	if err := g.authorize(r, namespace, env.Name, service, &env); err != nil {
+		writeRESTAccessError(w, err)
+		return
+	}
+	route, changed, err := g.routeForDeclaration(&env, decl)
+	if err != nil || !g.enabled() {
+		writeProblem(w, http.StatusServiceUnavailable, "portal-unavailable", "Portal unavailable", "the portal gateway is not configured")
+		return
+	}
+	if changed {
+		if err := g.resolver.Status().Update(r.Context(), &env); err != nil {
+			g.server.writeResourceError(w, "update portal route", namespace, env.Name, err)
+			return
+		}
+	}
+	var current platformv1alpha1.Environment
+	if err := g.resolver.Get(r.Context(), types.NamespacedName{Namespace: namespace, Name: association.EnvironmentName}, &current); err != nil {
+		g.server.writeResourceError(w, "refresh portal environment", namespace, association.EnvironmentName, err)
+		return
+	}
+	currentDeclaration, currentDeclarationOK := exactPortalDeclaration(&current, service)
+	if err := validateRunEnvironmentAssociation(r.Context(), g.resolver, namespace, &association, &current); err != nil || !currentDeclarationOK || currentDeclaration.InstanceID != decl.InstanceID || currentDeclaration.Revision != decl.Revision || !activeExactRoute(&current, route) || g.authorize(r, namespace, current.Name, service, &current) != nil {
+		writeRunTerminalAssociationConflict(w)
+		return
+	}
+	code, err := randomLocator()
+	if err != nil {
+		writeProblem(w, http.StatusServiceUnavailable, "portal-handoff-unavailable", "Portal handoff unavailable", "a one-time browser handoff could not be created")
+		return
+	}
+	g.handoffsMu.Lock()
+	now := time.Now()
+	if g.handoffs == nil {
+		g.handoffs = make(map[string]portalSessionHandoff)
+	}
+	for key, handoff := range g.handoffs {
+		if !now.Before(handoff.expiresAt) {
+			delete(g.handoffs, key)
+		}
+	}
+	if len(g.handoffs) >= 256 {
+		g.handoffsMu.Unlock()
+		writeProblem(w, http.StatusServiceUnavailable, "portal-handoff-capacity", "Portal handoff unavailable", "too many browser portal handoffs are active")
+		return
+	}
+	g.handoffs[code] = portalSessionHandoff{sessionID: cookie.Value, locator: route.Locator, origin: r.Header.Get("Origin"), expiresAt: now.Add(30 * time.Second)}
+	g.handoffsMu.Unlock()
+	action := fmt.Sprintf("%s://%s.%s/.swe/session-handoff", g.scheme, route.Locator, g.suffix)
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Cache-Control", "private, no-store")
+	w.Header().Set("Referrer-Policy", "no-referrer")
+	w.Header().Set("Content-Security-Policy", "default-src 'none'; script-src 'unsafe-inline'; form-action "+action+"; frame-ancestors 'none'")
+	fmt.Fprintf(w, `<!doctype html><title>Opening portal</title><form method="post" action="%s"><input type="hidden" name="code" value="%s"><button>Continue to portal</button></form><script>document.forms[0].submit()</script>`, html.EscapeString(action), html.EscapeString(code))
+}
+
+func (g *portalGateway) consumeSessionHandoff(w http.ResponseWriter, r *http.Request, locator string) {
+	if r.Method != http.MethodPost || r.ParseForm() != nil {
+		portal404(w)
+		return
+	}
+	code := r.PostForm.Get("code")
+	g.handoffsMu.Lock()
+	handoff, ok := g.handoffs[code]
+	delete(g.handoffs, code)
+	g.handoffsMu.Unlock()
+	origins := r.Header.Values("Origin")
+	if !ok || handoff.locator != locator || !time.Now().Before(handoff.expiresAt) || len(origins) != 1 || origins[0] != handoff.origin {
+		portal404(w)
+		return
+	}
+	http.SetCookie(w, &http.Cookie{Name: sessionCookieName, Value: handoff.sessionID, Path: "/", HttpOnly: true, Secure: !g.server.allowInsecureSessions, SameSite: http.SameSiteStrictMode})
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Cache-Control", "private, no-store")
+	w.Header().Set("Referrer-Policy", "no-referrer")
+	w.Header().Set("Content-Security-Policy", "default-src 'none'; script-src 'unsafe-inline'; frame-ancestors 'none'")
+	_, _ = io.WriteString(w, `<!doctype html><title>Portal ready</title><p><a href="/">Continue to portal</a></p><script>location.replace("/")</script>`)
 }
 
 func reconcileDisabledPortalRoute(env *platformv1alpha1.Environment, want, instanceID string, revision int64, presentationID string) (bool, platformv1alpha1.EnvironmentPortalRoute, error) {
@@ -344,6 +595,7 @@ func exactPortalDeclaration(env *platformv1alpha1.Environment, name string) (pla
 
 func reconcilePortalRoutes(env *platformv1alpha1.Environment, want, instanceID string, revision int64, presentationID string) (bool, platformv1alpha1.EnvironmentPortalRoute, error) {
 	changed := false
+	var current *platformv1alpha1.EnvironmentPortalRoute
 	declarations := map[string]platformv1alpha1.EnvironmentServiceDeclaration{}
 	for _, d := range env.Spec.Services {
 		if d.Protocol == platformv1alpha1.EnvironmentServiceProtocolHTTP && d.Visibility == platformv1alpha1.EnvironmentServiceVisibilityProject {
@@ -358,8 +610,11 @@ func reconcilePortalRoutes(env *platformv1alpha1.Environment, want, instanceID s
 			changed = true
 		}
 		if r.Active && r.Name == want && r.DeclarationInstanceID == instanceID && r.DeclarationRevision == revision {
-			return changed, *r, nil
+			current = r
 		}
+	}
+	if current != nil {
+		return changed, *current, nil
 	}
 	if want == "" {
 		return changed, platformv1alpha1.EnvironmentPortalRoute{}, nil
