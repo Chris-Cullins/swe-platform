@@ -94,6 +94,11 @@ spec:
               prompt:
                 description: Prompt is the task handed to the agent.
                 type: string
+              repositoryCredential:
+                description: RepositoryCredential selects short-lived repository authentication.
+                enum:
+                - GitHubApp
+                type: string
               templateRef:
                 description: TemplateRef selects the template for a controller-allocated
                   Environment.
@@ -107,8 +112,8 @@ spec:
             - message: set environmentRef or templateRef/projectRef, not both
               rule: 'has(self.environmentRef) ? (!has(self.templateRef) && !has(self.projectRef))
                 : (has(self.templateRef) || has(self.projectRef))'
-            - message: agent, prompt, environment selection, and credential profile
-                are immutable
+            - message: agent, prompt, environment selection, credential profile, and
+                repository credential are immutable
               rule: self.agent == oldSelf.agent && self.prompt == oldSelf.prompt &&
                 ((!has(self.environmentRef) && !has(oldSelf.environmentRef)) || (has(self.environmentRef)
                 && has(oldSelf.environmentRef) && self.environmentRef == oldSelf.environmentRef))
@@ -118,7 +123,10 @@ spec:
                 && has(oldSelf.templateRef) && self.templateRef == oldSelf.templateRef))
                 && ((!has(self.credentialProfileRef) && !has(oldSelf.credentialProfileRef))
                 || (has(self.credentialProfileRef) && has(oldSelf.credentialProfileRef)
-                && self.credentialProfileRef == oldSelf.credentialProfileRef))
+                && self.credentialProfileRef == oldSelf.credentialProfileRef)) &&
+                ((!has(self.repositoryCredential) && !has(oldSelf.repositoryCredential))
+                || (has(self.repositoryCredential) && has(oldSelf.repositoryCredential)
+                && self.repositoryCredential == oldSelf.repositoryCredential))
             - message: cancel cannot be unset
               rule: '!has(oldSelf.cancel) || !oldSelf.cancel || (has(self.cancel)
                 && self.cancel)'

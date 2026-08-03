@@ -324,6 +324,9 @@ func decodeCreateRun(w http.ResponseWriter, r *http.Request) (CreateRunRequest, 
 	if request.Prompt == "" {
 		return CreateRunRequest{}, fmt.Errorf("prompt is required")
 	}
+	if request.RepositoryCredential != "" && request.RepositoryCredential != "GitHubApp" {
+		return CreateRunRequest{}, fmt.Errorf("repositoryCredential must be GitHubApp")
+	}
 	return request, nil
 }
 

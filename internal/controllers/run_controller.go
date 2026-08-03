@@ -25,6 +25,7 @@ import (
 	platformv1alpha1 "github.com/Chris-Cullins/swe-platform/api/v1alpha1"
 	"github.com/Chris-Cullins/swe-platform/internal/agent"
 	"github.com/Chris-Cullins/swe-platform/internal/lifecycle"
+	"github.com/Chris-Cullins/swe-platform/internal/repositorycredential"
 	"github.com/Chris-Cullins/swe-platform/internal/sandboxclient"
 	"github.com/Chris-Cullins/swe-platform/internal/tenancy"
 	sandboxdv1 "github.com/Chris-Cullins/swe-platform/sandboxd/gen/proto/sandboxd/v1"
@@ -52,13 +53,14 @@ const (
 // and declared-service processes inside the Environment.
 type RunReconciler struct {
 	client.Client
-	APIReader client.Reader
-	Scheme    *runtime.Scheme
-	Scope     *tenancy.ReconcileScope
-	Adapters  map[string]agent.AdapterLifecycle
-	EventSink agent.AdapterEventSink
-	Connector sandboxclient.Connector
-	Metrics   *OperatorMetrics
+	APIReader             client.Reader
+	Scheme                *runtime.Scheme
+	Scope                 *tenancy.ReconcileScope
+	Adapters              map[string]agent.AdapterLifecycle
+	EventSink             agent.AdapterEventSink
+	Connector             sandboxclient.Connector
+	Metrics               *OperatorMetrics
+	RepositoryCredentials repositorycredential.Provider
 }
 
 // +kubebuilder:rbac:groups=swe.dev,resources=runs,verbs=get;list;watch;update;patch

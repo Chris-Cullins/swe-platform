@@ -9,6 +9,13 @@ image:
   pullPolicy: IfNotPresent
 
 operator:
+  # Short-lived repository credentials are disabled unless an administrator-owned
+  # GitHub App Secret is explicitly selected. The chart never creates it.
+  githubApp:
+    enabled: false
+    clientID: ""
+    secretName: ""
+    privateKeyKey: private-key.pem
   metrics:
     # Exposed on the internal operator metrics Service.
     port: 8080

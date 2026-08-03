@@ -34,13 +34,14 @@ type controlPlaneClient interface {
 
 // CreateRunInput is the bounded immutable Run intent exposed to MCP clients.
 type CreateRunInput struct {
-	Name              string `json:"name" jsonschema:"Stable Run name and idempotency key."`
-	Prompt            string `json:"prompt" jsonschema:"Task for the selected agent."`
-	Agent             string `json:"agent,omitempty" jsonschema:"Agent adapter; defaults to claude-code."`
-	Environment       string `json:"environment,omitempty" jsonschema:"Existing Environment; exclusive with project and template."`
-	Project           string `json:"project,omitempty" jsonschema:"Project supplying repository and default template configuration."`
-	Template          string `json:"template,omitempty" jsonschema:"EnvironmentTemplate; may override a Project default."`
-	CredentialProfile string `json:"credentialProfile,omitempty" jsonschema:"Same-namespace AgentCredentialProfile name."`
+	Name                 string `json:"name" jsonschema:"Stable Run name and idempotency key."`
+	Prompt               string `json:"prompt" jsonschema:"Task for the selected agent."`
+	Agent                string `json:"agent,omitempty" jsonschema:"Agent adapter; defaults to claude-code."`
+	Environment          string `json:"environment,omitempty" jsonschema:"Existing Environment; exclusive with project and template."`
+	Project              string `json:"project,omitempty" jsonschema:"Project supplying repository and default template configuration."`
+	Template             string `json:"template,omitempty" jsonschema:"EnvironmentTemplate; may override a Project default."`
+	CredentialProfile    string `json:"credentialProfile,omitempty" jsonschema:"Same-namespace AgentCredentialProfile name."`
+	RepositoryCredential string `json:"repositoryCredential,omitempty" jsonschema:"Repository credential provider; GitHubApp when selected."`
 }
 
 // RunReference is the concise, immutable identity returned by create_run.
@@ -132,9 +133,10 @@ func createRun(ctx context.Context, client controlPlaneClient, namespace string,
 			Project:     input.Project,
 			Template:    input.Template,
 		},
-		Agent:             agent,
-		Prompt:            input.Prompt,
-		CredentialProfile: input.CredentialProfile,
+		Agent:                agent,
+		Prompt:               input.Prompt,
+		CredentialProfile:    input.CredentialProfile,
+		RepositoryCredential: input.RepositoryCredential,
 	})
 	if err != nil {
 		return CreateRunOutput{}, fmt.Errorf("create Run: %w", err)
@@ -171,6 +173,9 @@ func validateCreateRun(input CreateRunInput) error {
 	}
 	if input.Prompt == "" || len(input.Prompt) > maxPromptBytes {
 		return fmt.Errorf("prompt is required and must not exceed %d bytes", maxPromptBytes)
+	}
+	if input.RepositoryCredential != "" && input.RepositoryCredential != "GitHubApp" {
+		return fmt.Errorf("repositoryCredential must be GitHubApp")
 	}
 	return nil
 }
@@ -292,6 +297,7 @@ func createRunSchema() *jsonschema.Schema {
 	for _, field := range []string{"environment", "project", "template", "credentialProfile"} {
 		setStringBounds(schema, field, 0, 253)
 	}
+	setStringBounds(schema, "repositoryCredential", 0, 9)
 	return schema
 }
 

@@ -145,6 +145,7 @@ func desiredRunSpec(request CreateRunRequest) platformv1alpha1.RunSpec {
 		Agent:                request.Agent,
 		Prompt:               request.Prompt,
 		CredentialProfileRef: request.CredentialProfile,
+		RepositoryCredential: platformv1alpha1.RepositoryCredential(request.RepositoryCredential),
 		Notify:               nil,
 		ParentRef:            "",
 	}
@@ -263,10 +264,11 @@ func runDTO(run *platformv1alpha1.Run) Run {
 		Generation: run.Generation,
 		CreatedAt:  run.CreationTimestamp.Time,
 		Intent: RunIntent{
-			Selector:          RunSelector{Environment: run.Spec.EnvironmentRef, Project: run.Spec.ProjectRef, Template: run.Spec.TemplateRef},
-			Agent:             run.Spec.Agent,
-			Prompt:            run.Spec.Prompt,
-			CredentialProfile: run.Spec.CredentialProfileRef,
+			Selector:             RunSelector{Environment: run.Spec.EnvironmentRef, Project: run.Spec.ProjectRef, Template: run.Spec.TemplateRef},
+			Agent:                run.Spec.Agent,
+			Prompt:               run.Spec.Prompt,
+			CredentialProfile:    run.Spec.CredentialProfileRef,
+			RepositoryCredential: string(run.Spec.RepositoryCredential),
 		},
 		CancelRequested: run.Spec.Cancel,
 		State:           string(run.Status.State),

@@ -1,5 +1,21 @@
 # Security model
 
+## GitHub App repository credentials
+
+When explicitly selected by immutable Run intent, the operator exchanges its
+administrator-owned GitHub App private key for a short-lived installation token.
+The recipient is only the canonical `github.com` repository in frozen provisioning
+data; scope is exactly that repository with `contents:write`. App keys are mounted
+only in the operator. Tokens are intended only for clone and Run-owned agent
+processes, never status, transcripts, sandboxd, hooks, command arguments,
+repository URLs, or persistent git config. Cleanup fences the Environment before
+revocation. GitHub's fixed one-hour maximum expiry bounds a crash between issuance
+and persistence, where no token exists locally to revoke.
+
+Only `https://github.com/<owner>/<repo>[.git]` is accepted. SSH, userinfo,
+ports, query/fragment components, redirects, enterprise hosts, and alternate API
+hosts are rejected.
+
 ## sandboxd threat model
 
 `sandboxd` is a privileged capability endpoint: successful calls can execute arbitrary
