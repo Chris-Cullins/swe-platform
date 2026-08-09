@@ -50,6 +50,7 @@ type fakeClient struct {
 	beforeLaunchErr error
 	afterLaunchErr  error
 	stoppedKey      *sandboxdv1.ProcessKey
+	stopErr         error
 	readRequests    []*sandboxdv1.ReadOutputRequest
 }
 
@@ -101,6 +102,9 @@ func (f *fakeClient) Get(context.Context, *sandboxdv1.GetProcessRequest, ...grpc
 }
 func (f *fakeClient) Stop(_ context.Context, request *sandboxdv1.StopProcessRequest, _ ...grpc.CallOption) (*sandboxdv1.Process, error) {
 	f.stoppedKey = request.Key
+	if f.stopErr != nil {
+		return nil, f.stopErr
+	}
 	if f.process == nil {
 		return &sandboxdv1.Process{State: sandboxdv1.ProcessState_PROCESS_STATE_EXITED}, nil
 	}
@@ -157,7 +161,7 @@ func TestTerminalValidationFailsOnRetainedOutputGap(t *testing.T) {
 		retainedFrom: 1024,
 	}
 	got, detail, err := (&Adapter{}).Observe(context.Background(), agent.AdapterTask{ID: "run"}, testSandbox(client))
-	if err != nil || got != agent.AdapterObservationFailed || !strings.Contains(detail, "truncated before terminal validation") || !strings.Contains(detail, "retained from offset 1024") {
+	if err != nil || got != agent.AdapterObservationFailed || detail != got.StatusMessage() {
 		t.Fatalf("Observe = %q, %q, %v", got, detail, err)
 	}
 }
@@ -301,6 +305,29 @@ func TestObservationOutcomes(t *testing.T) {
 	}
 }
 
+func TestObservationMessagesExcludeAgentControlledDetails(t *testing.T) {
+	const sentinel = "!!AMP-STATUS-SECRET!!"
+	exit0 := int32(0)
+	tests := []struct {
+		name    string
+		process *sandboxdv1.Process
+		output  string
+		want    agent.AdapterObservation
+	}{
+		{"process failure", &sandboxdv1.Process{State: sandboxdv1.ProcessState_PROCESS_STATE_FAILED, Error: sentinel, ExecutionId: "e"}, "", agent.AdapterObservationFailed},
+		{"provider failure", &sandboxdv1.Process{State: sandboxdv1.ProcessState_PROCESS_STATE_EXITED, ExitCode: &exit0, ExecutionId: "e"}, `{"type":"result","subtype":"error","is_error":true,"error":{"message":"` + sentinel + `"}}` + "\n", agent.AdapterObservationFailed},
+		{"success result", &sandboxdv1.Process{State: sandboxdv1.ProcessState_PROCESS_STATE_EXITED, ExitCode: &exit0, ExecutionId: "e"}, `{"type":"result","subtype":"success","is_error":false,"result":"` + sentinel + `"}` + "\n", agent.AdapterObservationSucceeded},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			observation, message, err := (&Adapter{}).Observe(context.Background(), agent.AdapterTask{ID: "run"}, testSandbox(&fakeClient{process: test.process, stdout: []byte(test.output)}))
+			if err != nil || observation != test.want || message != test.want.StatusMessage() || strings.Contains(message, sentinel) {
+				t.Fatalf("Observe = (%q, %q, %v), want fixed %q message", observation, message, err, test.want)
+			}
+		})
+	}
+}
+
 func TestCancellationAndBoundedIdempotentOutput(t *testing.T) {
 	client := &fakeClient{process: &sandboxdv1.Process{State: sandboxdv1.ProcessState_PROCESS_STATE_RUNNING, ExecutionId: "execution"}, stdout: []byte("stdout"), stderr: []byte("stderr")}
 	var events []agent.AdapterEvent
@@ -329,6 +356,13 @@ func TestCancellationAndBoundedIdempotentOutput(t *testing.T) {
 	err := adapter.Cancel(context.Background(), agent.AdapterTask{ID: "run"}, sandbox)
 	if !errors.Is(err, agent.ErrAdapterCancellationPending) || client.stoppedKey.OwnerId != "run" {
 		t.Fatalf("cancel = %v/%#v", err, client.stoppedKey)
+	}
+}
+
+func TestCancellationTreatsAbsentProcessAsComplete(t *testing.T) {
+	client := &fakeClient{stopErr: status.Error(codes.NotFound, "absent")}
+	if err := (&Adapter{}).Cancel(context.Background(), agent.AdapterTask{ID: "run"}, testSandbox(client)); err != nil {
+		t.Fatalf("Cancel() error = %v, want absent process to be complete", err)
 	}
 }
 

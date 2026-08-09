@@ -78,10 +78,123 @@ interface TranscriptState {
 }
 
 const MAX_SSE_BUFFER = 8 << 20
+const INITIAL_SSE_BUFFER = 4096
 
-function sseBoundary(buffer: string): { index: number; length: number } | undefined {
-  const match = /\r\n\r\n|\n\n|\r\r/.exec(buffer)
-  return match ? { index: match.index, length: match[0].length } : undefined
+class TerminalStreamError extends Error {}
+
+// CRLF has greedy precedence over the byte-identical CR + LF combination
+// while streaming. The ambiguous CR + LF delimiter is accepted only at EOF.
+// Completed frames are consumed synchronously, and large accumulators shrink
+// after dispatch so an unresolved suffix never retains a large source buffer.
+// Exported for deterministic chunk-boundary/property tests.
+export class SSEFramer {
+  private bytes = new Uint8Array(INITIAL_SSE_BUFFER)
+  private length = 0
+  private scan = 0
+  private previousEndingStart = -1
+  private previousEndingEnd = -1
+
+  push(chunk: Uint8Array, consume: (frame: Uint8Array) => void) {
+    for (const byte of chunk) {
+      this.append(byte)
+      this.scanAvailable(consume, false)
+      this.checkBodyLimit()
+    }
+  }
+
+  finish(consume: (frame: Uint8Array) => void) {
+    this.scanAvailable(consume, true)
+    if (this.length && this.previousEndingEnd === this.length && this.previousEndingEnd-this.previousEndingStart === 2 &&
+      this.bytes[this.previousEndingStart] === 13 && this.bytes[this.previousEndingStart + 1] === 10) {
+      // At EOF only, resolve the otherwise ambiguous CRLF as CR + LF.
+      this.consumeFrame(this.previousEndingStart, this.length, consume)
+    }
+    if (this.length !== 0) throw new TerminalStreamError('Malformed transcript event stream at EOF')
+  }
+
+  private append(byte: number) {
+    if (this.length === MAX_SSE_BUFFER + 4) throw new TerminalStreamError(`Transcript event exceeds ${MAX_SSE_BUFFER} bytes`)
+    if (this.length === this.bytes.length) {
+      const grown = new Uint8Array(Math.min(MAX_SSE_BUFFER + 4, this.bytes.length * 2))
+      grown.set(this.bytes)
+      this.bytes = grown
+    }
+    this.bytes[this.length++] = byte
+  }
+
+  private checkBodyLimit() {
+    let bodyBytes = this.length
+    if (this.scan < this.length) {
+      bodyBytes = this.previousEndingEnd === this.scan ? this.previousEndingStart : this.scan
+    } else if (this.previousEndingEnd === this.length) {
+      bodyBytes = this.previousEndingStart
+    }
+    if (bodyBytes > MAX_SSE_BUFFER) throw new TerminalStreamError(`Transcript event exceeds ${MAX_SSE_BUFFER} bytes`)
+  }
+
+  private consumeFrame(bodyLength: number, consumedEnd: number, consume: (frame: Uint8Array) => void) {
+    if (bodyLength > MAX_SSE_BUFFER) throw new TerminalStreamError(`Transcript event exceeds ${MAX_SSE_BUFFER} bytes`)
+    consume(this.bytes.subarray(0, bodyLength))
+    const suffixLength = this.length - consumedEnd
+    if (this.bytes.length > INITIAL_SSE_BUFFER) {
+      const compact = new Uint8Array(Math.max(INITIAL_SSE_BUFFER, suffixLength))
+      compact.set(this.bytes.subarray(consumedEnd, this.length))
+      this.bytes = compact
+    } else if (suffixLength) {
+      this.bytes.copyWithin(0, consumedEnd, this.length)
+    }
+    this.length = suffixLength
+    this.scan = 0
+    this.previousEndingStart = -1
+    this.previousEndingEnd = -1
+  }
+
+  private scanAvailable(consume: (frame: Uint8Array) => void, eof: boolean) {
+    while (this.scan < this.length) {
+      const start = this.scan
+      const byte = this.bytes[start]
+      let endingLength = 0
+      if (byte === 10) endingLength = 1
+      else if (byte === 13) {
+        if (start + 1 === this.length && !eof) return
+        endingLength = start + 1 < this.length && this.bytes[start + 1] === 10 ? 2 : 1
+      } else {
+        this.scan += 1
+        continue
+      }
+      const end = start + endingLength
+      if (this.previousEndingEnd === start) {
+        this.consumeFrame(this.previousEndingStart, end, consume)
+        continue
+      }
+      this.previousEndingStart = start
+      this.previousEndingEnd = end
+      this.scan = end
+    }
+  }
+}
+
+function dataPayloadBytes(bytes: Uint8Array): number {
+  let fields = 0
+  let total = 0
+  for (let start = 0; start <= bytes.length;) {
+    let end = start
+    while (end < bytes.length && bytes[end] !== 10 && bytes[end] !== 13) end += 1
+    const length = end - start
+    if (length >= 4 && bytes[start] === 100 && bytes[start + 1] === 97 && bytes[start + 2] === 116 && bytes[start + 3] === 97 && (length === 4 || bytes[start + 4] === 58)) {
+      let valueStart = start + 4
+      if (length > 4) {
+        valueStart += 1
+        if (valueStart < end && bytes[valueStart] === 32) valueStart += 1
+      }
+      total += end - valueStart
+      fields += 1
+    }
+    if (end === bytes.length) break
+    if (bytes[end] === 13 && bytes[end + 1] === 10) end += 1
+    start = end + 1
+  }
+  return total + Math.max(0, fields - 1)
 }
 
 function emptyTranscriptState(): TranscriptState {
@@ -132,23 +245,23 @@ export function Transcript({ namespace, run, identity }: { namespace: string; ru
         timer = window.setTimeout(flushTimeline, 16)
       }
     }
-    const onTranscript = (raw: Event) => {
+    const onTranscript = (raw: Event, rawBytes: number) => {
       if (disposed) return
       const entry = parseEntry(raw as MessageEvent)
       if (!entry) return
       if (queuedTimeline.some(item => item.kind === 'event' && (item.entry.id === entry.id || item.entry.sequence === entry.sequence))) return
-      const next: TranscriptRenderItem = { kind: 'event', entry, position: entry.sequence, rawBytes: (raw as MessageEvent).data.length }
+      const next: TranscriptRenderItem = { kind: 'event', entry, position: entry.sequence, rawBytes }
       queuedTimeline = appendTimelineItem(queuedTimeline, next)
       scheduleTimelineFlush()
     }
-    const onGap = (raw: Event) => {
+    const onGap = (raw: Event, rawBytes: number) => {
       if (disposed) return
       const gap = parseGap(raw as MessageEvent)
       if (!gap) return
       if (queuedTimeline.some(item => item.kind === 'gap' && item.gap.resumeAfter === gap.resumeAfter && item.gap.earliestSequence === gap.earliestSequence && item.gap.latestSequence === gap.latestSequence)) return
       const lastPosition = queuedTimeline.reduce((latest, item) => Math.max(latest, item.position), 0)
       const position = gap.earliestSequence ?? lastPosition + 0.5
-      const next: TranscriptRenderItem = { kind: 'gap', gap, position, rawBytes: (raw as MessageEvent).data.length }
+      const next: TranscriptRenderItem = { kind: 'gap', gap, position, rawBytes }
       queuedTimeline = appendTimelineItem(queuedTimeline, next)
       scheduleTimelineFlush()
     }
@@ -192,40 +305,38 @@ export function Transcript({ namespace, run, identity }: { namespace: string; ru
           freshRecoveryUsed = false
           setStatus('Connected')
           const reader = response.body.getReader()
-          const decoder = new TextDecoder()
-          let buffer = ''
+          const decoder = new TextDecoder('utf-8', { fatal: true })
+          const framer = new SSEFramer()
+          const consumeFrame = (frameBytes: Uint8Array) => {
+            let block: string
+            try { block = decoder.decode(frameBytes) } catch { throw new TerminalStreamError('Malformed UTF-8 in transcript event stream') }
+            let type = 'message'
+            let id = ''
+            let hasID = false
+            const data: string[] = []
+            for (const line of block.split(/\r\n|\n|\r/)) {
+              if (!line || line.startsWith(':')) continue
+              const colon = line.indexOf(':')
+              const field = colon < 0 ? line : line.slice(0, colon)
+              const fieldValue = colon < 0 ? '' : line.slice(colon + 1).replace(/^ /, '')
+              if (field === 'event') type = fieldValue
+              else if (field === 'id' && !fieldValue.includes('\0')) { id = fieldValue; hasID = true }
+              else if (field === 'data') data.push(fieldValue)
+              else if (field === 'retry' && /^\d+$/.test(fieldValue)) reconnectWait = Math.min(Number(fieldValue), 30_000)
+            }
+            if (hasID) lastEventID = id
+            if (!data.length) return
+            const event = new MessageEvent(type, { data: data.join('\n'), lastEventId: lastEventID })
+            const rawBytes = dataPayloadBytes(frameBytes)
+            if (type === 'transcript') onTranscript(event, rawBytes)
+            else if (type === 'transcript-gap') onGap(event, rawBytes)
+          }
           try {
             while (!disposed) {
               const { value, done } = await reader.read()
-              if (value) buffer += decoder.decode(value, { stream: true })
-              let boundary: { index: number; length: number } | undefined
-              while ((boundary = sseBoundary(buffer)) !== undefined) {
-                if (boundary.index > MAX_SSE_BUFFER) throw new Error(`Transcript event exceeds ${MAX_SSE_BUFFER} bytes`)
-                const block = buffer.slice(0, boundary.index)
-                buffer = buffer.slice(boundary.index + boundary.length)
-                let type = 'message'
-                let id = ''
-                let hasID = false
-                const data: string[] = []
-                for (const line of block.split(/\r\n|\n|\r/)) {
-                  if (!line || line.startsWith(':')) continue
-                  const colon = line.indexOf(':')
-                  const field = colon < 0 ? line : line.slice(0, colon)
-                  const fieldValue = colon < 0 ? '' : line.slice(colon + 1).replace(/^ /, '')
-                  if (field === 'event') type = fieldValue
-                  else if (field === 'id' && !fieldValue.includes('\0')) { id = fieldValue; hasID = true }
-                  else if (field === 'data') data.push(fieldValue)
-                  else if (field === 'retry' && /^\d+$/.test(fieldValue)) reconnectWait = Math.min(Number(fieldValue), 30_000)
-                }
-                if (hasID) lastEventID = id
-                if (!data.length) continue
-                const event = new MessageEvent(type, { data: data.join('\n'), lastEventId: lastEventID })
-                if (type === 'transcript') onTranscript(event)
-                else if (type === 'transcript-gap') onGap(event)
-              }
-              if (buffer.length > MAX_SSE_BUFFER) throw new Error(`Transcript event exceeds ${MAX_SSE_BUFFER} bytes`)
+              if (value) framer.push(value, consumeFrame)
               if (done) {
-                decoder.decode()
+                framer.finish(consumeFrame)
                 break
               }
             }
@@ -238,7 +349,7 @@ export function Transcript({ namespace, run, identity }: { namespace: string; ru
           }
         } catch (error) {
           if (disposed || controller.signal.aborted) return
-          if (!(error instanceof Error && error.message.startsWith('Transcript event exceeds'))) {
+          if (!(error instanceof TerminalStreamError)) {
             setStatus('Reconnecting')
             await reconnectDelay()
             continue

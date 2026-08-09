@@ -219,11 +219,34 @@ func TestObservationOutcomes(t *testing.T) {
 	}
 }
 
+func TestObservationMessagesExcludeAgentControlledDetails(t *testing.T) {
+	const sentinel = "!!PI-STATUS-SECRET!!"
+	exit0 := int32(0)
+	tests := []struct {
+		name    string
+		process *sandboxdv1.Process
+		stdout  string
+		want    agent.AdapterObservation
+	}{
+		{"process failure", &sandboxdv1.Process{State: sandboxdv1.ProcessState_PROCESS_STATE_FAILED, Error: sentinel, ExecutionId: "e"}, "", agent.AdapterObservationFailed},
+		{"provider failure", &sandboxdv1.Process{State: sandboxdv1.ProcessState_PROCESS_STATE_EXITED, ExitCode: &exit0, ExecutionId: "e"}, `{"type":"agent_end","messages":[{"role":"assistant","stopReason":"error","errorMessage":"` + sentinel + `"}]}`, agent.AdapterObservationFailed},
+		{"success result", &sandboxdv1.Process{State: sandboxdv1.ProcessState_PROCESS_STATE_EXITED, ExitCode: &exit0, ExecutionId: "e"}, `{"type":"agent_end","messages":[{"role":"assistant","stopReason":"stop","errorMessage":"` + sentinel + `"}]}`, agent.AdapterObservationSucceeded},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			observation, message, err := (&Adapter{}).Observe(context.Background(), agent.AdapterTask{ID: "run"}, processSandbox(&processClient{process: test.process, stdout: []byte(test.stdout)}, "epoch"))
+			if err != nil || observation != test.want || message != test.want.StatusMessage() || strings.Contains(message, sentinel) {
+				t.Fatalf("Observe = (%q, %q, %v), want fixed %q message", observation, message, err, test.want)
+			}
+		})
+	}
+}
+
 func TestTerminalValidationFailsOnRetainedOutputGap(t *testing.T) {
 	exit0 := int32(0)
 	client := &processClient{process: &sandboxdv1.Process{State: sandboxdv1.ProcessState_PROCESS_STATE_EXITED, ExecutionId: "e", ExitCode: &exit0}, stdout: []byte(`{"type":"agent_end","messages":[]}`), retainedFrom: 41}
 	got, detail, err := (&Adapter{}).Observe(context.Background(), agent.AdapterTask{ID: "run"}, processSandbox(client, "epoch"))
-	if err != nil || got != agent.AdapterObservationFailed || !strings.Contains(detail, "retained from offset 41") {
+	if err != nil || got != agent.AdapterObservationFailed || detail != got.StatusMessage() {
 		t.Fatalf("Observe = %q, %q, %v", got, detail, err)
 	}
 }
@@ -306,7 +329,7 @@ func TestPermanentOutputRejectionFailsObserveButNotTerminalCancel(t *testing.T) 
 	sandbox := processSandbox(client, "epoch")
 	sandbox.EmitEvent = func(context.Context, agent.AdapterEvent) error { return agent.ErrAdapterEventRejected }
 	got, detail, err := (&Adapter{}).Observe(context.Background(), agent.AdapterTask{ID: "run"}, sandbox)
-	if err != nil || got != agent.AdapterObservationFailed || !strings.Contains(detail, "permanently rejected") {
+	if err != nil || got != agent.AdapterObservationFailed || detail != got.StatusMessage() {
 		t.Fatalf("Observe = %q, %q, %v", got, detail, err)
 	}
 	client.process.State, client.process.ExitCode = sandboxdv1.ProcessState_PROCESS_STATE_EXITED, &exit0

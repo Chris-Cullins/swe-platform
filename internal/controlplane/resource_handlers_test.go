@@ -74,6 +74,10 @@ func (f *fakeResources) GetRun(_ context.Context, n, x string) (Run, error) {
 	f.calls = append(f.calls, "get")
 	return f.existing, f.errorGet
 }
+func (f *fakeResources) GetRunExact(_ context.Context, n, x, uid string) (Run, error) {
+	f.calls = append(f.calls, "get-exact:"+uid)
+	return f.existing, f.errorGet
+}
 func (f *fakeResources) CancelRun(_ context.Context, n, x, uid string) (Run, error) {
 	f.calls = append(f.calls, "cancel")
 	f.cancelUID = uid
@@ -421,5 +425,38 @@ func TestKubernetesResourceErrorsAreProblems(t *testing.T) {
 		if w.Code != tc.status || w.Header().Get("Content-Type") != "application/problem+json" {
 			t.Errorf("err=%v response=%d/%q", tc.err, w.Code, w.Header().Get("Content-Type"))
 		}
+	}
+}
+
+func TestGetRunOptionalUIDPrecondition(t *testing.T) {
+	resources := &fakeResources{existing: Run{Name: "run", UID: "current-uid"}}
+	server := NewServer(nil, ServerOptions{Access: &recordingAccess{}, Resources: resources})
+	request := func(header *string) *httptest.ResponseRecorder {
+		r := httptest.NewRequest(http.MethodGet, "/api/v1/namespaces/ns/runs/run", nil)
+		if header != nil {
+			r.Header.Set(RunUIDHeader, *header)
+		}
+		w := httptest.NewRecorder()
+		server.Handler().ServeHTTP(w, r)
+		return w
+	}
+	if response := request(nil); response.Code != http.StatusOK || !reflect.DeepEqual(resources.calls, []string{"get"}) {
+		t.Fatalf("headerless response/calls = %d/%v", response.Code, resources.calls)
+	}
+	resources.calls = nil
+	uid := "current-uid"
+	if response := request(&uid); response.Code != http.StatusOK || !reflect.DeepEqual(resources.calls, []string{"get-exact:current-uid"}) {
+		t.Fatalf("exact response/calls = %d/%v", response.Code, resources.calls)
+	}
+	resources.calls = nil
+	resources.errorGet = errRunUIDConflict
+	uid = "stale-uid"
+	if response := request(&uid); response.Code != http.StatusConflict || !strings.Contains(response.Body.String(), `/run-uid-conflict"`) {
+		t.Fatalf("stale response/body = %d/%s", response.Code, response.Body.String())
+	}
+	resources.calls = nil
+	uid = " "
+	if response := request(&uid); response.Code != http.StatusPreconditionRequired || len(resources.calls) != 0 {
+		t.Fatalf("blank response/calls = %d/%v", response.Code, resources.calls)
 	}
 }

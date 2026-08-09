@@ -2,8 +2,10 @@ package server
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net"
+	"sync"
 	"testing"
 	"time"
 
@@ -137,6 +139,124 @@ func TestPortalCancellationReleasesSilentTargetAndTunnelSlot(t *testing.T) {
 		t.Fatal("portal cancellation did not close the silent target connection")
 	}
 }
+
+func TestPortalCancellationUnblocksTargetWriteAndReleasesTunnelSlot(t *testing.T) {
+	client, portalServer := portalTestHarness(t, 50051)
+	target := newBlockingPortalConn()
+	portalServer.dialContext = func(context.Context, string, string) (net.Conn, error) {
+		return target, nil
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	stream, err := client.Tunnel(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := stream.Send(&sandboxdv1.PortalFrame{TargetPort: 8080, Data: []byte("blocked")}); err != nil {
+		t.Fatal(err)
+	}
+	ack, err := stream.Recv()
+	if err != nil || !ack.Opened {
+		t.Fatalf("ack = %#v, %v", ack, err)
+	}
+	select {
+	case <-target.writeStarted:
+	case <-time.After(time.Second):
+		t.Fatal("portal target write did not start")
+	}
+	if len(portalServer.active) != 1 {
+		t.Fatalf("active tunnels during blocked write = %d, want 1", len(portalServer.active))
+	}
+	cancel()
+	deadline := time.Now().Add(time.Second)
+	for len(portalServer.active) != 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if len(portalServer.active) != 0 {
+		t.Fatalf("active tunnels after cancellation = %d, want 0", len(portalServer.active))
+	}
+	select {
+	case <-target.closed:
+	case <-time.After(time.Second):
+		t.Fatal("portal cancellation did not close the blocked target connection")
+	}
+}
+
+func TestPortalDialsOnlyLiteralLoopbacksWithDualStackFallback(t *testing.T) {
+	client, portalServer := portalTestHarness(t, 50051)
+	var addresses []string
+	portalServer.dialContext = func(_ context.Context, _, address string) (net.Conn, error) {
+		addresses = append(addresses, address)
+		host, _, err := net.SplitHostPort(address)
+		if err != nil {
+			return nil, err
+		}
+		ip := net.ParseIP(host)
+		if ip == nil || !ip.IsLoopback() {
+			return nil, errors.New("portal attempted a non-loopback address")
+		}
+		if ip.To4() != nil {
+			return nil, errors.New("IPv4 target unavailable")
+		}
+		server, target := net.Pipe()
+		t.Cleanup(func() { _ = target.Close() })
+		return server, nil
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	stream, err := client.Tunnel(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := stream.Send(&sandboxdv1.PortalFrame{TargetPort: 8080}); err != nil {
+		t.Fatal(err)
+	}
+	ack, err := stream.Recv()
+	if err != nil || !ack.Opened {
+		t.Fatalf("ack = %#v, %v", ack, err)
+	}
+	want := []string{"127.0.0.1:8080", "[::1]:8080"}
+	if len(addresses) != len(want) || addresses[0] != want[0] || addresses[1] != want[1] {
+		t.Fatalf("dial addresses = %v, want %v", addresses, want)
+	}
+}
+
+type blockingPortalConn struct {
+	writeStarted chan struct{}
+	closed       chan struct{}
+	writeOnce    sync.Once
+	closeOnce    sync.Once
+}
+
+func newBlockingPortalConn() *blockingPortalConn {
+	return &blockingPortalConn{writeStarted: make(chan struct{}), closed: make(chan struct{})}
+}
+
+func (c *blockingPortalConn) Read([]byte) (int, error) {
+	<-c.closed
+	return 0, net.ErrClosed
+}
+
+func (c *blockingPortalConn) Write([]byte) (int, error) {
+	c.writeOnce.Do(func() { close(c.writeStarted) })
+	<-c.closed
+	return 0, net.ErrClosed
+}
+
+func (c *blockingPortalConn) Close() error {
+	c.closeOnce.Do(func() { close(c.closed) })
+	return nil
+}
+
+func (*blockingPortalConn) LocalAddr() net.Addr              { return portalTestAddr("local") }
+func (*blockingPortalConn) RemoteAddr() net.Addr             { return portalTestAddr("remote") }
+func (*blockingPortalConn) SetDeadline(time.Time) error      { return nil }
+func (*blockingPortalConn) SetReadDeadline(time.Time) error  { return nil }
+func (*blockingPortalConn) SetWriteDeadline(time.Time) error { return nil }
+
+type portalTestAddr string
+
+func (a portalTestAddr) Network() string { return "test" }
+func (a portalTestAddr) String() string  { return string(a) }
 
 func TestPortalRejectsInvalidControlUnavailableAndOversizedFrames(t *testing.T) {
 	closed, err := net.Listen("tcp", "127.0.0.1:0")

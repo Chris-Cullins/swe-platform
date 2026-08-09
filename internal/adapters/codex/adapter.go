@@ -112,43 +112,43 @@ func (a *Adapter) Observe(ctx context.Context, task agent.AdapterTask, sandbox a
 	p, err := client.Get(ctx, &sandboxdv1.GetProcessRequest{Key: key(task)})
 	if err != nil {
 		if status.Code(err) == codes.NotFound {
-			return agent.AdapterObservationFailed, "Codex execution is absent in the current sandbox epoch", nil
+			return agent.AdapterObservationFailed, agent.AdapterObservationFailed.StatusMessage(), nil
 		}
 		return "", "", err
 	}
 	if err = a.forward(ctx, client, task, sandbox, p); err != nil {
 		if errors.Is(err, agent.ErrAdapterEventRejected) {
-			return agent.AdapterObservationFailed, "Codex transcript output was permanently rejected", nil
+			return agent.AdapterObservationFailed, agent.AdapterObservationFailed.StatusMessage(), nil
 		}
 		return "", "", err
 	}
 	switch p.State {
 	case sandboxdv1.ProcessState_PROCESS_STATE_RUNNING, sandboxdv1.ProcessState_PROCESS_STATE_STOPPING:
-		return agent.AdapterObservationRunning, "Codex is running", nil
+		return agent.AdapterObservationRunning, agent.AdapterObservationRunning.StatusMessage(), nil
 	case sandboxdv1.ProcessState_PROCESS_STATE_FAILED:
-		return agent.AdapterObservationFailed, message("Codex failed to start", p.Error), nil
+		return agent.AdapterObservationFailed, agent.AdapterObservationFailed.StatusMessage(), nil
 	case sandboxdv1.ProcessState_PROCESS_STATE_EXITED:
 		if p.ExitCode == nil {
-			return agent.AdapterObservationFailed, "Codex exited without an exit code", nil
+			return agent.AdapterObservationFailed, agent.AdapterObservationFailed.StatusMessage(), nil
 		}
 		if p.GetExitCode() != 0 {
-			return agent.AdapterObservationFailed, fmt.Sprintf("Codex exited with code %d", p.GetExitCode()), nil
+			return agent.AdapterObservationFailed, agent.AdapterObservationFailed.StatusMessage(), nil
 		}
 		out, e := readOutput(ctx, client, key(task), p.ExecutionId)
 		if e != nil {
 			var truncated *outputTruncatedError
 			if errors.As(e, &truncated) {
-				return agent.AdapterObservationFailed, message("Codex stdout was truncated before terminal validation", truncated.Error()), nil
+				return agent.AdapterObservationFailed, agent.AdapterObservationFailed.StatusMessage(), nil
 			}
 			return "", "", e
 		}
-		thread, detail, ok := terminal(out)
+		_, _, ok := terminal(out)
 		if !ok {
-			return agent.AdapterObservationFailed, message("Codex exited without a coherent completed turn", detail), nil
+			return agent.AdapterObservationFailed, agent.AdapterObservationFailed.StatusMessage(), nil
 		}
-		return agent.AdapterObservationSucceeded, "Codex completed thread " + thread, nil
+		return agent.AdapterObservationSucceeded, agent.AdapterObservationSucceeded.StatusMessage(), nil
 	default:
-		return agent.AdapterObservationFailed, fmt.Sprintf("Codex returned invalid process state %s", p.State), nil
+		return agent.AdapterObservationFailed, agent.AdapterObservationFailed.StatusMessage(), nil
 	}
 }
 
@@ -295,15 +295,6 @@ func streamName(s sandboxdv1.OutputStream) string {
 		return "stderr"
 	}
 	return "stdout"
-}
-func message(a, b string) string {
-	if b == "" {
-		return a
-	}
-	if len(b) > 512 {
-		b = b[:512] + "…"
-	}
-	return a + ": " + b
 }
 func (a *Adapter) getCursor(c cursor) uint64 {
 	a.mu.Lock()

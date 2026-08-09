@@ -264,6 +264,28 @@ func TestResourceServiceGetRunPublishesOnlyExactAttachableEnvironmentUID(t *test
 	}
 }
 
+func TestResourceServiceGetRunExactRejectsSameNameReplacementBeforeEnvironmentRead(t *testing.T) {
+	run := &platformv1alpha1.Run{
+		ObjectMeta: metav1.ObjectMeta{Name: "run", Namespace: "ns", UID: "replacement-uid"},
+		Status: platformv1alpha1.RunStatus{EnvironmentRef: &platformv1alpha1.RunEnvironmentReference{
+			Name: "environment", UID: "environment-uid",
+		}},
+	}
+	gets := 0
+	base := fake.NewClientBuilder().WithScheme(resourceScheme(t)).WithObjects(run).Build()
+	wrapped := interceptor.NewClient(base, interceptor.Funcs{Get: func(ctx context.Context, underlying client.WithWatch, key client.ObjectKey, object client.Object, options ...client.GetOption) error {
+		gets++
+		return underlying.Get(ctx, key, object, options...)
+	}})
+	service := &KubernetesResourceService{Client: wrapped}
+	if _, err := service.GetRunExact(context.Background(), "ns", "run", "original-uid"); !errors.Is(err, errRunUIDConflict) || gets != 1 {
+		t.Fatalf("stale exact GET error/reads = %v/%d", err, gets)
+	}
+	if got, err := service.GetRun(context.Background(), "ns", "run"); err != nil || got.UID != "replacement-uid" {
+		t.Fatalf("ordinary current GET = %#v, %v", got, err)
+	}
+}
+
 func TestResourceServiceRunDTOMapsLifecycleTimestamps(t *testing.T) {
 	startedAt := metav1.NewTime(time.Date(2026, 7, 19, 18, 5, 0, 0, time.UTC))
 	finishedAt := metav1.NewTime(time.Date(2026, 7, 19, 18, 10, 0, 0, time.UTC))

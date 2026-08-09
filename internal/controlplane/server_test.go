@@ -128,6 +128,144 @@ func TestTranscriptStreamSendsHeartbeat(t *testing.T) {
 	}
 }
 
+func TestTranscriptStreamClosesWhenHeartbeatReauthorizationFails(t *testing.T) {
+	access := &fakeAccess{}
+	api := NewServer(nil, ServerOptions{
+		Access:                      access,
+		Runs:                        &fakeRunResolver{},
+		TranscriptStore:             NewMemoryTranscriptStore(MemoryTranscriptStoreOptions{}),
+		TranscriptHeartbeatInterval: 10 * time.Millisecond,
+	})
+	server := httptest.NewServer(api.Handler())
+	defer server.Close()
+
+	request, err := http.NewRequest(http.MethodGet, server.URL+transcriptURL, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set(RunUIDHeader, "run-1-uid")
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	access.setError(errForbidden)
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := io.Copy(io.Discard, response.Body)
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("read reauthorization-closed SSE stream: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("SSE stream remained open after authorization revocation")
+	}
+	if got := access.callCount(); got < 2 {
+		t.Fatalf("authorization calls = %d, want establishment plus lease check", got)
+	}
+}
+
+func TestTranscriptStreamClosesAfterBrowserLogout(t *testing.T) {
+	store := NewMemorySessionStore(MemorySessionStoreOptions{})
+	sessionID, err := store.Create(context.Background(), "kubernetes-token")
+	if err != nil {
+		t.Fatal(err)
+	}
+	api := NewServer(nil, ServerOptions{
+		Access:                      sessionResolvingAccess{store: store},
+		Sessions:                    KubernetesAccessController{Sessions: store},
+		Runs:                        &fakeRunResolver{},
+		TranscriptStore:             NewMemoryTranscriptStore(MemoryTranscriptStoreOptions{}),
+		TranscriptHeartbeatInterval: 10 * time.Millisecond,
+		AllowInsecureSessions:       true,
+	})
+	server := httptest.NewServer(api.Handler())
+	defer server.Close()
+
+	request, err := http.NewRequest(http.MethodGet, server.URL+transcriptURL, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set(RunUIDHeader, "run-1-uid")
+	request.AddCookie(&http.Cookie{Name: sessionCookieName, Value: sessionID})
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+
+	logout, err := http.NewRequest(http.MethodDelete, server.URL+"/api/v1/session", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	logout.Header.Set("Origin", server.URL)
+	logout.AddCookie(&http.Cookie{Name: sessionCookieName, Value: sessionID})
+	logoutResponse, err := http.DefaultClient.Do(logout)
+	if err != nil {
+		t.Fatal(err)
+	}
+	logoutResponse.Body.Close()
+	if logoutResponse.StatusCode != http.StatusNoContent {
+		t.Fatalf("logout status = %d, want %d", logoutResponse.StatusCode, http.StatusNoContent)
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := io.Copy(io.Discard, response.Body)
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("read logout-closed SSE stream: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("SSE stream remained open after browser logout")
+	}
+}
+
+func TestTranscriptStreamClosesWhenRunIdentityChangesAtRenewal(t *testing.T) {
+	resolver := &mutableRunResolver{uid: "run-1-uid"}
+	api := NewServer(nil, ServerOptions{
+		Access:                      &fakeAccess{},
+		Runs:                        resolver,
+		TranscriptStore:             NewMemoryTranscriptStore(MemoryTranscriptStoreOptions{}),
+		TranscriptHeartbeatInterval: 10 * time.Millisecond,
+	})
+	server := httptest.NewServer(api.Handler())
+	defer server.Close()
+
+	request, err := http.NewRequest(http.MethodGet, server.URL+transcriptURL, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set(RunUIDHeader, "run-1-uid")
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	resolver.setUID("replacement-run-uid")
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := io.Copy(io.Discard, response.Body)
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("read identity-closed SSE stream: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("SSE stream remained open after Run replacement")
+	}
+}
+
 func TestMetricsHandlerDoesNotExposeApplicationRoutes(t *testing.T) {
 	registry := prometheus.NewRegistry()
 	NewMetrics(registry)
@@ -608,12 +746,60 @@ func (a *fakeAccess) Authorize(request *http.Request, access ResourceAccess, _ b
 	return nil
 }
 
+func (a *fakeAccess) setError(err error) {
+	a.mu.Lock()
+	a.err = err
+	a.mu.Unlock()
+}
+
+func (a *fakeAccess) callCount() int {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return len(a.calls)
+}
+
+type sessionResolvingAccess struct {
+	store SessionStore
+}
+
+func (a sessionResolvingAccess) Authorize(request *http.Request, access ResourceAccess, allowSession bool) error {
+	if !allowSession {
+		return errUnauthenticated
+	}
+	cookie, err := request.Cookie(sessionCookieName)
+	if err != nil {
+		return errUnauthenticated
+	}
+	if _, err := a.store.Resolve(request.Context(), cookie.Value); err != nil {
+		return errUnauthenticated
+	}
+	*request = *request.WithContext(context.WithValue(request.Context(), namespaceUIDContextKey{}, testNamespaceUID(access.Namespace)))
+	return nil
+}
+
 func testNamespaceUID(namespace string) types.UID { return types.UID("namespace-uid-" + namespace) }
 
 type fakeRunResolver struct {
 	calls int
 	err   error
 	uid   types.UID
+}
+
+type mutableRunResolver struct {
+	mu  sync.Mutex
+	uid types.UID
+}
+
+func (r *mutableRunResolver) ResolveRun(_ context.Context, _, _ string) (types.UID, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.uid, nil
+}
+
+func (r *mutableRunResolver) setUID(uid types.UID) {
+	r.mu.Lock()
+	r.uid = uid
+	r.mu.Unlock()
 }
 
 func (r *fakeRunResolver) ResolveRun(_ context.Context, _, name string) (types.UID, error) {

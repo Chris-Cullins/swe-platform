@@ -86,12 +86,50 @@ All current CRDs are namespaced:
 The current ownership/reference shape is:
 
 Environment status is controller-owned: the operator and its Run controller retain status
-subresource authority. The control plane has no `environments/status` permission unless the
-portal gateway is enabled; that gateway configuration adds update-only status authority for
-its bounded `portalRoutes` and `nextPortalRouteGeneration` ownership. A fail-closed admission
-policy binds that exact gateway ServiceAccount to those fields and rejects changes to all
-controller-owned status, including the provisioning snapshot. The policy is installed even
-when the gateway is disabled so the fence precedes any later RBAC enablement.
+subresource authority. The control plane has update-only `environments/status` authority for
+the gateway's bounded `portalRoutes` and `nextPortalRouteGeneration` ownership, including while
+portals are disabled so authenticated discovery can tombstone active routes and publish a
+durable denial generation. A fail-closed admission policy binds that exact gateway ServiceAccount
+to those fields and rejects changes to all controller-owned status, including the provisioning
+snapshot.
+
+The control plane's ordinary Environment patch authority is similarly bound by a fail-closed
+exact-ServiceAccount admission policy. It may replace only `spec.lifecycle.wake` with a current
+UID/current hold-policy, Idle-scoped Terminal or Portal wake intent, and may update only the
+fixed `lifecycle.swe.dev/activity-terminal` and `lifecycle.swe.dev/activity-portal` annotation
+slots. All other Environment spec, labels, finalizers, owner references, and annotations are
+frozen for that identity. This leaves hold/suspend/service and controller bookkeeping ownership
+with their existing CLI and controller writers without constraining the operator ServiceAccount.
+The fence also freezes mutable `generateName`; it deliberately ignores API-server bookkeeping
+(`resourceVersion`, `generation`, and `managedFields`) whose admission-time changes accompany
+legitimate patches and do not alter business intent.
+Chart validation unconditionally prevents the operator and control plane from resolving to the
+same ServiceAccount identity, including while the control plane is disabled and its admission
+fence remains pre-staged.
+
+Ordinary Environment mutation ownership is currently:
+
+| Base-resource field | Legitimate writer |
+|---|---|
+| `spec.lifecycle.wake` | Control-plane terminal/portal traffic and the Run controller through the shared UID/hold-revision-fenced lifecycle helper |
+| `metadata.annotations[lifecycle.swe.dev/activity-{terminal,portal}]` | Control-plane terminal and portal heartbeats through the execution-fenced lifecycle helper |
+| `metadata.annotations[lifecycle.swe.dev/activity-{inbox,agent,run}]` | Reserved shared lifecycle-helper slots for those platform sources; no current control-plane writer |
+| `spec.lifecycle.suspend` | Run cleanup/credential refresh through the shared lifecycle helper; the Environment controller clears rejected or replayed intent |
+| `spec.lifecycle.hold` | Environment hold/release CLI, Project offboarding CLI, and Environment controller offboarding/legacy-pause migration |
+| `spec.paused` | Deprecated input accepted from legacy clients; only the Environment controller clears it while migrating to `hold` |
+| `spec.services` | Environment services CLI for API-owned declarations and declared-service controller for Repository-owned declarations |
+| `spec.projectRef`, warm-pool label, and Template owner reference | Run controller's atomic warm-Environment promotion |
+| Environment finalizer | Environment controller |
+| Repository-provisioning and warm-pool-cleanup annotations | Environment controller and warm-pool controller respectively |
+
+`spec.templateRef` and `spec.backend` have no legitimate update writer after creation. Other
+labels, owner references, finalizers, and annotations are not control-plane-owned merely because
+Kubernetes permits their mutation. Status ownership remains the separate subresource contract
+above. A reciprocal policy binds the exact operator ServiceAccount and rejects changes to the
+two gateway-owned fields. Both status policies and the base-intent policy are installed even
+when the gateway or control plane is disabled, so the fences precede any later RBAC enablement.
+One Kubernetes principal cannot satisfy these disjoint writer contracts, hence the unconditional
+ServiceAccount collision check.
 
 ```text
 Installation --UID claim--> Namespace --exact name + UID--> Project
@@ -290,6 +328,12 @@ The Run UID is the idempotency key for allocation, adapter acceptance, and sandb
 process ownership. A durable acceptance-attempt condition is written before calling an
 adapter, so cancellation remains conservative after an uncertain response. Run status exposes
 adapter-neutral milestones from allocation through terminal success, failure, or cancellation.
+Normalized adapter observation reasons and messages are fixed, bounded platform vocabulary;
+the Run controller derives the persisted message from the observation enum and never persists
+an adapter-returned detail string. Process errors, provider fields, result text, thread IDs, and
+other agent-controlled bytes remain only in adapter-owned opaque transcript events. Permanent
+adapter rejection and cancellation conditions likewise use fixed platform messages. Reconcile
+also normalizes legacy adapter observation/rejection messages before terminal or deletion cleanup.
 
 One Environment controller owns suspension transitions. Explicit user/admin policy is a
 revisioned `spec.lifecycle.hold`; ordinary callers publish UID- and hold-revision-fenced wake,
@@ -464,9 +508,11 @@ Interactive terminal connections and the separately capability-scoped service-ob
 are not pooled.
 
 Uncached reads around an adapter call remain deliberate: the Run controller proves the exact
-Run/Environment association before the call, the pool proves the complete fence before every
-lease, and the controller repeats exact association plus backend-execution currentness after the
-call. Cached reads are not accepted for these authorization/currentness boundaries. In the stable
+Run/Environment association before the call, adapter acceptance revalidates the complete active
+Installation/Namespace/Project claim at the process-dial boundary, the pool proves the complete
+execution fence before every lease, and the controller repeats exact association plus
+backend-execution currentness after the call. Cached reads are not accepted for these
+authorization/currentness boundaries. In the stable
 one-minute-equivalent contract (30 polls at the fixed two-second cadence), reuse reduces physical
 connection creations from 30 to 1 and process-connector Kubernetes reads from 150 to 124. Across
 the complete adapter call path, including unchanged mandatory association and execution-receipt
@@ -478,6 +524,8 @@ is deterministic contract evidence, not an end-to-end API-server load benchmark.
 Transcript transport is fenced by namespace name, immutable Namespace UID, Run name, and
 immutable Run UID. It supplies
 idempotent append, monotonic per-Run cursors, bounded retention, explicit gaps, replay, and SSE.
+Established transcript SSE connections repeat TokenReview, exact transcript SAR, and tenancy
+authorization on the existing 15-second keepalive cadence and close on any failure.
 Production presets require an external PostgreSQL URL; live PostgreSQL delivery is currently
 database-polled. With no URL, the control plane logs a warning and uses a bounded, non-durable,
 process-local development store. Durable legacy rows without a Namespace UID are associated
@@ -586,13 +634,49 @@ Provider failures produce stable secret-free conditions and retry without releas
 finalizer. GitHub Enterprise, SSH repository URLs, broader App permissions, and credentials for
 non-GitHub repositories remain unsupported.
 
+Rejected structurally valid token handles and tokens whose active lease cannot be persisted use
+a deterministic pending-revocation Secret as a write-ahead log. The immutable record includes
+provider, frozen provisioning source, canonical repository, installation, expiry, and
+issuance/rotation generation, plus strict `pending`/`complete` state and an optional disposition
+(currently `ProviderInvalidToken`). The record is persisted before revoke. Pending records alone
+may invoke the provider; successful revoke or authoritative persisted expiry advances the exact
+UID/resourceVersion to complete, with uncached exact-content recovery for an ambiguous update.
+Complete records never revoke. A complete disposition is written to Run status while retaining
+the Secret, and deletion occurs on a later reconciliation only after an uncached read proves the
+exact durable failed Run reason. Delete uses UID/resourceVersion preconditions and safely treats
+only an uncached absent record as recovery from an ambiguous response. Every pending action and
+duplicate/deletion action first validates the expected provider, frozen source, stateless
+canonical identity, and issuance generation; an unprovable record retains the Secret and Run
+finalizer and reports a secret-free actionable condition. Legacy pending records with neither
+state annotation are interpreted as pending; partial or unknown state metadata is rejected.
+Terminal active-lease cleanup applies the same frozen provider/source/canonical proof before
+revoke or expiry deletion and never falls back to identity asserted by a colliding Secret. This
+cleanup authority comes only from the Run's exact Environment UID and its validated,
+`ProjectVerified` frozen provisioning snapshot and does not depend on the live Project continuing
+to exist. Issuance separately requires the live exact Project. During durable rotation, active
+terminal cleanup accepts either the recorded old Secret UID at target generation minus one or a
+replacement Secret UID at the target generation; malformed or mismatched records block before
+provider or delete side effects.
+
+Every structurally cleanup-capable token in a decoded GitHub response is returned as cleanup
+authority even when `expires_at` is absent, malformed, zero, past, too short, or beyond GitHub's
+fixed one-hour lifetime. Such responses are never delivered and receive a conservative local
+cleanup deadline exactly one hour after a single captured response-validation time. A valid
+future provider expiry no more than one hour away may be retained, while delivery additionally
+requires strict greater-than minimum validity and exact scope, permissions, and repository.
+
+Residuals remain: if pending persistence and immediate fallback revoke both fail or are
+ambiguous, no durable local handle exists and exposure is bounded only by provider expiry.
+Issuance response loss likewise may lose the handle.
+
 ### Terminal and operations console
 
 `swe attach`, `swe tui`, and the browser console bridge a WebSocket to sandboxd's bidirectional
 terminal RPC. Clients open with dimensions, exchange binary terminal bytes, and can resize.
 All clients share the Environment's `swe` tmux session. Terminal open and heartbeat record
 bounded lifecycle activity; stale hold, Run association, Environment, epoch, or Pod identity
-revokes the lease.
+revokes the lease. Established WebSockets also repeat their exact TokenReview, terminal SARs,
+and tenancy authorization every five seconds and close on any failure.
 
 The embedded React console and terminal TUI are agent-neutral operations clients. They list,
 watch, create, inspect, and cancel Runs; show exact Environment detail and opaque transcripts;

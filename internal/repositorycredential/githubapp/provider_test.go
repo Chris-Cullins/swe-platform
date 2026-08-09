@@ -157,6 +157,70 @@ func TestIssueAndRevokeGitHubContract(t *testing.T) {
 	}
 }
 
+func TestIssueValidatesExactTokenBoundaryAndScope(t *testing.T) {
+	now := time.Date(2026, 8, 8, 12, 0, 0, 0, time.UTC)
+	key, err := rsa.GenerateKey(rand.Reader, 1024)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tests := []struct {
+		name           string
+		expires        any
+		selection      string
+		permissions    map[string]string
+		repositories   []string
+		token          string
+		wantCredential bool
+		wantError      bool
+		wantDeadline   time.Time
+	}{
+		{name: "missing expiry", expires: nil, selection: "selected", permissions: map[string]string{"contents": "write"}, repositories: []string{"acme/widget"}, token: "token", wantCredential: true, wantError: true, wantDeadline: now.Add(time.Hour)},
+		{name: "malformed expiry", expires: "not-a-time", selection: "selected", permissions: map[string]string{"contents": "write"}, repositories: []string{"acme/widget"}, token: "token", wantCredential: true, wantError: true, wantDeadline: now.Add(time.Hour)},
+		{name: "zero expiry", expires: time.Time{}, selection: "selected", permissions: map[string]string{"contents": "write"}, repositories: []string{"acme/widget"}, token: "token", wantCredential: true, wantError: true, wantDeadline: now.Add(time.Hour)},
+		{name: "past expiry", expires: now.Add(-time.Minute), selection: "selected", permissions: map[string]string{"contents": "write"}, repositories: []string{"acme/widget"}, token: "token", wantCredential: true, wantError: true, wantDeadline: now.Add(time.Hour)},
+		{name: "exact minimum", expires: now.Add(repositorycredential.MinimumValidity), selection: "selected", permissions: map[string]string{"contents": "write"}, repositories: []string{"acme/widget"}, token: "token", wantCredential: true, wantError: true, wantDeadline: now.Add(time.Hour)},
+		{name: "below minimum", expires: now.Add(repositorycredential.MinimumValidity - time.Nanosecond), selection: "selected", permissions: map[string]string{"contents": "write"}, repositories: []string{"acme/widget"}, token: "token", wantCredential: true, wantError: true, wantDeadline: now.Add(time.Hour)},
+		{name: "above exact scope", expires: now.Add(repositorycredential.MinimumValidity + time.Nanosecond), selection: "selected", permissions: map[string]string{"contents": "write"}, repositories: []string{"acme/widget"}, token: "token", wantCredential: true},
+		{name: "beyond maximum", expires: now.Add(time.Hour + time.Nanosecond), selection: "selected", permissions: map[string]string{"contents": "write"}, repositories: []string{"acme/widget"}, token: "token", wantCredential: true, wantError: true, wantDeadline: now.Add(time.Hour)},
+		{name: "wrong selection", expires: now.Add(time.Hour), selection: "all", permissions: map[string]string{"contents": "write"}, repositories: []string{"acme/widget"}, token: "token", wantCredential: true, wantError: true},
+		{name: "broader permissions", expires: now.Add(time.Hour), selection: "selected", permissions: map[string]string{"contents": "write", "issues": "write"}, repositories: []string{"acme/widget"}, token: "token", wantCredential: true, wantError: true},
+		{name: "returned repository mismatch", expires: now.Add(time.Hour), selection: "selected", permissions: map[string]string{"contents": "write"}, repositories: []string{"acme/other"}, token: "token", wantCredential: true, wantError: true},
+		{name: "empty token", expires: now.Add(time.Hour), selection: "selected", permissions: map[string]string{"contents": "write"}, token: "", wantError: true},
+		{name: "NUL token", expires: now.Add(time.Hour), selection: "selected", permissions: map[string]string{"contents": "write"}, token: "bad\x00token", wantError: true},
+		{name: "oversize token", expires: now.Add(time.Hour), selection: "selected", permissions: map[string]string{"contents": "write"}, token: strings.Repeat("x", repositorycredential.MaxTokenBytes+1), wantError: true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			calls := 0
+			p := &Provider{ClientID: "client", Key: key, Now: func() time.Time { return now }}
+			p.Client = &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+				calls++
+				var body []byte
+				if calls == 1 {
+					body, _ = json.Marshal(map[string]any{"id": 42})
+				} else {
+					repositories := make([]map[string]string, len(tc.repositories))
+					for i, repository := range tc.repositories {
+						repositories[i] = map[string]string{"full_name": repository}
+					}
+					body, _ = json.Marshal(map[string]any{"token": tc.token, "expires_at": tc.expires, "repository_selection": tc.selection, "permissions": tc.permissions, "repositories": repositories})
+				}
+				return &http.Response{StatusCode: 200, Header: make(http.Header), Body: io.NopCloser(bytes.NewReader(body))}, nil
+			})}
+			credential, issueErr := p.Issue(context.Background(), "https://github.com/acme/widget")
+			if (credential != nil) != tc.wantCredential || (issueErr != nil) != tc.wantError {
+				t.Fatalf("Issue credential=%#v error=%v", credential, issueErr)
+			}
+			if tc.wantError && repositorycredential.Reason(issueErr) != "ProviderInvalidToken" {
+				t.Fatalf("reason = %q, error %v", repositorycredential.Reason(issueErr), issueErr)
+			}
+			if tc.wantDeadline.IsZero() == false && (credential == nil || !credential.ExpiresAt.Equal(tc.wantDeadline)) {
+				t.Fatalf("cleanup deadline = %#v, want %v", credential, tc.wantDeadline)
+			}
+		})
+	}
+}
+
 func TestRevokeTreatsUnauthorizedAsAlreadyInactive(t *testing.T) {
 	p := &Provider{Client: &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
 		body, _ := json.Marshal(map[string]string{"message": "Bad credentials"})

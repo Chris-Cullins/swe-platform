@@ -154,20 +154,21 @@ rules:
     verbs: ["get", "list"]
   - apiGroups: ["swe.dev"]
     resources: ["environments"]
+    # An exact-ServiceAccount admission policy limits patch to current
+    # Idle-scoped wake intents and fixed Terminal/Portal activity slots.
     verbs:
       - "get"
       - "patch"
       {{- if .Values.controlPlane.portal.enabled }}
       - "list"
       {{- end }}
-  {{- if .Values.controlPlane.portal.enabled }}
   # The gateway is the sole owner of status.portalRoutes and
-  # status.nextPortalRouteGeneration. Keep status authority absent when the
-  # portal is disabled rather than granting it to every control-plane install.
+  # status.nextPortalRouteGeneration. Update-only authority remains when the
+  # portal is disabled so discovery can tombstone routes and publish a durable
+  # denial generation; the admission policy fences every other status field.
   - apiGroups: ["swe.dev"]
     resources: ["environments/status"]
     verbs: ["update"]
-  {{- end }}
   - apiGroups: ["swe.dev"]
     resources: ["environmenttemplates"]
     verbs: ["get"]

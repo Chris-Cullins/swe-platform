@@ -112,43 +112,43 @@ func (a *Adapter) Observe(ctx context.Context, task agent.AdapterTask, sandbox a
 	p, err := c.Get(ctx, &sandboxdv1.GetProcessRequest{Key: key(task)})
 	if err != nil {
 		if status.Code(err) == codes.NotFound {
-			return agent.AdapterObservationFailed, "Pi execution is absent in the current sandbox epoch", nil
+			return agent.AdapterObservationFailed, agent.AdapterObservationFailed.StatusMessage(), nil
 		}
 		return "", "", err
 	}
 	if err = a.forward(ctx, c, task, sandbox, p); err != nil {
 		if errors.Is(err, agent.ErrAdapterEventRejected) {
-			return agent.AdapterObservationFailed, "Pi transcript output was permanently rejected", nil
+			return agent.AdapterObservationFailed, agent.AdapterObservationFailed.StatusMessage(), nil
 		}
 		return "", "", err
 	}
 	switch p.State {
 	case sandboxdv1.ProcessState_PROCESS_STATE_RUNNING, sandboxdv1.ProcessState_PROCESS_STATE_STOPPING:
-		return agent.AdapterObservationRunning, "Pi is running", nil
+		return agent.AdapterObservationRunning, agent.AdapterObservationRunning.StatusMessage(), nil
 	case sandboxdv1.ProcessState_PROCESS_STATE_FAILED:
-		return agent.AdapterObservationFailed, message("Pi failed to start", p.Error), nil
+		return agent.AdapterObservationFailed, agent.AdapterObservationFailed.StatusMessage(), nil
 	case sandboxdv1.ProcessState_PROCESS_STATE_EXITED:
 		if p.ExitCode == nil {
-			return agent.AdapterObservationFailed, "Pi exited without an exit code", nil
+			return agent.AdapterObservationFailed, agent.AdapterObservationFailed.StatusMessage(), nil
 		}
 		if p.GetExitCode() != 0 {
-			return agent.AdapterObservationFailed, fmt.Sprintf("Pi exited with code %d", p.GetExitCode()), nil
+			return agent.AdapterObservationFailed, agent.AdapterObservationFailed.StatusMessage(), nil
 		}
 		out, e := readOutput(ctx, c, key(task), p.ExecutionId)
 		if e != nil {
 			var gap *outputTruncatedError
 			if errors.As(e, &gap) {
-				return agent.AdapterObservationFailed, message("Pi stdout was truncated before terminal validation", gap.Error()), nil
+				return agent.AdapterObservationFailed, agent.AdapterObservationFailed.StatusMessage(), nil
 			}
 			return "", "", e
 		}
-		detail, ok := terminal(out)
+		_, ok := terminal(out)
 		if !ok {
-			return agent.AdapterObservationFailed, message("Pi exited without a coherent final agent_end", detail), nil
+			return agent.AdapterObservationFailed, agent.AdapterObservationFailed.StatusMessage(), nil
 		}
-		return agent.AdapterObservationSucceeded, "Pi completed", nil
+		return agent.AdapterObservationSucceeded, agent.AdapterObservationSucceeded.StatusMessage(), nil
 	default:
-		return agent.AdapterObservationFailed, fmt.Sprintf("Pi returned invalid process state %s", p.State), nil
+		return agent.AdapterObservationFailed, agent.AdapterObservationFailed.StatusMessage(), nil
 	}
 }
 func terminal(out []byte) (string, bool) {
@@ -190,7 +190,7 @@ func terminal(out []byte) (string, bool) {
 	case "stop", "length", "toolUse":
 		return "", true
 	case "error", "aborted":
-		return message("final assistant stopReason is "+final.StopReason, final.Error), false
+		return "final assistant reported failure", false
 	default:
 		return "final assistant has invalid stopReason", false
 	}
@@ -283,15 +283,6 @@ func streamName(s sandboxdv1.OutputStream) string {
 		return "stderr"
 	}
 	return "stdout"
-}
-func message(a, b string) string {
-	if b == "" {
-		return a
-	}
-	if len(b) > 512 {
-		b = b[:512] + "…"
-	}
-	return a + ": " + b
 }
 func (a *Adapter) getCursor(c cursor) uint64 {
 	a.mu.Lock()

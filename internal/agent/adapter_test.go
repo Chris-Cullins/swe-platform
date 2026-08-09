@@ -42,3 +42,21 @@ func TestPrepareLaunchMaterialMergeCopyCleanupAndConflict(t *testing.T) {
 		t.Fatalf("duplicate conflict = %v", err)
 	}
 }
+
+func TestAdapterObservationStatusMessagesAreFixedPlatformVocabulary(t *testing.T) {
+	tests := map[AdapterObservation]string{
+		AdapterObservationAccepted:   "adapter accepted the task",
+		AdapterObservationRunning:    "adapter is running",
+		AdapterObservationNeedsInput: "adapter needs input",
+		AdapterObservationSucceeded:  "adapter completed successfully",
+		AdapterObservationFailed:     "adapter reported failure",
+	}
+	for observation, want := range tests {
+		if got := observation.StatusMessage(); got != want {
+			t.Errorf("%s status message = %q, want %q", observation, got, want)
+		}
+	}
+	if got := AdapterObservation("provider-controlled").StatusMessage(); got != "" {
+		t.Fatalf("unknown observation status message = %q, want empty", got)
+	}
+}

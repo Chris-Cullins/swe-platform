@@ -24,6 +24,18 @@ current pair, fails without mutation. A greater pair
 atomically replaces desired intent: removed roles are stopped, changed roles are
 stopped before replacement, and new roles are started. Responses report each desired
 logical role's current `Process` state and opaque execution ID, never an OS identity.
+One set contains at most 32 services. Owner IDs are at most 256 NUL-free UTF-8 bytes;
+roles use the platform declaration limit of 32 NUL-free UTF-8 bytes. Managed argv
+retains at most 64 arguments, 4,096 UTF-8 bytes per argument, and 16 KiB aggregate; cwd and public
+environment are likewise explicitly size- and encoding-bounded: cwd is at most 4,096
+UTF-8 bytes, and environment is at most 64 entries, 256 UTF-8 bytes per name, 64 KiB
+per UTF-8 value, and 256 KiB aggregate. Across one daemon epoch, retained
+managed-owner tombstones and aggregate desired managed-service slots are each bounded
+by the process record limit (1,024 by default); a new owner or desired set that would
+exceed those daemon resources fails with `RESOURCE_EXHAUSTED` without mutation.
+Tombstones preserve revision and exact-retry fencing, including after a complete-set
+removal. Only one reconciliation is admitted at a time; a concurrent call receives
+`RESOURCE_EXHAUSTED` rather than retaining another queued request.
 
 Every unrequested exit, including exit zero and start failure, is restarted with
 bounded exponential backoff. Backoff is capped and resets after stable operation. A
@@ -33,7 +45,9 @@ close suppress the old execution's restart. Restart admission is serialized with
 reconciliation and explicit Stop. Revision/generation fencing applies to delayed restart work,
 so stale reconciliation cannot resurrect a removed service or
 overwrite newer intent. Managed services use only `ProcessSpec.env`; launch material
-is deliberately unsupported.
+is deliberately unsupported. At most one delayed restart is retained per desired
+owner/role; replacement, removal, and daemon close cancel obsolete delayed work, and
+a retry never waits in a goroutine behind reconciliation.
 
 Committed states include natural `RUNNING -> EXITED` and controlled
 `RUNNING -> STOPPING -> EXITED`, with `FAILED` terminal for a

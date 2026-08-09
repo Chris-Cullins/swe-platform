@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"errors"
 	"io"
 	"net"
@@ -15,16 +16,20 @@ import (
 
 const portalMaxFrame = 64 * 1024
 
+var portalLoopbacks = []string{"127.0.0.1", "::1"}
+
 // PortalServer tunnels bytes only to logical loopback. The semaphore bounds
 // daemon-wide tunnel concurrency and is deliberately independent of HTTP.
 type PortalServer struct {
 	sandboxdv1.UnimplementedPortalServiceServer
 	controlPort uint32
 	active      chan struct{}
+	dialContext dialContextFunc
 }
 
 func NewPortalServer(controlPort uint32) *PortalServer {
-	return &PortalServer{controlPort: controlPort, active: make(chan struct{}, 64)}
+	dialer := &net.Dialer{}
+	return &PortalServer{controlPort: controlPort, active: make(chan struct{}, 64), dialContext: dialer.DialContext}
 }
 
 func (s *PortalServer) Tunnel(stream sandboxdv1.PortalService_TunnelServer) error {
@@ -41,12 +46,16 @@ func (s *PortalServer) Tunnel(stream sandboxdv1.PortalService_TunnelServer) erro
 	if first.TargetPort == 0 || first.TargetPort > 65535 || first.TargetPort == s.controlPort || len(first.Data) > portalMaxFrame || first.Opened {
 		return status.Error(codes.InvalidArgument, "invalid portal target or frame")
 	}
-	dialer := net.Dialer{Timeout: 2 * time.Second}
-	conn, err := dialer.DialContext(stream.Context(), "tcp", net.JoinHostPort("localhost", strconv.Itoa(int(first.TargetPort))))
+	conn, err := s.dialLoopback(stream.Context(), first.TargetPort)
 	if err != nil {
 		return status.Error(codes.Unavailable, "portal target unavailable")
 	}
 	defer conn.Close()
+	// A target that stops reading can block a synchronous write. Closing the
+	// connection is the portable way to unblock both directions on cancellation
+	// and ensures the bounded tunnel slot is released.
+	stopCloseOnCancel := context.AfterFunc(stream.Context(), func() { _ = conn.Close() })
+	defer stopCloseOnCancel()
 	// This acknowledgement is the open handshake: clients must not expose a
 	// connection before receiving it.
 	if err := stream.Send(&sandboxdv1.PortalFrame{Opened: true}); err != nil {
@@ -132,6 +141,23 @@ func (s *PortalServer) Tunnel(stream sandboxdv1.PortalService_TunnelServer) erro
 			}
 		}
 	}
+}
+
+func (s *PortalServer) dialLoopback(ctx context.Context, port uint32) (net.Conn, error) {
+	dialCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	var lastErr error
+	for _, loopback := range portalLoopbacks {
+		conn, err := s.dialContext(dialCtx, "tcp", net.JoinHostPort(loopback, strconv.Itoa(int(port))))
+		if err == nil {
+			return conn, nil
+		}
+		lastErr = err
+		if dialCtx.Err() != nil {
+			break
+		}
+	}
+	return nil, lastErr
 }
 
 func closeWrite(conn net.Conn) {

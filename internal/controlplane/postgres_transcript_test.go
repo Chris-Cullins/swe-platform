@@ -171,6 +171,26 @@ func TestPostgresTranscriptStoreContract(t *testing.T) {
 		}
 	})
 
+	t.Run("empty subscription rejects a later conflicting Namespace identity", func(t *testing.T) {
+		current := RunIdentity{Namespace: "replacement-race", NamespaceUID: "namespace-uid-new", UID: "shared-run-uid"}
+		subscription, err := store.Subscribe(ctx, current, "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer subscription.Unsubscribe()
+
+		stale := current
+		stale.NamespaceUID = "namespace-uid-old"
+		appendStoreEvent(t, store, stale, "stale")
+		select {
+		case event := <-subscription.Events:
+			t.Fatalf("conflicting Namespace identity delivered event: %#v", event)
+		case <-subscription.Dropped:
+		case <-time.After(2 * time.Second):
+			t.Fatal("conflicting Namespace identity did not close the subscription")
+		}
+	})
+
 	t.Run("opaque bytes and uint64 source sequence round trip", func(t *testing.T) {
 		run := RunIdentity{Namespace: "project-a", NamespaceUID: testNamespaceUID("project-a"), UID: "opaque-run"}
 		maximum := ^uint64(0)

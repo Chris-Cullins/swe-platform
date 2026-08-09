@@ -6,8 +6,9 @@ import {
 } from 'react-router'
 import {
   api, ApiProblem, fallbackPollInterval, isTerminal, onUnauthorized, queryKeys,
+  retryTransientResourceError, transientResourceError,
 } from './api'
-import type { CreateRun, Run, Selector } from './contracts'
+import type { CreateRun, Environment, PortalServiceList, Run, Selector } from './contracts'
 import { useRunFeed } from './runFeed'
 import { Transcript } from './Transcript'
 
@@ -58,6 +59,9 @@ const useActiveRunFeed = () => {
 
 function RunFeedOutlet({ namespace }: { namespace: string }) {
   const feed = useRunFeed(namespace)
+  if (feed.watchError instanceof ApiProblem && feed.watchError.status === 403) {
+    return <main><Failure error={feed.watchError} /></main>
+  }
   return <RunFeedContext.Provider value={feed}><Outlet /></RunFeedContext.Provider>
 }
 const age = (createdAt: string) => {
@@ -154,7 +158,7 @@ function RunList() {
     {query.fallback && <p className="hint" role="status">Live updates unavailable; refreshing every 4 seconds.</p>}
     {!query.fallback && query.watchError && <p className="hint" role="status">Live updates disconnected; reconnecting…</p>}
     {query.isPending ? <Busy label="Loading runs" /> : query.error ? <Failure error={query.error} /> : !query.data.items.length ? <p role="status">No runs found.</p> :
-      <div className="cards">{query.data.items.map(run => <Link className="card" key={run.uid} to={`${encodeURIComponent(run.name)}/overview`}>
+      <div className="cards">{query.data.items.map(run => <Link className="card" key={run.uid} to={`${encodeURIComponent(run.name)}/overview`} state={{ runUID: run.uid }}>
         <div><strong>{run.name}</strong><span className="pill">{run.state}</span></div>
         <p>{run.promptPreview}</p><dl><dt>Agent</dt><dd>{run.agent}</dd><dt>Environment</dt><dd>{run.environment?.name || 'Allocating'}</dd><dt>Age</dt><dd title={run.createdAt}>{age(run.createdAt)}</dd></dl>
       </Link>)}</div>}
@@ -182,7 +186,7 @@ function NewRun() {
     const value: CreateRun = { name: form.name.trim(), agent: form.agent.trim(), prompt: form.prompt, selector, ...(credentialProfile ? { credentialProfile } : {}), ...(repositoryCredential ? { repositoryCredential: repositoryCredential as 'GitHubApp' } : {}) }
     const error = validateCreateRun(value)
     setValidation(error || '')
-    if (!error) mutation.mutate(value, { onSuccess: run => navigate(`/namespaces/${encodeURIComponent(namespace)}/runs/${encodeURIComponent(run.name)}/overview`) })
+    if (!error) mutation.mutate(value, { onSuccess: run => navigate(`/namespaces/${encodeURIComponent(namespace)}/runs/${encodeURIComponent(run.name)}/overview`, { state: { runUID: run.uid } }) })
   }}>
     {field('name', 'Name')}{field('agent', 'Agent')}{field('credentialProfile', 'Credential profile')}
     <label>Git credential<select value={form.repositoryCredential} onChange={event => setForm({ ...form, repositoryCredential: event.target.value })}><option value="">None</option><option value="GitHubApp">GitHub App</option></select></label>{field('prompt', 'Prompt / task', true)}
@@ -196,11 +200,41 @@ function NewRun() {
 function useRun() {
   const { namespace = '', run = '' } = useParams()
   const feed = useActiveRunFeed()
-  return useQuery({
-    queryKey: queryKeys.run(namespace, run),
-    queryFn: ({ signal }) => api.run(namespace, run, signal),
-    refetchInterval: feed.fallback ? fallbackPollInterval : false,
+  const location = useLocation()
+  const bootstrapRequest = React.useId()
+  const selectedUID = location.state && typeof location.state === 'object' && 'runUID' in location.state && typeof location.state.runUID === 'string' && location.state.runUID
+    ? location.state.runUID
+    : undefined
+  const [locked, setLocked] = React.useState<{ namespace: string; name: string; uid: string } | undefined>(
+    selectedUID ? { namespace, name: run, uid: selectedUID } : undefined,
+  )
+  const [confirmed, setConfirmed] = React.useState<{ namespace: string; name: string; uid: string }>()
+  const matchingLockedUID = locked?.namespace === namespace && locked.name === run ? locked.uid : undefined
+  const runUID = selectedUID || matchingLockedUID
+  React.useEffect(() => {
+    if (selectedUID) setLocked({ namespace, name: run, uid: selectedUID })
+  }, [namespace, run, selectedUID])
+  const query = useQuery<Run | string, Error>({
+    queryKey: runUID ? queryKeys.run(namespace, run, runUID) : queryKeys.runBootstrap(namespace, run, bootstrapRequest),
+    queryFn: async ({ signal }) => {
+      if (runUID) {
+        const exact = await api.runExact(namespace, run, runUID, signal)
+        setConfirmed({ namespace, name: run, uid: runUID })
+        return exact
+      }
+      const discovered = await api.run(namespace, run, signal)
+      setLocked({ namespace, name: run, uid: discovered.uid })
+      return discovered.uid
+    },
+    retry: retryTransientResourceError,
+    refetchInterval: current => feed.fallback && !!runUID && (!current.state.error || transientResourceError(current.state.error)) ? fallbackPollInterval : false,
+    refetchOnWindowFocus: current => !current.state.error || transientResourceError(current.state.error),
+    refetchOnReconnect: current => !current.state.error || transientResourceError(current.state.error),
   })
+  const confirmedRun = runUID && confirmed?.namespace === namespace && confirmed.name === run && confirmed.uid === runUID && typeof query.data !== 'string'
+    ? query.data
+    : undefined
+  return { ...query, isPending: !query.error && (!confirmedRun || query.isPending), data: confirmedRun }
 }
 
 function Detail() {
@@ -208,6 +242,7 @@ function Detail() {
   const query = useRun()
   if (query.isPending) return <main><Busy label="Loading run" /></main>
   if (query.error) return <main><Failure error={query.error} /></main>
+  if (!query.data) return <main><Busy label="Confirming run identity" /></main>
   return <main><div className="title"><div><Link to={`/namespaces/${encodeURIComponent(namespace)}/runs`}>← Runs</Link><h1>{run}</h1></div><span className="pill">{query.data.state}</span></div>
     <nav aria-label="Run sections"><NavLink to="overview">Overview</NavLink><NavLink to="transcript">Transcript</NavLink>{query.data.environment?.uid && <NavLink to="portals">Portals</NavLink>}{query.data.terminalAvailable && query.data.environment?.uid && <NavLink to="terminal">Terminal</NavLink>}</nav>
     <Outlet context={query.data} />
@@ -220,17 +255,22 @@ function Overview() {
   const run = useOutletRun()
   const { namespace = '' } = useParams()
   const queryClient = useQueryClient()
-  const environment = useQuery({
-    queryKey: queryKeys.environment(namespace, run.environment?.name || ''),
-    queryFn: () => api.environment(namespace, run.environment!.name),
-    enabled: !!run.environment,
-    refetchInterval: () => !isTerminal(run.state) ? 4000 : false,
+  const environmentUID = run.environment?.uid || ''
+  const environment = useQuery<Environment, Error>({
+    queryKey: queryKeys.environment(namespace, run.environment?.name || '', environmentUID),
+    queryFn: ({ signal }) => api.environmentExact(namespace, run.environment!.name, environmentUID, signal),
+    enabled: !!environmentUID,
+    retry: retryTransientResourceError,
+    refetchInterval: current => !isTerminal(run.state) && (!current.state.error || transientResourceError(current.state.error)) ? 4000 : false,
+    refetchOnWindowFocus: current => !current.state.error || transientResourceError(current.state.error),
+    refetchOnReconnect: current => !current.state.error || transientResourceError(current.state.error),
   })
   const cancel = useMutation({
     mutationFn: () => api.cancelRun(namespace, run.name, run.uid),
     onSuccess: updated => {
-      queryClient.setQueryData<Run>(queryKeys.run(namespace, run.name), current => current?.uid === run.uid && updated.uid === run.uid ? updated : current)
-      queryClient.invalidateQueries({ queryKey: queryKeys.run(namespace, run.name) })
+      const key = queryKeys.run(namespace, run.name, run.uid)
+      queryClient.setQueryData<Run>(key, current => current?.uid === run.uid && updated.uid === run.uid ? updated : current)
+      queryClient.invalidateQueries({ queryKey: key, exact: true })
     },
   })
   const env = environment.data
@@ -240,9 +280,9 @@ function Overview() {
     <h2>Operational conditions</h2><table><thead><tr><th>Exposed fact</th><th>Status</th></tr></thead><tbody>
       <tr><td>Cancellation requested</td><td>{run.cancelRequested ? 'Yes' : 'No'}</td></tr>
       <tr><td>Environment allocated</td><td>{run.environment ? 'Yes' : 'No'}</td></tr>
-      {run.environment && <><tr><td>Environment ready</td><td>{environment.isPending ? 'Loading…' : env?.ready ? 'Yes' : 'No'}</td></tr><tr><td>Environment paused</td><td>{environment.isPending ? 'Loading…' : env?.paused ? 'Yes' : 'No'}</td></tr></>}
+      {environmentUID && <><tr><td>Environment ready</td><td>{environment.isPending ? 'Loading…' : env?.ready ? 'Yes' : 'No'}</td></tr><tr><td>Environment paused</td><td>{environment.isPending ? 'Loading…' : env?.paused ? 'Yes' : 'No'}</td></tr></>}
     </tbody></table>
-    <h2>Environment</h2>{run.environment ? environment.error ? <Failure error={environment.error} /> : <dl className="facts"><dt>Name</dt><dd>{run.environment.name}</dd><dt>Ownership</dt><dd>{run.environment.ownership}</dd><dt>Phase</dt><dd>{env?.phase || 'Loading…'}</dd><dt>Backend</dt><dd>{env?.backend || 'Loading…'}</dd><dt>Template</dt><dd>{env?.template || 'Loading…'}</dd><dt>Status</dt><dd>{env ? `${env.ready ? 'Ready' : 'Not ready'}, ${env.paused ? 'paused' : 'active'}` : 'Loading…'}</dd></dl> : <p>Not allocated.</p>}
+    <h2>Environment</h2>{!run.environment ? <p>Not allocated.</p> : !environmentUID ? <p role="status">Exact Environment identity unavailable.</p> : environment.error ? <Failure error={environment.error} /> : <dl className="facts"><dt>Name</dt><dd>{run.environment.name}</dd><dt>Ownership</dt><dd>{run.environment.ownership}</dd><dt>Phase</dt><dd>{env?.phase || 'Loading…'}</dd><dt>Backend</dt><dd>{env?.backend || 'Loading…'}</dd><dt>Template</dt><dd>{env?.template || 'Loading…'}</dd><dt>Status</dt><dd>{env ? `${env.ready ? 'Ready' : 'Not ready'}, ${env.paused ? 'paused' : 'active'}` : 'Loading…'}</dd></dl>}
     {!isTerminal(run.state) && <button className="danger" disabled={cancel.isPending} onClick={() => cancel.mutate()}>Cancel run</button>}{cancel.isError && <Failure error={cancel.error} />}
   </section>
 }
@@ -262,11 +302,14 @@ function Portals() {
   const run = useOutletRun()
   const { namespace = '' } = useParams()
   const environmentUID = run.environment?.uid || ''
-  const query = useQuery({
+  const query = useQuery<PortalServiceList, Error>({
     queryKey: queryKeys.portals(namespace, run.name, run.uid, environmentUID),
     queryFn: () => api.portals(namespace, run.name, run.uid, environmentUID),
     enabled: !!environmentUID,
-    refetchInterval: 4000,
+    retry: retryTransientResourceError,
+    refetchInterval: current => !current.state.error || transientResourceError(current.state.error) ? 4000 : false,
+    refetchOnWindowFocus: current => !current.state.error || transientResourceError(current.state.error),
+    refetchOnReconnect: current => !current.state.error || transientResourceError(current.state.error),
   })
   if (!environmentUID) return <p role="status">Portals unavailable for this Run identity.</p>
   if (query.isPending) return <Busy label="Loading portals" />

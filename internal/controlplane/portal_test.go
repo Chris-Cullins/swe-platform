@@ -108,6 +108,7 @@ func (w statusDenyingWriter) Update(context.Context, client.Object, ...client.Su
 
 type headerPortalAccess struct {
 	projectCalls atomic.Int64
+	denied       atomic.Bool
 }
 
 func (a *headerPortalAccess) Authorize(r *http.Request, _ ResourceAccess, _ bool) error {
@@ -125,6 +126,9 @@ func (a *headerPortalAccess) AuthorizePrincipal(r *http.Request, access Resource
 func (a *headerPortalAccess) AuthenticatePrincipal(r *http.Request, _ bool) (string, error) {
 	if r.Header.Get("Authorization") != "Bearer portal-user" {
 		return "", errUnauthenticated
+	}
+	if a.denied.Load() {
+		return "", errForbidden
 	}
 	return "portal-user", nil
 }
@@ -1183,6 +1187,30 @@ func TestPortalWebSocketSurvivesLeaseRevalidationThenClosesOnRouteRevocation(t *
 	_ = connection.SetReadDeadline(time.Now().Add(time.Second))
 	if _, _, err := connection.ReadMessage(); err == nil {
 		t.Fatal("revoked portal route retained its WebSocket")
+	}
+	waitPortalSlotsReleased(t, fixture)
+}
+
+func TestPortalWebSocketClosesOnLeaseAuthorizationRevocation(t *testing.T) {
+	fixture := newPortalWebSocketFixture(t, 20*time.Millisecond)
+	connection, response, err := websocket.DefaultDialer.DialContext(context.Background(), fixture.webSocketURL, fixture.requestHeader)
+	if err != nil {
+		if response != nil {
+			t.Fatalf("dial websocket: %v (%s)", err, response.Status)
+		}
+		t.Fatal(err)
+	}
+	defer connection.Close()
+	select {
+	case <-fixture.dialer.opened:
+	case <-time.After(time.Second):
+		t.Fatal("portal tunnel did not open")
+	}
+
+	fixture.access.denied.Store(true)
+	_ = connection.SetReadDeadline(time.Now().Add(time.Second))
+	if _, _, err := connection.ReadMessage(); err == nil {
+		t.Fatal("portal WebSocket remained open after authorization revocation")
 	}
 	waitPortalSlotsReleased(t, fixture)
 }

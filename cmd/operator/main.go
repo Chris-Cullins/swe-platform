@@ -221,15 +221,16 @@ func main() {
 	}
 	if !(mode == tenancy.ModeScoped && len(tenancyNamespaces) == 0) {
 		if err := (&controllers.RunReconciler{
-			Client:                guardedClient,
-			APIReader:             mgr.GetAPIReader(),
-			Scheme:                mgr.GetScheme(),
-			Scope:                 scope,
-			Adapters:              adapters,
-			EventSink:             eventSink,
-			Connector:             connector,
-			Metrics:               operatorMetrics,
-			RepositoryCredentials: repositoryCredentials,
+			Client:                  guardedClient,
+			APIReader:               mgr.GetAPIReader(),
+			Scheme:                  mgr.GetScheme(),
+			Scope:                   scope,
+			Adapters:                adapters,
+			EventSink:               eventSink,
+			Connector:               connector,
+			Metrics:                 operatorMetrics,
+			RepositoryCredentials:   repositoryCredentials,
+			RepositoryCanonicalizer: githubapp.Canonicalizer{},
 		}).SetupWithManager(mgr); err != nil {
 			setupLog.Error(err, "unable to create controller", "controller", "Run")
 			os.Exit(1)

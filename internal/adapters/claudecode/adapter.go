@@ -28,6 +28,7 @@ type Adapter struct {
 
 	mu      sync.Mutex
 	cursors map[outputCursor]uint64
+	pending map[outputCursor]pendingEvent
 }
 
 var _ agent.AdapterLifecycle = (*Adapter)(nil)
@@ -37,6 +38,11 @@ type outputCursor struct {
 	owner       string
 	execution   string
 	stream      sandboxdv1.OutputStream
+}
+
+type pendingEvent struct {
+	event      agent.AdapterEvent
+	nextOffset uint64
 }
 
 type outputEvent struct {
@@ -119,50 +125,50 @@ func (a *Adapter) Observe(ctx context.Context, task agent.AdapterTask, sandbox a
 	process, err := client.Get(ctx, &sandboxdv1.GetProcessRequest{Key: processKey(task)})
 	if err != nil {
 		if status.Code(err) == codes.NotFound {
-			return agent.AdapterObservationFailed, "Claude Code execution is absent in the current sandbox epoch", nil
+			return agent.AdapterObservationFailed, agent.AdapterObservationFailed.StatusMessage(), nil
 		}
 		return "", "", err
 	}
 	if err := a.forwardOutput(ctx, client, task, sandbox, process); err != nil {
 		if errors.Is(err, agent.ErrAdapterEventRejected) {
-			return agent.AdapterObservationFailed, "Claude Code transcript output was permanently rejected", nil
+			return agent.AdapterObservationFailed, agent.AdapterObservationFailed.StatusMessage(), nil
 		}
 		return "", "", err
 	}
 
 	switch process.State {
 	case sandboxdv1.ProcessState_PROCESS_STATE_RUNNING, sandboxdv1.ProcessState_PROCESS_STATE_STOPPING:
-		return agent.AdapterObservationRunning, "Claude Code is running", nil
+		return agent.AdapterObservationRunning, agent.AdapterObservationRunning.StatusMessage(), nil
 	case sandboxdv1.ProcessState_PROCESS_STATE_FAILED:
-		return agent.AdapterObservationFailed, processMessage("Claude Code failed to start", process.Error), nil
+		return agent.AdapterObservationFailed, agent.AdapterObservationFailed.StatusMessage(), nil
 	case sandboxdv1.ProcessState_PROCESS_STATE_EXITED:
 		if process.ExitCode == nil {
-			return agent.AdapterObservationFailed, "Claude Code exited without an exit code", nil
+			return agent.AdapterObservationFailed, agent.AdapterObservationFailed.StatusMessage(), nil
 		}
 		if process.GetExitCode() != 0 {
-			return agent.AdapterObservationFailed, fmt.Sprintf("Claude Code exited with code %d", process.GetExitCode()), nil
+			return agent.AdapterObservationFailed, agent.AdapterObservationFailed.StatusMessage(), nil
 		}
 		output, err := readRetainedOutput(ctx, client, processKey(task), process.ExecutionId, sandboxdv1.OutputStream_OUTPUT_STREAM_STDOUT)
 		if err != nil {
 			var truncated *outputTruncatedError
 			if errors.As(err, &truncated) {
-				return agent.AdapterObservationFailed, processMessage("Claude Code stdout was truncated before terminal validation", truncated.Error()), nil
+				return agent.AdapterObservationFailed, agent.AdapterObservationFailed.StatusMessage(), nil
 			}
 			return "", "", err
 		}
 		result, ok := finalResult(output)
 		if !ok {
-			return agent.AdapterObservationFailed, "Claude Code exited without a valid result event", nil
+			return agent.AdapterObservationFailed, agent.AdapterObservationFailed.StatusMessage(), nil
 		}
 		if result.IsError == nil {
-			return agent.AdapterObservationFailed, "Claude Code result is missing is_error", nil
+			return agent.AdapterObservationFailed, agent.AdapterObservationFailed.StatusMessage(), nil
 		}
 		if *result.IsError || result.Subtype != "success" {
-			return agent.AdapterObservationFailed, processMessage("Claude Code reported "+result.Subtype, result.Result), nil
+			return agent.AdapterObservationFailed, agent.AdapterObservationFailed.StatusMessage(), nil
 		}
-		return agent.AdapterObservationSucceeded, processMessage("Claude Code completed", result.Result), nil
+		return agent.AdapterObservationSucceeded, agent.AdapterObservationSucceeded.StatusMessage(), nil
 	default:
-		return agent.AdapterObservationFailed, fmt.Sprintf("Claude Code returned invalid process state %s", process.State), nil
+		return agent.AdapterObservationFailed, agent.AdapterObservationFailed.StatusMessage(), nil
 	}
 }
 
@@ -179,6 +185,9 @@ func (a *Adapter) Cancel(ctx context.Context, task agent.AdapterTask, sandbox ag
 		GracePeriodMs: 10_000,
 	})
 	if err != nil {
+		if status.Code(err) == codes.NotFound {
+			return nil
+		}
 		return err
 	}
 	switch process.State {
@@ -203,6 +212,17 @@ func (a *Adapter) forwardOutput(ctx context.Context, client sandboxdv1.ProcessSe
 		cursor := outputCursor{environment: string(sandbox.EnvironmentUID), owner: task.ID, execution: process.ExecutionId, stream: stream}
 		offset := a.cursor(cursor)
 		for {
+			if pending, ok := a.pendingEvent(cursor); ok {
+				if err := sandbox.EmitEvent(ctx, pending.event); err != nil {
+					if errors.Is(err, agent.ErrAdapterEventRejected) {
+						a.dropPending(cursor)
+					}
+					return err
+				}
+				offset = pending.nextOffset
+				a.commitPending(cursor, offset)
+				continue
+			}
 			response, err := client.ReadOutput(ctx, &sandboxdv1.ReadOutputRequest{Key: processKey(task), ExecutionId: process.ExecutionId, Stream: stream, Offset: offset, MaxBytes: outputPageMax})
 			if err != nil {
 				return err
@@ -220,11 +240,16 @@ func (a *Adapter) forwardOutput(ctx context.Context, client sandboxdv1.ProcessSe
 			}
 			digest := sha256.Sum256(payload)
 			key := fmt.Sprintf("v1:%s:%x", streamName(stream), digest)
-			if err := sandbox.EmitEvent(ctx, agent.AdapterEvent{Source: "claude-code", IdempotencyKey: key, Type: "claude-code.process-output", Data: payload}); err != nil {
+			event := agent.AdapterEvent{Source: "claude-code", IdempotencyKey: key, Type: "claude-code.process-output", Data: payload}
+			a.setPending(cursor, pendingEvent{event: event, nextOffset: response.NextOffset})
+			if err := sandbox.EmitEvent(ctx, event); err != nil {
+				if errors.Is(err, agent.ErrAdapterEventRejected) {
+					a.dropPending(cursor)
+				}
 				return err
 			}
 			offset = response.NextOffset
-			a.setCursor(cursor, offset)
+			a.commitPending(cursor, offset)
 			if response.Eof || offset >= response.ProducedEnd {
 				break
 			}
@@ -279,17 +304,6 @@ func streamName(stream sandboxdv1.OutputStream) string {
 	return "stdout"
 }
 
-func processMessage(summary, detail string) string {
-	if detail == "" {
-		return summary
-	}
-	const maxDetail = 512
-	if len(detail) > maxDetail {
-		detail = detail[:maxDetail] + "…"
-	}
-	return summary + ": " + detail
-}
-
 func (a *Adapter) cursor(key outputCursor) uint64 {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -299,11 +313,34 @@ func (a *Adapter) cursor(key outputCursor) uint64 {
 	return a.cursors[key]
 }
 
-func (a *Adapter) setCursor(key outputCursor, offset uint64) {
+func (a *Adapter) pendingEvent(key outputCursor) (pendingEvent, bool) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	pending, ok := a.pending[key]
+	return pending, ok
+}
+
+func (a *Adapter) setPending(key outputCursor, pending pendingEvent) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.pending == nil {
+		a.pending = make(map[outputCursor]pendingEvent)
+	}
+	a.pending[key] = pending
+}
+
+func (a *Adapter) dropPending(key outputCursor) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	delete(a.pending, key)
+}
+
+func (a *Adapter) commitPending(key outputCursor, offset uint64) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if a.cursors == nil {
 		a.cursors = make(map[outputCursor]uint64)
 	}
 	a.cursors[key] = offset
+	delete(a.pending, key)
 }

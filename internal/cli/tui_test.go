@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -143,13 +144,139 @@ func TestTUIPollRecoversSnapshotAndExactDetailFailures(t *testing.T) {
 	model.mode = tuiDetail
 	model.run = &controlplane.Run{Name: "same", UID: "uid"}
 	model.detailInFlight = true
-	_, _ = model.Update(runLoadedMsg{name: "same", expectedUID: "uid", err: errors.New("temporary detail failure")})
+	_, _ = model.Update(runLoadedMsg{name: "same", expectedUID: "uid", err: &url.Error{Op: "Get", URL: "https://control-plane", Err: errors.New("temporary detail failure")}})
 	if !model.detailNeedsRefresh || model.detailInFlight {
 		t.Fatalf("failed detail state = needs refresh %t, inflight %t", model.detailNeedsRefresh, model.detailInFlight)
 	}
 	_, command = model.Update(pollMsg(time.Now()))
 	if command == nil || !model.detailInFlight {
 		t.Fatalf("detail recovery = command %v, inflight %t", command, model.detailInFlight)
+	}
+}
+
+func TestTUIExactDetailTerminalFailuresRemainBlockedUntilExplicitSelection(t *testing.T) {
+	terminalErrors := []error{
+		&controlplaneclient.ProblemError{Problem: controlplaneclient.Problem{Status: http.StatusNotFound}},
+		&controlplaneclient.ProblemError{Problem: controlplaneclient.Problem{Status: http.StatusConflict}},
+		fmt.Errorf("exact GET: %w", controlplaneclient.ErrRunIdentityMismatch),
+	}
+	for _, terminalErr := range terminalErrors {
+		model := newTUIModel(context.Background(), nil, "team-a")
+		model.mode = tuiDetail
+		model.run = &controlplane.Run{Name: "same", UID: "selected-uid", Environment: &controlplane.RunEnvironment{Name: "old-environment"}}
+		model.pollFallback = true
+		model.detailInFlight = true
+		_, command := model.Update(runLoadedMsg{name: "same", expectedUID: "selected-uid", err: terminalErr})
+		if command != nil || !model.detailRefreshBlocked || model.detailNeedsRefresh || model.detailInFlight {
+			t.Fatalf("terminal state for %v = command %v, blocked %t, needs refresh %t, inflight %t", terminalErr, command, model.detailRefreshBlocked, model.detailNeedsRefresh, model.detailInFlight)
+		}
+		_, _ = model.Update(pollMsg(time.Now()))
+		if model.detailInFlight || model.envInFlight {
+			t.Fatalf("fallback poll restarted blocked detail children for %v: detail %t, environment %t", terminalErr, model.detailInFlight, model.envInFlight)
+		}
+		_, _ = model.Update(keyMessage("r"))
+		if model.detailInFlight {
+			t.Fatalf("manual refresh restarted blocked selection for %v", terminalErr)
+		}
+		model.listInFlight = false
+		model.mode = tuiList
+		model.runs = []controlplane.RunSummary{{Name: "same", UID: "replacement-uid"}}
+		_, command = model.Update(keyMessage("enter"))
+		if command == nil || model.detailRefreshBlocked || !model.detailInFlight || model.run.UID != "replacement-uid" {
+			t.Fatalf("explicit selection state for %v = command %v, blocked %t, inflight %t, run %#v", terminalErr, command, model.detailRefreshBlocked, model.detailInFlight, model.run)
+		}
+	}
+}
+
+func TestTUIExactDetailTransientStatusesContinueRecovery(t *testing.T) {
+	for _, status := range []int{http.StatusRequestTimeout, http.StatusTooManyRequests, http.StatusInternalServerError, http.StatusServiceUnavailable} {
+		model := newTUIModel(context.Background(), nil, "team-a")
+		model.mode = tuiDetail
+		model.run = &controlplane.Run{Name: "run", UID: "uid"}
+		model.detailInFlight = true
+		err := &controlplaneclient.ProblemError{Problem: controlplaneclient.Problem{Status: status}}
+		_, _ = model.Update(runLoadedMsg{name: "run", expectedUID: "uid", err: err})
+		_, command := model.Update(pollMsg(time.Now()))
+		if model.detailRefreshBlocked || command == nil || !model.detailInFlight {
+			t.Fatalf("status %d recovery = blocked %t, command %v, inflight %t", status, model.detailRefreshBlocked, command, model.detailInFlight)
+		}
+	}
+}
+
+func TestTUIEnvironmentMismatchAndNotFoundStopOnlyEnvironmentPolling(t *testing.T) {
+	for _, terminalErr := range []error{
+		fmt.Errorf("exact Environment GET: %w", controlplaneclient.ErrEnvironmentIdentityMismatch),
+		&controlplaneclient.ProblemError{Problem: controlplaneclient.Problem{Status: http.StatusNotFound}},
+	} {
+		model := newTUIModel(context.Background(), nil, "team-a")
+		model.mode = tuiDetail
+		model.pollFallback = true
+		model.run = &controlplane.Run{Name: "run", UID: "run-uid", Environment: &controlplane.RunEnvironment{Name: "env", UID: "env-uid"}}
+		model.env = &controlplane.Environment{Name: "env", UID: "env-uid"}
+		model.envInFlight = true
+		_, _ = model.Update(environmentLoadedMsg{identity: model.currentIdentity(), name: "env", expectedUID: "env-uid", err: terminalErr})
+		if !model.envRefreshBlocked || model.env != nil || model.run == nil {
+			t.Fatalf("terminal Environment state for %v = blocked %t, env %#v, run %#v", terminalErr, model.envRefreshBlocked, model.env, model.run)
+		}
+		_, _ = model.Update(pollMsg(time.Now()))
+		if model.envInFlight {
+			t.Fatalf("terminal Environment error %v restarted polling", terminalErr)
+		}
+	}
+}
+
+func TestTUIEnvironmentTransient503RecoversOnPoll(t *testing.T) {
+	model := newTUIModel(context.Background(), nil, "team-a")
+	model.mode = tuiDetail
+	model.run = &controlplane.Run{Name: "run", UID: "run-uid", Environment: &controlplane.RunEnvironment{Name: "env", UID: "env-uid"}}
+	model.envInFlight = true
+	err := &controlplaneclient.ProblemError{Problem: controlplaneclient.Problem{Status: http.StatusServiceUnavailable}}
+	_, _ = model.Update(environmentLoadedMsg{identity: model.currentIdentity(), name: "env", expectedUID: "env-uid", err: err})
+	_, command := model.Update(pollMsg(time.Now()))
+	if model.envRefreshBlocked || command == nil || !model.envInFlight {
+		t.Fatalf("503 recovery = blocked %t, command %v, inflight %t", model.envRefreshBlocked, command, model.envInFlight)
+	}
+}
+
+func TestTUIEnvironmentAssociationChangeClearsTerminalBlock(t *testing.T) {
+	model := newTUIModel(context.Background(), nil, "team-a")
+	model.mode = tuiDetail
+	model.run = &controlplane.Run{Name: "run", UID: "run-uid", Environment: &controlplane.RunEnvironment{Name: "env", UID: "old-uid"}}
+	model.envRefreshBlocked = true
+	model.env = &controlplane.Environment{Name: "env", UID: "old-uid"}
+	replacement := controlplane.Run{Name: "run", UID: "run-uid", Environment: &controlplane.RunEnvironment{Name: "env", UID: "new-uid"}}
+	_, command := model.Update(runLoadedMsg{name: "run", expectedUID: "run-uid", run: replacement})
+	if model.envRefreshBlocked || model.env != nil || command == nil || !model.envInFlight {
+		t.Fatalf("association change = blocked %t, env %#v, command %v, inflight %t", model.envRefreshBlocked, model.env, command, model.envInFlight)
+	}
+}
+
+func TestTUIWatchDeleteReconcilesOnlySelectedUID(t *testing.T) {
+	model := newTUIModel(context.Background(), nil, "team-a")
+	model.mode = tuiDetail
+	model.run = &controlplane.Run{Name: "same", UID: "replacement-b"}
+	model.runs = []controlplane.RunSummary{{Name: "same", UID: "replacement-b"}}
+	model.resourceGeneration = 1
+	staleCommitted := make(chan struct{})
+	_, command := model.Update(runWatchMsg{generation: 1, event: controlplane.RunWatchEvent{Type: "DELETED", ResourceVersion: "2", Run: controlplane.RunSummary{Name: "same", UID: "old-a"}}, committed: staleCommitted})
+	if model.detailInFlight || model.detailRefreshPending {
+		t.Fatalf("stale delete refreshed replacement: command %v, inflight %t, pending %t", command, model.detailInFlight, model.detailRefreshPending)
+	}
+
+	model.run = &controlplane.Run{Name: "same", UID: "old-a"}
+	currentCommitted := make(chan struct{})
+	_, command = model.Update(runWatchMsg{generation: 1, event: controlplane.RunWatchEvent{Type: "DELETED", ResourceVersion: "3", Run: controlplane.RunSummary{Name: "same", UID: "old-a"}}, committed: currentCommitted})
+	if command == nil || !model.detailInFlight {
+		t.Fatalf("current delete did not settle exact identity once: command %v, inflight %t", command, model.detailInFlight)
+	}
+	notFound := &controlplaneclient.ProblemError{Problem: controlplaneclient.Problem{Status: http.StatusNotFound}}
+	_, command = model.Update(runLoadedMsg{name: "same", expectedUID: "old-a", err: notFound})
+	if command != nil || !model.detailRefreshBlocked || model.detailInFlight {
+		t.Fatalf("current delete settlement = command %v, blocked %t, inflight %t", command, model.detailRefreshBlocked, model.detailInFlight)
+	}
+	_, _ = model.Update(pollMsg(time.Now()))
+	if model.detailInFlight {
+		t.Fatal("settled current delete entered a refresh loop")
 	}
 }
 

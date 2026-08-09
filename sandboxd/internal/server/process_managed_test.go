@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -94,6 +95,233 @@ func TestManagedRestartDelayProgressionAndCap(t *testing.T) {
 	}
 	if got := s.managedRestartDelay(^uint(0)); got != 40*time.Millisecond {
 		t.Fatalf("overflow-scale attempt delay = %s, want cap", got)
+	}
+}
+
+func TestManagedServiceAdmissionBounds(t *testing.T) {
+	t.Run("maximum services accepted", func(t *testing.T) {
+		s := NewProcessServer(t.TempDir())
+		defer s.Close()
+		request := &sandboxdv1.ReconcileManagedServicesRequest{OwnerId: "uid", IntentRevision: 1}
+		for i := 0; i < maxManagedServices; i++ {
+			request.Services = append(request.Services, &sandboxdv1.ManagedServiceSpec{Role: fmt.Sprintf("service-%02d", i), Spec: &sandboxdv1.ProcessSpec{Argv: []string{"never-admitted"}}})
+		}
+		response, err := s.ReconcileManagedServices(context.Background(), request)
+		if err != nil {
+			t.Fatalf("maximum desired set: %v", err)
+		}
+		if len(response.Services) != maxManagedServices {
+			t.Fatalf("maximum desired set = %d services, want %d", len(response.Services), maxManagedServices)
+		}
+	})
+
+	t.Run("services per set", func(t *testing.T) {
+		s := NewProcessServer(t.TempDir())
+		defer s.Close()
+		request := &sandboxdv1.ReconcileManagedServicesRequest{OwnerId: "uid", IntentRevision: 1}
+		for i := 0; i <= maxManagedServices; i++ {
+			request.Services = append(request.Services, &sandboxdv1.ManagedServiceSpec{Role: fmt.Sprintf("service-%02d", i), Spec: &sandboxdv1.ProcessSpec{Argv: []string{"never-admitted"}}})
+		}
+		if _, err := s.ReconcileManagedServices(context.Background(), request); status.Code(err) != codes.InvalidArgument {
+			t.Fatalf("oversized desired set = %v, want InvalidArgument", err)
+		}
+		if len(s.managedOwners) != 0 || len(s.processes) != 0 {
+			t.Fatalf("oversized desired set mutated state: owners=%d processes=%d", len(s.managedOwners), len(s.processes))
+		}
+	})
+
+	t.Run("owners retain bounded tombstones", func(t *testing.T) {
+		s := NewProcessServer(t.TempDir())
+		s.MaxRecords = 2
+		defer s.Close()
+		for _, owner := range []string{"one", "two"} {
+			if _, err := s.ReconcileManagedServices(context.Background(), managedRequest(owner, 1, "", "", "", nil)); err != nil {
+				t.Fatalf("owner %q: %v", owner, err)
+			}
+		}
+		if _, err := s.ReconcileManagedServices(context.Background(), managedRequest("three", 1, "", "", "", nil)); status.Code(err) != codes.ResourceExhausted {
+			t.Fatalf("third owner = %v, want ResourceExhausted", err)
+		}
+		if _, err := s.ReconcileManagedServices(context.Background(), managedRequest("one", 1, "", "", "", nil)); err != nil {
+			t.Fatalf("exact retry at owner limit: %v", err)
+		}
+	})
+
+	t.Run("aggregate desired slots", func(t *testing.T) {
+		s := NewProcessServer(t.TempDir())
+		s.MaxRecords = 1
+		defer s.Close()
+		missing := &sandboxdv1.ProcessSpec{Argv: []string{filepath.Join(t.TempDir(), "missing")}}
+		first := &sandboxdv1.ReconcileManagedServicesRequest{OwnerId: "one", IntentRevision: 1, Services: []*sandboxdv1.ManagedServiceSpec{{Role: "svc", Spec: missing}}}
+		if _, err := s.ReconcileManagedServices(context.Background(), first); err != nil {
+			t.Fatal(err)
+		}
+		second := &sandboxdv1.ReconcileManagedServicesRequest{OwnerId: "one", IntentRevision: 2, Services: []*sandboxdv1.ManagedServiceSpec{{Role: "svc", Spec: missing}, {Role: "second", Spec: missing}}}
+		if _, err := s.ReconcileManagedServices(context.Background(), second); status.Code(err) != codes.ResourceExhausted {
+			t.Fatalf("second desired slot = %v, want ResourceExhausted", err)
+		}
+		if s.managedOwners["one"].revision != 1 || len(s.managedOwners["one"].desired) != 1 {
+			t.Fatal("rejected desired set mutated the accepted owner")
+		}
+	})
+}
+
+func TestConcurrentManagedReconcileReturnsResourceExhausted(t *testing.T) {
+	s := NewProcessServer(t.TempDir())
+	defer s.Close()
+	entered, release := make(chan struct{}), make(chan struct{})
+	s.beforeManagedStart = func() {
+		close(entered)
+		<-release
+	}
+	request := &sandboxdv1.ReconcileManagedServicesRequest{OwnerId: "uid", IntentRevision: 1, Services: []*sandboxdv1.ManagedServiceSpec{{Role: "svc", Spec: &sandboxdv1.ProcessSpec{Argv: []string{"never-admitted"}}}}}
+	done := make(chan error, 1)
+	go func() {
+		_, err := s.ReconcileManagedServices(context.Background(), request)
+		done <- err
+	}()
+	<-entered
+	_, concurrentErr := s.ReconcileManagedServices(context.Background(), request)
+	close(release)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if status.Code(concurrentErr) != codes.ResourceExhausted {
+		t.Fatalf("concurrent reconcile = %v, want ResourceExhausted", concurrentErr)
+	}
+}
+
+func TestManagedServiceFieldBoundsPreserveAcceptedIntent(t *testing.T) {
+	tests := map[string]func(*sandboxdv1.ReconcileManagedServicesRequest){
+		"owner": func(request *sandboxdv1.ReconcileManagedServicesRequest) {
+			request.OwnerId = strings.Repeat("o", maxManagedOwnerBytes+1)
+		},
+		"owner NUL": func(request *sandboxdv1.ReconcileManagedServicesRequest) {
+			request.OwnerId = "uid\x00other"
+		},
+		"role": func(request *sandboxdv1.ReconcileManagedServicesRequest) {
+			request.Services[0].Role = strings.Repeat("r", maxManagedRoleBytes+1)
+		},
+		"role NUL": func(request *sandboxdv1.ReconcileManagedServicesRequest) {
+			request.Services[0].Role = "svc\x00other"
+		},
+		"argument count": func(request *sandboxdv1.ReconcileManagedServicesRequest) {
+			request.Services[0].Spec.Argv = make([]string, maxManagedArgs+1)
+			for i := range request.Services[0].Spec.Argv {
+				request.Services[0].Spec.Argv[i] = "x"
+			}
+		},
+		"argument bytes": func(request *sandboxdv1.ReconcileManagedServicesRequest) {
+			request.Services[0].Spec.Argv = []string{strings.Repeat("x", maxManagedArgBytes+1)}
+		},
+		"argv bytes": func(request *sandboxdv1.ReconcileManagedServicesRequest) {
+			request.Services[0].Spec.Argv = []string{strings.Repeat("x", maxManagedArgBytes), strings.Repeat("y", maxManagedArgBytes), strings.Repeat("z", maxManagedArgBytes), strings.Repeat("w", maxManagedArgBytes), "overflow"}
+		},
+		"cwd": func(request *sandboxdv1.ReconcileManagedServicesRequest) {
+			request.Services[0].Spec.Cwd = strings.Repeat("c", maxManagedCWDBytes+1)
+		},
+		"environment count": func(request *sandboxdv1.ReconcileManagedServicesRequest) {
+			request.Services[0].Spec.Env = make(map[string]string, maxManagedEnvEntries+1)
+			for i := 0; i <= maxManagedEnvEntries; i++ {
+				request.Services[0].Spec.Env[string(rune('a'+i))] = "x"
+			}
+		},
+		"environment value": func(request *sandboxdv1.ReconcileManagedServicesRequest) {
+			request.Services[0].Spec.Env = map[string]string{"VALUE": strings.Repeat("x", maxLaunchMaterialValue+1)}
+		},
+	}
+	for name, mutate := range tests {
+		t.Run(name, func(t *testing.T) {
+			s := NewProcessServer(t.TempDir())
+			s.restartInitial = 10 * time.Second
+			defer s.Close()
+			accepted := &sandboxdv1.ReconcileManagedServicesRequest{OwnerId: "uid", IntentRevision: 1, Services: []*sandboxdv1.ManagedServiceSpec{{Role: "svc", Spec: &sandboxdv1.ProcessSpec{Argv: []string{filepath.Join(t.TempDir(), "missing")}}}}}
+			if _, err := s.ReconcileManagedServices(context.Background(), accepted); err != nil {
+				t.Fatal(err)
+			}
+			owner := s.managedOwners["uid"]
+			timer := owner.restarts["svc"]
+			candidate := &sandboxdv1.ReconcileManagedServicesRequest{OwnerId: "uid", IntentRevision: 2, Services: []*sandboxdv1.ManagedServiceSpec{{Role: "svc", Spec: &sandboxdv1.ProcessSpec{Argv: []string{"valid"}}}}}
+			mutate(candidate)
+			if _, err := s.ReconcileManagedServices(context.Background(), candidate); status.Code(err) != codes.InvalidArgument {
+				t.Fatalf("invalid field = %v, want InvalidArgument", err)
+			}
+			if len(s.managedOwners) != 1 || s.managedOwners["uid"] != owner || owner.revision != 1 || owner.restarts["svc"] != timer {
+				t.Fatal("invalid field mutated accepted intent or its retry")
+			}
+		})
+	}
+}
+
+func TestManagedRetryDoesNotWaitBehindReconcile(t *testing.T) {
+	s := NewProcessServer(t.TempDir())
+	s.MaxRecords = 1
+	s.restartInitial = 30 * time.Millisecond
+	s.restartMax = 60 * time.Millisecond
+	defer s.Close()
+	occupied := &sandboxdv1.ProcessSpec{Argv: []string{os.Args[0], "-test.run=TestSetManagedProcessHelper"}, EnvMode: sandboxdv1.EnvironmentMode_ENVIRONMENT_MODE_REPLACE, Env: map[string]string{"SANDBOXD_MANAGED_HELPER": "1", "MARKER": filepath.Join(t.TempDir(), "occupied"), "VALUE": "occupied", "WAIT": "1"}}
+	if _, err := s.Start(context.Background(), &sandboxdv1.StartProcessRequest{Key: &sandboxdv1.ProcessKey{OwnerId: "ordinary", Role: "slot"}, Spec: occupied}); err != nil {
+		t.Fatal(err)
+	}
+	attempted := make(chan struct{}, 2)
+	s.beforeManagedStart = func() { attempted <- struct{}{} }
+	request := &sandboxdv1.ReconcileManagedServicesRequest{OwnerId: "uid", IntentRevision: 1, Services: []*sandboxdv1.ManagedServiceSpec{{Role: "svc", Spec: &sandboxdv1.ProcessSpec{Argv: []string{"never-admitted"}}}}}
+	if _, err := s.ReconcileManagedServices(context.Background(), request); err != nil {
+		t.Fatal(err)
+	}
+	<-attempted
+	s.mu.Lock()
+	originalTimer := s.managedOwners["uid"].restarts["svc"]
+	s.mu.Unlock()
+	s.reconcileMu.Lock()
+	time.Sleep(75 * time.Millisecond)
+	s.mu.Lock()
+	if len(s.managedOwners["uid"].restarts) != 1 {
+		t.Fatalf("pending retries = %d, want one", len(s.managedOwners["uid"].restarts))
+	}
+	if s.managedOwners["uid"].restarts["svc"] == originalTimer {
+		t.Fatal("expired retry waited behind reconciliation instead of re-arming")
+	}
+	s.mu.Unlock()
+	select {
+	case <-attempted:
+		t.Fatal("retry crossed held reconciliation admission")
+	default:
+	}
+	s.reconcileMu.Unlock()
+	select {
+	case <-attempted:
+	case <-time.After(250 * time.Millisecond):
+		t.Fatal("re-armed retry did not run after reconciliation admission released")
+	}
+}
+
+func TestManagedRemovalCancelsExhaustedRecordRetry(t *testing.T) {
+	s := NewProcessServer(t.TempDir())
+	s.MaxRecords = 1
+	s.restartInitial = 100 * time.Millisecond
+	s.restartMax = 100 * time.Millisecond
+	defer s.Close()
+	occupied := &sandboxdv1.ProcessSpec{Argv: []string{os.Args[0], "-test.run=TestSetManagedProcessHelper"}, EnvMode: sandboxdv1.EnvironmentMode_ENVIRONMENT_MODE_REPLACE, Env: map[string]string{"SANDBOXD_MANAGED_HELPER": "1", "MARKER": filepath.Join(t.TempDir(), "occupied"), "VALUE": "occupied", "WAIT": "1"}}
+	if _, err := s.Start(context.Background(), &sandboxdv1.StartProcessRequest{Key: &sandboxdv1.ProcessKey{OwnerId: "ordinary", Role: "slot"}, Spec: occupied}); err != nil {
+		t.Fatal(err)
+	}
+
+	attempted := make(chan struct{}, 2)
+	s.beforeManagedStart = func() { attempted <- struct{}{} }
+	request := &sandboxdv1.ReconcileManagedServicesRequest{OwnerId: "uid", IntentRevision: 1, Services: []*sandboxdv1.ManagedServiceSpec{{Role: "svc", Spec: &sandboxdv1.ProcessSpec{Argv: []string{"never-admitted"}}}}}
+	if _, err := s.ReconcileManagedServices(context.Background(), request); err != nil {
+		t.Fatal(err)
+	}
+	<-attempted
+	if _, err := s.ReconcileManagedServices(context.Background(), managedRequest("uid", 2, "", "", "", nil)); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(200 * time.Millisecond)
+	select {
+	case <-attempted:
+		t.Fatal("removed service retained an exhausted-record retry")
+	default:
 	}
 }
 
@@ -322,19 +550,21 @@ func TestManagedRestartAdmissionSerializesNewerRemoval(t *testing.T) {
 		t.Fatal("restart did not reach managed admission hook")
 	}
 
-	done := make(chan error, 1)
-	go func() {
-		_, err := s.ReconcileManagedServices(context.Background(), managedRequest("uid", 2, "", marker, "", nil))
-		done <- err
-	}()
-	select {
-	case err := <-done:
-		t.Fatalf("newer removal crossed in-flight admission: %v", err)
-	case <-time.After(25 * time.Millisecond):
+	removal := managedRequest("uid", 2, "", marker, "", nil)
+	if _, err := s.ReconcileManagedServices(context.Background(), removal); status.Code(err) != codes.ResourceExhausted {
+		t.Fatalf("concurrent newer removal = %v, want ResourceExhausted", err)
 	}
 	close(release)
-	if err := <-done; err != nil {
-		t.Fatal(err)
+	deadline := time.Now().Add(time.Second)
+	for {
+		_, err := s.ReconcileManagedServices(context.Background(), removal)
+		if err == nil {
+			break
+		}
+		if status.Code(err) != codes.ResourceExhausted || time.Now().After(deadline) {
+			t.Fatal(err)
+		}
+		time.Sleep(time.Millisecond)
 	}
 	s.beforeManagedStart = nil
 	time.Sleep(100 * time.Millisecond)

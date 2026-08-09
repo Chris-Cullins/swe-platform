@@ -52,7 +52,9 @@ type tuiModel struct {
 	detailInFlight        bool
 	detailRefreshPending  bool
 	detailNeedsRefresh    bool
+	detailRefreshBlocked  bool
 	envInFlight           bool
+	envRefreshBlocked     bool
 	mutationInFlight      bool
 	mutationID            uint64
 	cancelIdentity        runIdentity
@@ -119,6 +121,8 @@ type runLoadedMsg struct {
 
 type environmentLoadedMsg struct {
 	identity    runIdentity
+	name        string
+	expectedUID string
 	environment controlplane.Environment
 	err         error
 }
@@ -226,11 +230,11 @@ func (m *tuiModel) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		if (m.pollFallback || m.listNeedsRefresh) && !m.listInFlight {
 			commands = append(commands, m.loadRuns())
 		}
-		if (m.pollFallback || m.detailNeedsRefresh) && m.mode == tuiDetail && m.run != nil && !m.detailInFlight {
+		if (m.pollFallback || m.detailNeedsRefresh) && m.mode == tuiDetail && m.run != nil && !m.detailInFlight && !m.detailRefreshBlocked {
 			commands = append(commands, m.loadRun(m.run.Name))
 		}
-		if m.mode == tuiDetail && m.run != nil && m.run.Environment != nil && !m.envInFlight {
-			commands = append(commands, m.loadEnvironment(m.currentIdentity(), m.run.Environment.Name))
+		if m.mode == tuiDetail && m.run != nil && m.run.Environment != nil && !m.envInFlight && !m.detailRefreshBlocked && !m.envRefreshBlocked {
+			commands = append(commands, m.loadEnvironment(m.currentIdentity(), m.run.Environment.Name, m.run.Environment.UID))
 		}
 		return m, tea.Batch(commands...)
 	case runsLoadedMsg:
@@ -270,7 +274,9 @@ func (m *tuiModel) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		if m.cursor < 0 {
 			m.cursor = 0
 		}
-		if m.mode == tuiDetail && m.run != nil && msg.event.Run.Name == m.run.Name {
+		relevantDetailEvent := m.mode == tuiDetail && m.run != nil && msg.event.Run.Name == m.run.Name &&
+			(msg.event.Type != "DELETED" || msg.event.Run.UID == m.run.UID)
+		if relevantDetailEvent && !m.detailRefreshBlocked {
 			if m.detailInFlight {
 				m.detailRefreshPending = true
 			} else {
@@ -319,6 +325,16 @@ func (m *tuiModel) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		if msg.err != nil {
 			m.err = safeError(msg.err)
+			if isProblemStatus(msg.err, http.StatusConflict) || isProblemStatus(msg.err, http.StatusNotFound) || errors.Is(msg.err, controlplaneclient.ErrRunIdentityMismatch) {
+				m.detailNeedsRefresh = false
+				m.detailRefreshBlocked = true
+				return m, nil
+			}
+			if !controlplaneclient.RetryableResourceError(msg.err) {
+				m.detailNeedsRefresh = false
+				m.detailRefreshBlocked = true
+				return m, nil
+			}
 			m.detailNeedsRefresh = true
 			if refreshAgain {
 				return m, m.loadRun(msg.name)
@@ -327,6 +343,7 @@ func (m *tuiModel) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.err = ""
 		m.detailNeedsRefresh = false
+		m.detailRefreshBlocked = false
 		identity := runIdentity{namespace: m.namespace, name: msg.run.Name, uid: msg.run.UID}
 		if identity != m.streamID {
 			m.stopStream()
@@ -335,11 +352,20 @@ func (m *tuiModel) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 			m.streamRecoveryCount = 0
 			m.streamBlocked = false
 		}
+		associationChanged := m.run.Environment == nil != (msg.run.Environment == nil)
+		if m.run.Environment != nil && msg.run.Environment != nil {
+			associationChanged = m.run.Environment.Name != msg.run.Environment.Name || m.run.Environment.UID != msg.run.Environment.UID
+		}
+		if associationChanged {
+			m.env = nil
+			m.envRefreshBlocked = false
+			m.envInFlight = false
+		}
 		m.run = &msg.run
 		commands := []tea.Cmd{}
 		if msg.run.Environment != nil {
-			if !m.envInFlight {
-				commands = append(commands, m.loadEnvironment(identity, msg.run.Environment.Name))
+			if !m.envInFlight && !m.envRefreshBlocked {
+				commands = append(commands, m.loadEnvironment(identity, msg.run.Environment.Name, msg.run.Environment.UID))
 			}
 		} else {
 			m.env = nil
@@ -352,15 +378,20 @@ func (m *tuiModel) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, tea.Batch(commands...)
 	case environmentLoadedMsg:
-		m.envInFlight = false
-		if msg.identity != m.currentIdentity() {
+		if msg.identity != m.currentIdentity() || m.run == nil || m.run.Environment == nil ||
+			m.run.Environment.UID != msg.expectedUID || m.run.Environment.Name != msg.name {
 			return m, nil
 		}
+		m.envInFlight = false
 		if msg.err != nil {
 			m.env = nil
 			m.err = safeError(msg.err)
+			if !controlplaneclient.RetryableResourceError(msg.err) {
+				m.envRefreshBlocked = true
+			}
 		} else {
 			m.env = &msg.environment
+			m.envRefreshBlocked = false
 		}
 		return m, nil
 	case transcriptMsg:
@@ -468,6 +499,9 @@ func (m *tuiModel) handleKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if m.mode == tuiDetail && m.run != nil {
 			m.streamBlocked = false
 			m.streamRecoveryCount = 0
+			if m.detailRefreshBlocked {
+				return m, m.loadRuns()
+			}
 			return m, tea.Batch(m.loadRuns(), m.loadRun(m.run.Name))
 		}
 		return m, m.loadRuns()
@@ -496,6 +530,9 @@ func (m *tuiModel) handleKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.mode = tuiDetail
 				m.loading = true
 				m.err, m.status = "", ""
+				m.detailRefreshBlocked = false
+				m.envRefreshBlocked = false
+				m.env = nil
 				m.streamBlocked = false
 				m.streamRecoveryCount = 0
 				return m, m.loadRun(summary.Name)
@@ -683,28 +720,25 @@ func (m *tuiModel) loadRuns() tea.Cmd {
 }
 
 func (m *tuiModel) loadRun(name string) tea.Cmd {
-	if m.detailInFlight {
+	if m.detailInFlight || m.run == nil || m.run.Name != name || m.run.UID == "" {
 		return nil
 	}
 	m.detailInFlight = true
-	expectedUID := ""
-	if m.run != nil && m.run.Name == name {
-		expectedUID = m.run.UID
-	}
+	expectedUID := m.run.UID
 	return func() tea.Msg {
-		run, err := m.client.GetRun(m.ctx, m.namespace, name)
+		run, err := m.client.GetRunExact(m.ctx, m.namespace, name, expectedUID)
 		return runLoadedMsg{name: name, expectedUID: expectedUID, run: run, err: err}
 	}
 }
 
-func (m *tuiModel) loadEnvironment(identity runIdentity, name string) tea.Cmd {
+func (m *tuiModel) loadEnvironment(identity runIdentity, name, expectedUID string) tea.Cmd {
 	if m.envInFlight {
 		return nil
 	}
 	m.envInFlight = true
 	return func() tea.Msg {
-		environment, err := m.client.GetEnvironment(m.ctx, m.namespace, name)
-		return environmentLoadedMsg{identity: identity, environment: environment, err: err}
+		environment, err := m.client.GetEnvironmentExact(m.ctx, m.namespace, name, expectedUID)
+		return environmentLoadedMsg{identity: identity, name: name, expectedUID: expectedUID, environment: environment, err: err}
 	}
 }
 

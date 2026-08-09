@@ -2,9 +2,11 @@ package controlplane
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -40,6 +42,58 @@ func (a *principalAccess) Authorize(*http.Request, ResourceAccess, bool) error {
 func (a *principalAccess) AuthorizePrincipal(_ *http.Request, access ResourceAccess, _ bool) (string, error) {
 	a.access = access
 	return a.key, a.err
+}
+
+type revocableWatchAccess struct {
+	mu     sync.Mutex
+	denied bool
+}
+
+func (a *revocableWatchAccess) Authorize(*http.Request, ResourceAccess, bool) error {
+	_, err := a.AuthorizePrincipal(nil, ResourceAccess{}, true)
+	return err
+}
+
+func (a *revocableWatchAccess) AuthorizePrincipal(*http.Request, ResourceAccess, bool) (string, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.denied {
+		return "", errForbidden
+	}
+	return "uid", nil
+}
+
+func (a *revocableWatchAccess) revoke() {
+	a.mu.Lock()
+	a.denied = true
+	a.mu.Unlock()
+}
+
+type blockingReauthAccess struct {
+	calls           atomic.Int32
+	initialDeadline chan bool
+	reauthDeadline  chan time.Duration
+	reauthCanceled  chan struct{}
+}
+
+func (a *blockingReauthAccess) Authorize(*http.Request, ResourceAccess, bool) error {
+	return errors.New("unexpected non-principal authorization")
+}
+
+func (a *blockingReauthAccess) AuthorizePrincipal(r *http.Request, _ ResourceAccess, _ bool) (string, error) {
+	deadline, hasDeadline := r.Context().Deadline()
+	if a.calls.Add(1) == 1 {
+		a.initialDeadline <- hasDeadline
+		return "uid", nil
+	}
+	if hasDeadline {
+		a.reauthDeadline <- time.Until(deadline)
+	} else {
+		a.reauthDeadline <- 0
+	}
+	<-r.Context().Done()
+	close(a.reauthCanceled)
+	return "", r.Context().Err()
 }
 
 func TestRunWatchQueryRequiresExactOpaqueCursorAndLastEventIDWins(t *testing.T) {
@@ -95,6 +149,73 @@ func TestRunWatchStreamsBoundedSummaryAndExactWatchSAR(t *testing.T) {
 	}
 }
 
+func TestRunWatchReauthorizesBeforeForwardingEvents(t *testing.T) {
+	upstream := watch.NewRaceFreeFake()
+	access := &revocableWatchAccess{}
+	started := make(chan struct{})
+	server := NewServer(nil, ServerOptions{Access: access, Resources: &watchResources{fakeResources: &fakeResources{}, watch: upstream, started: started}})
+	request := httptest.NewRequest(http.MethodGet, "/api/v1/namespaces/ns/runs?watch=true&view=summary&resourceVersion=10", nil)
+	request.Header.Set("Accept", "text/event-stream")
+	response := httptest.NewRecorder()
+	done := make(chan struct{})
+	go func() {
+		server.Handler().ServeHTTP(response, request)
+		close(done)
+	}()
+	<-started
+	access.revoke()
+	upstream.Add(&platformv1alpha1.Run{ObjectMeta: metav1.ObjectMeta{Name: "private", Namespace: "ns", UID: "uid", ResourceVersion: "11"}})
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("authorization loss did not close the watch")
+	}
+	if strings.Contains(response.Body.String(), "private") {
+		t.Fatalf("event was forwarded after authorization loss: %q", response.Body.String())
+	}
+}
+
+func TestRunWatchBoundsAndCancelsStalledReauthorization(t *testing.T) {
+	requestCtx, cancelRequest := context.WithCancel(context.Background())
+	defer cancelRequest()
+	upstream := &stoppedWatch{result: make(chan watch.Event, 1)}
+	upstream.result <- watch.Event{Type: watch.Added, Object: &platformv1alpha1.Run{ObjectMeta: metav1.ObjectMeta{Name: "private", Namespace: "ns", UID: "uid", ResourceVersion: "11"}}}
+	access := &blockingReauthAccess{initialDeadline: make(chan bool, 1), reauthDeadline: make(chan time.Duration, 1), reauthCanceled: make(chan struct{})}
+	server := NewServer(nil, ServerOptions{Access: access, Resources: &watchResources{fakeResources: &fakeResources{}, watch: upstream}})
+	request := httptest.NewRequest(http.MethodGet, "/api/v1/namespaces/ns/runs?watch=true&view=summary&resourceVersion=10", nil).WithContext(requestCtx)
+	request.Header.Set("Accept", "text/event-stream")
+	response := httptest.NewRecorder()
+	done := make(chan struct{})
+	go func() {
+		server.Handler().ServeHTTP(response, request)
+		close(done)
+	}()
+	if <-access.initialDeadline {
+		t.Fatal("initial authorization was unexpectedly bounded by the watch lifetime")
+	}
+	deadline := <-access.reauthDeadline
+	if deadline <= 0 || deadline > runWatchReauthorizeMax {
+		t.Fatalf("reauthorization deadline = %v, want within (0, %v]", deadline, runWatchReauthorizeMax)
+	}
+	cancelRequest()
+	select {
+	case <-access.reauthCanceled:
+	case <-time.After(time.Second):
+		t.Fatal("watch cancellation did not cancel stalled reauthorization")
+	}
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("stalled reauthorization retained the watch handler")
+	}
+	if !upstream.stopped.Load() {
+		t.Fatal("stalled reauthorization retained the upstream watch")
+	}
+	if strings.Contains(response.Body.String(), "private") {
+		t.Fatalf("event was forwarded while reauthorization stalled: %q", response.Body.String())
+	}
+}
+
 func TestRunWatchStaleBeforeAndAfterHeaders(t *testing.T) {
 	request := func() *http.Request {
 		r := httptest.NewRequest(http.MethodGet, "/api/v1/namespaces/ns/runs?watch=true&view=summary&resourceVersion=old", nil)
@@ -102,10 +223,17 @@ func TestRunWatchStaleBeforeAndAfterHeaders(t *testing.T) {
 		return r
 	}
 	t.Run("startup", func(t *testing.T) {
-		w := httptest.NewRecorder()
-		NewServer(nil, ServerOptions{Access: &principalAccess{key: "uid"}, Resources: &watchResources{fakeResources: &fakeResources{}, err: apierrors.NewResourceExpired("old")}}).Handler().ServeHTTP(w, request())
-		if w.Code != http.StatusGone || strings.Contains(w.Body.String(), "old") {
-			t.Fatalf("response = %d %q", w.Code, w.Body.String())
+		for name, err := range map[string]error{
+			"resource expired": apierrors.NewResourceExpired("old"),
+			"gone":             apierrors.NewGone("old"),
+		} {
+			t.Run(name, func(t *testing.T) {
+				w := httptest.NewRecorder()
+				NewServer(nil, ServerOptions{Access: &principalAccess{key: "uid"}, Resources: &watchResources{fakeResources: &fakeResources{}, err: err}}).Handler().ServeHTTP(w, request())
+				if w.Code != http.StatusGone || strings.Contains(w.Body.String(), "old") {
+					t.Fatalf("response = %d %q", w.Code, w.Body.String())
+				}
+			})
 		}
 	})
 	t.Run("streamed", func(t *testing.T) {

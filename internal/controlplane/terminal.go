@@ -27,6 +27,7 @@ const (
 	wakeTimeout                   = 2 * time.Minute
 	wakePollInterval              = 250 * time.Millisecond
 	terminalPolicyPollInterval    = 5 * time.Second
+	terminalAuthorizationTimeout  = 5 * time.Second
 	terminalHealthTimeout         = 5 * time.Second
 	terminalHandshakeTimeout      = 5 * time.Second
 	terminalStreamingWriteTimeout = 15 * time.Second
@@ -513,7 +514,10 @@ func (s *Server) handleTerminal(w http.ResponseWriter, r *http.Request, namespac
 		writeProblem(w, http.StatusBadRequest, "terminal-identity-required", "Terminal identity required", "an exact Environment UID is required")
 		return
 	}
-	s.serveTerminal(w, r, namespace, environment, func(ctx context.Context) (sandboxdv1.TerminalServiceClient, sandboxdv1.HealthServiceClient, io.Closer, error) {
+	authorization := func(ctx context.Context) error {
+		return s.access.Authorize(r.Clone(ctx), ResourceAccess{Namespace: namespace, Verb: "get", Resource: "environments", Subresource: "terminal", Name: environment}, true)
+	}
+	s.serveTerminal(w, r, namespace, environment, authorization, func(ctx context.Context) (sandboxdv1.TerminalServiceClient, sandboxdv1.HealthServiceClient, io.Closer, error) {
 		return s.terminalDialer.DialTerminal(ctx, namespace, environment, expectedEnvironmentUID)
 	})
 }
@@ -570,14 +574,22 @@ func (s *Server) handleRunTerminalWithIdentity(w http.ResponseWriter, r *http.Re
 		writeAccessError(w, err)
 		return
 	}
-	s.serveTerminal(w, r, namespace, association.EnvironmentName, func(ctx context.Context) (sandboxdv1.TerminalServiceClient, sandboxdv1.HealthServiceClient, io.Closer, error) {
+	authorization := func(ctx context.Context) error {
+		authRequest := r.Clone(ctx)
+		if err := s.access.Authorize(authRequest, ResourceAccess{Namespace: namespace, Verb: "get", Resource: "runs", Name: runName}, true); err != nil {
+			return err
+		}
+		return s.access.Authorize(authRequest, ResourceAccess{Namespace: namespace, Verb: "get", Resource: "environments", Subresource: "terminal", Name: association.EnvironmentName}, true)
+	}
+	s.serveTerminal(w, r, namespace, association.EnvironmentName, authorization, func(ctx context.Context) (sandboxdv1.TerminalServiceClient, sandboxdv1.HealthServiceClient, io.Closer, error) {
 		return s.terminalDialer.DialRunTerminal(ctx, namespace, association)
 	})
 }
 
 type terminalBackendDial func(context.Context) (sandboxdv1.TerminalServiceClient, sandboxdv1.HealthServiceClient, io.Closer, error)
+type terminalAuthorization func(context.Context) error
 
-func (s *Server) serveTerminal(w http.ResponseWriter, r *http.Request, namespace, environment string, dial terminalBackendDial) {
+func (s *Server) serveTerminal(w http.ResponseWriter, r *http.Request, namespace, environment string, authorize terminalAuthorization, dial terminalBackendDial) {
 	if !websocket.IsWebSocketUpgrade(r) {
 		http.Error(w, "websocket upgrade is required", http.StatusBadRequest)
 		return
@@ -613,16 +625,47 @@ func (s *Server) serveTerminal(w http.ResponseWriter, r *http.Request, namespace
 		http.Error(w, "environment terminal is unavailable", http.StatusBadGateway)
 		return
 	}
+	authorizeOnce := func(ctx context.Context) error {
+		authContext, cancel := context.WithTimeout(ctx, terminalAuthorizationTimeout)
+		defer cancel()
+		return authorize(authContext)
+	}
+	if err := authorizeOnce(r.Context()); err != nil {
+		writeAccessError(w, err)
+		return
+	}
 
 	connection, err := terminalUpgrader.Upgrade(w, r, nil)
 	if err != nil {
 		return
 	}
 	defer connection.Close()
-	stopCloseOnCancel := context.AfterFunc(r.Context(), func() { _ = connection.Close() })
+	bridgeContext, cancelBridge := context.WithCancel(r.Context())
+	defer cancelBridge()
+	stopCloseOnCancel := context.AfterFunc(bridgeContext, func() { _ = connection.Close() })
 	defer stopCloseOnCancel()
+	authPoll := s.terminalAuthPoll
+	if authPoll <= 0 {
+		authPoll = terminalPolicyPollInterval
+	}
+	go func() {
+		ticker := time.NewTicker(authPoll)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-bridgeContext.Done():
+				return
+			case <-ticker.C:
+				if authorizeOnce(bridgeContext) != nil {
+					cancelBridge()
+					_ = connection.Close()
+					return
+				}
+			}
+		}
+	}()
 	connection.SetReadLimit(1 << 20)
-	if err := bridgeWebTerminalWithTimeouts(r.Context(), connection, terminal, s.terminalOpenTimeout, s.terminalWriteTimeout); err != nil {
+	if err := bridgeWebTerminalWithTimeouts(bridgeContext, connection, terminal, s.terminalOpenTimeout, s.terminalWriteTimeout); err != nil {
 		if r.Context().Err() == nil {
 			s.log.Debug("web terminal closed", "namespace", namespace, "environment", environment, "error", err)
 		}
