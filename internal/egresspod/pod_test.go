@@ -90,6 +90,7 @@ func TestValidateBoundPodRequiresExactUIDAndFingerprint(t *testing.T) {
 		"fingerprint":                       func(_ *corev1.Pod, s *corev1.Secret) { s.Data[egressidentity.ClientCertificateKey] = []byte("bad") },
 		"private key":                       func(_ *corev1.Pod, s *corev1.Secret) { s.Data[egressidentity.ClientPrivateKeyKey] = []byte("bad") },
 		"gate":                              func(p *corev1.Pod, _ *corev1.Secret) { p.Spec.SchedulingGates = nil },
+		"admission nodeName":                func(p *corev1.Pod, _ *corev1.Secret) { p.Spec.NodeName = "worker" },
 		"admission mount": func(p *corev1.Pod, _ *corev1.Secret) {
 			p.Spec.Containers[0].VolumeMounts = append(p.Spec.Containers[0].VolumeMounts, corev1.VolumeMount{Name: CredentialVolume})
 		},
@@ -249,6 +250,7 @@ func TestPrepareRejectsUnsupportedAndAmbientCredentialExposureAtomically(t *test
 	for name, mutate := range map[string]func(*corev1.Pod, *RestrictedEgress){
 		"unsupported backend": func(_ *corev1.Pod, in *RestrictedEgress) { in.Backend = "kubevirt" }, "Windows": func(_ *corev1.Pod, in *RestrictedEgress) { in.OperatingSystem = "windows" },
 		"host PID": func(p *corev1.Pod, _ *RestrictedEgress) { p.Spec.HostPID = true }, "no fsGroup": func(p *corev1.Pod, _ *RestrictedEgress) { p.Spec.SecurityContext.FSGroup = nil },
+		"preset nodeName": func(p *corev1.Pod, _ *RestrictedEgress) { p.Spec.NodeName = "worker" },
 		"aliased Secret volume": func(p *corev1.Pod, in *RestrictedEgress) {
 			p.Spec.Volumes = append(p.Spec.Volumes, corev1.Volume{Name: "alias", VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{SecretName: in.CredentialSecret}}})
 		},

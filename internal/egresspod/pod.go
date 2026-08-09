@@ -267,6 +267,9 @@ func validatePreparation(pod *corev1.Pod, in RestrictedEgress) error {
 	if pod.Spec.HostPID || pod.Spec.HostIPC || pod.Spec.HostNetwork || pod.Spec.ShareProcessNamespace != nil && *pod.Spec.ShareProcessNamespace {
 		return errors.New("restricted egress Pod must not use host or shared process namespaces")
 	}
+	if pod.Spec.NodeName != "" {
+		return errors.New("restricted egress Pod must be held by the scheduler")
+	}
 	if pod.Spec.SecurityContext == nil || pod.Spec.SecurityContext.FSGroup == nil || in.CredentialFSGroup <= 0 || *pod.Spec.SecurityContext.FSGroup != in.CredentialFSGroup {
 		return errors.New("restricted egress Pod requires an fsGroup for read-only credentials")
 	}
@@ -291,6 +294,9 @@ func validatePersistedPod(pod *corev1.Pod, in RestrictedEgress) error {
 	}
 	if pod.Spec.HostPID || pod.Spec.HostIPC || pod.Spec.HostNetwork || pod.Spec.ShareProcessNamespace != nil && *pod.Spec.ShareProcessNamespace {
 		return errors.New("persisted Pod uses a forbidden namespace")
+	}
+	if pod.Spec.NodeName != "" {
+		return errors.New("persisted Pod bypasses the scheduling gate")
 	}
 	if pod.Spec.AutomountServiceAccountToken == nil || *pod.Spec.AutomountServiceAccountToken || pod.Spec.EnableServiceLinks == nil || *pod.Spec.EnableServiceLinks || pod.Spec.SecurityContext == nil || pod.Spec.SecurityContext.FSGroup == nil || *pod.Spec.SecurityContext.FSGroup != in.CredentialFSGroup {
 		return errors.New("persisted Pod ambient identity settings changed")
