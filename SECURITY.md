@@ -117,11 +117,29 @@ kind fixture, with an allowed connection as a positive control. The operator doe
 that a production cluster's CNI enforces NetworkPolicy, and Environment status does not claim
 effective CNI enforcement.
 
-Default-deny egress and the per-project egress proxy are not implemented. The
-`Project.spec.egressAllowlist` field is reserved for that future contract; the operator rejects
-non-empty values and fences any existing Environment execution rather than running with an
-unenforced allowlist. Empty or omitted allowlists do not restrict environment egress, which is
-subject to the cluster's network configuration.
+Default-deny egress and the per-project egress proxy are not implemented. The admitted v1
+`Project.spec.egressAllowlist` contract is a set of at most 64 exact lowercase ASCII FQDN tenant
+selections, not an autonomous grant. Each entry is 1–253 bytes, has at least two labels, uses only
+1–63 byte `[a-z0-9]([a-z0-9-]*[a-z0-9])?` labels, and means only TLS-over-CONNECT to that exact
+name on TCP 443. Uppercase, trailing dots, `xn--`, non-ASCII, wildcards, URL components, percent
+encoding, whitespace/control bytes, NUL, and all IP forms are rejected rather than normalized.
+The CRD enforces expressible bounds and shape; `internal/egresspolicy` is the sole complete Go
+authority for parsing and canonical policy composition.
+
+The approved but not wired administrator policy has a 256-entry ceiling and a 64-entry baseline
+using the same grammar. Baseline and Project selection must both be subsets of the ceiling, and
+the future effective set is their union. Invalid or out-of-ceiling input fails closed rather than
+being silently intersected. The platform baseline is empty and no repository, provider, package,
+CDN, redirect, or WebSocket host is inferred. Templates neither grant nor narrow egress. The
+canonical future runtime revision binds the revision domain, exact Installation UID, immutable
+policy ConfigMap UID and content SHA-256, sorted ceiling/baseline, exact Project UID, and sorted
+selection.
+
+The operator still rejects every non-empty Project selection and fences any existing Environment
+execution rather than running with unenforced intent. Empty or omitted selections do not restrict
+Environment egress today, which remains subject to cluster network configuration. No policy
+ConfigMap, proxy, identity, path forcing, restricted NetworkPolicy, or enforcement proof is wired;
+the approved restricted runtime is Calico v3.32.1-only and remains later issue #68 work.
 
 When an EnvironmentTemplate explicitly names a RuntimeClass, the operator verifies that the
 cluster-scoped RuntimeClass object exists before execution and fences exact-owned execution if

@@ -50,13 +50,23 @@ spec:
                 type: string
               egressAllowlist:
                 description: |-
-                  EgressAllowlist is reserved for future per-project egress enforcement.
-                  Non-empty values are currently unsupported and cause referenced Environments
-                  to fail validation until the egress proxy is implemented.
+                  EgressAllowlist selects exact HTTPS FQDN destinations from an administrator-owned
+                  ceiling. Runtime enforcement is not enabled yet: non-empty values still cause
+                  referenced Environments to fail validation until the egress proxy is implemented.
                 items:
+                  maxLength: 253
+                  minLength: 1
+                  pattern: ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$
                   type: string
+                maxItems: 64
                 type: array
                 x-kubernetes-list-type: set
+                x-kubernetes-validations:
+                - message: egress allowlist entries must not contain IDNA A-labels
+                  rule: self.all(host, !host.startsWith('xn--') && !host.contains('.xn--'))
+                - message: egress allowlist entries must not be IPv4 literals
+                  rule: self.all(host, !(host.split('.').size() == 4 && host.split('.').all(part,
+                    part.matches('^(0|[1-9][0-9]{0,2})$') && int(part) <= 255)))
               repositories:
                 description: |-
                   Repositories contains the single git repository URL this project works on.
