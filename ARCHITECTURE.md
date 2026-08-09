@@ -808,12 +808,40 @@ sorted ceiling and baseline, exact Project UID, and sorted Project selection. La
 proxy integration must independently recompute this from authoritative uncached reads. Helm
 rendering is not runtime authority.
 
-Only this API and canonical-policy foundation is implemented. The current non-empty Project
-allowlist rejection remains unchanged until per-execution identity, proxy readiness, technical
-path forcing, Calico v3.32.1-only enforcement proof, and acceptance land together. There is
-currently no default-deny egress, proxy deployment, runtime policy ConfigMap, restricted profile,
-or production egress-enforcement claim; generic Kubernetes, k3s, GKE, and EKS restricted profiles
-remain deferred. Issue #68 is not runtime-complete.
+The inert identity and Pod-construction foundation is also implemented, but no reconciler calls
+it. The versioned canonical identity binds exact Installation namespace/name/UID, Project
+namespace/name/UID, Environment namespace/name/UID, Pod name/UID, execution generation, runtime
+policy revision, forwarder security revision, and SHA-256 client-certificate fingerprint.
+Certificate subject fields and the fingerprint presented by TLS are untrusted lookup hints: a
+future authorizer must resolve the fingerprint and repeat exact currentness checks against
+authoritative objects. A separate self-signed ECDSA ClientAuth keypair is generated for each
+execution and is not sandboxd ServerAuth material.
+
+The Pod helper resolves the UID ordering problem with a staged Kubernetes scheduling gate. Before
+CREATE it accepts a complete Linux Pod-backend preparation input, prepends the native restartable
+init container and required non-optional but not-yet-created credential Secret, and leaves the
+Pod unscheduled. After the API assigns a UID, the separate binding validator requires the exact
+persisted/admission-mutated Pod, Environment owner, execution generation, scheduling gate,
+certificate fingerprint, and canonical claims. Future wiring may issue and create that exact
+UID-bound credential only after validation, then remove the gate; no unbound credential is ever
+placed in a runnable Pod. The foundation's issuer returns one immutable exact-Pod-owned Secret
+containing the mutually verified client certificate, matching private key, client trust copy,
+and canonical claims plus a private issuance binding. Future wiring must successfully create
+(never adopt, including on `AlreadyExists`) that Secret, seal the private binding exactly once
+with the UID/resourceVersion from that successful CREATE response, uncached-reread the Secret,
+revalidate the exact sealed identity and still-gated Pod, and only then UID/resourceVersion-fence
+gate removal. A GET, adoption, empty create identity, mismatched response, or reseal fails closed.
+The helper mounts per-execution client cert/key and the separate
+administrator-owned proxy server CA only in the forwarder, uses a fixed non-root, read-only,
+drop-all security context and bounded resources, and injects loopback proxy variables while
+clearing `NO_PROXY`. It rejects Windows and non-Pod backends.
+
+The current non-empty Project allowlist rejection remains unchanged and runs before child or
+Pod-spec construction. It stays until identity publication and exact two-second currentness,
+proxy readiness, technical path forcing, Calico v3.32.1-only enforcement proof, and acceptance
+land together. There is currently no default-deny egress, proxy deployment, runtime policy
+ConfigMap, restricted profile, or production egress-enforcement claim; generic Kubernetes, k3s,
+GKE, and EKS restricted profiles remain deferred. Issue #68 is not runtime-complete.
 
 Slice 3 provides only a default-off experimental conformance runner. The separate pinned
 dual-stack, two-worker kind topology and `hack/egress-conformance.sh` can perform one disposable,

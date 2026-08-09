@@ -3112,6 +3112,10 @@ func TestProjectRepositoryValidationIsTerminal(t *testing.T) {
 }
 
 func TestReconcileRejectsUnsupportedEgressAllowlistBeforeCreatingChildren(t *testing.T) {
+	// This reconcile-level test is also the activation fence for the inert
+	// egressidentity/egresspod foundation: the unsupported policy gate runs
+	// before any child or Pod-spec construction, so no future helper can be
+	// reached accidentally while non-empty selections remain unsupported.
 	scheme := runtime.NewScheme()
 	if err := corev1.AddToScheme(scheme); err != nil {
 		t.Fatal(err)
