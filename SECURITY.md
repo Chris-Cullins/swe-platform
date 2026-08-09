@@ -141,6 +141,14 @@ Environment egress today, which remains subject to cluster network configuration
 ConfigMap, proxy, identity, path forcing, restricted NetworkPolicy, or enforcement proof is wired;
 the approved restricted runtime is Calico v3.32.1-only and remains later issue #68 work.
 
+An experimental Calico v3.32.1 conformance runner exists as default-off diagnostic groundwork.
+It runs only by explicit invocation against its separate disposable kind fixture, aborts when
+its clean-cluster prerequisites cannot be checked, and exits nonzero on any failed positive or
+negative network check. Its terminal output is not attestation or freshness evidence and is not
+persisted or accepted by any controller, chart, runtime component, or production preset. Normal
+CI and E2E never execute the live runner. This diagnostic does not establish production egress
+isolation and does not change the allowlist behavior above.
+
 When an EnvironmentTemplate explicitly names a RuntimeClass, the operator verifies that the
 cluster-scoped RuntimeClass object exists before execution and fences exact-owned execution if
 it is removed or replaced under the same name. Environment pods pin the RuntimeClass UID; the

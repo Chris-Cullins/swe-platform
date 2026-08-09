@@ -1,0 +1,19 @@
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+# Default-off issue #68 diagnostic topology. Normal E2E continues to use kind-calico.yaml.
+networking:
+  disableDefaultCNI: true
+  ipFamily: dual
+  podSubnet: "192.168.0.0/16,fd00:10:244::/64"
+  serviceSubnet: "10.96.0.0/16,fd00:10:96::/112"
+nodes:
+  - role: control-plane
+    image: kindest/node:v1.35.0
+  - role: worker
+    image: kindest/node:v1.35.0
+    labels:
+      swe.dev/egress-conformance: eligible
+  - role: worker
+    image: kindest/node:v1.35.0
+    labels:
+      swe.dev/egress-conformance: eligible

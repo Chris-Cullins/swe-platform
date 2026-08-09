@@ -760,14 +760,16 @@ strips credentials, session cookies, and hop-by-hop headers and supports WebSock
 
 ### Approved fail-closed proxy-only egress contract
 
-The maintainer approved the [outbound-network contract in #68](https://github.com/Chris-Cullins/swe-platform/issues/68#issuecomment-5078805740):
+The maintainer approved the [outbound-network contract in #68](https://github.com/Chris-Cullins/swe-platform/issues/68#issuecomment-5231375346):
 
 - production requires a demonstrably enforcing CNI and fails before execution when enforcement
   is unavailable; any unrestricted local mode is explicitly non-production;
 - Environment traffic is technically forced through an authenticated shared proxy, with no
   direct fallback; proxy environment variables are compatibility, not enforcement;
-- installation administrators define a destination ceiling and Projects may select only a
-  subset;
+- installation administrators define a destination ceiling and baseline; the effective policy
+  is the baseline union the Project selection, with both constrained by the ceiling. The
+  platform baseline is empty, Templates have no egress-policy role, and no required destination
+  is inferred;
 - the first version allows canonical HTTPS FQDN destinations on port 443 and HTTPS Git, not
   direct IPs, Git SSH/`git://`, arbitrary TCP/UDP, QUIC, private Project networks, or alternate
   DNS paths;
@@ -812,6 +814,16 @@ path forcing, Calico v3.32.1-only enforcement proof, and acceptance land togethe
 currently no default-deny egress, proxy deployment, runtime policy ConfigMap, restricted profile,
 or production egress-enforcement claim; generic Kubernetes, k3s, GKE, and EKS restricted profiles
 remain deferred. Issue #68 is not runtime-complete.
+
+Slice 3 provides only a default-off experimental conformance runner. The separate pinned
+dual-stack, two-worker kind topology and `hack/egress-conformance.sh` can perform one disposable,
+human-observed Calico v3.32.1 diagnostic run after explicit context and cluster-UID confirmation.
+The runner aborts on unavailable prerequisites and exits nonzero on any failed positive or
+negative check. It emits human-readable diagnostics only: there is no persisted proof schema,
+freshness model, attestation, controller, chart component, production capability, or runtime
+input. Normal CI and `hack/e2e.sh` never execute the live runner; CI only checks that it remains
+disabled and isolated. This groundwork installs no proxy and changes no Environment policy or
+non-empty allowlist rejection behavior.
 
 ## Remaining decisions and open work
 

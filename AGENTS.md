@@ -118,11 +118,14 @@ runs both via `make` targets:
 - **Local operator:** `make run` requires explicit `RUN_TENANCY_MODE`,
   `RUN_SYSTEM_NAMESPACE`, and `RUN_INSTALLATION_NAME`; scoped mode also takes a
   space-separated `RUN_TENANCY_NAMESPACES` list.
-- **Unit tests:** `make test` (including rendered Helm RBAC, Argo port-forward, and BYOC
-  production-preset checks) · **Vet:** `make vet`. PostgreSQL transcript/session integration tests
+- **Unit tests:** `make test` (including rendered Helm RBAC, Argo port-forward, BYOC
+  production-preset checks, and the disabled egress-conformance guard) · **Vet:** `make vet`.
+  PostgreSQL transcript/session integration tests
   run when `SWE_TEST_POSTGRES_URL` points to a disposable database; CI supplies PostgreSQL 17.
   The required `build-test` CI job runs the root and sandboxd Go suites plus
-  the three shell checks above, mirroring `make test`.
+  the four shell checks above, mirroring `make test`. The egress-conformance live runner remains
+  default-off on its separate `hack/kind-calico-conformance.yaml` topology and must not be invoked
+  by CI/e2e; only its guard test runs.
 - **Operations console:** from `ui/`, install with `npm ci`; use `npm run lint`,
   `npm run typecheck`, `npm test -- --run`, and `npm run build`. Start the standalone
   Vite development server with `npm run dev`. Production uses `make ui-build`
