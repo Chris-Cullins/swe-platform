@@ -81,8 +81,10 @@ func TestParseConfigMapStrictSchemaAndBounds(t *testing.T) {
 			c.RestrictedProfile.ResolverIPs = []string{"1.1.1.1", "2.2.2.2", "3.3.3.3", "4.4.4.4", "5.5.5.5"}
 		},
 		"noncanonical resolver":    func(c *Config) { c.RestrictedProfile.ResolverIPs = []string{"2001:0db8::1"} },
+		"mapped IPv4 resolver":     func(c *Config) { c.RestrictedProfile.ResolverIPs = []string{"::ffff:8.8.8.8"} },
 		"API CIDR minimum":         func(c *Config) { c.RestrictedProfile.APIServerCIDRs = nil },
 		"unmasked CIDR":            func(c *Config) { c.RestrictedProfile.PodCIDRs = []string{"10.244.1.1/16"} },
+		"mapped IPv4 CIDR":         func(c *Config) { c.RestrictedProfile.AdditionalDeniedCIDRs = []string{"::ffff:8.8.8.8/128"} },
 		"baseline outside ceiling": func(c *Config) { c.Baseline = []Hostname{"other.example.com"} },
 		"ceiling maximum":          func(c *Config) { c.Ceiling = make([]Hostname, MaxCeilingEntries+1) },
 		"TLS Secret":               func(c *Config) { c.TLSSecretName = "Bad" },

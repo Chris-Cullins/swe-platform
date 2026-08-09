@@ -192,7 +192,7 @@ func canonicalIPs(name string, values []string, minimum, maximum int) ([]string,
 	seen := make(map[netip.Addr]struct{}, len(values))
 	for _, value := range result {
 		address, err := netip.ParseAddr(value)
-		if err != nil || address.Zone() != "" || address.String() != value {
+		if err != nil || address.Zone() != "" || address.Is4In6() || address.String() != value {
 			return nil, fmt.Errorf("%s contains a non-canonical IP literal", name)
 		}
 		if _, exists := seen[address]; exists {
@@ -213,7 +213,7 @@ func canonicalCIDRs(name string, values []string, minimum, maximum int) ([]strin
 	seen := make(map[netip.Prefix]struct{}, len(values))
 	for _, value := range result {
 		prefix, err := netip.ParsePrefix(value)
-		if err != nil || prefix.Addr().Zone() != "" || prefix != prefix.Masked() || prefix.String() != value {
+		if err != nil || prefix.Addr().Zone() != "" || prefix.Addr().Is4In6() || prefix != prefix.Masked() || prefix.String() != value {
 			return nil, fmt.Errorf("%s contains a non-canonical CIDR", name)
 		}
 		if _, exists := seen[prefix]; exists {

@@ -111,6 +111,9 @@ func (a *CurrentnessAuthorizer) authorize(ctx context.Context, hint Identity, ta
 	if claims.InstallationNamespace != a.Installation.Key.Namespace || claims.InstallationName != a.Installation.Key.Name || claims.InstallationUID != a.Installation.UID || a.PolicyConfigMap.Namespace != a.Installation.Key.Namespace {
 		return Authorization{}, errors.New("identity or policy ConfigMap does not match the configured Installation")
 	}
+	if claims.ProjectNamespace == a.Installation.Key.Namespace {
+		return Authorization{}, errors.New("Project namespace must be distinct from the Installation system namespace")
+	}
 	presentedFingerprint := hex.EncodeToString(hint.Fingerprint[:])
 	if claims.CertificateFingerprint != presentedFingerprint {
 		return Authorization{}, errors.New("presented certificate fingerprint does not match canonical identity")

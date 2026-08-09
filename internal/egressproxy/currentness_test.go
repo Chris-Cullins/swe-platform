@@ -357,6 +357,23 @@ func TestCurrentnessAuthorizerForgedClaimsAndAPIUncertainty(t *testing.T) {
 	}
 }
 
+func TestCurrentnessAuthorizerRejectsSystemProjectNamespace(t *testing.T) {
+	f := newCurrentnessFixture(t)
+	reader := fake.NewClientBuilder().WithScheme(currentnessScheme(t)).WithObjects(f.objects()...).Build()
+	authorizer := f.authorizer(t, reader)
+	claims := f.claims
+	claims.ProjectNamespace = claims.InstallationNamespace
+	claims.EnvironmentNamespace = claims.InstallationNamespace
+	canonical, err := claims.CanonicalBytes()
+	if err != nil {
+		t.Fatal(err)
+	}
+	authorizer.Identities = &staticIdentityLookup{claims: canonical}
+	if _, err := authorizer.Authorize(context.Background(), f.hint, "api.example.com"); err == nil || !strings.Contains(err.Error(), "must be distinct") {
+		t.Fatalf("system namespace was not rejected at the tenancy boundary: %v", err)
+	}
+}
+
 func TestCurrentnessAuthorizerRejectsForeignInstallationAndMidProofChange(t *testing.T) {
 	f := newCurrentnessFixture(t)
 	base := fake.NewClientBuilder().WithScheme(currentnessScheme(t)).WithObjects(f.objects()...).Build()
