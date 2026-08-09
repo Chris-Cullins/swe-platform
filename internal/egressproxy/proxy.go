@@ -22,6 +22,9 @@ type Authorization struct {
 	// Currentness closes after any failed recheck for this certificate
 	// fingerprint. The disabled transport does not yet consume this signal.
 	Currentness <-chan struct{}
+	// ReleaseCurrentness releases this authorization's lifecycle lease. Future
+	// transport wiring must call it when replacing or closing a tunnel lease.
+	ReleaseCurrentness func()
 }
 type Authorizer interface {
 	Authorize(context.Context, Identity, string) (Authorization, error)

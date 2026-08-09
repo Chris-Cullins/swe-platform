@@ -820,7 +820,10 @@ and immutable policy ConfigMap. It independently recomputes policy and revision,
 execution, policy, forwarder, and certificate-fingerprint annotations, and rejects API
 uncertainty. Each successful fingerprint receives a currentness signal that closes after any
 failed recheck so future tunnel wiring can revoke established connections without caching
-authority. No command constructs this authorizer; `egress-proxy serve` still uses the deny-all
+authority. Every successful authorization also returns a one-shot lifecycle release; future
+transport wiring must release the prior lease when a recheck replaces it and release the final
+lease when the tunnel closes. The final release closes the signal and reclaims its bounded state.
+No command constructs this authorizer; `egress-proxy serve` still uses the deny-all
 `DisabledAuthorizer`. A separate self-signed ECDSA ClientAuth keypair is generated for each
 execution and is not sandboxd ServerAuth material.
 

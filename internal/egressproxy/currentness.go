@@ -54,9 +54,10 @@ type executionState struct {
 }
 
 type executionRecord struct {
-	mu    sync.Mutex
-	state *executionState
-	users int
+	mu     sync.Mutex
+	state  *executionState
+	users  int
+	leases int
 }
 
 func newExecutionState() *executionState { return &executionState{done: make(chan struct{})} }
@@ -92,6 +93,7 @@ func (a *CurrentnessAuthorizer) Authorize(ctx context.Context, hint Identity, ta
 		record.state = newExecutionState()
 	}
 	authorization.Currentness = record.state.done
+	authorization.ReleaseCurrentness = a.acquireLease(hint.Fingerprint, record)
 	return authorization, nil
 }
 
@@ -305,9 +307,31 @@ func (a *CurrentnessAuthorizer) release(fingerprint [sha256.Size]byte, record *e
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	record.users--
-	if record.users == 0 && isClosed(record.state.done) && a.records[fingerprint] == record {
+	if record.users == 0 && record.leases == 0 && a.records[fingerprint] == record {
 		delete(a.records, fingerprint)
 	}
+}
+
+func (a *CurrentnessAuthorizer) acquireLease(fingerprint [sha256.Size]byte, record *executionRecord) func() {
+	a.mu.Lock()
+	record.leases++
+	a.mu.Unlock()
+	return sync.OnceFunc(func() {
+		record.mu.Lock()
+		defer record.mu.Unlock()
+		a.mu.Lock()
+		defer a.mu.Unlock()
+		if record.leases == 0 {
+			return
+		}
+		record.leases--
+		if record.leases == 0 {
+			record.state.revoke()
+		}
+		if record.users == 0 && record.leases == 0 && a.records[fingerprint] == record {
+			delete(a.records, fingerprint)
+		}
+	})
 }
 
 func isClosed(done <-chan struct{}) bool {

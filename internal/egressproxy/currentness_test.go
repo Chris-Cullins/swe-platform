@@ -189,13 +189,15 @@ func TestCurrentnessAuthorizerUnchangedIdentity(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if authorization.ExecutionKey != "environment-uid/7/pod-uid" || authorization.ProjectKey != "project-uid" || len(authorization.DeniedPrefixes) != 6 || authorization.Currentness == nil || isClosed(authorization.Currentness) {
+	if authorization.ExecutionKey != "environment-uid/7/pod-uid" || authorization.ProjectKey != "project-uid" || len(authorization.DeniedPrefixes) != 6 || authorization.Currentness == nil || authorization.ReleaseCurrentness == nil || isClosed(authorization.Currentness) {
 		t.Fatalf("unexpected authorization: %#v", authorization)
 	}
+	defer authorization.ReleaseCurrentness()
 	second, err := authorizer.Authorize(context.Background(), Identity{Fingerprint: f.hint.Fingerprint, Subject: "another forged subject"}, "api.example.com")
 	if err != nil || second.Currentness != authorization.Currentness || isClosed(second.Currentness) {
 		t.Fatalf("unchanged recheck = %#v, %v", second, err)
 	}
+	defer second.ReleaseCurrentness()
 	if _, err := authorizer.Authorize(context.Background(), f.hint, "denied.example.com"); err == nil {
 		t.Fatal("destination outside effective policy accepted")
 	}
@@ -425,6 +427,7 @@ func TestCurrentnessAuthorizerFailedRecheckRevokes(t *testing.T) {
 	if !isClosed(first.Currentness) {
 		t.Fatal("existing tunnel state remained current after failed recheck")
 	}
+	first.ReleaseCurrentness()
 
 	pod.Annotations[egresspod.CertificateFingerprintAnnotation] = f.claims.CertificateFingerprint
 	if err := reader.Update(context.Background(), &pod); err != nil {
@@ -434,8 +437,27 @@ func TestCurrentnessAuthorizerFailedRecheckRevokes(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer second.ReleaseCurrentness()
 	authorizer.Reader = failingReader{Reader: reader}
 	if _, err := authorizer.Authorize(context.Background(), f.hint, "api.example.com"); err == nil || !isClosed(second.Currentness) {
 		t.Fatal("API uncertainty retained a previous authorization")
+	}
+}
+
+func TestCurrentnessAuthorizerReleaseReclaimsSuccessfulState(t *testing.T) {
+	f := newCurrentnessFixture(t)
+	reader := fake.NewClientBuilder().WithScheme(currentnessScheme(t)).WithObjects(f.objects()...).Build()
+	authorizer := f.authorizer(t, reader)
+	authorization, err := authorizer.Authorize(context.Background(), f.hint, "api.example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(authorizer.records) != 1 {
+		t.Fatalf("currentness records = %d, want 1", len(authorizer.records))
+	}
+	authorization.ReleaseCurrentness()
+	authorization.ReleaseCurrentness()
+	if !isClosed(authorization.Currentness) || len(authorizer.records) != 0 {
+		t.Fatalf("released currentness remained live: closed=%t records=%d", isClosed(authorization.Currentness), len(authorizer.records))
 	}
 }
