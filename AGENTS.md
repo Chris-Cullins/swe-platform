@@ -67,7 +67,10 @@ Pi deliberately supports no credential profiles or credential injection.
 - **Layout:** kubebuilder conventions — `api/v1alpha1/` for types,
   `internal/controllers/`, and `cmd/{operator,control-plane,swe,egress-proxy}` for root-module
   binaries. The egress proxy command is a disabled protocol foundation and intentionally remains
-  outside `make build` and image publishing until the fail-closed runtime is enabled. The exact adapter contract boundary is
+  outside `make build` and image publishing until the fail-closed runtime is enabled.
+  `internal/egressidentity/` and `internal/egresspod/` are likewise inert contract foundations;
+  do not wire them into reconciliation or relax the non-empty allowlist fence before the complete
+  restricted runtime is atomically enabled. The exact adapter contract boundary is
   `internal/agent/`. Shared fenced Environment intent
   publication and validation belongs in `internal/lifecycle/`; controllers remain
   the sole owners of observed lifecycle transitions. Environment reconciliation is split
