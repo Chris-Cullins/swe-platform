@@ -77,7 +77,7 @@ All current CRDs are namespaced:
 | Resource | Current contract |
 |---|---|
 | `Installation` | Empty-spec identity object in the system namespace. Its immutable Kubernetes UID is the stable installation identity used by namespace claims, catalog sources, managed Template copies, and baseline resources. |
-| `Project` | One repository URL (represented as a one-item list), a same-namespace default Template reference, changes-workflow metadata, and a reserved egress allowlist. A non-empty allowlist is rejected when an Environment uses the Project. |
+| `Project` | One repository URL (represented as a one-item list), a same-namespace default Template reference, changes-workflow metadata, and up to 64 exact lowercase-ASCII FQDN egress selections. The selection contract is admitted, but a non-empty selection remains rejected when an Environment uses the Project because runtime egress enforcement is not enabled. |
 | `EnvironmentTemplate` | Pod image, size/resources, disk, runtime class, idle timeout, warm-pool minimum, and backend. Admission currently permits only the `pod` backend. Chart-owned system-namespace objects are inert catalog sources; execution accepts only installation-managed same-namespace copies bound to exact Installation, source, and Project identities. |
 | `Environment` | Immutable Template selection, an immutable optional backend override, one-way empty-to-nonempty Project binding, explicit hold policy, bounded wake/suspend/activity intents, and up to 32 API- or Repository-owned service declarations. New declarations have an immutable-per-incarnation random `instanceID`; upgrade-retained legacy declarations may omit it, receive no portal route, and can add it only with a higher revision. Omitted legacy service ownership defaults only to `API` and is immutable thereafter. Controller-owned status includes the immutable resolved `provisioning` snapshot, readiness, lifecycle/execution, claim, observations, activity, and nested backend-neutral recovery state; recovery records attempts, exhaustion, the exact failed execution generation being accounted, and the next allowed attempt time, while generation zero means no recovery identity. The gateway owns bounded `portalRoutes` and monotonic `nextPortalRouteGeneration`; inactive routes are denial tombstones preserved by other status writers. |
 | `Run` | Immutable agent task and Environment/Project/Template/agent-credential/repository-credential selection plus monotonic cancellation; status records normalized lifecycle, exact Environment name/UID and ownership, exact credential profile identity, repository credential readiness, accepted lifecycle epoch, and accepted execution generation. `notify` and `parentRef` are schema placeholders without an implemented inbox. |
@@ -210,7 +210,8 @@ runtime-class name, and effective backend plus the Project repository are frozen
 inputs. Template generation and Project generation are recorded for diagnosis but live edits do
 not rewrite the snapshot. Template `idleTimeout` remains live lifecycle policy;
 `warmPool.min` remains live pool policy; and Project egress allowlist remains live security
-policy (currently any non-empty list fences execution as unsupported). Project-less warm members
+policy (currently any non-empty list fences execution as unsupported, even though its bounded v1
+selection grammar is admitted). Project-less warm members
 are current only when Template name/UID and the resolved provisioning projection match; generation
 alone is not compared because it can contain policy-only edits. A provisioning edit makes old
 members unclaimable and quarantined while bounded replacement members roll out; the existing
@@ -757,7 +758,7 @@ Hold, Requested suspension, stale association/declaration/route/execution, and u
 the same 404 as an unknown locator. Idle requests wake and await a fresh execution. The proxy
 strips credentials, session cookies, and hop-by-hop headers and supports WebSocket upgrade.
 
-### Fail-closed proxy-only egress
+### Approved fail-closed proxy-only egress contract
 
 The maintainer approved the [outbound-network contract in #68](https://github.com/Chris-Cullins/swe-platform/issues/68#issuecomment-5078805740):
 
@@ -780,8 +781,37 @@ The maintainer approved the [outbound-network contract in #68](https://github.co
 - required Git, package, provider, and CDN traffic is explicit and observable, and denials
   provide useful operator evidence.
 
-The current non-empty Project allowlist rejection remains until identity, proxy readiness, and
-path forcing ship together after Project namespace claims.
+The [approved v1 implementation package](https://github.com/Chris-Cullins/swe-platform/issues/68#issuecomment-5231375346)
+defines `Project.spec.egressAllowlist` as a tenant selection, not a grant. It is a set of 0–64
+exact lowercase ASCII FQDNs, each 1–253 bytes with at least two 1–63 byte labels matching
+`[a-z0-9]([a-z0-9-]*[a-z0-9])?`. Uppercase, trailing dots, `xn--`, non-ASCII, wildcards,
+schemes, ports, paths, queries, fragments, userinfo, percent encoding, whitespace/control bytes,
+NUL, and every IP literal form are invalid and are rejected rather than normalized. Each entry
+means only TLS-over-CONNECT to that exact FQDN on TCP 443; redirects require independent policy.
+The CRD enforces bounded expressible shape, while `internal/egresspolicy` is the sole complete Go
+grammar and canonicalization authority.
+
+The future immutable administrator-owned policy has a maximum 256-entry ceiling and maximum
+64-entry baseline using the same grammar. Baseline and Project selection must each be subsets of
+the ceiling; an invalid or out-of-ceiling value fails closed rather than being silently
+intersected. Effective v1 policy is `baseline ∪ Project selection`; the platform baseline is
+empty, so two empty sets mean deny-all under the future restricted runtime. Administrators must
+explicitly list repository, provider, package, CDN, redirect, and WebSocket destinations. The
+platform infers none. EnvironmentTemplates neither grant nor narrow egress, and Project-less warm
+Environments receive no egress identity or external egress in the approved runtime design.
+
+The canonical runtime revision is SHA-256 over deterministic canonical bytes containing the
+revision domain, exact Installation UID, immutable policy ConfigMap UID and content SHA-256,
+sorted ceiling and baseline, exact Project UID, and sorted Project selection. Later operator and
+proxy integration must independently recompute this from authoritative uncached reads. Helm
+rendering is not runtime authority.
+
+Only this API and canonical-policy foundation is implemented. The current non-empty Project
+allowlist rejection remains unchanged until per-execution identity, proxy readiness, technical
+path forcing, Calico v3.32.1-only enforcement proof, and acceptance land together. There is
+currently no default-deny egress, proxy deployment, runtime policy ConfigMap, restricted profile,
+or production egress-enforcement claim; generic Kubernetes, k3s, GKE, and EKS restricted profiles
+remain deferred. Issue #68 is not runtime-complete.
 
 ## Remaining decisions and open work
 

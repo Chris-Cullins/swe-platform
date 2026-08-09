@@ -29,10 +29,16 @@ type ProjectSpec struct {
 	// +optional
 	ChangesWorkflow ChangesWorkflow `json:"changesWorkflow,omitempty"`
 
-	// EgressAllowlist is reserved for future per-project egress enforcement.
-	// Non-empty values are currently unsupported and cause referenced Environments
-	// to fail validation until the egress proxy is implemented.
+	// EgressAllowlist selects exact HTTPS FQDN destinations from an administrator-owned
+	// ceiling. Runtime enforcement is not enabled yet: non-empty values still cause
+	// referenced Environments to fail validation until the egress proxy is implemented.
 	// +optional
+	// +kubebuilder:validation:MaxItems=64
+	// +kubebuilder:validation:items:MinLength=1
+	// +kubebuilder:validation:items:MaxLength=253
+	// +kubebuilder:validation:items:Pattern=`^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$`
+	// +kubebuilder:validation:XValidation:rule="self.all(host, !host.startsWith('xn--') && !host.contains('.xn--'))",message="egress allowlist entries must not contain IDNA A-labels"
+	// +kubebuilder:validation:XValidation:rule="self.all(host, !(host.split('.').size() == 4 && host.split('.').all(part, part.matches('^(0|[1-9][0-9]{0,2})$') && int(part) <= 255)))",message="egress allowlist entries must not be IPv4 literals"
 	// +listType=set
 	EgressAllowlist []string `json:"egressAllowlist,omitempty"`
 }
