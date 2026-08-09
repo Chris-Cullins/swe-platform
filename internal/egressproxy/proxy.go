@@ -11,12 +11,11 @@ import (
 	"net/netip"
 	"sync"
 	"time"
+
+	"github.com/Chris-Cullins/swe-platform/internal/egressidentity"
 )
 
-type Identity struct {
-	Fingerprint [32]byte
-	Subject     string
-}
+type Identity = egressidentity.CertificateHint
 type Authorization struct {
 	ExecutionKey, ProjectKey string
 	DeniedPrefixes           []netip.Prefix

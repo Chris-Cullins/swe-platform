@@ -138,8 +138,38 @@ selection.
 The operator still rejects every non-empty Project selection and fences any existing Environment
 execution rather than running with unenforced intent. Empty or omitted selections do not restrict
 Environment egress today, which remains subject to cluster network configuration. No policy
-ConfigMap, proxy, identity, path forcing, restricted NetworkPolicy, or enforcement proof is wired;
-the approved restricted runtime is Calico v3.32.1-only and remains later issue #68 work.
+ConfigMap, proxy deployment, identity publication, path forcing, restricted NetworkPolicy, or
+enforcement proof is wired; the approved restricted runtime is Calico v3.32.1-only and remains
+later issue #68 work.
+
+The implemented but unreachable identity foundation uses bounded canonical v1 claims for exact
+Installation, Project, Environment, Pod, execution, policy, forwarder, and certificate-fingerprint
+identity. A separate per-execution self-signed ECDSA certificate has ClientAuth usage only; its
+key and trust material are distinct from sandboxd's ServerAuth credential. TLS certificate
+subjects and presented fingerprints are lookup hints, never authorization claims. A future proxy
+authorizer must map the fingerprint to canonical claims, independently repeat exact uncached
+currentness checks, and reject any stale object, execution, policy revision, forwarder revision,
+or fingerprint.
+
+Kubernetes assigns a Pod UID only after creation. The inert Pod helper therefore adds an
+egress-specific scheduling gate and a required, deliberately absent credential Secret reference
+before CREATE. After UID assignment, a separate validator checks the exact persisted Pod,
+Environment owner, execution generation, gate, canonical claims, and issued certificate
+fingerprint. The provided issuer constructs one immutable exact-Pod-owned Secret and a private
+issuance binding. Future wiring must treat create collision as failure, uncached-reread the
+assigned Secret UID/resourceVersion, and recheck its exact data, owner, canonical claims,
+fingerprint, matching key, self trust, and still-gated Pod against that binding before fenced gate
+removal. Only the exact successful CREATE response may seal the binding once; `AlreadyExists`,
+adoption/GET, empty or mismatched create identity, resealing, and a different UID or
+resourceVersion on uncached reread all fail closed. A Pod can never run with an unbound credential
+through this staged contract. The helper's native
+restartable init-sidecar precedes clone/hooks, receives the only egress client key/cert and
+administrator-owned proxy CA mounts, has no workspace or service-account-token mount and no
+host/shared PID namespace, and uses
+non-root, read-only-root, no-escalation, drop-all controls plus bounded requests and limits. Proxy
+environment variables are supplied to clone, hooks, and the environment only for compatibility;
+they are not enforcement. The helper supports only Linux Pod specs and is callable only by unit
+tests today.
 
 An experimental Calico v3.32.1 conformance runner exists as default-off diagnostic groundwork.
 It runs only by explicit invocation against its separate disposable kind fixture, aborts when
