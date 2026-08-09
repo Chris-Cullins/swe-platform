@@ -480,7 +480,10 @@ Environment status does not report it as effective isolation.
 
 The chart does not install default-deny egress or an egress allowlist proxy. Project
 `egressAllowlist` values are reserved and rejected when non-empty; empty or omitted values leave
-egress subject to the cluster's network configuration.
+egress subject to the cluster's network configuration. The Go foundation can validate a future
+immutable, content-addressed system policy ConfigMap and perform disabled uncached currentness
+proofs, but this chart deliberately has no values, ConfigMap, Deployment, Service, ServiceAccount,
+RBAC, TLS Secret, or NetworkPolicy for that foundation. No production preset enables it.
 
 The repository also contains a deliberately disabled experimental Calico v3.32.1 diagnostic
 runner on a separate dual-stack kind topology. It is not a chart component, production preset
@@ -730,7 +733,7 @@ plane pod from starting after installation, with no memory fallback.
 |---|---|---|
 | Control-plane exposure | ClusterIP Service on port 80. Optional portal Ingress owns only `*.controlPlane.portal.suffix` | Expose the ordinary API separately; provide wildcard DNS and an administrator-owned wildcard TLS Secret for portals |
 | Environment sandboxd isolation | Ingress NetworkPolicy per environment pod: port 50051 admitted only from release-namespace control-plane and operator pods | CNI must enforce Kubernetes NetworkPolicy for defense in depth; TLS and capability authorization remain mandatory regardless |
-| Environment egress | No default-deny egress or egress proxy | Environment egress is subject to cluster network configuration; `Project.spec.egressAllowlist` is reserved and rejected when non-empty |
+| Environment egress | No default-deny egress, policy ConfigMap instance, or egress proxy; parser/currentness code is inert and not chart-rendered | Environment egress is subject to cluster network configuration; `Project.spec.egressAllowlist` is reserved and rejected when non-empty |
 | Operator → control plane | In-cluster HTTP to the control-plane Service | No external networking required; both components run in the release namespace |
 
 The `controlPlane.auth.trustProxyHeaders` option is available for a trusted reverse proxy

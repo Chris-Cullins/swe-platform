@@ -15,6 +15,7 @@ func fixture() (*corev1.Pod, RestrictedEgress) {
 	group := int64(10001)
 	controller := true
 	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "env-one", Namespace: "project", Annotations: map[string]string{ExecutionGenerationAnnotation: "1"}, OwnerReferences: []metav1.OwnerReference{{APIVersion: "swe.dev/v1alpha1", Kind: "Environment", Name: "one", UID: "e", Controller: &controller}}}, Spec: corev1.PodSpec{
+		RestartPolicy:   corev1.RestartPolicyNever,
 		SecurityContext: &corev1.PodSecurityContext{FSGroup: &group}, Containers: []corev1.Container{{Name: "environment", Env: []corev1.EnvVar{{Name: "NO_PROXY", Value: "metadata"}}}},
 		InitContainers: []corev1.Container{{Name: "repository-clone"}, {Name: "project-hooks"}}, Volumes: []corev1.Volume{{Name: "workspace"}},
 	}}
@@ -250,7 +251,10 @@ func TestPrepareRejectsUnsupportedAndAmbientCredentialExposureAtomically(t *test
 	for name, mutate := range map[string]func(*corev1.Pod, *RestrictedEgress){
 		"unsupported backend": func(_ *corev1.Pod, in *RestrictedEgress) { in.Backend = "kubevirt" }, "Windows": func(_ *corev1.Pod, in *RestrictedEgress) { in.OperatingSystem = "windows" },
 		"host PID": func(p *corev1.Pod, _ *RestrictedEgress) { p.Spec.HostPID = true }, "no fsGroup": func(p *corev1.Pod, _ *RestrictedEgress) { p.Spec.SecurityContext.FSGroup = nil },
-		"preset nodeName": func(p *corev1.Pod, _ *RestrictedEgress) { p.Spec.NodeName = "worker" },
+		"preset nodeName":           func(p *corev1.Pod, _ *RestrictedEgress) { p.Spec.NodeName = "worker" },
+		"empty restart policy":      func(p *corev1.Pod, _ *RestrictedEgress) { p.Spec.RestartPolicy = "" },
+		"always restart policy":     func(p *corev1.Pod, _ *RestrictedEgress) { p.Spec.RestartPolicy = corev1.RestartPolicyAlways },
+		"on-failure restart policy": func(p *corev1.Pod, _ *RestrictedEgress) { p.Spec.RestartPolicy = corev1.RestartPolicyOnFailure },
 		"aliased Secret volume": func(p *corev1.Pod, in *RestrictedEgress) {
 			p.Spec.Volumes = append(p.Spec.Volumes, corev1.Volume{Name: "alias", VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{SecretName: in.CredentialSecret}}})
 		},

@@ -25,16 +25,19 @@ import (
 )
 
 const (
-	ForwarderName                 = "egress-forwarder"
-	CredentialVolume              = "egress-client-credentials"
-	ProxyCAVolume                 = "egress-proxy-ca"
-	CredentialMount               = "/var/run/swe-platform/egress/client"
-	ProxyCAMount                  = "/var/run/swe-platform/egress/proxy"
-	ProxyServerCAKey              = "ca.crt"
-	SchedulingGateName            = "egress.swe.dev/identity-ready"
-	ExecutionGenerationAnnotation = "swe.dev/execution-generation"
-	LoopbackPort                  = int32(15001)
-	ForwarderRevision             = "1"
+	ForwarderName                    = "egress-forwarder"
+	CredentialVolume                 = "egress-client-credentials"
+	ProxyCAVolume                    = "egress-proxy-ca"
+	CredentialMount                  = "/var/run/swe-platform/egress/client"
+	ProxyCAMount                     = "/var/run/swe-platform/egress/proxy"
+	ProxyServerCAKey                 = "ca.crt"
+	SchedulingGateName               = "egress.swe.dev/identity-ready"
+	ExecutionGenerationAnnotation    = "swe.dev/execution-generation"
+	PolicyRevisionAnnotation         = "swe.dev/egress-policy-revision"
+	ForwarderRevisionAnnotation      = "swe.dev/egress-forwarder-security-revision"
+	CertificateFingerprintAnnotation = "swe.dev/egress-client-certificate-sha256"
+	LoopbackPort                     = int32(15001)
+	ForwarderRevision                = "1"
 )
 
 type RestrictedEgress struct {
@@ -267,6 +270,9 @@ func validatePreparation(pod *corev1.Pod, in RestrictedEgress) error {
 	if pod.Spec.HostPID || pod.Spec.HostIPC || pod.Spec.HostNetwork || pod.Spec.ShareProcessNamespace != nil && *pod.Spec.ShareProcessNamespace {
 		return errors.New("restricted egress Pod must not use host or shared process namespaces")
 	}
+	if pod.Spec.RestartPolicy != corev1.RestartPolicyNever {
+		return errors.New("restricted egress Pod must use restartPolicy Never")
+	}
 	if pod.Spec.NodeName != "" {
 		return errors.New("restricted egress Pod must be held by the scheduler")
 	}
@@ -294,6 +300,9 @@ func validatePersistedPod(pod *corev1.Pod, in RestrictedEgress) error {
 	}
 	if pod.Spec.HostPID || pod.Spec.HostIPC || pod.Spec.HostNetwork || pod.Spec.ShareProcessNamespace != nil && *pod.Spec.ShareProcessNamespace {
 		return errors.New("persisted Pod uses a forbidden namespace")
+	}
+	if pod.Spec.RestartPolicy != corev1.RestartPolicyNever {
+		return errors.New("persisted Pod can restart within one execution identity")
 	}
 	if pod.Spec.NodeName != "" {
 		return errors.New("persisted Pod bypasses the scheduling gate")

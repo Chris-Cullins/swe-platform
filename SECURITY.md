@@ -138,7 +138,7 @@ selection.
 The operator still rejects every non-empty Project selection and fences any existing Environment
 execution rather than running with unenforced intent. Empty or omitted selections do not restrict
 Environment egress today, which remains subject to cluster network configuration. No policy
-ConfigMap, proxy deployment, identity publication, path forcing, restricted NetworkPolicy, or
+ConfigMap instance, proxy deployment, identity publication, path forcing, restricted NetworkPolicy, or
 enforcement proof is wired; the approved restricted runtime is Calico v3.32.1-only and remains
 later issue #68 work.
 
@@ -146,10 +146,20 @@ The implemented but unreachable identity foundation uses bounded canonical v1 cl
 Installation, Project, Environment, Pod, execution, policy, forwarder, and certificate-fingerprint
 identity. A separate per-execution self-signed ECDSA certificate has ClientAuth usage only; its
 key and trust material are distinct from sandboxd's ServerAuth credential. TLS certificate
-subjects and presented fingerprints are lookup hints, never authorization claims. A future proxy
-authorizer must map the fingerprint to canonical claims, independently repeat exact uncached
-currentness checks, and reject any stale object, execution, policy revision, forwarder revision,
-or fingerprint.
+subjects and presented fingerprints are lookup hints, never authorization claims. The unreachable
+proxy currentness foundation maps the fingerprint to canonical claims, then performs a fresh,
+two-second-bounded proof of the exact Installation, active Namespace claim and sole Project,
+frozen Project-bound ready Environment execution, controlled non-deleting Pod, and live effective
+policy revision. API errors, replacements, malformed or out-of-ceiling policy, and stale
+execution/policy/forwarder/fingerprint values deny and close a per-fingerprint currentness signal
+suitable for future tunnel revocation. The shipped serve command still installs only the deny-all
+authorizer.
+
+The policy library now also validates a future immutable, content-addressed ConfigMap document:
+canonical schema v1, `unrestricted|restricted` mode, bounded ceiling/baseline, digest-qualified
+proxy image, named administrator TLS Secret, and exact Calico v3.32.1 resolver/CIDR bounds for
+restricted mode. The chart creates none of those resources and Helm rendering is not authority;
+runtime authority would be the exact ConfigMap UID plus canonical content.
 
 Kubernetes assigns a Pod UID only after creation. The inert Pod helper therefore adds an
 egress-specific scheduling gate and a required, deliberately absent credential Secret reference

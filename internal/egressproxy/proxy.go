@@ -19,6 +19,9 @@ type Identity = egressidentity.CertificateHint
 type Authorization struct {
 	ExecutionKey, ProjectKey string
 	DeniedPrefixes           []netip.Prefix
+	// Currentness closes after any failed recheck for this certificate
+	// fingerprint. The disabled transport does not yet consume this signal.
+	Currentness <-chan struct{}
 }
 type Authorizer interface {
 	Authorize(context.Context, Identity, string) (Authorization, error)
