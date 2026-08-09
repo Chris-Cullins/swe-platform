@@ -25,6 +25,8 @@ grep -q 'kind get kubeconfig --name "\$KIND_CLUSTER"' "$h"
 grep -q 'active context server or CA differs from exact kind kubeconfig' "$h"
 grep -q 'kubectl() { command kubectl --context "\$CONTEXT"' "$h"
 grep -q 'timeout 8 kubectl --context "\$CONTEXT"' "$h"
+grep -q '\[\[ -z "\$KIND_CONFIG" \]\] || rm -f "\$KIND_CONFIG"' "$h"
+[[ "$(grep -n 'trap cleanup EXIT' "$h" | cut -d: -f1)" -lt "$(grep -n 'gate; require_clean_cluster' "$h" | cut -d: -f1)" ]]
 grep -q 'kubectl delete namespace "\$NS"' "$h"
 [[ "$(grep -c 'command kubectl' "$h")" == 1 ]]
 grep -q 'kind fixture must have one control-plane and two exact eligible v1.35.0 workers' "$h"
@@ -68,7 +70,8 @@ grep -q 'target post-check' "$h"
 ! grep -Rqs 'egress-conformance.sh run' .github/workflows
 
 # Fixture protocol exercises TCP and UDP over both families without Kubernetes.
-python3 -m py_compile hack/egress-conformance-client.py hack/egress-conformance-server.py
+PYTHONPYCACHEPREFIX="$tmp/pycache" python3 -m py_compile hack/egress-conformance-client.py hack/egress-conformance-server.py
+! test -e hack/__pycache__
 python3 hack/egress-conformance-server.py tcp:18443 udp:18444 >"$tmp/server.log" 2>&1 &
 server_pid=$!
 sleep .2

@@ -14,7 +14,9 @@ CALICO_CNI_IMAGE='quay.io/calico/cni:v3.32.1'
 CALICO_CONTROLLERS_IMAGE='quay.io/calico/kube-controllers:v3.32.1'
 KUBERNETES_VERSION=v1.35.0
 MANIFEST=
+KIND_CONFIG=
 CONTEXT=
+FIXTURE_CREATED=false
 
 die() { echo "FAIL: $*" >&2; exit 1; }
 pass() { echo "PASS: $*"; }
@@ -23,7 +25,8 @@ pass() { echo "PASS: $*"; }
 kubectl() { command kubectl --context "$CONTEXT" "$@"; }
 cleanup() {
 	[[ -z "$MANIFEST" ]] || rm -f "$MANIFEST"
-	kubectl delete namespace "$NS" --ignore-not-found --wait=false >/dev/null 2>&1 || true
+	[[ -z "$KIND_CONFIG" ]] || rm -f "$KIND_CONFIG"
+	[[ "$FIXTURE_CREATED" = false ]] || kubectl delete namespace "$NS" --ignore-not-found --wait=false >/dev/null 2>&1 || true
 }
 gate() {
 	[[ "${EGRESS_CONFORMANCE_EXPERIMENTAL:-}" == 1 ]] || die "experimental runner disabled; set EGRESS_CONFORMANCE_EXPERIMENTAL=1"
@@ -33,12 +36,13 @@ gate() {
 	[[ "$CONTEXT" == "kind-$KIND_CLUSTER" ]] || die "expected context is not the exact kind cluster context"
 	kind get clusters | grep -Fxq "$KIND_CLUSTER" || die "expected kind cluster does not exist"
 	[[ "$(kubectl config current-context)" == "$EGRESS_CONFORMANCE_EXPECTED_CONTEXT" ]] || die "kube context mismatch"
-	local kind_config active_config expected_config connection_filter
-	kind_config=$(mktemp)
-	kind get kubeconfig --name "$KIND_CLUSTER" >"$kind_config"
+	local active_config expected_config connection_filter
+	KIND_CONFIG=$(mktemp)
+	kind get kubeconfig --name "$KIND_CLUSTER" >"$KIND_CONFIG"
 	active_config=$(kubectl config view --raw --flatten -o json)
-	expected_config=$(KUBECONFIG="$kind_config" kubectl config view --raw --flatten -o json)
-	rm -f "$kind_config"
+	expected_config=$(KUBECONFIG="$KIND_CONFIG" kubectl config view --raw --flatten -o json)
+	rm -f "$KIND_CONFIG"
+	KIND_CONFIG=
 	connection_filter='. as $root|.contexts[]|select(.name==$ctx)|.context.cluster as $cluster|$root.clusters[]|select(.name==$cluster)|[.cluster.server,.cluster["certificate-authority-data"]]|@tsv'
 	[[ "$(jq -er --arg ctx "$CONTEXT" "$connection_filter" <<<"$active_config")" == "$(jq -er --arg ctx "$CONTEXT" "$connection_filter" <<<"$expected_config")" ]] || die "active context server or CA differs from exact kind kubeconfig"
 	[[ "$(kubectl get namespace kube-system -o jsonpath='{.metadata.uid}')" == "$EGRESS_CONFORMANCE_EXPECTED_CLUSTER_UID" ]] || die "kube-system UID mismatch"
@@ -127,6 +131,7 @@ spec:
 YAML
 }
 create_fixture() {
+	FIXTURE_CREATED=true
 	kubectl create namespace "$NS" >/dev/null
 	for node in "${NODES[@]}"; do
 		local n=${node//./-}
@@ -213,7 +218,8 @@ run_checks() {
 	done
 }
 run() {
-	gate; require_clean_cluster; trap cleanup EXIT
+	trap cleanup EXIT
+	gate; require_clean_cluster
 	install_calico; check_cluster_shape; create_fixture; run_checks
 	check_cluster_shape
 	echo "PASS: all experimental diagnostic checks completed; no reusable proof was produced"
