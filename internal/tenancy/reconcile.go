@@ -73,6 +73,29 @@ func (s *ReconcileScope) Begin(ctx context.Context, namespace string, permitted 
 	return context.WithValue(ctx, mutationLeaseKey{}, lease), claim, nil
 }
 
+// Revalidate proves that the complete claim captured by Begin remains current
+// immediately before a privileged operation outside the Kubernetes client.
+func (s *ReconcileScope) Revalidate(ctx context.Context, namespace string, permitted ...Lifecycle) (Claim, error) {
+	if s == nil || s.Verifier == nil {
+		return Claim{Lifecycle: LifecycleActive}, nil
+	}
+	lease, ok := ctx.Value(mutationLeaseKey{}).(mutationLease)
+	if !ok || lease.fenceOnly || lease.namespace != namespace {
+		return Claim{}, errors.New("tenancy scope refuses operation without a matching reconcile lease")
+	}
+	claim, err := s.Verifier.VerifyNamespace(ctx, namespace)
+	if err != nil {
+		return Claim{}, err
+	}
+	if claim != lease.claim {
+		return Claim{}, fmt.Errorf("%w: Namespace %q claim changed during reconciliation", ErrOutOfScope, namespace)
+	}
+	if !permitsLifecycle(claim.Lifecycle, permitted) {
+		return Claim{}, fmt.Errorf("%w: Namespace %q lifecycle is %s", ErrOutOfScope, namespace, claim.Lifecycle)
+	}
+	return claim, nil
+}
+
 type GuardedClient struct {
 	client.Client
 	Verifier *Verifier

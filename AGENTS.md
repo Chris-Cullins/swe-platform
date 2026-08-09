@@ -201,4 +201,3 @@ commit.**
 ## Safety
 
 - Never commit secrets or tokens.
-- Don't create git commits/pushes unless the maintainer explicitly asks.

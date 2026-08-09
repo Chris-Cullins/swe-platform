@@ -11,8 +11,28 @@ container, and Run-owned agent process launch material—not status, transcripts
 sandboxd's ambient environment, hooks, command arguments, repository URLs, or
 persistent git config. The selected agent and its descendants can read, emit, or
 persist the token; transcript redaction is not guaranteed. Cleanup fences the
-Environment before revocation. GitHub's fixed one-hour maximum expiry bounds a crash
-between issuance and persistence, where no token exists locally to revoke.
+Environment before revocation. Rejected, structurally valid token handles and failed
+active-Secret persistence are first written to a deterministic Secret write-ahead log.
+Its explicit `pending` state is changed with an exact UID/resourceVersion compare-and-swap
+to `complete` only after revocation succeeds or the recorded expiry becomes authoritative;
+completed records are never revoked again. A failure disposition is applied only from a
+completed record, which is retained until the exact failed Run status is durably observed.
+All pending and active cleanup derives repository authority from the exact Run Environment UID
+and its validated, ProjectVerified frozen provisioning snapshot, independently of the live
+Project object. It then proves provider, frozen source, canonical repository, and issuance
+generation where applicable, and otherwise retains both Secret and finalizer
+without provider side effects. Exact active duplicates of a completed WAL record are removed
+with UID/resourceVersion preconditions before the WAL itself can be deleted.
+
+A structurally cleanup-capable token returned with an invalid, absent, or malformed provider
+expiry is retained only as cleanup authority and assigned a conservative local deadline of one
+hour from the single response-validation time; provider expiry outside GitHub's fixed one-hour
+maximum is never trusted. Terminal cleanup during durable rotation accepts only the recorded old
+Secret at target generation minus one or a replacement Secret at the target generation.
+
+Residual exposure is bounded by token expiry if both pending-Secret persistence and the
+immediate fallback revoke fail or have ambiguous outcomes. Issuance response loss can leave
+no locally known handle. GitHub's fixed one-hour maximum expiry bounds these cases.
 
 Repository initialization is split into ordered clone and project-hook init
 containers. After uncached exact Run, Environment, frozen repository, and lease
@@ -199,6 +219,19 @@ association, lifecycle, execution fence, pod, Secret, TLS identity, and exact po
 Idle may queue a bounded wake; hold and Requested suspension do not. Remove/re-add tombstones the
 old locator. Authorization, platform session cookies, and hop-by-hop headers are stripped before
 forwarding; response hop-by-hop headers are filtered. WebSocket upgrades use the same checks.
+
+The control-plane ServiceAccount's ordinary Environment `patch` authority is admission-fenced
+to current UID/current hold-policy, Idle-scoped Terminal or Portal wake intents and the two fixed
+Terminal/Portal activity annotation slots. It cannot use that RBAC grant to change holds,
+suspend requests, services, project/template/backend intent, other metadata, or controller
+bookkeeping. This fail-closed exact-ServiceAccount policy is installed regardless of whether
+portals are enabled; it does not match the distinct operator ServiceAccount.
+API-server field-management bookkeeping (`resourceVersion`, `generation`, and `managedFields`)
+is not frozen because it changes as part of legitimate patches; it cannot change the protected
+business fields.
+Helm rejects an operator ServiceAccount override that collides with the derived control-plane
+ServiceAccount, including when the control plane is disabled, so the exact-identity policy can
+never match legitimate operator writes.
 Environment NetworkPolicy still admits only sandboxd port 50051 from installation-labeled
 operator/control-plane pods; Ingress reaches the control-plane Service, never pods directly.
 
@@ -240,6 +273,13 @@ audience-mismatch results revoke durably and idempotently. TokenReview transport
 `status.error` failures return 503 and retain the session for retry; SAR denial returns 403 and
 also retains it. Every use repeats TokenReview, then exact SAR with the reviewed username, UID,
 groups, and extras, so Kubernetes credential expiry/revocation and RBAC remain authoritative.
+Established terminal WebSockets and transcript SSE connections repeat those checks on their
+existing five- and fifteen-second heartbeat cadences respectively and close on any failure;
+portal tunnels use their separate two-second polling cadence. Each terminal and transcript
+authorization evaluation has a five-second timeout, and each portal lease evaluation has a
+two-second timeout. A transient authorization service failure therefore disconnects an
+established stream without revoking its retained browser session, and the client may reconnect
+and retry.
 Cookie security and same-origin mutation checks remain mandatory.
 
 For rotation, add a uniquely identified key, select it as active, and roll the control plane.
@@ -261,7 +301,10 @@ profiles and malformed or foreign Secret collisions fail closed.
 
 The operator performs uncached, exact-name profile and Secret reads immediately before adapter
 acceptance, copies the key into a short-lived adapter credential, and best-effort clears the
-buffers after the call. The Claude Code adapter sends it only through sandboxd's distinct
+buffers after the call. At the acceptance process-dial boundary it also uncached-revalidates the
+complete active Installation/Namespace/Project claim, so offboarding prevents an already-running
+reconcile from starting new work with launch-only credentials. The Claude Code adapter sends the
+key only through sandboxd's distinct
 `StartWithLaunchMaterial` RPC as `ANTHROPIC_API_KEY`. It never falls back to the ordinary Start
 RPC if an old sandboxd server reports `Unimplemented`. sandboxd validates launch material before
 publishing a process, applies it only to the child environment, and stores and returns only the

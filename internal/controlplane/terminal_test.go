@@ -233,6 +233,50 @@ func TestWebTerminalOpenTimeoutReleasesStreamAndBackend(t *testing.T) {
 	}
 }
 
+func TestWebTerminalClosesWhenLeaseReauthorizationFails(t *testing.T) {
+	backend := &terminalLivenessServer{started: make(chan struct{}), stopped: make(chan struct{})}
+	backendConnection := newTerminalTestConnection(t, backend)
+	access := &fakeAccess{}
+	controlPlane := NewServer(nil, ServerOptions{
+		Access: access,
+		TerminalDialer: &terminalTestDialer{
+			client: sandboxdv1.NewTerminalServiceClient(backendConnection),
+		},
+	})
+	controlPlane.terminalAuthPoll = 10 * time.Millisecond
+	server := httptest.NewServer(controlPlane.Handler())
+	t.Cleanup(server.Close)
+
+	websocketURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/api/v1/namespaces/project-1/environments/env-1/terminal"
+	connection, _, err := websocket.DefaultDialer.Dial(websocketURL, http.Header{"Authorization": []string{"Bearer reader"}, EnvironmentUIDHeader: []string{"env-uid"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = connection.Close() })
+	if err := connection.WriteJSON(terminalControl{Type: "open", Cols: 80, Rows: 24}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-backend.started:
+	case <-time.After(time.Second):
+		t.Fatal("sandboxd terminal stream did not open")
+	}
+
+	access.setError(errForbidden)
+	_ = connection.SetReadDeadline(time.Now().Add(time.Second))
+	if _, _, err := connection.ReadMessage(); err == nil {
+		t.Fatal("terminal WebSocket remained open after authorization revocation")
+	}
+	select {
+	case <-backend.stopped:
+	case <-time.After(time.Second):
+		t.Fatal("sandboxd terminal stream remained open after authorization revocation")
+	}
+	if got := access.callCount(); got < 2 {
+		t.Fatalf("authorization calls = %d, want establishment plus lease check", got)
+	}
+}
+
 func TestWebTerminalValidOpenClearsReadDeadline(t *testing.T) {
 	backend := &terminalIdleServer{opened: make(chan struct{})}
 	backendConnection := newTerminalTestConnection(t, backend)
@@ -1193,6 +1237,9 @@ func TestResolveRunTerminalRequiresExactCurrentAssociation(t *testing.T) {
 		{name: "released claim", runUID: "run-uid", environmentUID: "env-uid", mutate: func(_ *platformv1alpha1.Run, e *platformv1alpha1.Environment) { e.Status.ClaimedBy = nil }, want: errRunTerminalAssociation},
 		{name: "reclaimed by another Run", runUID: "run-uid", environmentUID: "env-uid", mutate: func(_ *platformv1alpha1.Run, e *platformv1alpha1.Environment) {
 			e.Status.ClaimedBy = &platformv1alpha1.RunReference{Name: "other", UID: "other-uid"}
+		}, want: errRunTerminalAssociation},
+		{name: "claimed with foreign controller owner", runUID: "run-uid", environmentUID: "env-uid", mutate: func(_ *platformv1alpha1.Run, e *platformv1alpha1.Environment) {
+			e.OwnerReferences = []metav1.OwnerReference{{APIVersion: platformv1alpha1.GroupVersion.String(), Kind: "Run", Name: "other", UID: "other-uid", Controller: &controller}}
 		}, want: errRunTerminalAssociation},
 		{name: "foreign owner", runUID: "run-uid", environmentUID: "env-uid", mutate: func(r *platformv1alpha1.Run, e *platformv1alpha1.Environment) {
 			r.Status.EnvironmentRef.Ownership = platformv1alpha1.EnvironmentOwnershipOwned

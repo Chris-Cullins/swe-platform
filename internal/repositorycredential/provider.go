@@ -24,8 +24,16 @@ type Credential struct {
 
 type Provider interface {
 	CanonicalRepository(string) (string, error)
+	// Issue returns both a credential and an error only when the credential is
+	// cleanup-capable but must not be delivered.
 	Issue(context.Context, string) (*Credential, error)
 	Revoke(context.Context, *Credential) error
+}
+
+// Canonicalizer is the stateless provider identity operation needed even when
+// issuance and revocation are disabled.
+type Canonicalizer interface {
+	CanonicalRepository(string) (string, error)
 }
 
 type Error struct {

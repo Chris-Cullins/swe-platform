@@ -41,6 +41,7 @@ const (
 	portalAdmissionTimeout         = 2 * time.Minute
 	portalAdmissionHeartbeat       = time.Second
 	portalLeasePollInterval        = 2 * time.Second
+	portalLeaseCheckTimeout        = 2 * time.Second
 )
 
 // PortalResolver is the narrow durable route authority used by the gateway.
@@ -1009,9 +1010,12 @@ func (g *portalGateway) revalidatePortalLease(ctx context.Context, request *http
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
+			checkContext, cancel := context.WithTimeout(ctx, portalLeaseCheckTimeout)
 			var env platformv1alpha1.Environment
-			authRequest := request.Clone(ctx)
-			if g.resolver.Get(ctx, key, &env) != nil || fence.Validate(&env) != nil || !snapshot.Matches(&env) || portalPolicyError(&env) != nil || !env.DeletionTimestamp.IsZero() || !activeExactRoute(&env, route) || g.authorize(authRequest, env.Namespace, env.Name, route.Name, &env) != nil || lifecycle.RecordActivity(ctx, g.resolver, fence, platformv1alpha1.EnvironmentActivitySourcePortal, fmt.Sprintf("portal/lease/%d", time.Now().UnixNano())) != nil {
+			authRequest := request.Clone(checkContext)
+			invalid := g.resolver.Get(checkContext, key, &env) != nil || fence.Validate(&env) != nil || !snapshot.Matches(&env) || portalPolicyError(&env) != nil || !env.DeletionTimestamp.IsZero() || !activeExactRoute(&env, route) || g.authorize(authRequest, env.Namespace, env.Name, route.Name, &env) != nil || lifecycle.RecordActivity(checkContext, g.resolver, fence, platformv1alpha1.EnvironmentActivitySourcePortal, fmt.Sprintf("portal/lease/%d", time.Now().UnixNano())) != nil
+			cancel()
+			if invalid {
 				_ = conn.Close()
 				return
 			}

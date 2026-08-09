@@ -81,6 +81,13 @@ func canonical(repository string) (string, string, string, error) {
 }
 
 func (p *Provider) CanonicalRepository(repository string) (string, error) {
+	return Canonicalizer{}.CanonicalRepository(repository)
+}
+
+// Canonicalizer performs no I/O and holds no provider credentials.
+type Canonicalizer struct{}
+
+func (Canonicalizer) CanonicalRepository(repository string) (string, error) {
 	canonicalURL, _, _, err := canonical(repository)
 	if err != nil {
 		return "", &repositorycredential.Error{Operation: "repository", Reason: "RepositoryUnsupported"}
@@ -198,7 +205,7 @@ func (p *Provider) Issue(ctx context.Context, repository string) (*repositorycre
 	}
 	var token struct {
 		Token               string            `json:"token"`
-		ExpiresAt           time.Time         `json:"expires_at"`
+		ExpiresAt           json.RawMessage   `json:"expires_at"`
 		RepositorySelection string            `json:"repository_selection"`
 		Permissions         map[string]string `json:"permissions"`
 		Repositories        []struct {
@@ -209,6 +216,15 @@ func (p *Provider) Issue(ctx context.Context, repository string) (*repositorycre
 	if err = p.request(ctx, http.MethodPost, fmt.Sprintf("/app/installations/%d/access_tokens", installation.ID), j, body, &token); err != nil {
 		return nil, err
 	}
+	cleanupNow := p.Now()
+	cleanupDeadline := cleanupNow.Add(time.Hour)
+	var expiresAt time.Time
+	var expiresText string
+	expiryTrusted := json.Unmarshal(token.ExpiresAt, &expiresText) == nil
+	if expiryTrusted {
+		expiresAt, err = time.Parse(time.RFC3339Nano, expiresText)
+		expiryTrusted = err == nil && expiresAt.After(cleanupNow.Add(repositorycredential.MinimumValidity)) && !expiresAt.After(cleanupDeadline)
+	}
 	validPermissions := len(token.Permissions) >= 1 && len(token.Permissions) <= 2 && token.Permissions["contents"] == "write"
 	for name, access := range token.Permissions {
 		if name != "contents" && (name != "metadata" || access != "read") {
@@ -216,10 +232,17 @@ func (p *Provider) Issue(ctx context.Context, repository string) (*repositorycre
 		}
 	}
 	validRepositories := len(token.Repositories) == 0 || len(token.Repositories) == 1 && strings.EqualFold(token.Repositories[0].FullName, owner+"/"+repo)
-	if token.Token == "" || len(token.Token) > repositorycredential.MaxTokenBytes || strings.IndexByte(token.Token, 0) >= 0 || !token.ExpiresAt.After(p.Now().Add(repositorycredential.MinimumValidity)) || token.RepositorySelection != "selected" || !validPermissions || !validRepositories {
+	credential := &repositorycredential.Credential{Token: []byte(token.Token), Repository: canonicalURL, InstallationID: installation.ID, ExpiresAt: cleanupDeadline}
+	if token.Token == "" || len(token.Token) > repositorycredential.MaxTokenBytes || strings.ContainsAny(token.Token, "\x00\r\n") {
 		return nil, &repositorycredential.Error{Operation: "token", Reason: "ProviderInvalidToken"}
 	}
-	return &repositorycredential.Credential{Token: []byte(token.Token), Repository: canonicalURL, InstallationID: installation.ID, ExpiresAt: token.ExpiresAt}, nil
+	if expiryTrusted {
+		credential.ExpiresAt = expiresAt
+	}
+	if !expiryTrusted || token.RepositorySelection != "selected" || !validPermissions || !validRepositories {
+		return credential, &repositorycredential.Error{Operation: "token", Reason: "ProviderInvalidToken"}
+	}
+	return credential, nil
 }
 
 func (p *Provider) Revoke(ctx context.Context, credential *repositorycredential.Credential) error {

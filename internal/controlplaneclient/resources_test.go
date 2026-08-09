@@ -107,6 +107,66 @@ func TestResourceClientAlwaysSendsCancelUIDPrecondition(t *testing.T) {
 	}
 }
 
+func TestResourceClientGetRunExactValidatesLocallyAndResponseIdentity(t *testing.T) {
+	requests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		if r.Header.Get(controlplane.RunUIDHeader) != "stale-uid" {
+			t.Errorf("Run UID header = %q", r.Header.Get(controlplane.RunUIDHeader))
+		}
+		w.Header().Set("Content-Type", "application/json")
+		writeTestRun(w, "run", false)
+	}))
+	defer server.Close()
+	client, _ := New(server.URL, "token", server.Client())
+	if _, err := client.GetRunExact(context.Background(), "ns", "run", " "); err == nil || requests != 0 {
+		t.Fatalf("blank exact error/requests = %v/%d", err, requests)
+	}
+	if _, err := client.GetRunExact(context.Background(), "ns", "run", "stale-uid"); !errors.Is(err, ErrRunIdentityMismatch) || !strings.Contains(err.Error(), `returned Run UID "uid-one"`) || requests != 1 {
+		t.Fatalf("mismatch error/requests = %v/%d", err, requests)
+	}
+}
+
+func TestResourceClientGetEnvironmentExactValidatesLocallyAndResponseIdentity(t *testing.T) {
+	requests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		requests++
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"name":"env","uid":"replacement-uid","createdAt":"2026-07-24T00:00:00Z"}`)
+	}))
+	defer server.Close()
+	client, _ := New(server.URL, "token", server.Client())
+	if _, err := client.GetEnvironmentExact(context.Background(), "ns", "env", " "); err == nil || requests != 0 {
+		t.Fatalf("blank exact error/requests = %v/%d", err, requests)
+	}
+	if _, err := client.GetEnvironmentExact(context.Background(), "ns", "env", "expected-uid"); !errors.Is(err, ErrEnvironmentIdentityMismatch) || !strings.Contains(err.Error(), `returned Environment UID "replacement-uid"`) || requests != 1 {
+		t.Fatalf("mismatch error/requests = %v/%d", err, requests)
+	}
+}
+
+func TestRetryableResourceErrorClassifiesOnlyTransportAndRetryableStatus(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{name: "transport", err: &url.Error{Op: "Get", URL: "https://control-plane", Err: errors.New("network unavailable")}, want: true},
+		{name: "request timeout", err: &ProblemError{Problem: Problem{Status: http.StatusRequestTimeout}}, want: true},
+		{name: "rate limited", err: &ProblemError{Problem: Problem{Status: http.StatusTooManyRequests}}, want: true},
+		{name: "unavailable", err: &ProblemError{Problem: Problem{Status: http.StatusServiceUnavailable}}, want: true},
+		{name: "conflict", err: &ProblemError{Problem: Problem{Status: http.StatusConflict}}},
+		{name: "decode", err: errors.New("invalid JSON")},
+		{name: "canceled transport", err: &url.Error{Op: "Get", URL: "https://control-plane", Err: context.Canceled}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := RetryableResourceError(test.err); got != test.want {
+				t.Fatalf("RetryableResourceError(%v) = %t, want %t", test.err, got, test.want)
+			}
+		})
+	}
+}
+
 func TestResourceClientSurfacesAPIStatusesWithoutCredentialDisclosure(t *testing.T) {
 	statuses := []int{http.StatusUnauthorized, http.StatusForbidden, http.StatusConflict, http.StatusServiceUnavailable}
 	for _, status := range statuses {

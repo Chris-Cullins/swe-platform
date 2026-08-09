@@ -7,6 +7,38 @@ export class ApiProblem extends Error {
   }
 }
 
+export class ResourceIdentityMismatch extends Error {
+  constructor(resource: 'Run' | 'Environment') {
+    super(`Control plane returned a different ${resource} identity`)
+    this.name = 'ResourceIdentityMismatch'
+  }
+}
+
+export class ResourceTransportError extends Error {
+  constructor(cause: unknown) {
+    super(cause instanceof Error ? cause.message : 'Resource transport failed', { cause })
+    this.name = 'ResourceTransportError'
+  }
+}
+
+export function terminalRunIdentityError(error: unknown) {
+  return error instanceof ResourceIdentityMismatch || error instanceof ApiProblem && (error.status === 404 || error.status === 409)
+}
+
+export function terminalEnvironmentIdentityError(error: unknown) {
+  return error instanceof ResourceIdentityMismatch || error instanceof ApiProblem && error.status === 404
+}
+
+export function transientResourceError(error: unknown) {
+  if (error instanceof ResourceTransportError) return true
+  if (error instanceof ApiProblem) return error.status === 408 || error.status === 429 || error.status >= 500
+  return false
+}
+
+export function retryTransientResourceError(failureCount: number, error: unknown) {
+  return transientResourceError(error) && failureCount < 2
+}
+
 type UnauthorizedListener = () => void
 const unauthorizedListeners = new Set<UnauthorizedListener>()
 export const onUnauthorized = (listener: UnauthorizedListener) => {
@@ -36,7 +68,13 @@ async function request<T>(path: string, init: RequestInit = {}, options?: { toke
   const headers = new Headers(init.headers)
   if (init.body !== undefined) headers.set('Content-Type', 'application/json')
   if (options?.token !== undefined) headers.set('Authorization', `Bearer ${options.token}`)
-  const response = await fetch(path, { ...init, headers, credentials: 'same-origin' })
+  let response: Response
+  try {
+    response = await fetch(path, { ...init, headers, credentials: 'same-origin' })
+  } catch (error) {
+    if (error instanceof DOMException && error.name === 'AbortError') throw error
+    throw new ResourceTransportError(error)
+  }
   if (!response.ok) {
     let body: unknown
     try { body = await response.json() } catch { body = undefined }
@@ -82,9 +120,19 @@ export const api = {
     })
   },
   run: (namespace: string, name: string, signal?: AbortSignal) => request<Run>(`${base(namespace)}/runs/${encodeURIComponent(name)}`, { signal }),
+  runExact: async (namespace: string, name: string, runUID: string, signal?: AbortSignal) => {
+    const run = await request<Run>(`${base(namespace)}/runs/${encodeURIComponent(name)}`, { headers: { 'SWE-Run-UID': runUID }, signal })
+    if (run.uid !== runUID) throw new ResourceIdentityMismatch('Run')
+    return run
+  },
   createRun: (namespace: string, value: CreateRun) => request<Run>(`${base(namespace)}/runs`, { method: 'POST', body: JSON.stringify(value) }),
   cancelRun: (namespace: string, name: string, runUID: string) => request<Run>(`${base(namespace)}/runs/${encodeURIComponent(name)}/cancel`, { method: 'POST', body: JSON.stringify({ runUID }) }),
   environment: (namespace: string, name: string) => request<Environment>(`${base(namespace)}/environments/${encodeURIComponent(name)}`),
+  environmentExact: async (namespace: string, name: string, environmentUID: string, signal?: AbortSignal) => {
+    const environment = await request<Environment>(`${base(namespace)}/environments/${encodeURIComponent(name)}`, { signal })
+    if (environment.uid !== environmentUID) throw new ResourceIdentityMismatch('Environment')
+    return environment
+  },
   portals: (namespace: string, run: string, runUID: string, environmentUID: string) => request<PortalServiceList>(`${base(namespace)}/runs/${encodeURIComponent(run)}/portals/${encodeURIComponent(runUID)}/${encodeURIComponent(environmentUID)}`),
   transcriptUrl: (namespace: string, name: string) => `${base(namespace)}/runs/${encodeURIComponent(name)}/transcript`,
   transcript: async (namespace: string, name: string, runUID: string, signal: AbortSignal, lastEventID?: string) => {
@@ -120,7 +168,9 @@ export const fallbackPollInterval = 4000
 export const queryKeys = {
   session: ['session'] as const,
   runs: (namespace: string) => ['runs', namespace] as const,
-  run: (namespace: string, name: string) => ['run', namespace, name] as const,
-  environment: (namespace: string, name: string) => ['environment', namespace, name] as const,
+  runPrefix: (namespace: string, name: string) => ['run', namespace, name] as const,
+  run: (namespace: string, name: string, uid: string) => ['run', namespace, name, uid] as const,
+  runBootstrap: (namespace: string, name: string, request: string) => ['run-bootstrap', namespace, name, request] as const,
+  environment: (namespace: string, name: string, uid: string) => ['environment', namespace, name, uid] as const,
   portals: (namespace: string, run: string, runUID: string, environmentUID: string) => ['portals', namespace, run, runUID, environmentUID] as const,
 }

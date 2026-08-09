@@ -844,6 +844,7 @@ EOF
 CONTROL_PLANE_SA_TOKEN=$(kubectl -n "$SYSTEM_NAMESPACE" create token "$CONTROL_PLANE_SA" --duration=10m)
 KUBE_API=$(kubectl config view --raw --minify -o jsonpath='{.clusters[0].cluster.server}')
 STATUS_URL="$KUBE_API/apis/swe.dev/v1alpha1/namespaces/${PROJECT_NAMESPACE}/environments/${STATUS_POLICY_PROBE}/status?dryRun=All"
+ENVIRONMENT_URL="$KUBE_API/apis/swe.dev/v1alpha1/namespaces/${PROJECT_NAMESPACE}/environments/${STATUS_POLICY_PROBE}?dryRun=All"
 for _ in {1..5}; do
 	kubectl -n "$PROJECT_NAMESPACE" get environment "$STATUS_POLICY_PROBE" -o json |
 		jq '.status.phase="Failed"' >/tmp/swe-e2e-status-policy-probe.json
@@ -853,9 +854,56 @@ for _ in {1..5}; do
 		-X PUT --data-binary @/tmp/swe-e2e-status-policy-probe.json "$STATUS_URL")
 	[[ "$STATUS_PATCH_CODE" == "409" ]] || break
 done
-unset CONTROL_PLANE_SA_TOKEN
 if [[ "$STATUS_PATCH_CODE" != "422" ]] || ! grep -q 'portal gateway may not change status.phase' /tmp/swe-e2e-status-policy.out; then
 	echo "FAIL: control-plane bearer-token non-portal status update returned $STATUS_PATCH_CODE without the field fence"
+	cat /tmp/swe-e2e-status-policy.out
+	exit 1
+fi
+ENVIRONMENT_PATCH_CODE=$(curl --silent --output /tmp/swe-e2e-environment-policy.out --write-out '%{http_code}' \
+	--cacert <(kubectl config view --raw --minify -o jsonpath='{.clusters[0].cluster.certificate-authority-data}' | base64 --decode) \
+	-H "Authorization: Bearer ${CONTROL_PLANE_SA_TOKEN}" -H 'Content-Type: application/merge-patch+json' \
+	-X PATCH --data-binary '{"spec":{"paused":true}}' "$ENVIRONMENT_URL")
+if [[ "$ENVIRONMENT_PATCH_CODE" != "422" ]] || ! grep -q 'control plane may not change spec.paused' /tmp/swe-e2e-environment-policy.out; then
+	echo "FAIL: control-plane bearer-token unauthorized Environment intent patch returned $ENVIRONMENT_PATCH_CODE without the field fence"
+	cat /tmp/swe-e2e-environment-policy.out
+	exit 1
+fi
+ENVIRONMENT_METADATA_CODE=$(curl --silent --output /tmp/swe-e2e-environment-metadata.out --write-out '%{http_code}' \
+	--cacert <(kubectl config view --raw --minify -o jsonpath='{.clusters[0].cluster.certificate-authority-data}' | base64 --decode) \
+	-H "Authorization: Bearer ${CONTROL_PLANE_SA_TOKEN}" -H 'Content-Type: application/merge-patch+json' \
+	-X PATCH --data-binary '{"metadata":{"generateName":"forbidden-"}}' "$ENVIRONMENT_URL")
+if [[ "$ENVIRONMENT_METADATA_CODE" != "422" ]] || ! grep -q 'control plane may not change metadata.generateName' /tmp/swe-e2e-environment-metadata.out; then
+	echo "FAIL: control-plane bearer-token unauthorized Environment metadata patch returned $ENVIRONMENT_METADATA_CODE without the field fence"
+	cat /tmp/swe-e2e-environment-metadata.out
+	exit 1
+fi
+STATUS_POLICY_PROBE_UID=$(kubectl -n "$PROJECT_NAMESPACE" get environment "$STATUS_POLICY_PROBE" -o jsonpath='{.metadata.uid}')
+ENVIRONMENT_WAKE_CODE=$(curl --silent --output /tmp/swe-e2e-environment-wake.out --write-out '%{http_code}' \
+	--cacert <(kubectl config view --raw --minify -o jsonpath='{.clusters[0].cluster.certificate-authority-data}' | base64 --decode) \
+	-H "Authorization: Bearer ${CONTROL_PLANE_SA_TOKEN}" -H 'Content-Type: application/merge-patch+json' \
+	-X PATCH --data-binary "{\"spec\":{\"lifecycle\":{\"wake\":{\"id\":\"portal/wake/1\",\"environmentUID\":\"${STATUS_POLICY_PROBE_UID}\",\"holdPolicyRevision\":1,\"expectedSuspensionReason\":\"Idle\"}}}}" "$ENVIRONMENT_URL")
+if [[ "$ENVIRONMENT_WAKE_CODE" != "200" ]]; then
+	echo "FAIL: control-plane bearer-token bounded Environment wake dry run returned $ENVIRONMENT_WAKE_CODE"
+	cat /tmp/swe-e2e-environment-wake.out
+	exit 1
+fi
+unset CONTROL_PLANE_SA_TOKEN
+OPERATOR_SA_TOKEN=$(kubectl -n "$SYSTEM_NAMESPACE" create token "$INSTALLATION_NAME" --duration=10m)
+for _ in {1..5}; do
+	kubectl -n "$PROJECT_NAMESPACE" get environment "$STATUS_POLICY_PROBE" -o json |
+		jq '.status.nextPortalRouteGeneration=1 | .status.portalRoutes=[{
+			name:"web", presentationID:"0123456789abcdef", declarationInstanceID:"abcdefghijklmnopqrst",
+			declarationRevision:1, locator:"abcdefghijklmnopqrst", generation:1, active:false
+		}]' >/tmp/swe-e2e-status-policy-probe.json
+	STATUS_PATCH_CODE=$(curl --silent --output /tmp/swe-e2e-status-policy.out --write-out '%{http_code}' \
+		--cacert <(kubectl config view --raw --minify -o jsonpath='{.clusters[0].cluster.certificate-authority-data}' | base64 --decode) \
+		-H "Authorization: Bearer ${OPERATOR_SA_TOKEN}" -H 'Content-Type: application/json' \
+		-X PUT --data-binary @/tmp/swe-e2e-status-policy-probe.json "$STATUS_URL")
+	[[ "$STATUS_PATCH_CODE" == "409" ]] || break
+done
+unset OPERATOR_SA_TOKEN
+if [[ "$STATUS_PATCH_CODE" != "422" ]] || ! grep -q 'operator may not change gateway-owned status.portalRoutes' /tmp/swe-e2e-status-policy.out; then
+	echo "FAIL: operator bearer-token portal status update returned $STATUS_PATCH_CODE without the reciprocal field fence"
 	cat /tmp/swe-e2e-status-policy.out
 	exit 1
 fi

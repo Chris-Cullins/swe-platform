@@ -471,12 +471,15 @@ func (s *PostgresTranscriptStore) pollBatch(ctx context.Context, run RunIdentity
 		return nil, 0, 0, err
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
+	var databaseNamespaceUID *string
 	var databaseHighWater int64
-	err = tx.QueryRow(ctx, `SELECT high_water FROM transcript_runs WHERE namespace = $1 AND namespace_uid = $2 AND run_uid = $3`, run.Namespace, string(run.NamespaceUID), string(run.UID)).Scan(&databaseHighWater)
+	err = tx.QueryRow(ctx, `SELECT namespace_uid, high_water FROM transcript_runs WHERE namespace = $1 AND run_uid = $2`, run.Namespace, string(run.UID)).Scan(&databaseNamespaceUID, &databaseHighWater)
 	if errors.Is(err, pgx.ErrNoRows) {
 		databaseHighWater = 0
 	} else if err != nil {
 		return nil, 0, 0, err
+	} else if databaseNamespaceUID == nil || *databaseNamespaceUID != string(run.NamespaceUID) {
+		return nil, 0, 0, ErrTranscriptIdentity
 	}
 	highWater := uint64(databaseHighWater)
 	earliest := highWater + 1

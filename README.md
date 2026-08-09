@@ -148,6 +148,9 @@ Run states are observable milestones: `Allocating`, `EnvironmentReady`,
 `AdapterAccepted`, `Running`, `NeedsInput`, `Paused`, and terminal `Succeeded`, `Failed`,
 or `Cancelled`. Conditions additionally report environment readiness, a durable adapter
 acceptance-attempt marker written before the acceptance RPC, and confirmed adapter acceptance.
+Normalized adapter observation condition reasons and messages use fixed platform vocabulary and
+contain no process, provider, result, or transcript bytes; detailed agent output remains in the
+adapter-owned opaque transcript.
 The EnvironmentReady condition tracks the allocation independently from terminal task outcome;
 it remains true for an adapter failure while sandboxd is reachable and becomes false after the
 allocation is released, lost, paused, or fenced. The attempt marker makes cancellation
@@ -692,6 +695,12 @@ payload, and retention gaps are displayed generically; adapter-owned payloads ar
 a common event schema. Both native and browser consoles show terminal navigation only when the
 Run API returns `terminalAvailable` with an exact `environment.uid`; reconnects and component
 remounts retain that same Run and Environment identity and never follow same-name replacements.
+Ordinary Run detail GET remains a current-name read for compatibility. Clients that selected a
+Run from a list or create response send its immutable UID in `SWE-Run-UID`; a stale UID conflicts
+instead of returning a same-name replacement. Detail identity conflicts and deletion are terminal
+for that selection: consoles do not automatically refetch until the user explicitly selects again.
+For name-only browser deep links, the ordinary GET discovers only a UID; the console does not cache
+or render its Run fields or mount child controls until a second, exact GET confirms that identity.
 
 For a non-interactive authentication/connectivity check (including CI), use `swe tui --check`.
 It validates namespaced Run-list access without starting a terminal UI or printing credentials.

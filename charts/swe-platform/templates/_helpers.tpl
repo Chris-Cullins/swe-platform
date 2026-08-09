@@ -26,6 +26,18 @@
 {{- printf "%s-control-plane" (include "swe-platform.clusterFullname" . | trunc 49 | trimSuffix "-") -}}
 {{- end }}
 
+{{- define "swe-platform.controlPlaneEnvIntentFullname" -}}
+{{- printf "%s-%s-control-plane-env-intent" (include "swe-platform.fullname" . | trunc 29 | trimSuffix "-") (sha256sum .Release.Namespace | trunc 8) -}}
+{{- end }}
+
+{{- define "swe-platform.controlPlanePortalStatusFullname" -}}
+{{- printf "%s-%s-control-plane-portal-status" (include "swe-platform.fullname" . | trunc 26 | trimSuffix "-") (sha256sum .Release.Namespace | trunc 8) -}}
+{{- end }}
+
+{{- define "swe-platform.operatorPortalStatusFullname" -}}
+{{- printf "%s-%s-operator-status" (include "swe-platform.fullname" . | trunc 37 | trimSuffix "-") (sha256sum .Release.Namespace | trunc 8) -}}
+{{- end }}
+
 {{- define "swe-platform.labels" -}}
 helm.sh/chart: {{ printf "%s-%s" .Chart.Name .Chart.Version | replace "+" "_" }}
 app.kubernetes.io/name: {{ include "swe-platform.name" . }}

@@ -24,6 +24,7 @@ import (
 const (
 	namespacedPathPrefix               = "/api/v1/namespaces/"
 	defaultTranscriptHeartbeatInterval = 15 * time.Second
+	streamAuthorizationTimeout         = 5 * time.Second
 )
 
 type appendTranscriptRequest struct {
@@ -47,6 +48,7 @@ type Server struct {
 	trustProxy            bool
 	allowInsecureSessions bool
 	heartbeat             time.Duration
+	terminalAuthPoll      time.Duration
 	streams               context.Context
 	watchAdmission        *watchAdmission
 	terminalOpenTimeout   time.Duration
@@ -124,6 +126,7 @@ func NewServer(log *slog.Logger, options ServerOptions) *Server {
 		trustProxy:            options.TrustProxy,
 		allowInsecureSessions: options.AllowInsecureSessions,
 		heartbeat:             heartbeat,
+		terminalAuthPoll:      terminalPolicyPollInterval,
 		streams:               streams,
 		watchAdmission:        processWatchAdmission,
 		terminalOpenTimeout:   terminalHandshakeTimeout,
@@ -405,7 +408,7 @@ func (s *Server) handleTranscript(w http.ResponseWriter, r *http.Request, namesp
 
 	switch r.Method {
 	case http.MethodGet:
-		s.streamTranscript(w, r, identity)
+		s.streamTranscript(w, r, identity, ResourceAccess{Namespace: namespace, Verb: "get", Resource: "runs", Subresource: "transcript", Name: run})
 	case http.MethodPost:
 		s.appendTranscript(w, r, identity)
 	}
@@ -495,13 +498,44 @@ func (s *Server) appendTranscript(w http.ResponseWriter, r *http.Request, run Ru
 	_ = json.NewEncoder(w).Encode(result.Event)
 }
 
-func (s *Server) streamTranscript(w http.ResponseWriter, r *http.Request, run RunIdentity) {
+func (s *Server) streamTranscript(w http.ResponseWriter, r *http.Request, run RunIdentity, authorization ResourceAccess) {
 	if s.store == nil {
 		http.Error(w, "transcript store is unavailable", http.StatusServiceUnavailable)
 		return
 	}
 	r, cancelStream := s.withStreamLifecycle(r)
 	defer cancelStream()
+	authorizationDeadline := time.Now().Add(s.heartbeat)
+	reauthorize := func() error {
+		timeout := streamAuthorizationTimeout
+		if s.heartbeat < timeout {
+			timeout = s.heartbeat
+		}
+		authContext, cancel := context.WithTimeout(r.Context(), timeout)
+		defer cancel()
+		authRequest := r.Clone(authContext)
+		if err := s.access.Authorize(authRequest, authorization, true); err != nil {
+			return err
+		}
+		if namespaceUIDFromRequest(authRequest) != run.NamespaceUID {
+			return ErrTranscriptIdentity
+		}
+		uid, err := s.runs.ResolveRun(authContext, run.Namespace, authorization.Name)
+		if err != nil {
+			return err
+		}
+		if uid != run.UID {
+			return ErrTranscriptIdentity
+		}
+		authorizationDeadline = time.Now().Add(s.heartbeat)
+		return nil
+	}
+	ensureAuthorization := func() error {
+		if time.Now().Before(authorizationDeadline) {
+			return nil
+		}
+		return reauthorize()
+	}
 	cursor := r.Header.Get("Last-Event-ID")
 	if cursor == "" {
 		cursor = r.URL.Query().Get("after")
@@ -529,7 +563,11 @@ func (s *Server) streamTranscript(w http.ResponseWriter, r *http.Request, run Ru
 
 	controller := http.NewResponseController(w)
 	write := func(payload string) error {
-		if err := controller.SetWriteDeadline(time.Now().Add(15 * time.Second)); err != nil && !errors.Is(err, http.ErrNotSupported) {
+		writeDeadline := time.Now().Add(15 * time.Second)
+		if authorizationDeadline.Before(writeDeadline) {
+			writeDeadline = authorizationDeadline
+		}
+		if err := controller.SetWriteDeadline(writeDeadline); err != nil && !errors.Is(err, http.ErrNotSupported) {
 			return err
 		}
 		if _, err := io.WriteString(w, payload); err != nil {
@@ -544,6 +582,9 @@ func (s *Server) streamTranscript(w http.ResponseWriter, r *http.Request, run Ru
 		return nil
 	}
 	writeEvent := func(event TranscriptEvent) error {
+		if err := ensureAuthorization(); err != nil {
+			return err
+		}
 		payload, err := json.Marshal(event)
 		if err != nil {
 			return err
@@ -554,6 +595,9 @@ func (s *Server) streamTranscript(w http.ResponseWriter, r *http.Request, run Ru
 		return nil
 	}
 	if subscription.Gap != nil {
+		if err := ensureAuthorization(); err != nil {
+			return
+		}
 		payload, marshalErr := json.Marshal(subscription.Gap)
 		if marshalErr != nil {
 			s.metrics.observeDelivery("gap", "error", nil)
@@ -577,26 +621,39 @@ func (s *Server) streamTranscript(w http.ResponseWriter, r *http.Request, run Ru
 	if err := controller.Flush(); err != nil {
 		return
 	}
-	heartbeats := time.NewTicker(s.heartbeat)
-	defer heartbeats.Stop()
-
 	for {
+		if err := ensureAuthorization(); err != nil {
+			return
+		}
+		authorizationTimer := time.NewTimer(time.Until(authorizationDeadline))
 		select {
 		case event := <-subscription.Events:
+			if !authorizationTimer.Stop() {
+				<-authorizationTimer.C
+			}
 			if err := writeEvent(event); err != nil {
 				s.metrics.observeDelivery("live", "error", nil)
 				return
 			}
 			s.metrics.observeDelivery("live", "delivered", &event)
 		case <-subscription.Dropped:
+			if !authorizationTimer.Stop() {
+				<-authorizationTimer.C
+			}
 			s.metrics.observeDelivery("live", "dropped", nil)
 			s.log.Warn("closing dropped transcript subscriber", "namespace", run.Namespace, "runUID", run.UID)
 			return
-		case <-heartbeats.C:
+		case <-authorizationTimer.C:
+			if err := reauthorize(); err != nil {
+				return
+			}
 			if err := write(": ping\n\n"); err != nil {
 				return
 			}
 		case <-r.Context().Done():
+			if !authorizationTimer.Stop() {
+				<-authorizationTimer.C
+			}
 			return
 		}
 	}

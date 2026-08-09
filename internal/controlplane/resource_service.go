@@ -38,6 +38,7 @@ type ResourceService interface {
 	CreateRun(ctx context.Context, namespace string, request CreateRunRequest) (Run, error)
 	ResolveRunCreateCollision(ctx context.Context, namespace string, request CreateRunRequest) (Run, error)
 	GetRun(ctx context.Context, namespace, name string) (Run, error)
+	GetRunExact(ctx context.Context, namespace, name, expectedUID string) (Run, error)
 	CancelRun(ctx context.Context, namespace, name, expectedUID string) (Run, error)
 	GetEnvironment(ctx context.Context, namespace, name string) (Environment, error)
 	ResolveRunTerminal(ctx context.Context, namespace, name, expectedRunUID, expectedEnvironmentUID string) (RunTerminalAssociation, error)
@@ -121,9 +122,26 @@ func (s *KubernetesResourceService) ResolveRunCreateCollision(ctx context.Contex
 }
 
 func (s *KubernetesResourceService) GetRun(ctx context.Context, namespace, name string) (Run, error) {
+	return s.getRun(ctx, namespace, name, "")
+}
+
+func (s *KubernetesResourceService) GetRunExact(ctx context.Context, namespace, name, expectedUID string) (Run, error) {
+	if expectedUID == "" {
+		return Run{}, errRunUIDRequired
+	}
+	if len(expectedUID) > maxRunUIDLength {
+		return Run{}, errRunUIDTooLong
+	}
+	return s.getRun(ctx, namespace, name, expectedUID)
+}
+
+func (s *KubernetesResourceService) getRun(ctx context.Context, namespace, name, expectedUID string) (Run, error) {
 	var run platformv1alpha1.Run
 	if err := s.Client.Get(ctx, types.NamespacedName{Namespace: namespace, Name: name}, &run); err != nil {
 		return Run{}, err
+	}
+	if expectedUID != "" && string(run.UID) != expectedUID {
+		return Run{}, errRunUIDConflict
 	}
 	result := runDTO(&run)
 	if run.Status.EnvironmentRef != nil {
@@ -241,7 +259,7 @@ func runOwnsOrClaimsEnvironment(run *platformv1alpha1.Run, environment *platform
 	}
 	switch run.Status.EnvironmentRef.Ownership {
 	case platformv1alpha1.EnvironmentOwnershipClaimed:
-		return environment.Status.ClaimedBy != nil && environment.Status.ClaimedBy.Name == run.Name && environment.Status.ClaimedBy.UID == run.UID
+		return metav1.GetControllerOf(environment) == nil && environment.Status.ClaimedBy != nil && environment.Status.ClaimedBy.Name == run.Name && environment.Status.ClaimedBy.UID == run.UID
 	case platformv1alpha1.EnvironmentOwnershipOwned:
 		owner := metav1.GetControllerOf(environment)
 		return owner != nil && owner.APIVersion == platformv1alpha1.GroupVersion.String() && owner.Kind == "Run" && owner.Name == run.Name && owner.UID == run.UID

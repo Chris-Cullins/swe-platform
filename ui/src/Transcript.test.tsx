@@ -1,7 +1,7 @@
 import { act, render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { Transcript } from './Transcript'
+import { SSEFramer, Transcript } from './Transcript'
 import { MAX_TRANSCRIPT_ITEMS } from './TranscriptTimeline'
 
 const reducerCalls = vi.hoisted(() => vi.fn())
@@ -238,6 +238,129 @@ describe('Transcript', () => {
     await waitFor(() => expect(screen.getByRole('status')).toHaveTextContent('Transcript event exceeds'))
     expect(stream.cancel).toHaveBeenCalledOnce()
     expect(Events.instances).toHaveLength(1)
+  })
+
+  it('accepts an exact byte-limit frame body and rejects one byte over', async () => {
+    mockStreams()
+    render(<Transcript namespace="n" run="limit" identity="uid-exact" />)
+    await waitFor(() => expect(Events.instances).toHaveLength(1))
+    const exact = new Uint8Array((8 << 20) + 2).fill(32)
+    exact.set(new TextEncoder().encode('data:'), 0)
+    exact.set([10, 10], exact.length - 2)
+    act(() => Events.current.write(exact))
+    expect(screen.getByRole('status')).toHaveTextContent('Connected')
+    act(() => Events.current.write(new Uint8Array((8 << 20) + 1).fill(120)))
+    await waitFor(() => expect(screen.getByRole('status')).toHaveTextContent('Transcript event exceeds'))
+    expect(Events.instances).toHaveLength(1)
+  })
+
+  it('recognizes all nine line-ending pairs at every delimiter byte boundary', () => {
+    const encoder = new TextEncoder()
+    const decoder = new TextDecoder()
+    const body = encoder.encode('event:transcript\ndata:{"sequence":1,"data":"combinations"}')
+    const endings = [[10], [13], [13, 10]]
+    for (const first of endings) for (const second of endings) {
+      const delimiter = Uint8Array.from([...first, ...second])
+      for (let split = 0; split <= delimiter.length; split += 1) {
+        const frames: Uint8Array[] = []
+        const framer = new SSEFramer()
+        const consume = (frame: Uint8Array) => frames.push(frame.slice())
+        framer.push(body, consume)
+        framer.push(delimiter.slice(0, split), consume)
+        framer.push(delimiter.slice(split), consume)
+        framer.finish(consume)
+        expect(frames.map(frame => decoder.decode(frame)), `${first}+${second} split ${split}`).toEqual([decoder.decode(body)])
+      }
+    }
+  })
+
+  it('preserves CRLF fields under deterministic randomized chunking', () => {
+    const encoder = new TextEncoder()
+    const decoder = new TextDecoder()
+    const bodies = Array.from({ length: 24 }, (_, index) => `event:transcript\r\ndata:first-${index}\r\ndata:second-${index}\r\nid:${index}`)
+    const delimiters = ['\n\n', '\n\r', '\n\r\n', '\r\r', '\r\r\n', '\r\n\n', '\r\n\r', '\r\n\r\n']
+    const source = encoder.encode(bodies.map((body, index) => body + delimiters[index % delimiters.length]).join(''))
+    for (let seed = 1; seed <= 32; seed += 1) {
+      const frames: string[] = []
+      const framer = new SSEFramer()
+      let state = seed
+      let offset = 0
+      while (offset < source.length) {
+        state = (state * 1664525 + 1013904223) >>> 0
+        const end = Math.min(source.length, offset + 1 + state % 19)
+        framer.push(source.slice(offset, end), frame => frames.push(decoder.decode(frame)))
+        offset = end
+      }
+      framer.finish(frame => frames.push(decoder.decode(frame)))
+      expect(frames, `seed ${seed}`).toEqual(bodies)
+    }
+  })
+
+  it('parses ordinary CRLF field lines before a CRLF-delimited blank line', async () => {
+    mockStreams()
+    render(<Transcript namespace="n" run="crlf-fields" identity="uid-exact" />)
+    await waitFor(() => expect(Events.instances).toHaveLength(1))
+    act(() => Events.current.write(new TextEncoder().encode('event:transcript\r\nid:1\r\ndata:{"sequence":1,"data":"crlf-fields"}\r\n\r\n')))
+    expect(await screen.findByText('crlf-fields')).toBeInTheDocument()
+  })
+
+  it('handles a split UTF-8 scalar, colonless data, and many frames in one source chunk', async () => {
+    mockStreams()
+    render(<Transcript namespace="n" run="bytes" identity="uid-exact" />)
+    await waitFor(() => expect(Events.instances).toHaveLength(1))
+    const encoder = new TextEncoder()
+    const snowman = encoder.encode('event:transcript\ndata:{"sequence":1,"data":"snowman ☃"}\n\n')
+    const scalar = snowman.indexOf(0xe2)
+    act(() => {
+      Events.current.write(snowman.slice(0, scalar + 1))
+      Events.current.write(snowman.slice(scalar + 1))
+      const frames = Array.from({ length: 100 }, (_, index) => `event:transcript\ndata\ndata:{"sequence":${index + 2},"data":"many-${index}"}\n\n`).join('')
+      Events.current.write(encoder.encode(frames))
+    })
+    expect(await screen.findByText('snowman ☃')).toBeInTheDocument()
+    await waitFor(() => expect(screen.getAllByRole('listitem')).toHaveLength(101))
+    expect(screen.getByText('many-99')).toBeInTheDocument()
+  })
+
+  it('counts colonless data and its inserted newline in the retained byte budget', async () => {
+    mockStreams()
+    render(<Transcript namespace="n" run="colonless-budget" identity="uid-exact" />)
+    await waitFor(() => expect(Events.instances).toHaveLength(1))
+    const payload = 'x'.repeat(2 * 1024 * 1024)
+    act(() => Events.current.write(new TextEncoder().encode(`id:1\nevent:transcript\ndata\ndata:${payload}\n\n`)))
+    expect(await screen.findByText(/approximately 2,097,153 raw bytes/)).toBeInTheDocument()
+  })
+
+  it('copies only a tiny unresolved suffix after processing a large source chunk', async () => {
+    mockStreams()
+    render(<Transcript namespace="n" run="suffix" identity="uid-exact" />)
+    await waitFor(() => expect(Events.instances).toHaveLength(1))
+    const frames = Array.from({ length: 1000 }, (_, index) => `event:transcript\ndata:{"sequence":${index + 1},"data":"bulk-${index}"}\n\n`).join('')
+    act(() => {
+      Events.current.write(new TextEncoder().encode(`${frames}event:trans`))
+      Events.current.write(new TextEncoder().encode('cript\ndata:{"sequence":1001,"data":"suffix-complete"}\n\n'))
+    })
+    expect(await screen.findByText('suffix-complete')).toBeInTheDocument()
+  })
+
+  it('terminates malformed UTF-8 and unresolved EOF without reconnecting', async () => {
+    mockStreams()
+    const firstView = render(<Transcript namespace="n" run="utf8" identity="uid-utf8" />)
+    await waitFor(() => expect(Events.instances).toHaveLength(1))
+    act(() => Events.current.write(Uint8Array.from([100, 97, 116, 97, 58, 0xc3, 10, 10])))
+    await waitFor(() => expect(screen.getByRole('status')).toHaveTextContent('Malformed UTF-8'))
+    expect(Events.instances).toHaveLength(1)
+    firstView.unmount()
+
+    render(<Transcript namespace="n" run="eof" identity="uid-eof" />)
+    await waitFor(() => expect(Events.instances).toHaveLength(2))
+    act(() => {
+      Events.current.write(new TextEncoder().encode('data:unfinished'))
+      Events.current.close()
+    })
+    await waitFor(() => expect(screen.getByRole('status')).toHaveTextContent('Malformed transcript event stream at EOF'))
+    await new Promise(resolve => setTimeout(resolve, 300))
+    expect(Events.instances).toHaveLength(2)
   })
 
   it('cancels a retryable error response before reconnecting with the same UID', async () => {

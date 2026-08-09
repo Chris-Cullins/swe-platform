@@ -34,6 +34,26 @@ const (
 	AdapterObservationFailed     AdapterObservation = "Failed"
 )
 
+// StatusMessage returns the fixed platform-owned message for a normalized
+// observation. Adapter- and provider-controlled details belong only in opaque
+// transcript events and must never be included in normalized status.
+func (o AdapterObservation) StatusMessage() string {
+	switch o {
+	case AdapterObservationAccepted:
+		return "adapter accepted the task"
+	case AdapterObservationRunning:
+		return "adapter is running"
+	case AdapterObservationNeedsInput:
+		return "adapter needs input"
+	case AdapterObservationSucceeded:
+		return "adapter completed successfully"
+	case AdapterObservationFailed:
+		return "adapter reported failure"
+	default:
+		return ""
+	}
+}
+
 // AdapterTask contains immutable task identity and input. ID is the Run UID
 // and is the adapter's idempotency key across retries and controller restarts.
 type AdapterTask struct {
@@ -126,6 +146,8 @@ type AdapterSandbox struct {
 // ErrAdapterTaskRejected for permanent intent rejection; Cancel succeeds when
 // work is already absent or terminal and returns
 // ErrAdapterCancellationPending while its execution tree is still stopping.
+// Observe's message must equal observation.StatusMessage(); arbitrary process,
+// provider, result, or transcript bytes are forbidden from normalized status.
 type AdapterLifecycle interface {
 	EnsureAccepted(context.Context, AdapterTask, AdapterSandbox, *AdapterLaunchMaterial) error
 	Observe(context.Context, AdapterTask, AdapterSandbox) (AdapterObservation, string, error)

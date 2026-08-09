@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strings"
 
 	"github.com/Chris-Cullins/swe-platform/internal/controlplane"
 )
@@ -51,7 +52,28 @@ func (c *Client) GetPortalRoute(ctx context.Context, namespace, environment, ser
 	return route, nil
 }
 
-var ErrRunRelist = errors.New("Run watch requires a full relist")
+var (
+	// ErrRunRelist reports that a Run watch must restart from a fresh snapshot.
+	ErrRunRelist = errors.New("Run watch requires a full relist")
+	// ErrRunIdentityMismatch reports that an exact Run GET returned another UID.
+	ErrRunIdentityMismatch = errors.New("control plane returned a different Run identity")
+	// ErrEnvironmentIdentityMismatch reports that an exact Environment GET returned another UID.
+	ErrEnvironmentIdentityMismatch = errors.New("control plane returned a different Environment identity")
+)
+
+// RetryableResourceError reports bounded automatic-recovery failures for exact
+// resource reads. Response decoding and local validation failures are terminal.
+func RetryableResourceError(err error) bool {
+	if err == nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+	var problem *ProblemError
+	if errors.As(err, &problem) {
+		return retryableHTTPStatus(problem.Problem.Status)
+	}
+	var transport *url.Error
+	return errors.As(err, &transport)
+}
 
 type initialRunWatchCompatibilityError struct{ error }
 
@@ -199,6 +221,36 @@ func (c *Client) GetRun(ctx context.Context, namespace, name string) (controlpla
 	return run, err
 }
 
+// GetRunExact returns the Run only while name identifies expectedUID.
+func (c *Client) GetRunExact(ctx context.Context, namespace, name, expectedUID string) (controlplane.Run, error) {
+	expectedUID = strings.TrimSpace(expectedUID)
+	if expectedUID == "" {
+		return controlplane.Run{}, fmt.Errorf("expected Run UID is required")
+	}
+	if len(expectedUID) > 128 {
+		return controlplane.Run{}, fmt.Errorf("expected Run UID exceeds 128 bytes")
+	}
+	var run controlplane.Run
+	request, err := c.NewRequest(ctx, http.MethodGet, c.Endpoint("api", "v1", "namespaces", namespace, "runs", name), nil)
+	if err != nil {
+		return run, err
+	}
+	request.Header.Set("Accept", "application/json")
+	request.Header.Set(controlplane.RunUIDHeader, expectedUID)
+	response, err := c.Do(request)
+	if err != nil {
+		return run, err
+	}
+	defer response.Body.Close()
+	if err := decodeJSON(response.Body, &run, maxExactResourceResponse); err != nil {
+		return run, err
+	}
+	if run.UID != expectedUID {
+		return controlplane.Run{}, fmt.Errorf("%w: returned Run UID %q, expected %q", ErrRunIdentityMismatch, run.UID, expectedUID)
+	}
+	return run, nil
+}
+
 // CreateRun creates a Run or returns the existing Run when the server accepts
 // an exact immutable-intent retry under the same name.
 func (c *Client) CreateRun(ctx context.Context, namespace string, value controlplane.CreateRunRequest) (controlplane.Run, error) {
@@ -220,6 +272,25 @@ func (c *Client) GetEnvironment(ctx context.Context, namespace, name string) (co
 	var environment controlplane.Environment
 	err := c.getJSON(ctx, c.Endpoint("api", "v1", "namespaces", namespace, "environments", name), &environment)
 	return environment, err
+}
+
+// GetEnvironmentExact returns the Environment only while name identifies expectedUID.
+func (c *Client) GetEnvironmentExact(ctx context.Context, namespace, name, expectedUID string) (controlplane.Environment, error) {
+	expectedUID = strings.TrimSpace(expectedUID)
+	if expectedUID == "" {
+		return controlplane.Environment{}, fmt.Errorf("expected Environment UID is required")
+	}
+	if len(expectedUID) > 128 {
+		return controlplane.Environment{}, fmt.Errorf("expected Environment UID exceeds 128 bytes")
+	}
+	environment, err := c.GetEnvironment(ctx, namespace, name)
+	if err != nil {
+		return environment, err
+	}
+	if environment.UID != expectedUID {
+		return controlplane.Environment{}, fmt.Errorf("%w: returned Environment UID %q, expected %q", ErrEnvironmentIdentityMismatch, environment.UID, expectedUID)
+	}
+	return environment, nil
 }
 
 func (c *Client) getJSON(ctx context.Context, endpoint string, destination any) error {

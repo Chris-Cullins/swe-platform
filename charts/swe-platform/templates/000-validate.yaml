@@ -1,24 +1,32 @@
-{{- $backend := .Values.controlPlane.sessions.backend -}}
-{{- if not (has $backend (list "memory" "postgres")) -}}
-{{- fail "controlPlane.sessions.backend must be memory or postgres" -}}
+{{- if eq (include "swe-platform.serviceAccountName" .) (include "swe-platform.controlPlaneFullname" .) -}}
+{{- fail "serviceAccount.name must not equal the derived control-plane ServiceAccount name" -}}
 {{- end -}}
-{{- if eq $backend "postgres" -}}
-  {{- if not .Values.controlPlane.transcripts.postgresSecret.name -}}
-    {{- fail "controlPlane.sessions.backend=postgres requires controlPlane.transcripts.postgresSecret.name" -}}
+{{- if .Values.controlPlane.enabled -}}
+  {{- $backend := .Values.controlPlane.sessions.backend -}}
+  {{- if not (has $backend (list "memory" "postgres")) -}}
+    {{- fail "controlPlane.sessions.backend must be memory or postgres" -}}
   {{- end -}}
-  {{- if not .Values.controlPlane.transcripts.postgresSecret.key -}}
-    {{- fail "controlPlane.sessions.backend=postgres requires controlPlane.transcripts.postgresSecret.key" -}}
+  {{- if eq $backend "postgres" -}}
+    {{- if not .Values.controlPlane.transcripts.postgresSecret.name -}}
+      {{- fail "controlPlane.sessions.backend=postgres requires controlPlane.transcripts.postgresSecret.name" -}}
+    {{- end -}}
+    {{- if not .Values.controlPlane.transcripts.postgresSecret.key -}}
+      {{- fail "controlPlane.sessions.backend=postgres requires controlPlane.transcripts.postgresSecret.key" -}}
+    {{- end -}}
+    {{- if not .Values.controlPlane.sessions.keyringSecret.name -}}
+      {{- fail "controlPlane.sessions.backend=postgres requires controlPlane.sessions.keyringSecret.name" -}}
+    {{- end -}}
+    {{- if not .Values.controlPlane.sessions.keyringSecret.key -}}
+      {{- fail "controlPlane.sessions.backend=postgres requires controlPlane.sessions.keyringSecret.key" -}}
+    {{- end -}}
+  {{- else if .Values.controlPlane.sessions.keyringSecret.name -}}
+    {{- fail "controlPlane.sessions.backend=memory must not set controlPlane.sessions.keyringSecret.name" -}}
   {{- end -}}
-  {{- if not .Values.controlPlane.sessions.keyringSecret.name -}}
-    {{- fail "controlPlane.sessions.backend=postgres requires controlPlane.sessions.keyringSecret.name" -}}
+  {{- if and .Values.controlPlane.image.digest (not (regexMatch "^sha256:[0-9a-f]{64}$" .Values.controlPlane.image.digest)) -}}
+    {{- fail "controlPlane.image.digest must be a sha256 digest" -}}
   {{- end -}}
-  {{- if not .Values.controlPlane.sessions.keyringSecret.key -}}
-    {{- fail "controlPlane.sessions.backend=postgres requires controlPlane.sessions.keyringSecret.key" -}}
-  {{- end -}}
-{{- else if .Values.controlPlane.sessions.keyringSecret.name -}}
-  {{- fail "controlPlane.sessions.backend=memory must not set controlPlane.sessions.keyringSecret.name" -}}
 {{- end -}}
-{{- range $name, $image := dict "image" .Values.image "controlPlane.image" .Values.controlPlane.image "environmentImage" .Values.environmentImage -}}
+{{- range $name, $image := dict "image" .Values.image "environmentImage" .Values.environmentImage -}}
   {{- if and $image.digest (not (regexMatch "^sha256:[0-9a-f]{64}$" $image.digest)) -}}
     {{- fail (printf "%s.digest must be a sha256 digest" $name) -}}
   {{- end -}}
@@ -42,30 +50,32 @@
 {{- if or (lt $operatorHealthPort 1) (gt $operatorHealthPort 65535) (eq $operatorMetricsPort $operatorHealthPort) -}}
 {{- fail "operator.health.port must be from 1 through 65535 and must differ from operator.metrics.port" -}}
 {{- end -}}
-{{- $metricsPort := int .Values.controlPlane.metrics.port -}}
-{{- if or (lt $metricsPort 1) (gt $metricsPort 65535) (eq $metricsPort 80) (eq $metricsPort 8080) -}}
-{{- fail "controlPlane.metrics.port must be from 1 through 65535 and must not be 80 or 8080" -}}
-{{- end -}}
-{{- $portal := .Values.controlPlane.portal -}}
-{{- if $portal.enabled -}}
-  {{- if not (regexMatch "^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$" $portal.suffix) -}}
-    {{- fail "controlPlane.portal.enabled requires a canonical DNS suffix without wildcard or trailing dot" -}}
+{{- if .Values.controlPlane.enabled -}}
+  {{- $metricsPort := int .Values.controlPlane.metrics.port -}}
+  {{- if or (lt $metricsPort 1) (gt $metricsPort 65535) (eq $metricsPort 80) (eq $metricsPort 8080) -}}
+    {{- fail "controlPlane.metrics.port must be from 1 through 65535 and must not be 80 or 8080" -}}
   {{- end -}}
-  {{- if not (has $portal.scheme (list "http" "https")) -}}
-    {{- fail "controlPlane.portal.scheme must be http or https" -}}
+  {{- $portal := .Values.controlPlane.portal -}}
+  {{- if $portal.enabled -}}
+    {{- if not (regexMatch "^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$" $portal.suffix) -}}
+      {{- fail "controlPlane.portal.enabled requires a canonical DNS suffix without wildcard or trailing dot" -}}
+    {{- end -}}
+    {{- if not (has $portal.scheme (list "http" "https")) -}}
+      {{- fail "controlPlane.portal.scheme must be http or https" -}}
+    {{- end -}}
+    {{- if and (eq $portal.scheme "http") (or $portal.ingress.enabled (not .Values.controlPlane.auth.allowInsecureSessions)) -}}
+      {{- fail "HTTP portals are allowed only for explicit insecure development with portal ingress disabled" -}}
+    {{- end -}}
+    {{- if and $portal.ingress.enabled (ne $portal.scheme "https") -}}
+      {{- fail "controlPlane.portal.ingress.enabled requires controlPlane.portal.scheme=https" -}}
+    {{- end -}}
+    {{- if and $portal.ingress.enabled (not .Values.controlPlane.auth.trustProxyHeaders) -}}
+      {{- fail "controlPlane.portal.ingress.enabled requires controlPlane.auth.trustProxyHeaders=true and an ingress that overwrites X-Forwarded-Host/Proto" -}}
+    {{- end -}}
+    {{- if and $portal.ingress.enabled (not $portal.ingress.tls.secretName) -}}
+      {{- fail "controlPlane.portal.ingress.enabled requires an administrator-owned portal TLS Secret name" -}}
+    {{- end -}}
+  {{- else if or $portal.suffix $portal.ingress.enabled -}}
+    {{- fail "controlPlane.portal suffix/ingress requires controlPlane.portal.enabled=true" -}}
   {{- end -}}
-  {{- if and (eq $portal.scheme "http") (or $portal.ingress.enabled (not .Values.controlPlane.auth.allowInsecureSessions)) -}}
-    {{- fail "HTTP portals are allowed only for explicit insecure development with portal ingress disabled" -}}
-  {{- end -}}
-  {{- if and $portal.ingress.enabled (ne $portal.scheme "https") -}}
-    {{- fail "controlPlane.portal.ingress.enabled requires controlPlane.portal.scheme=https" -}}
-  {{- end -}}
-  {{- if and $portal.ingress.enabled (not .Values.controlPlane.auth.trustProxyHeaders) -}}
-    {{- fail "controlPlane.portal.ingress.enabled requires controlPlane.auth.trustProxyHeaders=true and an ingress that overwrites X-Forwarded-Host/Proto" -}}
-  {{- end -}}
-  {{- if and $portal.ingress.enabled (not $portal.ingress.tls.secretName) -}}
-    {{- fail "controlPlane.portal.ingress.enabled requires an administrator-owned portal TLS Secret name" -}}
-  {{- end -}}
-{{- else if or $portal.suffix $portal.ingress.enabled -}}
-  {{- fail "controlPlane.portal suffix/ingress requires controlPlane.portal.enabled=true" -}}
 {{- end -}}

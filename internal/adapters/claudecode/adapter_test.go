@@ -43,6 +43,7 @@ type fakeProcessClient struct {
 	stoppedKey    *sandboxdv1.ProcessKey
 	stopMode      sandboxdv1.StopMode
 	getErr        error
+	stopErr       error
 	readRequests  []*sandboxdv1.ReadOutputRequest
 	launchRequest *sandboxdv1.StartProcessWithLaunchMaterialRequest
 	launchValue   []byte
@@ -90,6 +91,9 @@ func (f *fakeProcessClient) Get(context.Context, *sandboxdv1.GetProcessRequest, 
 
 func (f *fakeProcessClient) Stop(_ context.Context, request *sandboxdv1.StopProcessRequest, _ ...grpc.CallOption) (*sandboxdv1.Process, error) {
 	f.stoppedKey, f.stopMode = request.Key, request.Mode
+	if f.stopErr != nil {
+		return nil, f.stopErr
+	}
 	if f.process != nil {
 		return f.process, nil
 	}
@@ -218,6 +222,13 @@ func TestCancelWaitsForProcessTreeToBecomeTerminal(t *testing.T) {
 	}
 }
 
+func TestCancelTreatsAbsentProcessAsComplete(t *testing.T) {
+	client := &fakeProcessClient{stopErr: status.Error(codes.NotFound, "absent")}
+	if err := (&Adapter{}).Cancel(context.Background(), agent.AdapterTask{ID: "run-uid"}, sandboxFor(client)); err != nil {
+		t.Fatalf("Cancel() error = %v, want absent process to be complete", err)
+	}
+}
+
 func TestObservationMapping(t *testing.T) {
 	exit0, exit1 := int32(0), int32(1)
 	tests := []struct {
@@ -243,6 +254,29 @@ func TestObservationMapping(t *testing.T) {
 			got, _, err := (&Adapter{}).Observe(context.Background(), agent.AdapterTask{ID: "run"}, sandboxFor(client))
 			if err != nil || got != test.want {
 				t.Fatalf("Observe() = (%q, %v), want %q", got, err, test.want)
+			}
+		})
+	}
+}
+
+func TestObservationMessagesExcludeAgentControlledDetails(t *testing.T) {
+	const sentinel = "!!CLAUDE-STATUS-SECRET!!"
+	exit0 := int32(0)
+	tests := []struct {
+		name    string
+		process *sandboxdv1.Process
+		stdout  string
+		want    agent.AdapterObservation
+	}{
+		{name: "process failure", process: &sandboxdv1.Process{State: sandboxdv1.ProcessState_PROCESS_STATE_FAILED, Error: sentinel, ExecutionId: "e"}, want: agent.AdapterObservationFailed},
+		{name: "provider failure", process: &sandboxdv1.Process{State: sandboxdv1.ProcessState_PROCESS_STATE_EXITED, ExitCode: &exit0, ExecutionId: "e"}, stdout: `{"type":"result","subtype":"` + sentinel + `","is_error":true,"result":"` + sentinel + `"}` + "\n", want: agent.AdapterObservationFailed},
+		{name: "success result", process: &sandboxdv1.Process{State: sandboxdv1.ProcessState_PROCESS_STATE_EXITED, ExitCode: &exit0, ExecutionId: "e"}, stdout: `{"type":"result","subtype":"success","is_error":false,"result":"` + sentinel + `"}` + "\n", want: agent.AdapterObservationSucceeded},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			observation, message, err := (&Adapter{}).Observe(context.Background(), agent.AdapterTask{ID: "run"}, sandboxFor(&fakeProcessClient{process: test.process, stdout: []byte(test.stdout)}))
+			if err != nil || observation != test.want || message != test.want.StatusMessage() || strings.Contains(message, sentinel) {
+				t.Fatalf("Observe() = (%q, %q, %v), want fixed %q message", observation, message, err, test.want)
 			}
 		})
 	}
@@ -313,11 +347,11 @@ func TestOutputRetryAfterRestartUsesContentAddressedKeys(t *testing.T) {
 func TestTransientOutputFailureRetriesSameEvent(t *testing.T) {
 	client := &fakeProcessClient{process: &sandboxdv1.Process{State: sandboxdv1.ProcessState_PROCESS_STATE_RUNNING, ExecutionId: "execution"}, stdout: []byte("output")}
 	transient := errors.New("temporary transcript outage")
-	var keys []string
+	var events []agent.AdapterEvent
 	sandbox := sandboxFor(client)
 	sandbox.EmitEvent = func(_ context.Context, event agent.AdapterEvent) error {
-		keys = append(keys, event.IdempotencyKey)
-		if len(keys) == 1 {
+		events = append(events, event)
+		if len(events) == 1 {
 			return transient
 		}
 		return nil
@@ -326,12 +360,13 @@ func TestTransientOutputFailureRetriesSameEvent(t *testing.T) {
 	if _, _, err := adapter.Observe(context.Background(), agent.AdapterTask{ID: "run"}, sandbox); !errors.Is(err, transient) {
 		t.Fatalf("first Observe() error = %v, want transient error", err)
 	}
+	client.stdout = []byte("output appended")
 	got, _, err := adapter.Observe(context.Background(), agent.AdapterTask{ID: "run"}, sandbox)
 	if err != nil || got != agent.AdapterObservationRunning {
 		t.Fatalf("retry Observe() = (%q, %v)", got, err)
 	}
-	if len(keys) != 2 || keys[0] != keys[1] {
-		t.Fatalf("retry keys = %#v, want same idempotency key", keys)
+	if len(events) != 3 || !reflect.DeepEqual(events[0], events[1]) {
+		t.Fatalf("retry events = %#v, want exact pending event followed by appended output", events)
 	}
 }
 
@@ -341,9 +376,13 @@ func TestPermanentOutputRejectionFailsObservation(t *testing.T) {
 	sandbox.EmitEvent = func(context.Context, agent.AdapterEvent) error {
 		return agent.ErrAdapterEventRejected
 	}
-	got, message, err := (&Adapter{}).Observe(context.Background(), agent.AdapterTask{ID: "run"}, sandbox)
-	if err != nil || got != agent.AdapterObservationFailed || !strings.Contains(message, "permanently rejected") {
+	adapter := &Adapter{}
+	got, message, err := adapter.Observe(context.Background(), agent.AdapterTask{ID: "run"}, sandbox)
+	if err != nil || got != agent.AdapterObservationFailed || message != got.StatusMessage() {
 		t.Fatalf("Observe() = (%q, %q, %v)", got, message, err)
+	}
+	if len(adapter.pending) != 0 {
+		t.Fatalf("permanently rejected pending events retained: %d", len(adapter.pending))
 	}
 }
 
@@ -358,7 +397,7 @@ func TestTerminalValidationFailsOnRetainedOutputGap(t *testing.T) {
 		retainedFrom: 512,
 	}
 	got, detail, err := (&Adapter{}).Observe(context.Background(), agent.AdapterTask{ID: "run"}, sandboxFor(client))
-	if err != nil || got != agent.AdapterObservationFailed || !strings.Contains(detail, "truncated before terminal validation") || !strings.Contains(detail, "retained from offset 512") {
+	if err != nil || got != agent.AdapterObservationFailed || detail != got.StatusMessage() {
 		t.Fatalf("Observe() = (%q, %q, %v)", got, detail, err)
 	}
 }
@@ -370,8 +409,12 @@ func TestTerminalCancellationIgnoresPermanentOutputRejection(t *testing.T) {
 	sandbox.EmitEvent = func(context.Context, agent.AdapterEvent) error {
 		return agent.ErrAdapterEventRejected
 	}
-	if err := (&Adapter{}).Cancel(context.Background(), agent.AdapterTask{ID: "run"}, sandbox); err != nil {
+	adapter := &Adapter{}
+	if err := adapter.Cancel(context.Background(), agent.AdapterTask{ID: "run"}, sandbox); err != nil {
 		t.Fatalf("Cancel() error = %v", err)
+	}
+	if len(adapter.pending) != 0 {
+		t.Fatalf("permanently rejected pending events retained after cancellation: %d", len(adapter.pending))
 	}
 }
 

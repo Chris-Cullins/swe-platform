@@ -114,53 +114,49 @@ func (a *Adapter) Observe(ctx context.Context, task agent.AdapterTask, sandbox a
 	process, err := client.Get(ctx, &sandboxdv1.GetProcessRequest{Key: key(task)})
 	if err != nil {
 		if status.Code(err) == codes.NotFound {
-			return agent.AdapterObservationFailed, "Amp execution is absent in the current sandbox epoch", nil
+			return agent.AdapterObservationFailed, agent.AdapterObservationFailed.StatusMessage(), nil
 		}
 		return "", "", err
 	}
 	if err := a.forward(ctx, client, task, sandbox, process); err != nil {
 		if errors.Is(err, agent.ErrAdapterEventRejected) {
-			return agent.AdapterObservationFailed, "Amp transcript output was permanently rejected", nil
+			return agent.AdapterObservationFailed, agent.AdapterObservationFailed.StatusMessage(), nil
 		}
 		return "", "", err
 	}
 	switch process.State {
 	case sandboxdv1.ProcessState_PROCESS_STATE_RUNNING, sandboxdv1.ProcessState_PROCESS_STATE_STOPPING:
-		return agent.AdapterObservationRunning, "Amp is running", nil
+		return agent.AdapterObservationRunning, agent.AdapterObservationRunning.StatusMessage(), nil
 	case sandboxdv1.ProcessState_PROCESS_STATE_FAILED:
-		return agent.AdapterObservationFailed, message("Amp failed to start", process.Error), nil
+		return agent.AdapterObservationFailed, agent.AdapterObservationFailed.StatusMessage(), nil
 	case sandboxdv1.ProcessState_PROCESS_STATE_EXITED:
 		if process.ExitCode == nil {
-			return agent.AdapterObservationFailed, "Amp exited without an exit code", nil
+			return agent.AdapterObservationFailed, agent.AdapterObservationFailed.StatusMessage(), nil
 		}
 		if process.GetExitCode() != 0 {
-			return agent.AdapterObservationFailed, fmt.Sprintf("Amp exited with code %d", process.GetExitCode()), nil
+			return agent.AdapterObservationFailed, agent.AdapterObservationFailed.StatusMessage(), nil
 		}
 		output, err := readOutput(ctx, client, key(task), process.ExecutionId)
 		if err != nil {
 			var truncated *outputTruncatedError
 			if errors.As(err, &truncated) {
-				return agent.AdapterObservationFailed, message("Amp stdout was truncated before terminal validation", truncated.Error()), nil
+				return agent.AdapterObservationFailed, agent.AdapterObservationFailed.StatusMessage(), nil
 			}
 			return "", "", err
 		}
 		result, ok := finalResult(output)
 		if !ok {
-			return agent.AdapterObservationFailed, "Amp exited without a valid result event", nil
+			return agent.AdapterObservationFailed, agent.AdapterObservationFailed.StatusMessage(), nil
 		}
 		if result.IsError == nil {
-			return agent.AdapterObservationFailed, "Amp result is missing is_error", nil
+			return agent.AdapterObservationFailed, agent.AdapterObservationFailed.StatusMessage(), nil
 		}
 		if *result.IsError || result.Subtype != "success" {
-			detail := result.Result
-			if detail == "" {
-				detail = errorDetail(result.Error)
-			}
-			return agent.AdapterObservationFailed, message("Amp reported "+result.Subtype, detail), nil
+			return agent.AdapterObservationFailed, agent.AdapterObservationFailed.StatusMessage(), nil
 		}
-		return agent.AdapterObservationSucceeded, message("Amp completed", result.Result), nil
+		return agent.AdapterObservationSucceeded, agent.AdapterObservationSucceeded.StatusMessage(), nil
 	default:
-		return agent.AdapterObservationFailed, fmt.Sprintf("Amp returned invalid process state %s", process.State), nil
+		return agent.AdapterObservationFailed, agent.AdapterObservationFailed.StatusMessage(), nil
 	}
 }
 
@@ -173,6 +169,9 @@ func (a *Adapter) Cancel(ctx context.Context, task agent.AdapterTask, sandbox ag
 	defer closeConnection()
 	process, err := client.Stop(ctx, &sandboxdv1.StopProcessRequest{Key: key(task), Mode: sandboxdv1.StopMode_STOP_MODE_GRACEFUL, GracePeriodMs: 10_000})
 	if err != nil {
+		if status.Code(err) == codes.NotFound {
+			return nil
+		}
 		return err
 	}
 	switch process.State {
@@ -277,25 +276,6 @@ func streamName(stream sandboxdv1.OutputStream) string {
 		return "stderr"
 	}
 	return "stdout"
-}
-func message(summary, detail string) string {
-	if detail == "" {
-		return summary
-	}
-	if len(detail) > 512 {
-		detail = detail[:512] + "…"
-	}
-	return summary + ": " + detail
-}
-func errorDetail(raw json.RawMessage) string {
-	if len(raw) == 0 || bytes.Equal(raw, []byte("null")) {
-		return ""
-	}
-	var text string
-	if json.Unmarshal(raw, &text) == nil {
-		return text
-	}
-	return string(raw)
 }
 func (a *Adapter) getCursor(c cursor) uint64 {
 	a.mu.Lock()

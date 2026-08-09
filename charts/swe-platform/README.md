@@ -73,6 +73,12 @@ open SSE/WebSocket connections do not and this release makes no control-plane HA
 optional authenticated portal gateway exposes explicitly declared HTTP services through one
 wildcard host namespace.
 
+Set `controlPlane.enabled=false` for an operator-only installation. While disabled, the chart
+omits the control-plane workload, Service, identity/RBAC, and Ingress and ignores other
+`controlPlane.*` settings. Those settings are validated again before the control plane can be
+re-enabled, so stale values retained with `--reuse-values` must be corrected first. The
+portal-status admission fence remains pre-staged even in operator-only installs.
+
 ## Control-plane metrics
 
 The stable control-plane Service exposes a dedicated internal Prometheus scrape port named
@@ -166,11 +172,24 @@ The operator reconciles each `Run` as the single task intent and allocates or cl
 Run status/finalizer updates and Environment allocation/claim updates. Process execution
 remains behind the environment's portable sandboxd contract rather than Kubernetes exec.
 Environment status is controller-owned: the control-plane role can read and patch the base
-Environment resource where required, but has no `environments/status` authority unless the
-portal gateway is enabled. The enabled gateway receives update-only status authority for its
-bounded portal route allocation fields; a release-scoped fail-closed admission policy rejects
-changes by that ServiceAccount to every controller-owned status field. The policy is pre-staged
-when portals are disabled so later enablement cannot expose an unfenced status writer.
+Environment resource where required and receives update-only `environments/status` authority
+for the gateway's bounded portal route allocation fields. That narrow authority remains when
+portals are disabled so discovery can tombstone active routes and publish a durable denial
+generation; a release-scoped fail-closed admission policy rejects changes by that ServiceAccount
+to every controller-owned status field.
+The same exact-ServiceAccount fence restricts ordinary Environment patches to current,
+Idle-scoped Terminal/Portal wake intents and the fixed Terminal/Portal activity annotation
+slots; it rejects changes to holds, suspend intents, services, all other spec fields, labels,
+`generateName`, finalizers, owner references, and other annotations. API-server bookkeeping
+(`resourceVersion`, `generation`, and `managedFields`) remains exempt so legitimate patches are
+not denied. These policies require the chart's stated Kubernetes 1.33 minimum and do not match
+the operator ServiceAccount. Helm rejects an operator `serviceAccount.name` equal to the derived
+control-plane ServiceAccount name even when the control plane is disabled, because the admission
+policies are always pre-staged for later enablement. A reciprocal policy
+rejects operator ServiceAccount changes to gateway-owned portal route status. Both policies are
+pre-staged when portals are disabled so later enablement cannot expose an unfenced status writer.
+The chart rejects configurations that give the operator and control plane the same ServiceAccount
+name because that shared principal cannot meet the disjoint field-ownership contract.
 
 ## Install
 

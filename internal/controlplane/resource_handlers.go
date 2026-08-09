@@ -122,8 +122,28 @@ func (s *Server) handleGetRun(w http.ResponseWriter, r *http.Request, namespace,
 		writeProblem(w, http.StatusServiceUnavailable, "resource-service-unavailable", "Resource service unavailable", "Run resources are not configured")
 		return
 	}
-	run, err := s.resources.GetRun(r.Context(), namespace, name)
+	_, uidHeaderPresent := r.Header[http.CanonicalHeaderKey(RunUIDHeader)]
+	expectedUID := strings.TrimSpace(r.Header.Get(RunUIDHeader))
+	if uidHeaderPresent && expectedUID == "" {
+		writeProblem(w, http.StatusPreconditionRequired, "run-uid-required", "Run UID required", "a present "+RunUIDHeader+" header must contain an exact Run UID")
+		return
+	}
+	if len(expectedUID) > maxRunUIDLength {
+		writeProblem(w, http.StatusBadRequest, "invalid-request", "Invalid request", errRunUIDTooLong.Error())
+		return
+	}
+	var run Run
+	var err error
+	if uidHeaderPresent {
+		run, err = s.resources.GetRunExact(r.Context(), namespace, name, expectedUID)
+	} else {
+		run, err = s.resources.GetRun(r.Context(), namespace, name)
+	}
 	if err != nil {
+		if errors.Is(err, errRunUIDConflict) {
+			writeProblem(w, http.StatusConflict, "run-uid-conflict", "Run identity conflict", "the Run name now identifies a different Run")
+			return
+		}
 		s.writeResourceError(w, "get run", namespace, name, err)
 		return
 	}

@@ -17,8 +17,6 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"google.golang.org/protobuf/proto"
-
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
@@ -30,6 +28,14 @@ const (
 	defaultOutputCapacity     = 1024 * 1024
 	defaultMaxRecords         = 1024
 	defaultReadMax            = 64 * 1024
+	maxManagedServices        = 32
+	maxManagedOwnerBytes      = 256
+	maxManagedRoleBytes       = 32
+	maxManagedArgs            = 64
+	maxManagedArgBytes        = 4096
+	maxManagedArgvBytes       = 16 * 1024
+	maxManagedCWDBytes        = 4096
+	maxManagedEnvEntries      = 64
 	maxLaunchMaterialEntries  = 64
 	maxLaunchMaterialName     = 256
 	maxLaunchMaterialValue    = 64 * 1024
@@ -108,8 +114,8 @@ type ProcessServer struct {
 type managedOwner struct {
 	revision      uint64
 	routeRevision uint64
-	wire          []byte
 	desired       map[string]*sandboxdv1.ProcessSpec
+	restarts      map[string]*time.Timer
 	gen           uint64
 }
 
@@ -119,6 +125,13 @@ func NewProcessServer(workspace string, supervisors ...*Supervisor) *ProcessServ
 		sup = supervisors[0]
 	}
 	return &ProcessServer{Workspace: workspace, processes: make(map[processKey]*managedProcess), managedOwners: make(map[string]*managedOwner), OutputCapacity: defaultOutputCapacity, MaxRecords: defaultMaxRecords, supervisor: sup, restartInitial: 25 * time.Millisecond, restartMax: 5 * time.Second, restartStable: 30 * time.Second}
+}
+
+func (s *ProcessServer) maxRecords() int {
+	if s.MaxRecords > 0 {
+		return s.MaxRecords
+	}
+	return defaultMaxRecords
 }
 
 func validTimeout(ms uint64) bool { return ms <= uint64((time.Duration(1<<63-1))/time.Millisecond) }
@@ -260,34 +273,40 @@ func (s *ProcessServer) ReconcileManagedServices(_ context.Context, req *sandbox
 	if req == nil || req.OwnerId == "" || req.IntentRevision == 0 {
 		return nil, status.Error(codes.InvalidArgument, "owner_id and positive intent_revision are required")
 	}
+	if len(req.OwnerId) > maxManagedOwnerBytes || !utf8.ValidString(req.OwnerId) || strings.ContainsRune(req.OwnerId, 0) {
+		return nil, status.Errorf(codes.InvalidArgument, "owner_id must be valid UTF-8 without NUL and at most %d bytes", maxManagedOwnerBytes)
+	}
+	if len(req.Services) > maxManagedServices {
+		return nil, status.Errorf(codes.InvalidArgument, "services exceeds maximum of %d", maxManagedServices)
+	}
+	if !s.reconcileMu.TryLock() {
+		return nil, status.Error(codes.ResourceExhausted, "managed service reconciliation is busy")
+	}
+	defer s.reconcileMu.Unlock()
 	desired := make(map[string]*sandboxdv1.ProcessSpec, len(req.Services))
 	roles := make([]string, 0, len(req.Services))
 	for _, service := range req.Services {
-		if service == nil || service.Role == "" {
-			return nil, status.Error(codes.InvalidArgument, "service role must not be empty")
+		if service == nil || service.Role == "" || len(service.Role) > maxManagedRoleBytes || !utf8.ValidString(service.Role) || strings.ContainsRune(service.Role, 0) {
+			return nil, status.Errorf(codes.InvalidArgument, "service role must be valid UTF-8 without NUL and 1-%d bytes", maxManagedRoleBytes)
 		}
 		if _, exists := desired[service.Role]; exists {
 			return nil, status.Error(codes.InvalidArgument, "service roles must be unique")
+		}
+		if err := validateManagedSpec(service.Spec); err != nil {
+			return nil, err
 		}
 		spec, err := s.normalizeSpec(service.Spec)
 		if err != nil {
 			return nil, err
 		}
+		if len(spec.Env) == 0 {
+			spec.Env = nil
+		}
 		desired[service.Role] = spec
 		roles = append(roles, service.Role)
 	}
 	sort.Strings(roles)
-	canonical := &sandboxdv1.ReconcileManagedServicesRequest{OwnerId: req.OwnerId, IntentRevision: req.IntentRevision, RouteRevision: req.RouteRevision}
-	for _, role := range roles {
-		canonical.Services = append(canonical.Services, &sandboxdv1.ManagedServiceSpec{Role: role, Spec: desired[role]})
-	}
-	wire, err := proto.MarshalOptions{Deterministic: true}.Marshal(canonical)
-	if err != nil {
-		return nil, status.Errorf(codes.Internal, "encode desired services: %v", err)
-	}
 
-	s.reconcileMu.Lock()
-	defer s.reconcileMu.Unlock()
 	s.mu.Lock()
 	if s.closed {
 		s.mu.Unlock()
@@ -300,7 +319,7 @@ func (s *ProcessServer) ReconcileManagedServices(_ context.Context, req *sandbox
 			return nil, status.Error(codes.FailedPrecondition, "managed service revision is stale")
 		}
 		if req.IntentRevision == owner.revision && req.RouteRevision == owner.routeRevision {
-			if !bytes.Equal(wire, owner.wire) {
+			if !reflect.DeepEqual(desired, owner.desired) {
 				s.mu.Unlock()
 				return nil, status.Error(codes.FailedPrecondition, "intent_revision has a different desired set")
 			}
@@ -309,11 +328,27 @@ func (s *ProcessServer) ReconcileManagedServices(_ context.Context, req *sandbox
 			return resp, nil
 		}
 	}
+	maxRecords := s.maxRecords()
+	if owner == nil && len(s.managedOwners) >= maxRecords {
+		s.mu.Unlock()
+		return nil, status.Error(codes.ResourceExhausted, "managed service owner limit reached")
+	}
+	desiredRecords := len(desired)
+	for ownerID, existing := range s.managedOwners {
+		if ownerID != req.OwnerId {
+			desiredRecords += len(existing.desired)
+		}
+	}
+	if desiredRecords > maxRecords {
+		s.mu.Unlock()
+		return nil, status.Error(codes.ResourceExhausted, "managed service desired record limit reached")
+	}
 	gen := uint64(1)
 	if owner != nil {
 		gen = owner.gen + 1
+		s.cancelManagedRestartsLocked(owner)
 	}
-	owner = &managedOwner{revision: req.IntentRevision, routeRevision: req.RouteRevision, wire: wire, desired: desired, gen: gen}
+	owner = &managedOwner{revision: req.IntentRevision, routeRevision: req.RouteRevision, desired: desired, restarts: make(map[string]*time.Timer), gen: gen}
 	s.managedOwners[req.OwnerId] = owner
 	var stop []*managedProcess
 	toStart := make(map[string]struct{}, len(desired))
@@ -353,6 +388,42 @@ func (s *ProcessServer) ReconcileManagedServices(_ context.Context, req *sandbox
 	return resp, nil
 }
 
+func validateManagedSpec(spec *sandboxdv1.ProcessSpec) error {
+	if spec == nil || len(spec.Argv) == 0 {
+		return status.Error(codes.InvalidArgument, "managed service spec argv must not be empty")
+	}
+	if len(spec.Argv) > maxManagedArgs {
+		return status.Errorf(codes.InvalidArgument, "managed service argv exceeds maximum of %d arguments", maxManagedArgs)
+	}
+	argvBytes := 0
+	for _, arg := range spec.Argv {
+		if arg == "" || len(arg) > maxManagedArgBytes || !utf8.ValidString(arg) || strings.ContainsRune(arg, 0) {
+			return status.Errorf(codes.InvalidArgument, "managed service argument must be valid UTF-8 without NUL and 1-%d bytes", maxManagedArgBytes)
+		}
+		argvBytes += len(arg)
+	}
+	if argvBytes > maxManagedArgvBytes {
+		return status.Errorf(codes.InvalidArgument, "managed service argv exceeds %d aggregate bytes", maxManagedArgvBytes)
+	}
+	if len(spec.Cwd) > maxManagedCWDBytes || !utf8.ValidString(spec.Cwd) || strings.ContainsRune(spec.Cwd, 0) {
+		return status.Errorf(codes.InvalidArgument, "managed service cwd must be valid UTF-8 without NUL and at most %d bytes", maxManagedCWDBytes)
+	}
+	if len(spec.Env) > maxManagedEnvEntries {
+		return status.Errorf(codes.InvalidArgument, "managed service environment exceeds maximum of %d entries", maxManagedEnvEntries)
+	}
+	envBytes := 0
+	for name, value := range spec.Env {
+		if len(name) > maxLaunchMaterialName || !utf8.ValidString(name) || len(value) > maxLaunchMaterialValue || !utf8.ValidString(value) {
+			return status.Error(codes.InvalidArgument, "managed service environment entry exceeds portable size or encoding limits")
+		}
+		envBytes += len(name) + len(value)
+	}
+	if envBytes > maxLaunchMaterialTotal {
+		return status.Errorf(codes.InvalidArgument, "managed service environment exceeds %d aggregate bytes", maxLaunchMaterialTotal)
+	}
+	return nil
+}
+
 func (s *ProcessServer) managedResponseLocked(ownerID string, owner *managedOwner) *sandboxdv1.ReconcileManagedServicesResponse {
 	resp := &sandboxdv1.ReconcileManagedServicesResponse{OwnerId: ownerID, IntentRevision: owner.revision, RouteRevision: owner.routeRevision}
 	roles := make([]string, 0, len(owner.desired))
@@ -368,12 +439,6 @@ func (s *ProcessServer) managedResponseLocked(ownerID string, owner *managedOwne
 		resp.Services = append(resp.Services, &sandboxdv1.ManagedServiceStatus{Role: role, Process: process})
 	}
 	return resp
-}
-
-func (s *ProcessServer) ensureManaged(ownerID, role string, gen uint64, attempt uint) {
-	s.reconcileMu.Lock()
-	defer s.reconcileMu.Unlock()
-	s.ensureManagedUnderReconcile(ownerID, role, gen, attempt)
 }
 
 // ensureManagedUnderReconcile is called only while reconcileMu is held. The
@@ -408,7 +473,7 @@ func (s *ProcessServer) ensureManagedUnderReconcile(ownerID, role string, gen ui
 	if startErr != nil {
 		if owner == s.managedOwners[ownerID] && owner.gen == gen && owner.desired[role] != nil && !s.closed {
 			delay := s.managedRestartDelay(attempt)
-			time.AfterFunc(delay, func() { s.ensureManaged(ownerID, role, gen, attempt+1) })
+			s.scheduleManagedEnsureLocked(ownerID, role, owner, attempt+1, delay)
 		}
 		s.mu.Unlock()
 		return
@@ -435,8 +500,51 @@ func (s *ProcessServer) scheduleManagedRestartLocked(key processKey, p *managedP
 		attempt = 0
 	}
 	delay := s.managedRestartDelay(attempt)
-	gen := owner.gen
-	time.AfterFunc(delay, func() { s.ensureManaged(key.ownerID, key.role, gen, attempt+1) })
+	s.scheduleManagedEnsureLocked(key.ownerID, key.role, owner, attempt+1, delay)
+}
+
+func (s *ProcessServer) scheduleManagedEnsureLocked(ownerID, role string, owner *managedOwner, attempt uint, delay time.Duration) {
+	if timer := owner.restarts[role]; timer != nil {
+		timer.Stop()
+	}
+	var timer *time.Timer
+	timer = time.AfterFunc(delay, func() {
+		s.mu.Lock()
+		current := s.managedOwners[ownerID]
+		valid := current == owner && !s.closed && current.restarts[role] == timer && current.desired[role] != nil
+		s.mu.Unlock()
+		if !valid {
+			return
+		}
+		if !s.reconcileMu.TryLock() {
+			s.mu.Lock()
+			current = s.managedOwners[ownerID]
+			if current == owner && !s.closed && current.restarts[role] == timer && current.desired[role] != nil {
+				s.scheduleManagedEnsureLocked(ownerID, role, owner, attempt, s.restartInitial)
+			}
+			s.mu.Unlock()
+			return
+		}
+		defer s.reconcileMu.Unlock()
+		s.mu.Lock()
+		current = s.managedOwners[ownerID]
+		valid = current == owner && !s.closed && current.restarts[role] == timer && current.desired[role] != nil
+		if valid {
+			delete(current.restarts, role)
+		}
+		s.mu.Unlock()
+		if valid {
+			s.ensureManagedUnderReconcile(ownerID, role, owner.gen, attempt)
+		}
+	})
+	owner.restarts[role] = timer
+}
+
+func (s *ProcessServer) cancelManagedRestartsLocked(owner *managedOwner) {
+	for role, timer := range owner.restarts {
+		timer.Stop()
+		delete(owner.restarts, role)
+	}
 }
 
 func (s *ProcessServer) managedRestartDelay(attempt uint) time.Duration {
@@ -554,10 +662,7 @@ func (s *ProcessServer) start(keyRequest *sandboxdv1.ProcessKey, specRequest *sa
 		}
 		return processResponse(p), nil
 	}
-	maxRecords := s.MaxRecords
-	if maxRecords <= 0 {
-		maxRecords = defaultMaxRecords
-	}
+	maxRecords := s.maxRecords()
 	if len(s.processes) >= maxRecords {
 		return nil, status.Error(codes.ResourceExhausted, "process record limit reached")
 	}
@@ -771,8 +876,7 @@ func (s *ProcessServer) finishLocked(p *managedProcess) {
 		if p.managed {
 			s.scheduleManagedRestartLocked(key, p)
 		} else if owner := s.managedOwners[key.ownerID]; owner != nil && owner.desired[key.role] != nil && !p.managedSuppressed && !s.closed {
-			gen := owner.gen
-			time.AfterFunc(0, func() { s.ensureManaged(key.ownerID, key.role, gen, 0) })
+			s.scheduleManagedEnsureLocked(key.ownerID, key.role, owner, 0, 0)
 		}
 	}
 }
@@ -1004,6 +1108,9 @@ func (s *ProcessServer) CloseContext(ctx context.Context) error {
 		return s.supervisor.Close(ctx)
 	}
 	s.closed = true
+	for _, owner := range s.managedOwners {
+		s.cancelManagedRestartsLocked(owner)
+	}
 	s.mu.Unlock()
 	return s.supervisor.Close(ctx)
 }

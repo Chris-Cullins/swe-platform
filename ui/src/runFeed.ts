@@ -1,6 +1,6 @@
 import React from 'react'
 import { useQuery, useQueryClient, type QueryClient } from '@tanstack/react-query'
-import { api, ApiProblem, fallbackPollInterval, notifyUnauthorized, queryKeys } from './api'
+import { api, ApiProblem, fallbackPollInterval, notifyUnauthorized, queryKeys, terminalRunIdentityError, transientResourceError } from './api'
 import type { Run, RunSummary, RunSummaryList, RunWatchEvent } from './contracts'
 
 const MAX_PAGES = 100
@@ -103,17 +103,76 @@ export function applyRunEvent(snapshot: RunSummaryList, event: RunWatchEvent): R
 }
 
 export function refreshMatchingDetail(queryClient: QueryClient, namespace: string, summary: RunSummary) {
-  const detail = queryClient.getQueryData<Run>(queryKeys.run(namespace, summary.name))
-  if (!detail) {
-    void queryClient.resetQueries({ queryKey: queryKeys.run(namespace, summary.name), exact: true })
+  const key = queryKeys.run(namespace, summary.name, summary.uid)
+  const state = queryClient.getQueryState(key)
+  if (!state || terminalRunIdentityError(state.error)) return
+  const detail = queryClient.getQueryData<Run>(key)
+  if (detail?.generation !== undefined && summary.generation !== undefined && detail.generation > summary.generation) return
+  settleExactDetail(queryClient, key)
+}
+
+type Settlement = { dirty: boolean }
+const settlements = new WeakMap<QueryClient, Map<string, Settlement>>()
+
+function settleExactDetail(queryClient: QueryClient, key: readonly [string, string, string, string]) {
+  const state = queryClient.getQueryState(key)
+  if (!state || state.error && !transientResourceError(state.error)) return
+  let active = settlements.get(queryClient)
+  if (!active) {
+    active = new Map()
+    settlements.set(queryClient, active)
+  }
+  const identity = JSON.stringify(key)
+  const existing = active.get(identity)
+  if (existing) {
+    existing.dirty = true
     return
   }
-  if (detail.uid !== summary.uid) {
-    void queryClient.invalidateQueries({ queryKey: queryKeys.run(namespace, summary.name), exact: true })
+  const settlement: Settlement = { dirty: false }
+  active.set(identity, settlement)
+  void (async () => {
+    try {
+      do {
+        settlement.dirty = false
+        await queryClient.cancelQueries({ queryKey: key, exact: true })
+        await queryClient.refetchQueries({ queryKey: key, exact: true, type: 'active' })
+      } while (settlement.dirty && (() => {
+        const error = queryClient.getQueryState(key)?.error
+        return !error || transientResourceError(error)
+      })())
+    } finally {
+      active?.delete(identity)
+    }
+  })()
+}
+
+export function reconcileRunSnapshot(queryClient: QueryClient, namespace: string, snapshot: RunSummaryList, refreshMatches: boolean) {
+  const summaries = new Map(snapshot.items.map(summary => [summary.name, summary]))
+  for (const query of queryClient.getQueryCache().findAll({ queryKey: ['run', namespace] })) {
+    const [, queryNamespace, name, uid] = query.queryKey
+    if (query.queryKey.length !== 4 || queryNamespace !== namespace || typeof name !== 'string' || typeof uid !== 'string') continue
+    const summary = summaries.get(name)
+    if (summary?.uid === uid) {
+      if (refreshMatches) refreshMatchingDetail(queryClient, namespace, summary)
+    } else {
+      settleExactDetail(queryClient, query.queryKey as [string, string, string, string])
+    }
+  }
+}
+
+export function reconcileRunWatchPublication(queryClient: QueryClient, namespace: string, event: RunWatchEvent, snapshot: RunSummaryList) {
+  const published = snapshot.items.find(run => run.uid === event.run.uid)
+  if (event.type === 'DELETED') {
+    const key = queryKeys.run(namespace, event.run.name, event.run.uid)
+    if (!published) settleExactDetail(queryClient, key)
     return
   }
-  if (detail.generation !== undefined && summary.generation !== undefined && detail.generation > summary.generation) return
-  void queryClient.invalidateQueries({ queryKey: queryKeys.run(namespace, summary.name), exact: true })
+  for (const query of queryClient.getQueryCache().findAll({ queryKey: queryKeys.runPrefix(namespace, event.run.name) })) {
+    const uid = query.queryKey[3]
+    if (query.queryKey.length !== 4 || typeof uid !== 'string') continue
+    if (uid === event.run.uid && published) refreshMatchingDetail(queryClient, namespace, published)
+    else settleExactDetail(queryClient, query.queryKey as [string, string, string, string])
+  }
 }
 
 export function useRunFeed(namespace: string) {
@@ -121,7 +180,11 @@ export function useRunFeed(namespace: string) {
   const [fallback, setFallback] = React.useState(false)
   const [watchError, setWatchError] = React.useState<Error>()
   const query = useQuery({
-    queryKey: queryKeys.runs(namespace), queryFn: ({ signal }) => listRunSnapshot(namespace, signal),
+    queryKey: queryKeys.runs(namespace), queryFn: async ({ signal }) => {
+      const snapshot = await listRunSnapshot(namespace, signal)
+      reconcileRunSnapshot(queryClient, namespace, snapshot, !!snapshot.resourceVersion)
+      return snapshot
+    },
     refetchInterval: current => fallback || current.state.status === 'error' ? fallbackPollInterval : false,
     staleTime: fallback ? 0 : Infinity,
     refetchOnMount: false,
@@ -149,6 +212,7 @@ export function useRunFeed(namespace: string) {
       if (!snapshot.resourceVersion) { setFallback(true); controller.abort(); return false }
       if (controller.signal.aborted) return false
       queryClient.setQueryData(queryKeys.runs(namespace), snapshot)
+      reconcileRunSnapshot(queryClient, namespace, snapshot, true)
       cursor = snapshot.resourceVersion
       watchStart = snapshot.resourceVersion
       return true
@@ -181,8 +245,12 @@ export function useRunFeed(namespace: string) {
             if (message.event !== 'run') return
             const event = JSON.parse(message.data) as RunWatchEvent
             if (!message.id || event.resourceVersion !== message.id) throw new Error('Invalid Run watch event cursor.')
-            queryClient.setQueryData<RunSummaryList>(queryKeys.runs(namespace), old => old ? applyRunEvent(old, event) : old)
-            refreshMatchingDetail(queryClient, namespace, event.run)
+            let published: RunSummaryList | undefined
+            queryClient.setQueryData<RunSummaryList>(queryKeys.runs(namespace), old => {
+              published = old ? applyRunEvent(old, event) : old
+              return published
+            })
+            if (published) reconcileRunWatchPublication(queryClient, namespace, event, published)
             cursor = event.resourceVersion
           }, controller.signal)
         } catch (error) {

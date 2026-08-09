@@ -112,9 +112,39 @@ func TestRepositoryCloneCredentialRecoversBoundProvisioningLease(t *testing.T) {
 		t.Fatalf("recovered lease = %#v, %v", lease, err)
 	}
 	repositorycredential.ClearLease(lease)
-	delete(env.Annotations, repositoryProvisioningAnnotation)
-	if _, err := r.repositoryCloneCredential(context.Background(), env); !stderrors.Is(err, errRepositoryCredentialPending) {
-		t.Fatalf("bound lease without provisioning record error = %v", err)
+	for _, tc := range []struct {
+		name       string
+		annotation string
+	}{
+		{name: "missing provisioning record"},
+		{name: "revocation state present", annotation: repositorycredential.AnnotationRevocationState},
+		{name: "revocation disposition present", annotation: repositorycredential.AnnotationRevocationDisposition},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var currentSecret corev1.Secret
+			if err := c.Get(context.Background(), client.ObjectKeyFromObject(secret), &currentSecret); err != nil {
+				t.Fatal(err)
+			}
+			if tc.annotation != "" {
+				currentSecret.Annotations[tc.annotation] = ""
+				if err := c.Update(context.Background(), &currentSecret); err != nil {
+					t.Fatal(err)
+				}
+			}
+			currentEnv := env.DeepCopy()
+			if tc.annotation == "" {
+				delete(currentEnv.Annotations, repositoryProvisioningAnnotation)
+			}
+			if _, err := r.repositoryCloneCredential(context.Background(), currentEnv); err == nil || tc.annotation == "" && !stderrors.Is(err, errRepositoryCredentialPending) {
+				t.Fatalf("repositoryCloneCredential error = %v", err)
+			}
+			if tc.annotation != "" {
+				delete(currentSecret.Annotations, tc.annotation)
+				if err := c.Update(context.Background(), &currentSecret); err != nil {
+					t.Fatal(err)
+				}
+			}
+		})
 	}
 }
 

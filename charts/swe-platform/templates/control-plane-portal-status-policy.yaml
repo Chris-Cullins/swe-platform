@@ -1,7 +1,85 @@
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicy
 metadata:
-  name: {{ include "swe-platform.controlPlaneClusterFullname" . }}-portal-status
+  name: {{ include "swe-platform.controlPlaneEnvIntentFullname" . }}
+  labels:
+    {{- include "swe-platform.labels" . | nindent 4 }}
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: ["swe.dev"]
+        apiVersions: ["v1alpha1"]
+        operations: ["UPDATE"]
+        resources: ["environments"]
+        scope: Namespaced
+  matchConditions:
+    - name: control-plane-service-account
+      expression: request.userInfo.username == {{ printf "system:serviceaccount:%s:%s" .Release.Namespace (include "swe-platform.controlPlaneFullname" .) | quote }}
+  validations:
+    # Terminal and portal traffic publish only an Idle-scoped wake for the
+    # current Environment and hold-policy revision.
+    - expression: >-
+        object.?spec.?lifecycle.?wake == oldObject.?spec.?lifecycle.?wake ||
+        (has(object.spec.lifecycle.wake) &&
+        object.spec.lifecycle.wake.environmentUID == object.metadata.uid &&
+        object.spec.lifecycle.wake.holdPolicyRevision ==
+        (has(object.spec.lifecycle.hold) ? object.spec.lifecycle.hold.revision : 0) &&
+        object.spec.lifecycle.wake.expectedSuspensionReason == 'Idle' &&
+        object.spec.lifecycle.wake.id.matches('^(terminal|portal)/wake/[0-9]+$'))
+      message: the control plane may publish only a current Idle wake intent
+    - expression: object.?spec.?projectRef == oldObject.?spec.?projectRef
+      message: the control plane may not change spec.projectRef
+    - expression: object.?spec.?templateRef == oldObject.?spec.?templateRef
+      message: the control plane may not change spec.templateRef
+    - expression: object.?spec.?backend == oldObject.?spec.?backend
+      message: the control plane may not change spec.backend
+    - expression: object.?spec.?lifecycle.?hold == oldObject.?spec.?lifecycle.?hold
+      message: the control plane may not change spec.lifecycle.hold
+    - expression: object.?spec.?lifecycle.?suspend == oldObject.?spec.?lifecycle.?suspend
+      message: the control plane may not change spec.lifecycle.suspend
+    - expression: object.?spec.?lifecycle.?activity == oldObject.?spec.?lifecycle.?activity
+      message: the control plane may not change spec.lifecycle.activity
+    - expression: object.?spec.?services == oldObject.?spec.?services
+      message: the control plane may not change spec.services
+    - expression: object.?spec.?paused == oldObject.?spec.?paused
+      message: the control plane may not change spec.paused
+    - expression: object.metadata.?generateName == oldObject.metadata.?generateName
+      message: the control plane may not change metadata.generateName
+    - expression: object.metadata.?labels == oldObject.metadata.?labels
+      message: the control plane may not change metadata.labels
+    - expression: object.metadata.?finalizers == oldObject.metadata.?finalizers
+      message: the control plane may not change metadata.finalizers
+    - expression: object.metadata.?ownerReferences == oldObject.metadata.?ownerReferences
+      message: the control plane may not change metadata.ownerReferences
+    # Activity heartbeats use two fixed annotation slots so they do not make
+    # status stale by advancing metadata.generation. Freeze every other key in
+    # both directions, including annotations introduced after chart install.
+    - expression: >-
+        object.metadata.?annotations.orValue({}).all(k, v,
+        k in ['lifecycle.swe.dev/activity-terminal', 'lifecycle.swe.dev/activity-portal'] ||
+        (k in oldObject.metadata.?annotations.orValue({}) &&
+        v == oldObject.metadata.?annotations.orValue({})[k])) &&
+        oldObject.metadata.?annotations.orValue({}).all(k, v,
+        k in ['lifecycle.swe.dev/activity-terminal', 'lifecycle.swe.dev/activity-portal'] ||
+        (k in object.metadata.?annotations.orValue({}) &&
+        v == object.metadata.?annotations.orValue({})[k]))
+      message: the control plane may change only its Terminal and Portal activity annotations
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: {{ include "swe-platform.controlPlaneEnvIntentFullname" . }}
+  labels:
+    {{- include "swe-platform.labels" . | nindent 4 }}
+spec:
+  policyName: {{ include "swe-platform.controlPlaneEnvIntentFullname" . }}
+  validationActions: [Deny]
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: {{ include "swe-platform.controlPlanePortalStatusFullname" . }}
   labels:
     {{- include "swe-platform.labels" . | nindent 4 }}
 spec:
@@ -57,9 +135,43 @@ spec:
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicyBinding
 metadata:
-  name: {{ include "swe-platform.controlPlaneClusterFullname" . }}-portal-status
+  name: {{ include "swe-platform.controlPlanePortalStatusFullname" . }}
   labels:
     {{- include "swe-platform.labels" . | nindent 4 }}
 spec:
-  policyName: {{ include "swe-platform.controlPlaneClusterFullname" . }}-portal-status
+  policyName: {{ include "swe-platform.controlPlanePortalStatusFullname" . }}
+  validationActions: [Deny]
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: {{ include "swe-platform.operatorPortalStatusFullname" . }}
+  labels:
+    {{- include "swe-platform.labels" . | nindent 4 }}
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: ["swe.dev"]
+        apiVersions: ["v1alpha1"]
+        operations: ["UPDATE"]
+        resources: ["environments/status"]
+        scope: Namespaced
+  matchConditions:
+    - name: operator-service-account
+      expression: request.userInfo.username == {{ printf "system:serviceaccount:%s:%s" .Release.Namespace (include "swe-platform.serviceAccountName" .) | quote }}
+  validations:
+    - expression: object.?status.?portalRoutes == oldObject.?status.?portalRoutes
+      message: the operator may not change gateway-owned status.portalRoutes
+    - expression: object.?status.?nextPortalRouteGeneration == oldObject.?status.?nextPortalRouteGeneration
+      message: the operator may not change gateway-owned status.nextPortalRouteGeneration
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: {{ include "swe-platform.operatorPortalStatusFullname" . }}
+  labels:
+    {{- include "swe-platform.labels" . | nindent 4 }}
+spec:
+  policyName: {{ include "swe-platform.operatorPortalStatusFullname" . }}
   validationActions: [Deny]

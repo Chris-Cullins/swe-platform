@@ -19,9 +19,10 @@ import (
 )
 
 const (
-	maxRunWatchRV = 4096
-	maxRunEvent   = 64 << 10
-	runWatchLife  = 5 * time.Minute
+	maxRunWatchRV          = 4096
+	maxRunEvent            = 64 << 10
+	runWatchLife           = 5 * time.Minute
+	runWatchReauthorizeMax = 15 * time.Second
 )
 
 type runWatchService interface {
@@ -153,9 +154,19 @@ func (s *Server) watchRuns(w http.ResponseWriter, r *http.Request, namespace str
 	defer cleanup()
 	ctx, cancel := context.WithTimeout(r.Context(), runWatchLife)
 	defer cancel()
+	reauthorize := func() bool {
+		checkCtx, checkCancel := context.WithTimeout(ctx, runWatchReauthorizeMax)
+		defer checkCancel()
+		request := r.Clone(checkCtx)
+		if pa, ok := s.access.(principalAccessController); ok {
+			current, err := pa.AuthorizePrincipal(request, access, true)
+			return err == nil && current == principal
+		}
+		return s.access != nil && s.access.Authorize(request, access, true) == nil
+	}
 	upstream, err := service.WatchRuns(ctx, namespace, rv, time.Duration(240+rand.Intn(40))*time.Second)
 	if err != nil {
-		if apierrors.IsResourceExpired(err) {
+		if apierrors.IsResourceExpired(err) || apierrors.IsGone(err) {
 			writeProblem(w, 410, "run-relist", "Run relist required", "resourceVersion is no longer available")
 		} else {
 			s.writeResourceError(w, "watch runs", namespace, "", err)
@@ -223,10 +234,13 @@ func (s *Server) watchRuns(w http.ResponseWriter, r *http.Request, namespace str
 		case <-ctx.Done():
 			return
 		case event, open := <-upstream.ResultChan():
-			if !open || !process(event) {
+			if !open || !reauthorize() || !process(event) {
 				return
 			}
 		case <-heartbeat.C:
+			if !reauthorize() {
+				return
+			}
 			_ = controller.SetWriteDeadline(time.Now().Add(15 * time.Second))
 			if _, err := w.Write([]byte(": heartbeat\n\n")); err != nil {
 				return
