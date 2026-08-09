@@ -195,18 +195,30 @@ func TestForwarderMaxConnections(t *testing.T) {
 		t.Fatalf("first handler did not end before timeout: %v", err)
 	}
 
-	third, err := net.Dial("tcp", listener.Addr().String())
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer third.Close()
-	if _, err := io.WriteString(third, "CONNECT api.example.com:443 HTTP/1.1\r\nHost: api.example.com:443\r\n\r\n"); err != nil {
-		t.Fatal(err)
-	}
-	select {
-	case <-secondEntered:
-	case <-time.After(2 * time.Second):
-		t.Fatal("third connection did not acquire the released slot")
+	// Observing the first connection's FIN does not guarantee the serving
+	// goroutine has run its immediately-following deferred slot release. Retry
+	// bounded connection attempts until one observes that released slot.
+	deadline := time.Now().Add(2 * time.Second)
+	acquired := false
+	for !acquired {
+		third, err := net.Dial("tcp", listener.Addr().String())
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, writeErr := io.WriteString(third, "CONNECT api.example.com:443 HTTP/1.1\r\nHost: api.example.com:443\r\n\r\n")
+		select {
+		case <-secondEntered:
+			acquired = true
+			_ = third.Close()
+		case <-time.After(50 * time.Millisecond):
+			_ = third.Close()
+		}
+		if !acquired && writeErr != nil && time.Now().After(deadline) {
+			t.Fatalf("connection attempts failed after slot release: %v", writeErr)
+		}
+		if !acquired && time.Now().After(deadline) {
+			t.Fatal("no connection acquired the released slot")
+		}
 	}
 	if got := dialCount.Load(); got != 2 {
 		t.Fatalf("DialTLS count = %d, want 2", got)
