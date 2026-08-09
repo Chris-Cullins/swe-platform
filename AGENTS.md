@@ -128,7 +128,8 @@ runs both via `make` targets:
   The required `build-test` CI job runs the root and sandboxd Go suites plus
   the four shell checks above, mirroring `make test`. The egress-conformance live runner remains
   default-off on its separate `hack/kind-calico-conformance.yaml` topology and must not be invoked
-  by CI/e2e; only its guard test runs.
+  by CI/e2e; only its guard test runs. Keep its temporary kind admin kubeconfig and Python bytecode
+  inside cleanup-managed temporary paths so both early exits and `make test` leave no artifacts.
 - **Operations console:** from `ui/`, install with `npm ci`; use `npm run lint`,
   `npm run typecheck`, `npm test -- --run`, and `npm run build`. Start the standalone
   Vite development server with `npm run dev`. Production uses `make ui-build`
