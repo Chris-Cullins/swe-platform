@@ -65,7 +65,9 @@ Pi deliberately supports no credential profiles or credential injection.
 
 - **Language:** Go for control plane, operator, `sandboxd`, and CLI.
 - **Layout:** kubebuilder conventions — `api/v1alpha1/` for types,
-  `internal/controllers/`, `cmd/{operator,swe}`. The exact adapter contract boundary is
+  `internal/controllers/`, and `cmd/{operator,control-plane,swe,egress-proxy}` for root-module
+  binaries. The egress proxy command is a disabled protocol foundation and intentionally remains
+  outside `make build` and image publishing until the fail-closed runtime is enabled. The exact adapter contract boundary is
   `internal/agent/`. Shared fenced Environment intent
   publication and validation belongs in `internal/lifecycle/`; controllers remain
   the sole owners of observed lifecycle transitions. Environment reconciliation is split

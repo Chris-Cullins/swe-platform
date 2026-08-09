@@ -34,6 +34,20 @@ func (panicResolver) Query(context.Context, dnsmessage.Name, dnsmessage.Type) ([
 	panic("resolver invoked after denial")
 }
 
+type releaseCheckingResolver struct {
+	released <-chan struct{}
+	t        *testing.T
+}
+
+func (r releaseCheckingResolver) Query(context.Context, dnsmessage.Name, dnsmessage.Type) ([]dnsmessage.Resource, error) {
+	select {
+	case <-r.released:
+	default:
+		r.t.Error("pre-authorization slot was retained after authorization")
+	}
+	return nil, errors.New("stop after authorization")
+}
+
 func hello(name string, extra ...uint16) []byte {
 	ext := func(typ uint16, v []byte) []byte {
 		b := make([]byte, 4+len(v))
@@ -206,6 +220,31 @@ func TestForwarderMaxConnections(t *testing.T) {
 	}
 }
 
+func TestRelayClosesBothDirectionsWhenOneSideEnds(t *testing.T) {
+	client, relayClient := net.Pipe()
+	relayUpstream, upstream := net.Pipe()
+	done := make(chan struct{})
+	go func() {
+		relay(relayClient, relayUpstream, time.Minute, time.Hour)
+		close(done)
+	}()
+
+	if err := client.Close(); err != nil {
+		t.Fatal(err)
+	}
+	_ = upstream.SetReadDeadline(time.Now().Add(2 * time.Second))
+	if _, err := upstream.Read(make([]byte, 1)); err == nil {
+		t.Fatal("opposite relay direction remained open")
+	} else if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+		t.Fatalf("opposite relay direction blocked until deadline: %v", err)
+	}
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("relay did not release after one direction ended")
+	}
+}
+
 func TestSelfSignedClientFingerprintAuthorizerDenial(t *testing.T) {
 	serverCert := testCertificate(t, "server")
 	clientCert := testCertificate(t, "execution")
@@ -244,6 +283,38 @@ func TestSelfSignedClientFingerprintAuthorizerDenial(t *testing.T) {
 	if !called {
 		t.Fatal("authorizer not called")
 	}
+}
+
+func TestServerReleasesPreAuthSlotBeforeResolution(t *testing.T) {
+	serverCert := testCertificate(t, "server")
+	clientCert := testCertificate(t, "execution")
+	released := make(chan struct{})
+	s := &Server{
+		TLSConfig: &tls.Config{Certificates: []tls.Certificate{serverCert}, ClientAuth: tls.RequireAnyClientCert, MinVersion: tls.VersionTLS13, MaxVersion: tls.VersionTLS13, SessionTicketsDisabled: true},
+		Resolver:  releaseCheckingResolver{released: released, t: t},
+		Quotas:    NewQuotaManager(),
+		Authorizer: authorizerFunc(func(context.Context, Identity, string) (Authorization, error) {
+			return Authorization{ExecutionKey: "execution", ProjectKey: "project"}, nil
+		}),
+	}
+	serverSide, clientSide := net.Pipe()
+	done := make(chan struct{})
+	go func() {
+		s.handleWithPreAuth(tls.Server(serverSide, s.TLSConfig), func() { close(released) })
+		close(done)
+	}()
+	c := tls.Client(clientSide, &tls.Config{Certificates: []tls.Certificate{clientCert}, InsecureSkipVerify: true, MinVersion: tls.VersionTLS13, MaxVersion: tls.VersionTLS13})
+	if err := c.Handshake(); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeRequest(c, "api.example.com"); err != nil {
+		t.Fatal(err)
+	}
+	if err := readStatus(c); err == nil {
+		t.Fatal("resolution failure status accepted")
+	}
+	_ = c.Close()
+	<-done
 }
 
 func testCertificate(t *testing.T, cn string) tls.Certificate {

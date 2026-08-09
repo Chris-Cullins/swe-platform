@@ -68,15 +68,21 @@ func (s *Server) Serve(l net.Listener) error {
 		select {
 		case preAuth <- struct{}{}:
 			go func() {
-				defer func() { <-preAuth }()
-				s.handle(c)
+				release := sync.OnceFunc(func() { <-preAuth })
+				defer release()
+				s.handleWithPreAuth(c, release)
 			}()
 		default:
 			_ = c.Close()
 		}
 	}
 }
+
 func (s *Server) handle(c net.Conn) {
+	s.handleWithPreAuth(c, func() {})
+}
+
+func (s *Server) handleWithPreAuth(c net.Conn, releasePreAuth func()) {
 	defer c.Close()
 	_ = c.SetDeadline(time.Now().Add(5 * time.Second))
 	tc, ok := c.(*tls.Conn)
@@ -103,6 +109,7 @@ func (s *Server) handle(c net.Conn) {
 	authCtx, authCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	a, e := s.Authorizer.Authorize(authCtx, id, name)
 	authCancel()
+	releasePreAuth()
 	if e != nil {
 		s.deny(c)
 		return
@@ -385,8 +392,13 @@ func bytesContains(b []byte, want byte) bool {
 func relay(a, b net.Conn, idle, absolute time.Duration) {
 	end := time.Now().Add(absolute)
 	var wg sync.WaitGroup
+	closeBoth := sync.OnceFunc(func() {
+		_ = a.Close()
+		_ = b.Close()
+	})
 	cp := func(dst, src net.Conn) {
 		defer wg.Done()
+		defer closeBoth()
 		buf := make([]byte, 32<<10)
 		for {
 			d := time.Now().Add(idle)
