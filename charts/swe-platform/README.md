@@ -482,6 +482,11 @@ The chart does not install default-deny egress or an egress allowlist proxy. Pro
 `egressAllowlist` values are reserved and rejected when non-empty; empty or omitted values leave
 egress subject to the cluster's network configuration.
 
+The repository also contains a deliberately disabled experimental Calico v3.32.1 diagnostic
+runner on a separate dual-stack kind topology. It is not a chart component, production preset
+capability, attestation mechanism, or runtime input, and normal E2E does not run it. Its
+human-readable one-shot results do not change this table or claim production enforcement.
+
 For local development, use `values-kind.yaml`; it references locally loaded `:dev`
 images and disables leader election. `values-argocd.yaml` is the preset for the
 local Argo CD mirror (`hack/argocd-up.sh`): it tracks the mutable `:latest` images
