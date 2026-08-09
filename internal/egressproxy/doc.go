@@ -1,8 +1,8 @@
-// Package egressproxy contains the INERT, DISABLED and non-authoritative
-// transport slice of the future egress proxy. It does not consult Kubernetes,
-// authorize live Environments, or enforce network policy. The shipped command
-// deliberately installs an authorizer which denies every request. Tests and a
-// future authoritative integration may inject an Authorizer.
+// Package egressproxy contains the INERT and DISABLED transport plus an
+// unconstructed Kubernetes currentness-authorizer foundation for the future
+// egress proxy. It does not enforce network policy. The shipped command
+// deliberately installs an authorizer which denies every request; only tests
+// construct the uncached currentness proof.
 // This inert slice intentionally emits no request-derived logs until bounded,
 // non-sensitive observability is integrated.
 package egressproxy

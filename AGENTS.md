@@ -68,6 +68,11 @@ Pi deliberately supports no credential profiles or credential injection.
   `internal/controllers/`, and `cmd/{operator,control-plane,swe,egress-proxy}` for root-module
   binaries. The egress proxy command is a disabled protocol foundation and intentionally remains
   outside `make build` and image publishing until the fail-closed runtime is enabled.
+  `internal/egresspolicy/` owns the strict immutable ConfigMap parser as well as destination and
+  revision authority; `internal/egressproxy/` contains an uncached two-second currentness
+  authorizer foundation, but the command must remain wired to `DisabledAuthorizer`. Future
+  transport wiring must release every successful currentness lease when replacing it or closing
+  its tunnel so per-fingerprint state remains bounded.
   `internal/egressidentity/` and `internal/egresspod/` are likewise inert contract foundations;
   do not wire them into reconciliation or relax the non-empty allowlist fence before the complete
   restricted runtime is atomically enabled. The exact adapter contract boundary is

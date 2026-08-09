@@ -813,9 +813,29 @@ it. The versioned canonical identity binds exact Installation namespace/name/UID
 namespace/name/UID, Environment namespace/name/UID, Pod name/UID, execution generation, runtime
 policy revision, forwarder security revision, and SHA-256 client-certificate fingerprint.
 Certificate subject fields and the fingerprint presented by TLS are untrusted lookup hints: a
-future authorizer must resolve the fingerprint and repeat exact currentness checks against
-authoritative objects. A separate self-signed ECDSA ClientAuth keypair is generated for each
+disabled currentness-authorizer foundation resolves canonical claims by fingerprint and, within
+two seconds, repeats uncached reads for the exact live Installation, active Namespace claim and
+sole Project, frozen Project-bound ready Environment execution, controlled non-deleting Pod,
+and immutable policy ConfigMap. It independently recomputes policy and revision, checks the Pod's
+execution, policy, forwarder, and certificate-fingerprint annotations, and rejects API
+uncertainty. Each successful fingerprint receives a currentness signal that closes after any
+failed recheck so future tunnel wiring can revoke established connections without caching
+authority. Every successful authorization also returns a one-shot lifecycle release; future
+transport wiring must release the prior lease when a recheck replaces it and release the final
+lease when the tunnel closes. The final release closes the signal and reclaims its bounded state.
+No command constructs this authorizer; `egress-proxy serve` still uses the deny-all
+`DisabledAuthorizer`. A separate self-signed ECDSA ClientAuth keypair is generated for each
 execution and is not sandboxd ServerAuth material.
+
+`internal/egresspolicy` also strictly parses the future administrator policy ConfigMap contract.
+The exact live object must have a UID, be non-deleting and immutable, contain only canonical
+`policy.json`, and carry its canonical SHA-256 content address. Schema v1 fixes
+`unrestricted|restricted` mode, the existing 256-entry ceiling and 64-entry baseline bounds,
+an immutable digest-qualified proxy image, and an administrator TLS Secret name. Restricted mode
+requires the exact `calico-v3.32.1` profile with 1–4 canonical resolver IPs and bounded canonical
+API server, Pod, Service, node, control-plane, and additional-denial CIDR sets. Invalid,
+mutable, replaced, or non-canonical authority fails closed; Helm values are not authority. The
+chart does not create this ConfigMap, Secret, proxy, ServiceAccount, or RBAC.
 
 The Pod helper resolves the UID ordering problem with a staged Kubernetes scheduling gate. Before
 CREATE it accepts a complete Linux Pod-backend preparation input, prepends the native restartable
@@ -840,8 +860,9 @@ The current non-empty Project allowlist rejection remains unchanged and runs bef
 Pod-spec construction. It stays until identity publication and exact two-second currentness,
 proxy readiness, technical path forcing, Calico v3.32.1-only enforcement proof, and acceptance
 land together. There is currently no default-deny egress, proxy deployment, runtime policy
-ConfigMap, restricted profile, or production egress-enforcement claim; generic Kubernetes, k3s,
-GKE, and EKS restricted profiles remain deferred. Issue #68 is not runtime-complete.
+ConfigMap instance, active restricted profile, or production egress-enforcement claim; generic
+Kubernetes, k3s, GKE, and EKS restricted profiles remain deferred. Issue #68 is not
+runtime-complete.
 
 Slice 3 provides only a default-off experimental conformance runner. The separate pinned
 dual-stack, two-worker kind topology and `hack/egress-conformance.sh` can perform one disposable,
