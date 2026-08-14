@@ -231,6 +231,16 @@ not bypass Installation/Namespace/Project claims. Cluster-scoped RBAC names incl
 namespace, so same-named releases in different namespaces do not manage each other's roles or
 claims.
 
+`installation.isolation.mode` is a separately explicit, non-defaulted API selection. The kind
+and Argo development presets set `UnrestrictedDevelopment`. Production presets deliberately
+leave it empty for staged legacy migration because the only restricted mode,
+`RestrictedProductionCalicoV3_32_1`, is schema-only and cannot become active in this release.
+The restricted values path requires exact policy ConfigMap name, RuntimeClass name/handler, and
+StorageClass name/CSI driver; it does not create or verify those objects. Keep an
+administrator-selected value in the Helm release values on every upgrade so Helm remains the
+owner of the Installation selection rather than relying on an out-of-band edit. The selection
+does not change the Installation UID or Namespace-claim authority.
+
 ### Onboard a Project namespace
 
 In scoped mode, install the system identity/catalog first, then use the CLI to create or
@@ -440,11 +450,11 @@ unmeasured.
 
 | Preset | Assumptions |
 |---|---|
-| `values-kind.yaml` | Isolated local kind development with explicit process-local `memory` sessions, deliberate `trusted-admin`, `:dev` images, insecure HTTP browser sessions, and `Recreate` operator upgrades. `make kind-up` installs gVisor and snapshot-capable CSI; pass the printed `environmentTemplates[0].spec.runtimeClass=gvisor` catalog override. Primary acceptance instead overrides this preset to scoped mode and distinct system/Project namespaces. |
-| `values-argocd.yaml` | Isolated local Argo CD mirror with explicit process-local `memory` sessions, deliberate `trusted-admin`, mutable `:latest` images, an out-of-band bootstrap Secret, insecure HTTP browser sessions, and `Recreate` operator upgrades. `hack/argocd-up.sh` requires one kind node with at least 5 CPUs and 6 GiB allocatable. |
-| `values-k3s.yaml` | Production `scoped` mode with PostgreSQL transcripts and sessions and out-of-band `swe-platform-postgres` and `swe-platform-session-keyring` Secrets. Uses one operator replica, `Recreate` operator upgrades, and the default OCI runtime because k3s does not ship gVisor. |
-| `values-gke.yaml` | Production `scoped` mode with PostgreSQL transcripts and sessions and both out-of-band Secrets. GKE Sandbox is enabled on environment nodes. Sets `runtimeClass: gvisor`, runs two operator replicas with leader election, and uses `Recreate` upgrades for this compatibility transition. |
-| `values-eks.yaml` | Production `scoped` mode with PostgreSQL transcripts and sessions and both out-of-band Secrets. Uses a default EBS CSI StorageClass, two operator replicas, and `Recreate` upgrades for this compatibility transition. EKS does not provide a standard gVisor RuntimeClass, so managed Templates use the cluster default unless overridden. |
+| `values-kind.yaml` | Isolated local kind development with explicit inert `UnrestrictedDevelopment` isolation selection, process-local `memory` sessions, deliberate `trusted-admin`, `:dev` images, insecure HTTP browser sessions, and `Recreate` operator upgrades. `make kind-up` installs gVisor and snapshot-capable CSI; pass the printed `environmentTemplates[0].spec.runtimeClass=gvisor` catalog override. Primary acceptance instead overrides this preset to scoped mode and distinct system/Project namespaces. |
+| `values-argocd.yaml` | Isolated local Argo CD mirror with explicit inert `UnrestrictedDevelopment` isolation selection, process-local `memory` sessions, deliberate `trusted-admin`, mutable `:latest` images, an out-of-band bootstrap Secret, insecure HTTP browser sessions, and `Recreate` operator upgrades. `hack/argocd-up.sh` requires one kind node with at least 5 CPUs and 6 GiB allocatable. |
+| `values-k3s.yaml` | Production `scoped` mode with legacy-unclassified isolation, PostgreSQL transcripts and sessions, and out-of-band `swe-platform-postgres` and `swe-platform-session-keyring` Secrets. Uses one operator replica, `Recreate` operator upgrades, and the default OCI runtime because k3s does not ship gVisor. It does not claim restricted production isolation. |
+| `values-gke.yaml` | Production `scoped` mode with legacy-unclassified isolation, PostgreSQL transcripts and sessions, and both out-of-band Secrets. GKE Sandbox is enabled on environment nodes. Sets `runtimeClass: gvisor`, runs two operator replicas with leader election, and uses `Recreate` upgrades for this compatibility transition. It does not claim restricted production isolation. |
+| `values-eks.yaml` | Production `scoped` mode with legacy-unclassified isolation, PostgreSQL transcripts and sessions, and both out-of-band Secrets. Uses a default EBS CSI StorageClass, two operator replicas, and `Recreate` upgrades for this compatibility transition. EKS does not provide a standard gVisor RuntimeClass, so managed Templates use the cluster default unless overridden. It does not claim restricted production isolation. |
 
 The RuntimeClass applies to environment pods, not the operator. Before creating or retaining
 execution, the operator verifies that a RuntimeClass explicitly named by a template exists. A
@@ -486,8 +496,10 @@ The chart does not install default-deny egress or an egress allowlist proxy. Pro
 `egressAllowlist` values are reserved and rejected when non-empty; empty or omitted values leave
 egress subject to the cluster's network configuration. The Go foundation can validate a future
 immutable, content-addressed system policy ConfigMap and perform disabled uncached currentness
-proofs, but this chart deliberately has no values, ConfigMap, Deployment, Service, ServiceAccount,
-RBAC, TLS Secret, or NetworkPolicy for that foundation. No production preset enables it.
+proofs. The restricted Installation values can name that future administrator-owned ConfigMap,
+but the chart deliberately has no egress-policy document values, ConfigMap, Deployment, Service,
+ServiceAccount, RBAC, TLS Secret, or NetworkPolicy for that foundation. No production preset
+enables it.
 
 The repository also contains a deliberately disabled experimental Calico v3.32.1 diagnostic
 runner on a separate dual-stack kind topology. It is not a chart component, production preset

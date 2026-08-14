@@ -1,6 +1,11 @@
 # Production baseline for GKE clusters whose environment node pools have GKE
 # Sandbox enabled. Images inherit the chart appVersion as one coordinated
 # release. The gvisor RuntimeClass must exist before environments run.
+# Restricted activation is unsupported; omission preserves LegacyUnclassified.
+installation:
+  isolation:
+    mode: ""
+
 tenancy:
   mode: scoped
 

@@ -27,6 +27,11 @@ controlPlane:
 
 leaderElection: false
 
+# Explicit non-production selection; this contract is inert in this release.
+installation:
+  isolation:
+    mode: UnrestrictedDevelopment
+
 # Deliberate trusted-admin mode for the isolated local Argo mirror cluster.
 tenancy:
   mode: trusted-admin

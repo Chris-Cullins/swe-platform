@@ -69,3 +69,22 @@ app.kubernetes.io/managed-by: {{ .Release.Service }}
 {{- end -}}
 {{- $mode -}}
 {{- end }}
+
+{{- define "swe-platform.installationIsolationMode" -}}
+{{- $isolation := .Values.installation.isolation -}}
+{{- $mode := $isolation.mode -}}
+{{- if eq $mode "UnrestrictedDevelopment" -}}
+{{- if or $isolation.policyConfigMapName $isolation.runtimeClass.name $isolation.runtimeClass.handler $isolation.storageClass.name $isolation.storageClass.csiDriver -}}
+{{- fail "installation.isolation UnrestrictedDevelopment must omit restricted inputs" -}}
+{{- end -}}
+{{- else if eq $mode "RestrictedProductionCalicoV3_32_1" -}}
+{{- $_ := required "restricted installation isolation requires installation.isolation.policyConfigMapName" $isolation.policyConfigMapName -}}
+{{- $_ := required "restricted installation isolation requires installation.isolation.runtimeClass.name" $isolation.runtimeClass.name -}}
+{{- $_ := required "restricted installation isolation requires installation.isolation.runtimeClass.handler" $isolation.runtimeClass.handler -}}
+{{- $_ := required "restricted installation isolation requires installation.isolation.storageClass.name" $isolation.storageClass.name -}}
+{{- $_ := required "restricted installation isolation requires installation.isolation.storageClass.csiDriver" $isolation.storageClass.csiDriver -}}
+{{- else if $mode -}}
+{{- fail "installation.isolation.mode must be empty, UnrestrictedDevelopment, or RestrictedProductionCalicoV3_32_1" -}}
+{{- end -}}
+{{- $mode -}}
+{{- end }}

@@ -76,7 +76,7 @@ All current CRDs are namespaced:
 
 | Resource | Current contract |
 |---|---|
-| `Installation` | Empty-spec identity object in the system namespace. Its immutable Kubernetes UID is the stable installation identity used by namespace claims, catalog sources, managed Template copies, and baseline resources. |
+| `Installation` | System-namespace identity whose immutable Kubernetes UID remains the stable identity used by namespace claims, catalog sources, managed Template copies, and baseline resources. An optional, non-defaulted installation-wide `isolation` selection admits only explicit unrestricted development or the future Calico v3.32.1 restricted contract; omission exists only for staged legacy migration. Reserved status has bounded `LegacyUnclassified`, `Fencing`, `Blocked`, or `Active` vocabulary plus exact non-secret observed selection/object identities, a derived isolation revision, and conditions. No controller reads the selection or writes this status yet. |
 | `Project` | One repository URL (represented as a one-item list), a same-namespace default Template reference, changes-workflow metadata, and up to 64 exact lowercase-ASCII FQDN egress selections. The selection contract is admitted, but a non-empty selection remains rejected when an Environment uses the Project because runtime egress enforcement is not enabled. |
 | `EnvironmentTemplate` | Pod image, size/resources, disk, runtime class, idle timeout, warm-pool minimum, and backend. Admission currently permits only the `pod` backend. Chart-owned system-namespace objects are inert catalog sources; execution accepts only installation-managed same-namespace copies bound to exact Installation, source, and Project identities. |
 | `Environment` | Immutable Template selection, an immutable optional backend override, one-way empty-to-nonempty Project binding, explicit hold policy, bounded wake/suspend/activity intents, and up to 32 API- or Repository-owned service declarations. New declarations have an immutable-per-incarnation random `instanceID`; upgrade-retained legacy declarations may omit it, receive no portal route, and can add it only with a higher revision. Omitted legacy service ownership defaults only to `API` and is immutable thereafter. Controller-owned status includes the immutable resolved `provisioning` snapshot, readiness, lifecycle/execution, claim, observations, activity, and nested backend-neutral recovery state; recovery records attempts, exhaustion, the exact failed execution generation being accounted, and the next allowed attempt time, while generation zero means no recovery identity. The gateway owns bounded `portalRoutes` and monotonic `nextPortalRouteGeneration`; inactive routes are denial tombstones preserved by other status writers. |
@@ -84,6 +84,12 @@ All current CRDs are namespaced:
 | `AgentCredentialProfile` | Immutable adapter and `APIKey` type metadata. Key bytes live in an owner-linked Secret whose name is derived from the profile UID. |
 
 The current ownership/reference shape is:
+
+`Installation.spec.isolation` is installation-administrator authority; tenant resources cannot
+select or weaken it. The chart renders it only from explicit bounded values and otherwise keeps
+the legacy field omitted. `Installation.status` remains controller-owned but has no writer in the
+current inert slice. Neither configuration nor reserved status changes the Installation UID or
+the Namespace-claim authority derived from it.
 
 Environment status is controller-owned: the operator and its Run controller retain status
 subresource authority. The control plane has update-only `environments/status` authority for
@@ -242,8 +248,9 @@ exact workspace PVC and frozen provisioning inputs.
 
 ### Tenancy and Project namespace lifecycle
 
-The chart installs one empty-spec `Installation` in its system namespace. The object's
-immutable Kubernetes UID is the installation identity; cluster-scoped RBAC names also include
+The chart installs one `Installation` in its system namespace. Its optional isolation selection
+is explicit and non-defaulted; omission is the legacy migration shape. The object's immutable
+Kubernetes UID is still the installation identity; cluster-scoped RBAC names also include
 a stable hash of the system namespace, and the leader-election lease name is derived from the
 Installation UID, so releases do not share roles, bindings, or leadership. Names and labels are
 discovery data, not authority.
@@ -712,16 +719,19 @@ fixed at one replica with `Recreate`; PostgreSQL makes transcripts and browser s
 durable across replacement, but open streams disconnect and clients must reconnect. No
 multi-replica or control-plane HA claim is made.
 
-- `values-kind.yaml` deliberately opts into trusted-admin for isolated local development and
-  uses local `:dev` images and explicit memory-backed insecure HTTP sessions. Primary
+- `values-kind.yaml` deliberately opts into trusted-admin for isolated local development,
+  explicitly selects the inert `UnrestrictedDevelopment` isolation contract, and uses local
+  `:dev` images and explicit memory-backed insecure HTTP sessions. Primary
   acceptance overrides it to scoped mode with distinct system and Project namespaces.
-- `values-argocd.yaml` deliberately opts into trusted-admin in the isolated Argo mirror and
-  uses mutable `:latest` images and explicit memory-backed sessions. Base/default values also
+- `values-argocd.yaml` deliberately opts into trusted-admin in the isolated Argo mirror,
+  explicitly selects the inert `UnrestrictedDevelopment` isolation contract, and uses mutable
+  `:latest` images and explicit memory-backed sessions. Base/default values also
   select memory for development.
 - `values-k3s.yaml`, `values-gke.yaml`, and `values-eks.yaml` use coordinated immutable chart
   `appVersion` images, explicitly select PostgreSQL sessions, require out-of-band PostgreSQL
-  and session-keyring Secrets, and default to scoped mode with no Project namespaces. GKE
-  selects `gvisor`; k3s and EKS use the cluster default runtime unless explicitly overridden.
+  and session-keyring Secrets, and default to scoped mode with no Project namespaces. They
+  remain legacy-unclassified because no restricted runtime is implemented. GKE selects
+  `gvisor`; k3s and EKS use the cluster default runtime unless explicitly overridden.
   Each coordinated image also accepts a validated `sha256:` manifest digest that takes
   precedence over its tag, allowing a publish workflow release manifest to pin exact images.
 
@@ -764,6 +774,32 @@ require TokenReview and exact Environment/service SARs plus current Run or Proje
 Hold, Requested suspension, stale association/declaration/route/execution, and uncertainty return
 the same 404 as an unknown locator. Idle requests wake and await a fresh execution. The proxy
 strips credentials, session cookies, and hop-by-hop headers and supports WebSocket upgrade.
+
+### Approved installation isolation selection
+
+The first inert issue #10 contract adds one Installation-owned selection rather than an
+`IsolationProfile` CRD. `spec.isolation` has no default and is optional only for staged legacy
+migration. Its exact modes are `UnrestrictedDevelopment` and
+`RestrictedProductionCalicoV3_32_1`. Development mode has no restricted inputs. Restricted mode
+references the existing immutable #68 policy ConfigMap and states exact RuntimeClass
+name/handler and StorageClass name/CSI-driver expectations. The ConfigMap remains sole owner of
+network mode, Calico profile/CIDRs/resolvers, ceiling/baseline, proxy image, and TLS reference.
+
+The inert `internal/isolation` helper validates that cross-field contract and derives a
+domain-separated SHA-256 revision from the Installation UID, canonical selection, fixed API and
+revision domains, and exact policy ConfigMap, RuntimeClass, and StorageClass UIDs plus canonical
+policy content hash and observed handler/driver. There is no administrator-entered security
+revision. No reconciler calls the helper, looks up those objects, changes Environment/Run/warm
+pool behavior, or writes Installation status. In particular,
+`RestrictedProductionCalicoV3_32_1` is admitted configuration, not an active or production-ready
+profile. Activation still requires the complete #68 currentness, identity, proxy, path-forcing,
+and Calico v3.32.1 enforcement path; generic restricted profiles remain unsupported.
+
+The reserved Installation status state vocabulary is `LegacyUnclassified`, `Fencing`,
+`Blocked`, and `Active`, with exact non-secret observed selection/object identities, derived
+revision, and conditions. It is schema only. A later compatibility release must explicitly
+activate selection and fence installation-wide execution; restricted mode must never adopt a
+live legacy execution. Installation UID remains tenancy identity throughout migration.
 
 ### Approved fail-closed proxy-only egress contract
 

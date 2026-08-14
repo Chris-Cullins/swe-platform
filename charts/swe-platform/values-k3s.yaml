@@ -2,6 +2,11 @@
 # coordinated release. k3s does not include gVisor, so this preset uses the
 # cluster's default OCI runtime for environment pods.
 
+# Restricted activation is unsupported; omission preserves LegacyUnclassified.
+installation:
+  isolation:
+    mode: ""
+
 tenancy:
   mode: scoped
 

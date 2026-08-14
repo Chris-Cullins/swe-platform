@@ -30,7 +30,9 @@ to ~$0. Reviewable diff, branch, and PR publication remain planned work.
 
 - **Real isolation** — agents execute untrusted, model-generated code. Environments support
   hardened containers, sandboxd authentication, restricted sandboxd ingress, and optional
-  RuntimeClasses such as gVisor. Default-deny egress is not implemented yet.
+  RuntimeClasses such as gVisor. Installation API schema now admits an explicit unrestricted
+  development selection and a future Calico v3.32.1 restricted selection, but this contract is
+  inert: no controller activates it and default-deny egress is not implemented yet.
 - **Pause economics** — idle environments are paused (pod deleted, disk retained) and
   woken on demand. A suspended Environment costs ~$0 in compute.
 - **Agent-agnostic** — existing agents plug in via adapters; the platform never depends

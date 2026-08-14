@@ -12,6 +12,9 @@ import (
 type generatedCRDSchema struct {
 	Properties   map[string]generatedCRDSchema `json:"properties"`
 	Items        *generatedCRDSchema           `json:"items"`
+	Enum         []string                      `json:"enum"`
+	Default      any                           `json:"default"`
+	MaxItems     *int                          `json:"maxItems"`
 	XValidations []struct {
 		Message         string `json:"message"`
 		Rule            string `json:"rule"`

@@ -40,11 +40,87 @@ spec:
             type: object
           spec:
             description: |-
-              InstallationSpec is intentionally empty. The Installation object's immutable
-              UID is the durable identity used by claimed Project namespaces.
+              InstallationSpec preserves an omitted isolation selection only for staged
+              migration of legacy installations. There is deliberately no default.
+            properties:
+              isolation:
+                description: |-
+                  Isolation is the sole installation-wide isolation selection. Installation
+                  UID remains the tenancy identity regardless of this configuration.
+                properties:
+                  mode:
+                    description: |-
+                      InstallationIsolationMode is the administrator-selected installation-wide
+                      isolation contract. It is configuration, not evidence that isolation is
+                      active.
+                    enum:
+                    - UnrestrictedDevelopment
+                    - RestrictedProductionCalicoV3_32_1
+                    type: string
+                  policyConfigMapName:
+                    description: |-
+                      PolicyConfigMapName references the existing immutable administrator-owned
+                      egress policy ConfigMap contract.
+                    maxLength: 253
+                    minLength: 1
+                    pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$
+                    type: string
+                  runtimeClass:
+                    description: |-
+                      InstallationRuntimeClassExpectation names the exact RuntimeClass contract
+                      required by a restricted isolation selection.
+                    properties:
+                      handler:
+                        description: Handler is the exact RuntimeClass handler expected
+                          by the administrator.
+                        maxLength: 63
+                        minLength: 1
+                        pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
+                        type: string
+                      name:
+                        maxLength: 253
+                        minLength: 1
+                        pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$
+                        type: string
+                    required:
+                    - handler
+                    - name
+                    type: object
+                  storageClass:
+                    description: |-
+                      InstallationStorageClassExpectation names the exact StorageClass contract
+                      required by a restricted isolation selection.
+                    properties:
+                      csiDriver:
+                        description: CSIDriver is the exact CSI provisioner expected
+                          on the StorageClass.
+                        maxLength: 63
+                        minLength: 1
+                        pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$
+                        type: string
+                      name:
+                        maxLength: 253
+                        minLength: 1
+                        pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$
+                        type: string
+                    required:
+                    - csiDriver
+                    - name
+                    type: object
+                required:
+                - mode
+                type: object
+                x-kubernetes-validations:
+                - message: development mode must omit restricted inputs; restricted
+                    mode requires policyConfigMapName, runtimeClass, and storageClass
+                  rule: 'self.mode == ''UnrestrictedDevelopment'' ? (!has(self.policyConfigMapName)
+                    && !has(self.runtimeClass) && !has(self.storageClass)) : (has(self.policyConfigMapName)
+                    && has(self.runtimeClass) && has(self.storageClass))'
             type: object
           status:
-            description: InstallationStatus is reserved for installation-level observations.
+            description: |-
+              InstallationStatus contains bounded non-secret observations reserved for the
+              future installation isolation controller. This slice does not write status.
             properties:
               conditions:
                 items:
@@ -101,10 +177,184 @@ spec:
                   - status
                   - type
                   type: object
+                maxItems: 16
                 type: array
                 x-kubernetes-list-map-keys:
                 - type
                 x-kubernetes-list-type: map
+              isolationRevision:
+                description: |-
+                  IsolationRevision is SHA-256 over the versioned canonical selection and
+                  exact resolved object identities.
+                pattern: ^[a-f0-9]{64}$
+                type: string
+              isolationState:
+                description: |-
+                  InstallationIsolationState is bounded controller-owned vocabulary reserved
+                  for the staged activation flow. No controller writes it yet.
+                enum:
+                - LegacyUnclassified
+                - Fencing
+                - Blocked
+                - Active
+                type: string
+              observedIsolation:
+                description: ObservedIsolation is the exact selection used for these
+                  observations.
+                properties:
+                  mode:
+                    description: |-
+                      InstallationIsolationMode is the administrator-selected installation-wide
+                      isolation contract. It is configuration, not evidence that isolation is
+                      active.
+                    enum:
+                    - UnrestrictedDevelopment
+                    - RestrictedProductionCalicoV3_32_1
+                    type: string
+                  policyConfigMapName:
+                    description: |-
+                      PolicyConfigMapName references the existing immutable administrator-owned
+                      egress policy ConfigMap contract.
+                    maxLength: 253
+                    minLength: 1
+                    pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$
+                    type: string
+                  runtimeClass:
+                    description: |-
+                      InstallationRuntimeClassExpectation names the exact RuntimeClass contract
+                      required by a restricted isolation selection.
+                    properties:
+                      handler:
+                        description: Handler is the exact RuntimeClass handler expected
+                          by the administrator.
+                        maxLength: 63
+                        minLength: 1
+                        pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
+                        type: string
+                      name:
+                        maxLength: 253
+                        minLength: 1
+                        pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$
+                        type: string
+                    required:
+                    - handler
+                    - name
+                    type: object
+                  storageClass:
+                    description: |-
+                      InstallationStorageClassExpectation names the exact StorageClass contract
+                      required by a restricted isolation selection.
+                    properties:
+                      csiDriver:
+                        description: CSIDriver is the exact CSI provisioner expected
+                          on the StorageClass.
+                        maxLength: 63
+                        minLength: 1
+                        pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$
+                        type: string
+                      name:
+                        maxLength: 253
+                        minLength: 1
+                        pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$
+                        type: string
+                    required:
+                    - csiDriver
+                    - name
+                    type: object
+                required:
+                - mode
+                type: object
+                x-kubernetes-validations:
+                - message: development mode must omit restricted inputs; restricted
+                    mode requires policyConfigMapName, runtimeClass, and storageClass
+                  rule: 'self.mode == ''UnrestrictedDevelopment'' ? (!has(self.policyConfigMapName)
+                    && !has(self.runtimeClass) && !has(self.storageClass)) : (has(self.policyConfigMapName)
+                    && has(self.runtimeClass) && has(self.storageClass))'
+              policyConfigMap:
+                description: |-
+                  InstallationPolicyConfigMapIdentity records the exact immutable policy
+                  ConfigMap incarnation and canonical content digest.
+                properties:
+                  contentSHA256:
+                    pattern: ^[a-f0-9]{64}$
+                    type: string
+                  name:
+                    maxLength: 253
+                    minLength: 1
+                    pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$
+                    type: string
+                  uid:
+                    description: |-
+                      UID is a type that holds unique ID values, including UUIDs.  Because we
+                      don't ONLY use UUIDs, this is an alias to string.  Being a type captures
+                      intent and helps make sure that UIDs and names do not get conflated.
+                    type: string
+                required:
+                - contentSHA256
+                - name
+                - uid
+                type: object
+                x-kubernetes-validations:
+                - message: ConfigMap UID must be 1-128 bytes
+                  rule: size(self.uid) > 0 && size(self.uid) <= 128
+              runtimeClass:
+                description: |-
+                  InstallationRuntimeClassIdentity records an exact non-secret RuntimeClass
+                  incarnation and observed handler.
+                properties:
+                  handler:
+                    maxLength: 63
+                    minLength: 1
+                    pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
+                    type: string
+                  name:
+                    maxLength: 253
+                    minLength: 1
+                    pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$
+                    type: string
+                  uid:
+                    description: |-
+                      UID is a type that holds unique ID values, including UUIDs.  Because we
+                      don't ONLY use UUIDs, this is an alias to string.  Being a type captures
+                      intent and helps make sure that UIDs and names do not get conflated.
+                    type: string
+                required:
+                - handler
+                - name
+                - uid
+                type: object
+                x-kubernetes-validations:
+                - message: object UID must be 1-128 bytes
+                  rule: size(self.uid) > 0 && size(self.uid) <= 128
+              storageClass:
+                description: |-
+                  InstallationStorageClassIdentity records an exact non-secret StorageClass
+                  incarnation and observed CSI driver.
+                properties:
+                  csiDriver:
+                    maxLength: 63
+                    minLength: 1
+                    pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$
+                    type: string
+                  name:
+                    maxLength: 253
+                    minLength: 1
+                    pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$
+                    type: string
+                  uid:
+                    description: |-
+                      UID is a type that holds unique ID values, including UUIDs.  Because we
+                      don't ONLY use UUIDs, this is an alias to string.  Being a type captures
+                      intent and helps make sure that UIDs and names do not get conflated.
+                    type: string
+                required:
+                - csiDriver
+                - name
+                - uid
+                type: object
+                x-kubernetes-validations:
+                - message: object UID must be 1-128 bytes
+                  rule: size(self.uid) > 0 && size(self.uid) <= 128
             type: object
         type: object
     served: true
