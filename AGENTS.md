@@ -70,9 +70,10 @@ Pi deliberately supports no credential profiles or credential injection.
   outside `make build` and image publishing until the fail-closed runtime is enabled.
   `internal/egresspolicy/` owns the strict immutable ConfigMap parser as well as destination and
   revision authority; `internal/egressproxy/` contains an uncached two-second currentness
-  authorizer foundation, but the command must remain wired to `DisabledAuthorizer`. Future
-  transport wiring must release every successful currentness lease when replacing it or closing
-  its tunnel so per-fingerprint state remains bounded.
+  authorizer foundation and shared per-fingerprint lease lifecycle, but the command must remain
+  wired to `DisabledAuthorizer`. Keep one shared proof loop while leases exist, split the two-second
+  stale-authority bound between poll cadence and proof deadline, and stop and reclaim the loop when
+  the final tunnel lease closes.
   `internal/egressidentity/` and `internal/egresspod/` are likewise inert contract foundations;
   do not wire them into reconciliation or relax the non-empty allowlist fence before the complete
   restricted runtime is atomically enabled. The exact adapter contract boundary is
