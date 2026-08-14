@@ -531,8 +531,15 @@ Production presets require an external PostgreSQL URL; live PostgreSQL delivery 
 database-polled. With no URL, the control plane logs a warning and uses a bounded, non-durable,
 process-local development store. Durable legacy rows without a Namespace UID are associated
 only when an authorized request resolves the exact current Run UID; conflicting identity is
-rejected, and otherwise-unprovable rows are retained indefinitely. Transcript rows are not
-currently garbage-collected when a Run or Project is deleted.
+rejected, and otherwise-unprovable rows are retained indefinitely. The control plane now has an
+internal, explicit-bearer exact transcript DELETE foundation for a deleting Run. It requires
+`delete` authorization on the exact `runs/transcript`, an exact Namespace UID precondition,
+fresh active-tenancy and deleting-Run proof, and a bounded process-local cutoff/drain before the
+store performs idempotent exact `(namespace name, Namespace UID, Run UID)` deletion. PostgreSQL
+uses the existing Namespace-UID association and one transaction; the memory development store
+reclaims its accounting and subscribers. No operator, finalizer, client, CLI, or RBAC wiring
+invokes this capability yet, so transcript rows are not currently garbage-collected when a Run
+or Project is deleted and the existing operational limitation remains.
 
 ### Authentication and exact identity fences
 

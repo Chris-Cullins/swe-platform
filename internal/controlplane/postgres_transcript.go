@@ -264,6 +264,47 @@ func associateTranscriptRun(ctx context.Context, tx pgx.Tx, run RunIdentity) (bo
 	return true, nil
 }
 
+func (s *PostgresTranscriptStore) Delete(ctx context.Context, run RunIdentity) (DeleteTranscriptResult, error) {
+	if run.Namespace == "" || run.NamespaceUID == "" || run.UID == "" {
+		return DeleteTranscriptResult{}, fmt.Errorf("delete transcript: complete namespace and Run identity is required")
+	}
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
+	if err != nil {
+		return DeleteTranscriptResult{}, fmt.Errorf("begin transcript delete: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	// The handler has freshly proved the exact current deleting Run and
+	// Namespace identities, so the same proof may associate a legacy NULL row.
+	if _, err := tx.Exec(ctx, `UPDATE transcript_runs SET namespace_uid = $3 WHERE namespace = $1 AND run_uid = $2 AND namespace_uid IS NULL`, run.Namespace, string(run.UID), string(run.NamespaceUID)); err != nil {
+		return DeleteTranscriptResult{}, fmt.Errorf("associate legacy transcript for deletion: %w", err)
+	}
+	var namespaceUID string
+	err = tx.QueryRow(ctx, `SELECT namespace_uid FROM transcript_runs WHERE namespace = $1 AND run_uid = $2 FOR UPDATE`, run.Namespace, string(run.UID)).Scan(&namespaceUID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		if err := tx.Commit(ctx); err != nil {
+			return DeleteTranscriptResult{}, fmt.Errorf("commit absent transcript delete: %w", err)
+		}
+		return DeleteTranscriptResult{}, nil
+	}
+	if err != nil {
+		return DeleteTranscriptResult{}, fmt.Errorf("lock transcript delete: %w", err)
+	}
+	if namespaceUID != string(run.NamespaceUID) {
+		return DeleteTranscriptResult{}, ErrTranscriptIdentity
+	}
+	result, err := tx.Exec(ctx, `DELETE FROM transcript_runs WHERE namespace = $1 AND namespace_uid = $2 AND run_uid = $3`, run.Namespace, string(run.NamespaceUID), string(run.UID))
+	if err != nil {
+		return DeleteTranscriptResult{}, fmt.Errorf("delete exact transcript: %w", err)
+	}
+	if result.RowsAffected() != 1 {
+		return DeleteTranscriptResult{}, errors.New("exact transcript disappeared while locked")
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return DeleteTranscriptResult{}, fmt.Errorf("commit transcript delete: %w", err)
+	}
+	return DeleteTranscriptResult{Deleted: true}, nil
+}
+
 type postgresQuery interface {
 	QueryRow(context.Context, string, ...any) pgx.Row
 }

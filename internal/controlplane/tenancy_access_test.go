@@ -19,10 +19,12 @@ import (
 type orderedAccess struct {
 	called bool
 	err    error
+	access []ResourceAccess
 }
 
-func (a *orderedAccess) Authorize(*http.Request, ResourceAccess, bool) error {
+func (a *orderedAccess) Authorize(_ *http.Request, access ResourceAccess, _ bool) error {
 	a.called = true
+	a.access = append(a.access, access)
 	return a.err
 }
 
@@ -127,5 +129,44 @@ func TestTenancyAccessTrustedAdminIsExplicit(t *testing.T) {
 	request = httptest.NewRequest(http.MethodGet, "https://api.test/api/v1/namespaces/team/runs", nil)
 	if err := controller.Authorize(request, ResourceAccess{Namespace: "team", Verb: "list", Resource: "runs"}, true); !errors.Is(err, errForbidden) {
 		t.Fatalf("trusted admin unclaimed Namespace error = %v, want forbidden", err)
+	}
+}
+
+func TestTranscriptDeleteRequiresFreshActiveTenancyProof(t *testing.T) {
+	underlying := &orderedAccess{}
+	access := TenancyAccessController{
+		Access: underlying, Verifier: tenancyAccessFixture(t, tenancy.LifecycleActive, true),
+		Namespaces: map[string]struct{}{"team": {}},
+	}
+	api := NewServer(nil, ServerOptions{Access: access, Runs: &fakeRunResolver{uid: "run-uid", deleting: true}, TranscriptStore: NewMemoryTranscriptStore(MemoryTranscriptStoreOptions{})})
+	request := httptest.NewRequest(http.MethodDelete, "/api/v1/namespaces/team/runs/run/transcript", nil)
+	request.Header.Set("Authorization", "Bearer cleanup")
+	request.Header.Set(RunUIDHeader, "run-uid")
+	request.Header.Set(NamespaceUIDHeader, "namespace-uid")
+	response := httptest.NewRecorder()
+	api.Handler().ServeHTTP(response, request)
+	if response.Code != http.StatusNoContent {
+		t.Fatalf("active tenancy cleanup = %d %q", response.Code, response.Body.String())
+	}
+	if len(underlying.access) != 2 {
+		t.Fatalf("authorization proofs = %d, want initial and post-drain fresh proof", len(underlying.access))
+	}
+	for _, proof := range underlying.access {
+		if proof != (ResourceAccess{Namespace: "team", Verb: "delete", Resource: "runs", Subresource: "transcript", Name: "run"}) {
+			t.Fatalf("cleanup authorization = %#v", proof)
+		}
+	}
+
+	deniedAPI := NewServer(nil, ServerOptions{
+		Access: TenancyAccessController{
+			Access: &orderedAccess{}, Verifier: tenancyAccessFixture(t, tenancy.LifecycleFencing, true),
+			Namespaces: map[string]struct{}{"team": {}},
+		},
+		Runs: &fakeRunResolver{uid: "run-uid", deleting: true}, TranscriptStore: NewMemoryTranscriptStore(MemoryTranscriptStoreOptions{}),
+	})
+	deniedResponse := httptest.NewRecorder()
+	deniedAPI.Handler().ServeHTTP(deniedResponse, request.Clone(request.Context()))
+	if deniedResponse.Code != http.StatusForbidden || len(deniedAPI.transcriptGate.entries) != 0 {
+		t.Fatalf("fencing tenancy cleanup response/gates = %d/%d", deniedResponse.Code, len(deniedAPI.transcriptGate.entries))
 	}
 }

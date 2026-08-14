@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"k8s.io/apimachinery/pkg/types"
 )
@@ -354,6 +355,104 @@ func TestMemoryTranscriptStoreRequiresImmutableNamespaceIdentity(t *testing.T) {
 	if len(subscription.History) != 0 {
 		t.Fatalf("replacement Namespace observed old transcript: %#v", subscription.History)
 	}
+}
+
+func TestMemoryTranscriptStoreDeleteIsExactIdempotentAndReclaimsCapacity(t *testing.T) {
+	options := DefaultMemoryTranscriptStoreOptions()
+	options.MaxRuns = 1
+	store := NewMemoryTranscriptStore(options).(*memoryTranscriptStore)
+	run := RunIdentity{Namespace: "project-a", NamespaceUID: "namespace-uid", UID: "run-uid"}
+	appendStoreEvent(t, store, run, "first")
+	subscription, err := store.Subscribe(context.Background(), run, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	wrongNamespace := run
+	wrongNamespace.NamespaceUID = "replacement-namespace-uid"
+	result, err := store.Delete(context.Background(), wrongNamespace)
+	if err != nil || result.Deleted {
+		t.Fatalf("replacement Namespace delete = %#v, %v", result, err)
+	}
+	if len(store.runs[run].events) != 1 {
+		t.Fatal("replacement Namespace deleted exact transcript")
+	}
+
+	result, err = store.Delete(context.Background(), run)
+	if err != nil || !result.Deleted {
+		t.Fatalf("exact delete = %#v, %v", result, err)
+	}
+	select {
+	case <-subscription.Dropped:
+	default:
+		t.Fatal("delete did not tear down the subscriber")
+	}
+	if store.totalEvents != 0 || store.totalBytes != 0 || store.totalSubscribers != 0 || len(store.runs) != 0 || len(store.subscribers) != 0 {
+		t.Fatalf("retained accounting after delete: events=%d bytes=%d subscribers=%d runs=%d subscriberRuns=%d", store.totalEvents, store.totalBytes, store.totalSubscribers, len(store.runs), len(store.subscribers))
+	}
+	subscription.Unsubscribe()
+	result, err = store.Delete(context.Background(), run)
+	if err != nil || result.Deleted {
+		t.Fatalf("idempotent delete = %#v, %v", result, err)
+	}
+	other := RunIdentity{Namespace: "project-a", NamespaceUID: "namespace-uid", UID: "replacement-run-uid"}
+	appendStoreEvent(t, store, other, "first")
+}
+
+func TestTranscriptGateBoundsStateCutsOffStreamsAndDrainsAppends(t *testing.T) {
+	gate := newTranscriptGate(1)
+	run := RunIdentity{Namespace: "project-a", NamespaceUID: "namespace-uid", UID: "run-uid"}
+	streamContext, stream, err := gate.admit(context.Background(), run, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, appendAdmission, err := gate.admit(context.Background(), run, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	other := RunIdentity{Namespace: "project-a", NamespaceUID: "namespace-uid", UID: "other-run-uid"}
+	if _, _, err := gate.admit(context.Background(), other, false); !errors.Is(err, ErrTranscriptGateLimit) {
+		t.Fatalf("bounded admission error = %v, want %v", err, ErrTranscriptGateLimit)
+	}
+
+	cutoff, err := gate.cutoff(run)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cutoff.validate()
+	select {
+	case <-streamContext.Done():
+	case <-time.After(time.Second):
+		t.Fatal("cutoff did not cancel the admitted stream")
+	}
+	if _, _, err := gate.admit(context.Background(), run, false); !errors.Is(err, ErrTranscriptCutoff) {
+		t.Fatalf("append after cutoff error = %v, want %v", err, ErrTranscriptCutoff)
+	}
+
+	drained := make(chan error, 1)
+	go func() {
+		_, err := cutoff.beginCleanup(context.Background())
+		drained <- err
+	}()
+	select {
+	case err := <-drained:
+		t.Fatalf("cleanup did not wait for append: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+	appendAdmission.release()
+	select {
+	case err := <-drained:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("cleanup did not continue after append drained")
+	}
+	cutoff.finish(false)
+	if _, _, err := gate.admit(context.Background(), run, false); !errors.Is(err, ErrTranscriptCutoff) {
+		t.Fatalf("failed cleanup cutoff error = %v, want %v", err, ErrTranscriptCutoff)
+	}
+	stream.release()
 }
 
 func appendStoreEvent(t *testing.T, store TranscriptStore, run RunIdentity, key string) AppendTranscriptResult {

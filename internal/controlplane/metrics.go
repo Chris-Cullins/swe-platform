@@ -14,17 +14,19 @@ const metricsNamespace = "swe_control_plane"
 // Each process uses one instance and one registry so tests and embedded users do
 // not share global collector state.
 type Metrics struct {
-	transcriptAppends       *prometheus.CounterVec
-	transcriptAppendLatency *prometheus.HistogramVec
-	transcriptSubscribers   prometheus.Gauge
-	transcriptDeliveries    *prometheus.CounterVec
-	transcriptDeliveryLag   *prometheus.HistogramVec
-	terminalLeaseGrants     *prometheus.CounterVec
-	terminalRevocations     *prometheus.CounterVec
-	tokenReviews            *prometheus.CounterVec
-	tokenReviewLatency      *prometheus.HistogramVec
-	subjectAccessReviews    *prometheus.CounterVec
-	subjectAccessLatency    *prometheus.HistogramVec
+	transcriptAppends        *prometheus.CounterVec
+	transcriptAppendLatency  *prometheus.HistogramVec
+	transcriptSubscribers    prometheus.Gauge
+	transcriptDeliveries     *prometheus.CounterVec
+	transcriptDeliveryLag    *prometheus.HistogramVec
+	transcriptCleanups       *prometheus.CounterVec
+	transcriptCleanupLatency *prometheus.HistogramVec
+	terminalLeaseGrants      *prometheus.CounterVec
+	terminalRevocations      *prometheus.CounterVec
+	tokenReviews             *prometheus.CounterVec
+	tokenReviewLatency       *prometheus.HistogramVec
+	subjectAccessReviews     *prometheus.CounterVec
+	subjectAccessLatency     *prometheus.HistogramVec
 }
 
 // NewMetrics registers the control-plane collectors with registerer.
@@ -52,6 +54,15 @@ func NewMetrics(registerer prometheus.Registerer) *Metrics {
 			Help:    "Time from transcript event creation to successful SSE delivery.",
 			Buckets: []float64{.01, .025, .05, .1, .25, .5, 1, 2.5, 5, 10, 30, 60, 300, 900, 3600},
 		}, []string{"kind"}),
+		transcriptCleanups: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: metricsNamespace, Name: "transcript_cleanups_total",
+			Help: "Exact transcript cleanup attempts by bounded outcome.",
+		}, []string{"outcome"}),
+		transcriptCleanupLatency: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Namespace: metricsNamespace, Name: "transcript_cleanup_duration_seconds",
+			Help:    "Exact transcript cutoff, drain, and store deletion latency by bounded outcome.",
+			Buckets: prometheus.DefBuckets,
+		}, []string{"outcome"}),
 		terminalLeaseGrants: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Namespace: metricsNamespace, Name: "terminal_lease_grants_total",
 			Help: "Terminal lease grant attempts by outcome.",
@@ -81,7 +92,8 @@ func NewMetrics(registerer prometheus.Registerer) *Metrics {
 	}
 	registerer.MustRegister(
 		m.transcriptAppends, m.transcriptAppendLatency, m.transcriptSubscribers,
-		m.transcriptDeliveries, m.transcriptDeliveryLag, m.terminalLeaseGrants,
+		m.transcriptDeliveries, m.transcriptDeliveryLag, m.transcriptCleanups,
+		m.transcriptCleanupLatency, m.terminalLeaseGrants,
 		m.terminalRevocations, m.tokenReviews, m.tokenReviewLatency,
 		m.subjectAccessReviews, m.subjectAccessLatency,
 	)
@@ -99,6 +111,10 @@ func NewMetrics(registerer prometheus.Registerer) *Metrics {
 	for _, kind := range []string{"replay", "live"} {
 		m.transcriptDeliveryLag.WithLabelValues(kind)
 	}
+	for _, outcome := range []string{"deleted", "absent", "already_complete", "error"} {
+		m.transcriptCleanups.WithLabelValues(outcome)
+		m.transcriptCleanupLatency.WithLabelValues(outcome)
+	}
 	for _, outcome := range []string{"granted", "failed"} {
 		m.terminalLeaseGrants.WithLabelValues(outcome)
 	}
@@ -114,6 +130,14 @@ func NewMetrics(registerer prometheus.Registerer) *Metrics {
 		m.subjectAccessLatency.WithLabelValues(outcome)
 	}
 	return m
+}
+
+func (m *Metrics) observeCleanup(start time.Time, outcome string) {
+	if m == nil {
+		return
+	}
+	m.transcriptCleanups.WithLabelValues(outcome).Inc()
+	m.transcriptCleanupLatency.WithLabelValues(outcome).Observe(time.Since(start).Seconds())
 }
 
 // MetricsHandler exposes only the Prometheus scrape route. It deliberately

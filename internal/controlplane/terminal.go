@@ -41,6 +41,7 @@ var (
 
 const (
 	RunUIDHeader         = "SWE-Run-UID"
+	NamespaceUIDHeader   = "SWE-Namespace-UID"
 	EnvironmentUIDHeader = "SWE-Environment-UID"
 )
 
