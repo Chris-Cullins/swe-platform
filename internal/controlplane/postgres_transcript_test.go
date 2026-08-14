@@ -171,6 +171,61 @@ func TestPostgresTranscriptStoreContract(t *testing.T) {
 		}
 	})
 
+	t.Run("exact deletion is transactional idempotent and restart durable", func(t *testing.T) {
+		run := RunIdentity{Namespace: "delete-project", NamespaceUID: "delete-namespace-uid", UID: "delete-run-uid"}
+		appendStoreEvent(t, store, run, "first")
+		appendStoreEvent(t, store, run, "second")
+		replacementRun := run
+		replacementRun.UID = "replacement-run-uid"
+		appendStoreEvent(t, store, replacementRun, "replacement")
+
+		wrongNamespace := run
+		wrongNamespace.NamespaceUID = "replacement-namespace-uid"
+		if _, err := store.Delete(ctx, wrongNamespace); !errors.Is(err, ErrTranscriptIdentity) {
+			t.Fatalf("replacement Namespace delete error = %v, want %v", err, ErrTranscriptIdentity)
+		}
+		result, err := store.Delete(ctx, run)
+		if err != nil || !result.Deleted {
+			t.Fatalf("exact delete = %#v, %v", result, err)
+		}
+		var runRows, eventRows int
+		if err := store.pool.QueryRow(ctx, `SELECT count(*) FROM transcript_runs WHERE namespace = $1 AND run_uid = $2`, run.Namespace, string(run.UID)).Scan(&runRows); err != nil {
+			t.Fatal(err)
+		}
+		if err := store.pool.QueryRow(ctx, `SELECT count(*) FROM transcript_events WHERE namespace = $1 AND run_uid = $2`, run.Namespace, string(run.UID)).Scan(&eventRows); err != nil {
+			t.Fatal(err)
+		}
+		if runRows != 0 || eventRows != 0 {
+			t.Fatalf("deleted rows = runs %d events %d", runRows, eventRows)
+		}
+		restarted, err := NewPostgresTranscriptStore(ctx, databaseURL, options)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer restarted.Close()
+		result, err = restarted.Delete(ctx, run)
+		if err != nil || result.Deleted {
+			t.Fatalf("restart idempotent delete = %#v, %v", result, err)
+		}
+		subscription, err := restarted.Subscribe(ctx, replacementRun, "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(subscription.History) != 1 {
+			t.Fatalf("replacement Run history = %#v", subscription.History)
+		}
+		subscription.Unsubscribe()
+
+		legacy := RunIdentity{Namespace: "legacy-delete-project", NamespaceUID: "legacy-delete-namespace-uid", UID: "legacy-delete-run-uid"}
+		if _, err := store.pool.Exec(ctx, `INSERT INTO transcript_runs(namespace, run_uid) VALUES ($1, $2)`, legacy.Namespace, string(legacy.UID)); err != nil {
+			t.Fatal(err)
+		}
+		result, err = restarted.Delete(ctx, legacy)
+		if err != nil || !result.Deleted {
+			t.Fatalf("associated legacy delete = %#v, %v", result, err)
+		}
+	})
+
 	t.Run("empty subscription rejects a later conflicting Namespace identity", func(t *testing.T) {
 		current := RunIdentity{Namespace: "replacement-race", NamespaceUID: "namespace-uid-new", UID: "shared-run-uid"}
 		subscription, err := store.Subscribe(ctx, current, "")
@@ -584,6 +639,10 @@ func TestPostgresTranscriptStoreContract(t *testing.T) {
 		result, err := failed.Append(ctx, RunIdentity{Namespace: "project-a", NamespaceUID: testNamespaceUID("project-a"), UID: "failed-run"}, AppendTranscriptInput{Source: "adapter", IdempotencyKey: "failed", Type: "output", Data: json.RawMessage(`{}`)})
 		if err == nil || result.Event.Sequence != 0 {
 			t.Fatalf("failed append result/error = %#v/%v", result, err)
+		}
+		deleteResult, deleteErr := failed.Delete(ctx, RunIdentity{Namespace: "project-a", NamespaceUID: testNamespaceUID("project-a"), UID: "failed-run"})
+		if deleteErr == nil || deleteResult.Deleted {
+			t.Fatalf("failed delete result/error = %#v/%v", deleteResult, deleteErr)
 		}
 	})
 

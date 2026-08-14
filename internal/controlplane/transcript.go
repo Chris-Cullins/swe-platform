@@ -27,6 +27,8 @@ var (
 	ErrInvalidCursor       = errors.New("invalid transcript cursor")
 	ErrExpiredCursor       = errors.New("transcript cursor expired")
 	ErrTranscriptIdentity  = errors.New("transcript namespace identity does not match")
+	ErrTranscriptCutoff    = errors.New("transcript retention cutoff has been reached")
+	ErrTranscriptGateLimit = errors.New("transcript cutoff gate capacity exceeded")
 )
 
 // RunIdentity is the immutable tenant-aware identity of a transcript owner.
@@ -62,6 +64,12 @@ type AppendTranscriptResult struct {
 	Replayed bool
 }
 
+// DeleteTranscriptResult reports whether exact retained state was removed.
+// It deliberately exposes no identity or unbounded row/byte counts.
+type DeleteTranscriptResult struct {
+	Deleted bool
+}
+
 // TranscriptGap describes an explicitly skipped portion of retained history.
 type TranscriptGap struct {
 	ResumeAfter      string `json:"resumeAfter"`
@@ -82,10 +90,14 @@ type TranscriptSubscription struct {
 // linearizable per Run and atomically allocate sequence, persist idempotency state,
 // and publish. Subscribe must establish one atomic replay/live cut so every later
 // committed event appears exactly once unless Dropped is closed. Callers must treat
-// returned events and their opaque Data as immutable.
+// returned events and their opaque Data as immutable. Delete must remove only the
+// exact identity and is idempotent: an already-absent identity returns a zero result
+// without error. The control-plane boundary must cut off and drain appends before
+// calling Delete; the store does not retain lifecycle tombstones.
 type TranscriptStore interface {
 	Append(context.Context, RunIdentity, AppendTranscriptInput) (AppendTranscriptResult, error)
 	Subscribe(context.Context, RunIdentity, string) (TranscriptSubscription, error)
+	Delete(context.Context, RunIdentity) (DeleteTranscriptResult, error)
 }
 
 // MemoryTranscriptStoreOptions bounds every variable-size part of the reference store.
@@ -341,6 +353,30 @@ func (s *memoryTranscriptStore) Subscribe(_ context.Context, run RunIdentity, cu
 	}, nil
 }
 
+func (s *memoryTranscriptStore) Delete(_ context.Context, run RunIdentity) (DeleteTranscriptResult, error) {
+	if run.Namespace == "" || run.NamespaceUID == "" || run.UID == "" {
+		return DeleteTranscriptResult{}, fmt.Errorf("delete transcript: complete namespace and Run identity is required")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	state, deleted := s.runs[run]
+	if deleted {
+		s.totalEvents -= len(state.events)
+		s.totalBytes -= state.bytes
+		delete(s.runs, run)
+	}
+	for subscriber := range s.subscribers[run] {
+		if !subscriber.isDropped {
+			close(subscriber.dropped)
+			subscriber.isDropped = true
+		}
+		s.totalSubscribers--
+	}
+	delete(s.subscribers, run)
+	return DeleteTranscriptResult{Deleted: deleted}, nil
+}
+
 func (s *memoryTranscriptStore) unsubscribe(run RunIdentity, subscriber *memorySubscriber) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -424,6 +460,12 @@ func writeTranscriptStoreError(w http.ResponseWriter, err error) {
 	case errors.Is(err, ErrTranscriptCapacity):
 		status, code = http.StatusInsufficientStorage, "transcript_capacity"
 		title = err.Error()
+	case errors.Is(err, ErrTranscriptCutoff):
+		status, code = http.StatusGone, "transcript-retention-cutoff"
+		title = "Transcript retention cutoff reached"
+	case errors.Is(err, ErrTranscriptGateLimit):
+		status, code = http.StatusServiceUnavailable, "transcript-cutoff-capacity"
+		title = "Transcript cutoff admission is unavailable"
 	}
 	var cursorError *TranscriptCursorError
 	problem := struct {
@@ -458,7 +500,8 @@ func writeTranscriptProblem(w http.ResponseWriter, status int, code, title strin
 func isTranscriptContractError(err error) bool {
 	return errors.Is(err, ErrTranscriptIdentity) || errors.Is(err, ErrIdempotencyConflict) || errors.Is(err, ErrTranscriptCapacity) ||
 		errors.Is(err, ErrSubscriberCapacity) || errors.Is(err, ErrReplayLimit) ||
-		errors.Is(err, ErrInvalidCursor) || errors.Is(err, ErrExpiredCursor)
+		errors.Is(err, ErrInvalidCursor) || errors.Is(err, ErrExpiredCursor) ||
+		errors.Is(err, ErrTranscriptCutoff) || errors.Is(err, ErrTranscriptGateLimit)
 }
 
 func equalAppendInput(event TranscriptEvent, input AppendTranscriptInput) bool {

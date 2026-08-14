@@ -55,11 +55,18 @@ type Server struct {
 	terminalWriteTimeout  time.Duration
 	metrics               *Metrics
 	portal                *portalGateway
+	transcriptGate        *transcriptGate
+}
+
+// RunResolution is the exact current identity and deletion state of a Run.
+type RunResolution struct {
+	UID      types.UID
+	Deleting bool
 }
 
 // RunResolver verifies that a namespaced Run exists before transcript state is used.
 type RunResolver interface {
-	ResolveRun(context.Context, string, string) (types.UID, error)
+	ResolveRun(context.Context, string, string) (RunResolution, error)
 }
 
 // KubernetesRunResolver resolves Runs through the Kubernetes API.
@@ -68,12 +75,12 @@ type KubernetesRunResolver struct {
 }
 
 // ResolveRun verifies that the requested Run exists in the authorized namespace.
-func (r KubernetesRunResolver) ResolveRun(ctx context.Context, namespace, name string) (types.UID, error) {
+func (r KubernetesRunResolver) ResolveRun(ctx context.Context, namespace, name string) (RunResolution, error) {
 	var run platformv1alpha1.Run
 	if err := r.Client.Get(ctx, types.NamespacedName{Namespace: namespace, Name: name}, &run); err != nil {
-		return "", err
+		return RunResolution{}, err
 	}
-	return run.UID, nil
+	return RunResolution{UID: run.UID, Deleting: !run.DeletionTimestamp.IsZero()}, nil
 }
 
 // ServerOptions supplies the control plane's resource and authorization dependencies.
@@ -132,6 +139,7 @@ func NewServer(log *slog.Logger, options ServerOptions) *Server {
 		terminalOpenTimeout:   terminalHandshakeTimeout,
 		terminalWriteTimeout:  terminalStreamingWriteTimeout,
 		metrics:               options.Metrics,
+		transcriptGate:        newTranscriptGate(maxTranscriptGateEntries),
 	}
 	server.portal = newPortalGateway(server, options)
 	return server
@@ -344,9 +352,12 @@ func (s *Server) handleTranscript(w http.ResponseWriter, r *http.Request, namesp
 	if r.Method == http.MethodPost {
 		verb = "update"
 		allowSession = false
+	} else if r.Method == http.MethodDelete {
+		verb = "delete"
+		allowSession = false
 	}
-	if r.Method != http.MethodGet && r.Method != http.MethodPost {
-		w.Header().Set("Allow", "GET, POST")
+	if r.Method != http.MethodGet && r.Method != http.MethodPost && r.Method != http.MethodDelete {
+		w.Header().Set("Allow", "GET, POST, DELETE")
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
@@ -375,8 +386,51 @@ func (s *Server) handleTranscript(w http.ResponseWriter, r *http.Request, namesp
 		http.Error(w, "run resolver is unavailable", http.StatusServiceUnavailable)
 		return
 	}
+	namespaceUID := namespaceUIDFromRequest(r)
+	if namespaceUID == "" {
+		s.log.Warn("authorized transcript request without a Namespace UID", "namespace", namespace, "run", run)
+		http.Error(w, "namespace identity is unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	if r.Method == http.MethodDelete {
+		expectedNamespaceUID := types.UID(strings.TrimSpace(r.Header.Get(NamespaceUIDHeader)))
+		if expectedNamespaceUID == "" {
+			writeProblem(w, http.StatusPreconditionRequired, "namespace-uid-required", "Namespace UID required", "the "+NamespaceUIDHeader+" header is required for transcript deletion")
+			return
+		}
+		if len(expectedNamespaceUID) > 128 {
+			http.Error(w, "namespace UID exceeds its size limit", http.StatusBadRequest)
+			return
+		}
+		if expectedNamespaceUID != namespaceUID {
+			writeTranscriptProblem(w, http.StatusConflict, "namespace_uid_mismatch", "Namespace UID mismatch")
+			return
+		}
+	}
+	identity := RunIdentity{Namespace: namespace, NamespaceUID: namespaceUID, UID: expectedUID}
 
-	resolvedUID, err := s.runs.ResolveRun(r.Context(), namespace, run)
+	var admission *transcriptAdmission
+	var cutoff *transcriptCutoff
+	var err error
+	if r.Method == http.MethodDelete {
+		cutoff, err = s.transcriptGate.cutoff(identity)
+		if err != nil {
+			writeTranscriptStoreError(w, err)
+			return
+		}
+		defer cutoff.abort()
+	} else {
+		var admittedContext context.Context
+		admittedContext, admission, err = s.transcriptGate.admit(r.Context(), identity, r.Method == http.MethodGet)
+		if err != nil {
+			writeTranscriptStoreError(w, err)
+			return
+		}
+		defer admission.release()
+		r = r.WithContext(admittedContext)
+	}
+
+	resolved, err := s.runs.ResolveRun(r.Context(), namespace, run)
 	if err != nil {
 		if apierrors.IsNotFound(err) {
 			http.Error(w, "run not found", http.StatusNotFound)
@@ -386,25 +440,29 @@ func (s *Server) handleTranscript(w http.ResponseWriter, r *http.Request, namesp
 		}
 		return
 	}
-	if resolvedUID == "" {
+	if resolved.UID == "" {
 		s.log.Warn("resolved transcript run without a UID", "namespace", namespace, "run", run)
 		http.Error(w, "run identity is unavailable", http.StatusServiceUnavailable)
 		return
 	}
 
-	if expectedUID != resolvedUID {
+	if expectedUID != resolved.UID {
 		writeTranscriptProblem(w, http.StatusConflict, "run_uid_mismatch", "Run UID mismatch")
 		return
 	}
-	// Bind storage to the verified caller expectation, not merely the value
-	// returned by name resolution.
-	namespaceUID := namespaceUIDFromRequest(r)
-	if namespaceUID == "" {
-		s.log.Warn("authorized transcript request without a Namespace UID", "namespace", namespace, "run", run)
-		http.Error(w, "namespace identity is unavailable", http.StatusServiceUnavailable)
+	if r.Method != http.MethodDelete && resolved.Deleting {
+		writeTranscriptStoreError(w, ErrTranscriptCutoff)
 		return
 	}
-	identity := RunIdentity{Namespace: namespace, NamespaceUID: namespaceUID, UID: expectedUID}
+	if r.Method == http.MethodDelete {
+		if !resolved.Deleting {
+			writeTranscriptProblem(w, http.StatusConflict, "run-not-deleting", "Run is not deleting")
+			return
+		}
+		cutoff.validate()
+		s.deleteTranscript(w, r, identity, ResourceAccess{Namespace: namespace, Verb: "delete", Resource: "runs", Subresource: "transcript", Name: run}, cutoff)
+		return
+	}
 
 	switch r.Method {
 	case http.MethodGet:
@@ -412,6 +470,70 @@ func (s *Server) handleTranscript(w http.ResponseWriter, r *http.Request, namesp
 	case http.MethodPost:
 		s.appendTranscript(w, r, identity)
 	}
+}
+
+func (s *Server) deleteTranscript(w http.ResponseWriter, r *http.Request, run RunIdentity, authorization ResourceAccess, cutoff *transcriptCutoff) {
+	started := time.Now()
+	completed, err := cutoff.beginCleanup(r.Context())
+	if err != nil {
+		s.metrics.observeCleanup(started, "error")
+		writeTranscriptStoreError(w, err)
+		return
+	}
+	if completed {
+		s.metrics.observeCleanup(started, "already_complete")
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	// Draining may block, so repeat the complete live TokenReview -> exact SAR ->
+	// tenancy/Namespace -> deleting Run proof immediately before physical deletion.
+	if err := s.access.Authorize(r, authorization, false); err != nil {
+		cutoff.finish(false)
+		s.metrics.observeCleanup(started, "error")
+		writeAccessError(w, err)
+		return
+	}
+	if namespaceUIDFromRequest(r) != run.NamespaceUID {
+		cutoff.finish(false)
+		s.metrics.observeCleanup(started, "error")
+		writeTranscriptProblem(w, http.StatusConflict, "namespace_uid_mismatch", "Namespace UID mismatch")
+		return
+	}
+	resolved, err := s.runs.ResolveRun(r.Context(), run.Namespace, authorization.Name)
+	if err != nil || resolved.UID != run.UID || !resolved.Deleting {
+		cutoff.finish(false)
+		s.metrics.observeCleanup(started, "error")
+		if err != nil {
+			s.log.Warn("revalidate deleting transcript run", "namespace", run.Namespace, "run", authorization.Name, "error", err)
+			http.Error(w, "run resolver is unavailable", http.StatusServiceUnavailable)
+		} else if resolved.UID != run.UID {
+			writeTranscriptProblem(w, http.StatusConflict, "run_uid_mismatch", "Run UID mismatch")
+		} else {
+			writeTranscriptProblem(w, http.StatusConflict, "run-not-deleting", "Run is not deleting")
+		}
+		return
+	}
+	if s.store == nil {
+		cutoff.finish(true)
+		s.metrics.observeCleanup(started, "absent")
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	result, err := s.store.Delete(r.Context(), run)
+	if err != nil {
+		cutoff.finish(false)
+		s.metrics.observeCleanup(started, "error")
+		s.log.Error("delete transcript", "namespace", run.Namespace, "runUID", run.UID, "error", err)
+		writeTranscriptStoreError(w, err)
+		return
+	}
+	cutoff.finish(true)
+	outcome := "absent"
+	if result.Deleted {
+		outcome = "deleted"
+	}
+	s.metrics.observeCleanup(started, outcome)
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func (s *Server) appendTranscript(w http.ResponseWriter, r *http.Request, run RunIdentity) {
@@ -520,12 +642,15 @@ func (s *Server) streamTranscript(w http.ResponseWriter, r *http.Request, run Ru
 		if namespaceUIDFromRequest(authRequest) != run.NamespaceUID {
 			return ErrTranscriptIdentity
 		}
-		uid, err := s.runs.ResolveRun(authContext, run.Namespace, authorization.Name)
+		resolved, err := s.runs.ResolveRun(authContext, run.Namespace, authorization.Name)
 		if err != nil {
 			return err
 		}
-		if uid != run.UID {
+		if resolved.UID != run.UID {
 			return ErrTranscriptIdentity
+		}
+		if resolved.Deleting {
+			return ErrTranscriptCutoff
 		}
 		authorizationDeadline = time.Now().Add(s.heartbeat)
 		return nil

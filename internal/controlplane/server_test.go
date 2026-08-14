@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -17,11 +18,37 @@ import (
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	dto "github.com/prometheus/client_model/go"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+
+	platformv1alpha1 "github.com/Chris-Cullins/swe-platform/api/v1alpha1"
 )
 
 const transcriptURL = "/api/v1/namespaces/project-1/runs/run-1/transcript"
+
+func TestKubernetesRunResolverIncludesDeletionState(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := platformv1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	deletingAt := metav1.Now()
+	client := fake.NewClientBuilder().WithScheme(scheme).WithObjects(
+		&platformv1alpha1.Run{ObjectMeta: metav1.ObjectMeta{
+			Namespace: "project-1", Name: "run-1", UID: "run-1-uid",
+			DeletionTimestamp: &deletingAt, Finalizers: []string{"test/finalizer"},
+		}},
+	).Build()
+	resolved, err := (KubernetesRunResolver{Client: client}).ResolveRun(context.Background(), "project-1", "run-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resolved.UID != "run-1-uid" || !resolved.Deleting {
+		t.Fatalf("Run resolution = %#v", resolved)
+	}
+}
 
 func TestTranscriptReplayAndLiveStream(t *testing.T) {
 	metrics := NewMetrics(prometheus.NewRegistry())
@@ -491,7 +518,7 @@ func TestTranscriptRejectsAnonymousBeforeRunResolutionOrStoreAccess(t *testing.T
 	resolver := &fakeRunResolver{}
 	api := NewServer(nil, ServerOptions{Access: &fakeAccess{err: errUnauthenticated}, Runs: resolver, TranscriptStore: NewMemoryTranscriptStore(MemoryTranscriptStoreOptions{})})
 
-	for _, method := range []string{http.MethodGet, http.MethodPost} {
+	for _, method := range []string{http.MethodGet, http.MethodPost, http.MethodDelete} {
 		request := httptest.NewRequest(method, transcriptURL, strings.NewReader(`{"source":"adapter","idempotencyKey":"event-1","type":"output","data":{}}`))
 		response := httptest.NewRecorder()
 		api.Handler().ServeHTTP(response, request)
@@ -500,8 +527,8 @@ func TestTranscriptRejectsAnonymousBeforeRunResolutionOrStoreAccess(t *testing.T
 		}
 	}
 	store := api.store.(*memoryTranscriptStore)
-	if resolver.calls != 0 || len(store.runs) != 0 || len(store.subscribers) != 0 {
-		t.Fatalf("unauthorized request reached backend: resolves=%d runs=%d subscribers=%d", resolver.calls, len(store.runs), len(store.subscribers))
+	if resolver.calls != 0 || len(store.runs) != 0 || len(store.subscribers) != 0 || len(api.transcriptGate.entries) != 0 {
+		t.Fatalf("unauthorized request reached backend: resolves=%d runs=%d subscribers=%d gates=%d", resolver.calls, len(store.runs), len(store.subscribers), len(api.transcriptGate.entries))
 	}
 }
 
@@ -509,7 +536,7 @@ func TestTranscriptRejectsForbiddenBeforeUIDValidation(t *testing.T) {
 	resolver := &fakeRunResolver{}
 	store := NewMemoryTranscriptStore(MemoryTranscriptStoreOptions{})
 	api := NewServer(nil, ServerOptions{Access: &fakeAccess{err: errForbidden}, Runs: resolver, TranscriptStore: store})
-	for _, method := range []string{http.MethodGet, http.MethodPost} {
+	for _, method := range []string{http.MethodGet, http.MethodPost, http.MethodDelete} {
 		request := httptest.NewRequest(method, transcriptURL, nil)
 		request.Header.Set("Authorization", "Bearer denied")
 		request.Header.Set(RunUIDHeader, strings.Repeat("x", 129))
@@ -520,8 +547,8 @@ func TestTranscriptRejectsForbiddenBeforeUIDValidation(t *testing.T) {
 		}
 	}
 	memStore := store.(*memoryTranscriptStore)
-	if resolver.calls != 0 || len(memStore.runs) != 0 || len(memStore.subscribers) != 0 {
-		t.Fatalf("forbidden request reached backend: resolves=%d runs=%d subscribers=%d", resolver.calls, len(memStore.runs), len(memStore.subscribers))
+	if resolver.calls != 0 || len(memStore.runs) != 0 || len(memStore.subscribers) != 0 || len(api.transcriptGate.entries) != 0 {
+		t.Fatalf("forbidden request reached backend: resolves=%d runs=%d subscribers=%d gates=%d", resolver.calls, len(memStore.runs), len(memStore.subscribers), len(api.transcriptGate.entries))
 	}
 }
 
@@ -699,6 +726,275 @@ func TestTranscriptStoreRemovesEmptySubscriberMap(t *testing.T) {
 	}
 }
 
+func TestDeletingRunRejectsTranscriptReadsAndAppendsWithFixedCutoff(t *testing.T) {
+	store := NewMemoryTranscriptStore(MemoryTranscriptStoreOptions{}).(*memoryTranscriptStore)
+	resolver := &fakeRunResolver{deleting: true}
+	api := NewServer(nil, ServerOptions{Access: &fakeAccess{}, Runs: resolver, TranscriptStore: store})
+	for _, method := range []string{http.MethodGet, http.MethodPost} {
+		request := httptest.NewRequest(method, transcriptURL, strings.NewReader(`{"source":"adapter","idempotencyKey":"event","type":"output","data":{}}`))
+		request.Header.Set("Authorization", "Bearer transcript-user")
+		request.Header.Set(RunUIDHeader, "run-1-uid")
+		response := httptest.NewRecorder()
+		api.Handler().ServeHTTP(response, request)
+		if response.Code != http.StatusGone || response.Header().Get("Content-Type") != "application/problem+json" || !strings.Contains(response.Body.String(), "/transcript-retention-cutoff") {
+			t.Fatalf("%s cutoff response = %d %q", method, response.Code, response.Body.String())
+		}
+	}
+	if len(store.runs) != 0 || len(store.subscribers) != 0 || len(api.transcriptGate.entries) != 0 {
+		t.Fatalf("deleting Run rejection retained state: runs=%d subscribers=%d gates=%d", len(store.runs), len(store.subscribers), len(api.transcriptGate.entries))
+	}
+}
+
+func TestTranscriptDeleteRequiresExactBearerIdentityAndIsIdempotent(t *testing.T) {
+	metrics := NewMetrics(prometheus.NewRegistry())
+	access := &fakeAccess{}
+	store := NewMemoryTranscriptStore(MemoryTranscriptStoreOptions{}).(*memoryTranscriptStore)
+	run := RunIdentity{Namespace: "project-1", NamespaceUID: testNamespaceUID("project-1"), UID: "run-1-uid"}
+	appendStoreEvent(t, store, run, "first")
+	api := NewServer(nil, ServerOptions{Access: access, Runs: &fakeRunResolver{deleting: true}, TranscriptStore: store, Metrics: metrics})
+
+	missingNamespaceUID := httptest.NewRequest(http.MethodDelete, transcriptURL, nil)
+	missingNamespaceUID.Header.Set("Authorization", "Bearer cleanup")
+	missingNamespaceUID.Header.Set(RunUIDHeader, "run-1-uid")
+	missingResponse := httptest.NewRecorder()
+	api.Handler().ServeHTTP(missingResponse, missingNamespaceUID)
+	if missingResponse.Code != http.StatusPreconditionRequired || len(api.transcriptGate.entries) != 0 {
+		t.Fatalf("missing Namespace UID response/gates = %d/%d", missingResponse.Code, len(api.transcriptGate.entries))
+	}
+
+	requestDelete := func() *httptest.ResponseRecorder {
+		request := httptest.NewRequest(http.MethodDelete, transcriptURL, nil)
+		request.Header.Set("Authorization", "Bearer cleanup")
+		request.Header.Set(RunUIDHeader, "run-1-uid")
+		request.Header.Set(NamespaceUIDHeader, string(run.NamespaceUID))
+		response := httptest.NewRecorder()
+		api.Handler().ServeHTTP(response, request)
+		return response
+	}
+	if response := requestDelete(); response.Code != http.StatusNoContent {
+		t.Fatalf("delete response = %d %q", response.Code, response.Body.String())
+	}
+	if _, exists := store.runs[run]; exists {
+		t.Fatal("exact transcript remained after cleanup")
+	}
+	if response := requestDelete(); response.Code != http.StatusNoContent {
+		t.Fatalf("idempotent delete response = %d %q", response.Code, response.Body.String())
+	}
+	if got := testutil.ToFloat64(metrics.transcriptCleanups.WithLabelValues("deleted")); got != 1 {
+		t.Fatalf("deleted cleanup metric = %v, want 1", got)
+	}
+	if got := testutil.ToFloat64(metrics.transcriptCleanups.WithLabelValues("absent")); got != 1 {
+		t.Fatalf("absent cleanup metric = %v, want 1", got)
+	}
+	access.mu.Lock()
+	calls := append([]ResourceAccess(nil), access.calls...)
+	access.mu.Unlock()
+	deleteCalls := 0
+	for _, call := range calls {
+		if call.Verb == "delete" && call.Resource == "runs" && call.Subresource == "transcript" && call.Name == "run-1" {
+			deleteCalls++
+		}
+	}
+	if deleteCalls != 5 { // rejected header, then initial + fresh proof for each cleanup attempt
+		t.Fatalf("exact delete SAR calls = %d, want 5; calls=%#v", deleteCalls, calls)
+	}
+
+	sessionStore := NewMemorySessionStore(MemorySessionStoreOptions{})
+	sessionID, err := sessionStore.Create(context.Background(), "browser-token")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sessionAPI := NewServer(nil, ServerOptions{Access: sessionResolvingAccess{store: sessionStore}, Runs: &fakeRunResolver{deleting: true}, TranscriptStore: store})
+	sessionRequest := httptest.NewRequest(http.MethodDelete, transcriptURL, nil)
+	sessionRequest.Header.Set(RunUIDHeader, "run-1-uid")
+	sessionRequest.Header.Set(NamespaceUIDHeader, string(run.NamespaceUID))
+	sessionRequest.AddCookie(&http.Cookie{Name: sessionCookieName, Value: sessionID})
+	sessionResponse := httptest.NewRecorder()
+	sessionAPI.Handler().ServeHTTP(sessionResponse, sessionRequest)
+	if sessionResponse.Code != http.StatusUnauthorized || len(sessionAPI.transcriptGate.entries) != 0 {
+		t.Fatalf("browser cleanup response/gates = %d/%d", sessionResponse.Code, len(sessionAPI.transcriptGate.entries))
+	}
+}
+
+func TestTranscriptDeleteCancelsExistingStream(t *testing.T) {
+	resolver := &mutableRunResolver{uid: "run-1-uid"}
+	api := NewServer(nil, ServerOptions{Access: &fakeAccess{}, Runs: resolver, TranscriptStore: NewMemoryTranscriptStore(MemoryTranscriptStoreOptions{})})
+	server := httptest.NewServer(api.Handler())
+	defer server.Close()
+
+	streamRequest, err := http.NewRequest(http.MethodGet, server.URL+transcriptURL, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	streamRequest.Header.Set(RunUIDHeader, "run-1-uid")
+	streamResponse, err := http.DefaultClient.Do(streamRequest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer streamResponse.Body.Close()
+	resolver.setDeleting(true)
+	deleteRequest, err := http.NewRequest(http.MethodDelete, server.URL+transcriptURL, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	deleteRequest.Header.Set("Authorization", "Bearer cleanup")
+	deleteRequest.Header.Set(RunUIDHeader, "run-1-uid")
+	deleteRequest.Header.Set(NamespaceUIDHeader, string(testNamespaceUID("project-1")))
+	deleteResponse, err := http.DefaultClient.Do(deleteRequest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	deleteResponse.Body.Close()
+	if deleteResponse.StatusCode != http.StatusNoContent {
+		t.Fatalf("delete status = %d", deleteResponse.StatusCode)
+	}
+	done := make(chan error, 1)
+	go func() {
+		_, err := io.Copy(io.Discard, streamResponse.Body)
+		done <- err
+	}()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("existing transcript stream remained open after cutoff")
+	}
+}
+
+type flakyDeleteTranscriptStore struct {
+	TranscriptStore
+	mu       sync.Mutex
+	failures int
+}
+
+func (s *flakyDeleteTranscriptStore) Delete(ctx context.Context, run RunIdentity) (DeleteTranscriptResult, error) {
+	s.mu.Lock()
+	if s.failures > 0 {
+		s.failures--
+		s.mu.Unlock()
+		return DeleteTranscriptResult{}, errors.New("configured durable store unavailable")
+	}
+	s.mu.Unlock()
+	return s.TranscriptStore.Delete(ctx, run)
+}
+
+func TestTranscriptDeleteFailureRemainsCutOffForRetry(t *testing.T) {
+	inner := NewMemoryTranscriptStore(MemoryTranscriptStoreOptions{})
+	run := RunIdentity{Namespace: "project-1", NamespaceUID: testNamespaceUID("project-1"), UID: "run-1-uid"}
+	appendStoreEvent(t, inner, run, "first")
+	store := &flakyDeleteTranscriptStore{TranscriptStore: inner, failures: 1}
+	api := NewServer(nil, ServerOptions{Access: &fakeAccess{}, Runs: &fakeRunResolver{deleting: true}, TranscriptStore: store})
+	deleteRequest := func() *httptest.ResponseRecorder {
+		request := httptest.NewRequest(http.MethodDelete, transcriptURL, nil)
+		request.Header.Set("Authorization", "Bearer cleanup")
+		request.Header.Set(RunUIDHeader, "run-1-uid")
+		request.Header.Set(NamespaceUIDHeader, string(run.NamespaceUID))
+		response := httptest.NewRecorder()
+		api.Handler().ServeHTTP(response, request)
+		return response
+	}
+	if response := deleteRequest(); response.Code != http.StatusServiceUnavailable || strings.Contains(response.Body.String(), "configured durable") {
+		t.Fatalf("failed cleanup response = %d %q", response.Code, response.Body.String())
+	}
+	appendRequest := httptest.NewRequest(http.MethodPost, transcriptURL, strings.NewReader(`{"source":"adapter","idempotencyKey":"late","type":"output","data":{}}`))
+	appendRequest.Header.Set("Authorization", "Bearer producer")
+	appendRequest.Header.Set(RunUIDHeader, "run-1-uid")
+	appendResponse := httptest.NewRecorder()
+	api.Handler().ServeHTTP(appendResponse, appendRequest)
+	if appendResponse.Code != http.StatusGone || !strings.Contains(appendResponse.Body.String(), "/transcript-retention-cutoff") {
+		t.Fatalf("append after failed cleanup = %d %q", appendResponse.Code, appendResponse.Body.String())
+	}
+	if response := deleteRequest(); response.Code != http.StatusNoContent {
+		t.Fatalf("cleanup retry response = %d %q", response.Code, response.Body.String())
+	}
+}
+
+type blockingAppendTranscriptStore struct {
+	TranscriptStore
+	appendStarted chan struct{}
+	releaseAppend chan struct{}
+	deleteStarted chan struct{}
+	appendOnce    sync.Once
+	deleteOnce    sync.Once
+}
+
+func (s *blockingAppendTranscriptStore) Append(ctx context.Context, run RunIdentity, input AppendTranscriptInput) (AppendTranscriptResult, error) {
+	s.appendOnce.Do(func() { close(s.appendStarted) })
+	select {
+	case <-ctx.Done():
+		return AppendTranscriptResult{}, ctx.Err()
+	case <-s.releaseAppend:
+	}
+	return s.TranscriptStore.Append(ctx, run, input)
+}
+
+func (s *blockingAppendTranscriptStore) Delete(ctx context.Context, run RunIdentity) (DeleteTranscriptResult, error) {
+	s.deleteOnce.Do(func() { close(s.deleteStarted) })
+	return s.TranscriptStore.Delete(ctx, run)
+}
+
+func TestTranscriptDeleteDrainsRacingAppendBeforeStoreDeletion(t *testing.T) {
+	inner := NewMemoryTranscriptStore(MemoryTranscriptStoreOptions{})
+	store := &blockingAppendTranscriptStore{
+		TranscriptStore: inner,
+		appendStarted:   make(chan struct{}),
+		releaseAppend:   make(chan struct{}),
+		deleteStarted:   make(chan struct{}),
+	}
+	resolver := &mutableRunResolver{uid: "run-1-uid"}
+	api := NewServer(nil, ServerOptions{Access: &fakeAccess{}, Runs: resolver, TranscriptStore: store})
+
+	appendRequest := httptest.NewRequest(http.MethodPost, transcriptURL, strings.NewReader(`{"source":"adapter","idempotencyKey":"racing","type":"output","data":{}}`))
+	appendRequest.Header.Set("Authorization", "Bearer producer")
+	appendRequest.Header.Set(RunUIDHeader, "run-1-uid")
+	appendResponse := httptest.NewRecorder()
+	appendDone := make(chan struct{})
+	go func() {
+		api.Handler().ServeHTTP(appendResponse, appendRequest)
+		close(appendDone)
+	}()
+	select {
+	case <-store.appendStarted:
+	case <-time.After(time.Second):
+		t.Fatal("append did not reach the store")
+	}
+
+	resolver.setDeleting(true)
+	deleteRequest := httptest.NewRequest(http.MethodDelete, transcriptURL, nil)
+	deleteRequest.Header.Set("Authorization", "Bearer cleanup")
+	deleteRequest.Header.Set(RunUIDHeader, "run-1-uid")
+	deleteRequest.Header.Set(NamespaceUIDHeader, string(testNamespaceUID("project-1")))
+	deleteResponse := httptest.NewRecorder()
+	deleteDone := make(chan struct{})
+	go func() {
+		api.Handler().ServeHTTP(deleteResponse, deleteRequest)
+		close(deleteDone)
+	}()
+	select {
+	case <-store.deleteStarted:
+		t.Fatal("store deletion raced ahead of the admitted append")
+	case <-time.After(20 * time.Millisecond):
+	}
+	close(store.releaseAppend)
+	select {
+	case <-appendDone:
+	case <-time.After(time.Second):
+		t.Fatal("append did not drain")
+	}
+	select {
+	case <-deleteDone:
+	case <-time.After(time.Second):
+		t.Fatal("cleanup did not finish after append drained")
+	}
+	if appendResponse.Code != http.StatusCreated || deleteResponse.Code != http.StatusNoContent {
+		t.Fatalf("append/delete statuses = %d/%d, bodies %q/%q", appendResponse.Code, deleteResponse.Code, appendResponse.Body.String(), deleteResponse.Body.String())
+	}
+	run := RunIdentity{Namespace: "project-1", NamespaceUID: testNamespaceUID("project-1"), UID: "run-1-uid"}
+	memory := inner.(*memoryTranscriptStore)
+	if _, exists := memory.runs[run]; exists {
+		t.Fatal("racing append recreated transcript after cleanup")
+	}
+}
+
 func postEvent(t *testing.T, baseURL, body string) {
 	t.Helper()
 	request, err := http.NewRequest(http.MethodPost, baseURL+transcriptURL, strings.NewReader(body))
@@ -780,20 +1076,22 @@ func (a sessionResolvingAccess) Authorize(request *http.Request, access Resource
 func testNamespaceUID(namespace string) types.UID { return types.UID("namespace-uid-" + namespace) }
 
 type fakeRunResolver struct {
-	calls int
-	err   error
-	uid   types.UID
+	calls    int
+	err      error
+	uid      types.UID
+	deleting bool
 }
 
 type mutableRunResolver struct {
-	mu  sync.Mutex
-	uid types.UID
+	mu       sync.Mutex
+	uid      types.UID
+	deleting bool
 }
 
-func (r *mutableRunResolver) ResolveRun(_ context.Context, _, _ string) (types.UID, error) {
+func (r *mutableRunResolver) ResolveRun(_ context.Context, _, _ string) (RunResolution, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	return r.uid, nil
+	return RunResolution{UID: r.uid, Deleting: r.deleting}, nil
 }
 
 func (r *mutableRunResolver) setUID(uid types.UID) {
@@ -802,12 +1100,18 @@ func (r *mutableRunResolver) setUID(uid types.UID) {
 	r.mu.Unlock()
 }
 
-func (r *fakeRunResolver) ResolveRun(_ context.Context, _, name string) (types.UID, error) {
+func (r *mutableRunResolver) setDeleting(deleting bool) {
+	r.mu.Lock()
+	r.deleting = deleting
+	r.mu.Unlock()
+}
+
+func (r *fakeRunResolver) ResolveRun(_ context.Context, _, name string) (RunResolution, error) {
 	r.calls++
 	if r.uid != "" {
-		return r.uid, r.err
+		return RunResolution{UID: r.uid, Deleting: r.deleting}, r.err
 	}
-	return types.UID(name + "-uid"), r.err
+	return RunResolution{UID: types.UID(name + "-uid"), Deleting: r.deleting}, r.err
 }
 
 func nextLine(t *testing.T, lines <-chan string) string {

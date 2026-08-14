@@ -103,6 +103,8 @@ or live events with low lag, terminal grants, and allowed authentication reviews
 | `swe_control_plane_transcript_sse_subscribers` | none |
 | `swe_control_plane_transcript_sse_deliveries_total` | `kind`: `replay`, `live`, `gap`; `outcome`: `delivered`, `error`, plus `dropped` for live delivery |
 | `swe_control_plane_transcript_sse_delivery_lag_seconds` | `kind`: `replay`, `live` |
+| `swe_control_plane_transcript_cleanups_total` | `outcome`: `deleted`, `absent`, `already_complete`, `error` |
+| `swe_control_plane_transcript_cleanup_duration_seconds` | same `outcome` values |
 | `swe_control_plane_terminal_lease_grants_total` | `outcome`: `granted`, `failed` |
 | `swe_control_plane_terminal_lease_revocations_total` | `reason`: `run_association_changed`, `environment_changed`, `execution_changed`, `hold_policy_changed` |
 | `swe_control_plane_token_reviews_total` | `outcome`: `authenticated`, `denied`, `error` |
@@ -589,8 +591,11 @@ returns 403 and also retains it. The chart intentionally enforces one control-pl
 reconnect, and neither durable sessions nor transcripts constitute a live-connection survival
 or HA claim.
 
-Per-Run event and byte limits do not bound total database size across Run churn. Deleting a Run
-or fencing a Project does not reclaim its UID-fenced transcript rows. New and safely associated
+Per-Run event and byte limits do not bound total database size across Run churn. This release
+contains the control-plane/store half of exact deleting-Run transcript cleanup, including cutoff,
+drain, and idempotent deletion, but deliberately has no operator finalizer/client/RBAC or CLI
+wiring. Consequently, deleting a Run or fencing a Project still does not automatically reclaim
+its UID-fenced transcript rows. New and safely associated
 rows include the immutable Namespace UID. Legacy rows with no Namespace UID are associated only
 through an authorized exact current Run UID; otherwise they are retained indefinitely. The
 retain-only Project offboarding phase deliberately has no deletion API. Until a future exact
@@ -758,6 +763,7 @@ exact namespace, resource name, and subresource on every request:
 | Read an Environment | `get` on `environments` with the requested Environment `resourceName` |
 | Read a transcript | `get` on `runs/transcript` with the requested Run `resourceName` |
 | Append a transcript event | `update` on `runs/transcript` with the requested Run `resourceName` |
+| Internal deleting-Run transcript cleanup foundation (not currently invoked) | `delete` on `runs/transcript` with the requested Run `resourceName` |
 | Open a direct Environment terminal | `get` on `environments/terminal` with the requested Environment `resourceName` |
 | Open a Run terminal | `get` on the requested base `runs` `resourceName`, then `get` on the resolved `environments/terminal` `resourceName` |
 | Discover/use a portal | exact `get` on `environments/portal`, exact `get` on synthetic `environmentservices/portal` name `<environment>.<service>`, then exact current base Run or Project `get` |
@@ -1073,6 +1079,16 @@ The store generation and cursor signing key live in PostgreSQL and survive proce
 The memory implementation deliberately changes both on restart, making old cursors explicitly
 `400 invalid_cursor` instead of silently skipping events. Both stores use retained-window
 idempotency: after an event is evicted, its key may be reused and creates a new event.
+
+The internal `DELETE` on the same exact transcript route is release-sequencing foundation, not a
+current user workflow. It accepts only an explicit bearer credential, requires both the exact
+`SWE-Run-UID` and `SWE-Namespace-UID`, repeats TokenReview, exact `delete` SAR, active tenancy,
+Namespace identity, and exact deleting-Run currentness after draining admitted appends, and
+returns `204` for both committed and already-absent cleanup. Cutoff cancels existing streams and
+causes future reads/appends to return the fixed `410 transcript-retention-cutoff` problem. Failed
+cleanup remains cut off for retry in the current process; after restart, the still-deleting Run
+reestablishes the cutoff before an idempotent store retry. The bounded cleanup metrics above have
+no namespace, name, or UID labels. No supported caller ships in this release.
 
 ## Validate
 
