@@ -751,6 +751,7 @@ func TestTranscriptDeleteRequiresExactBearerIdentityAndIsIdempotent(t *testing.T
 	store := NewMemoryTranscriptStore(MemoryTranscriptStoreOptions{}).(*memoryTranscriptStore)
 	run := RunIdentity{Namespace: "project-1", NamespaceUID: testNamespaceUID("project-1"), UID: "run-1-uid"}
 	appendStoreEvent(t, store, run, "first")
+	wantReclaimedBytes := store.runs[run].bytes
 	api := NewServer(nil, ServerOptions{Access: access, Runs: &fakeRunResolver{deleting: true}, TranscriptStore: store, Metrics: metrics})
 
 	missingNamespaceUID := httptest.NewRequest(http.MethodDelete, transcriptURL, nil)
@@ -780,11 +781,17 @@ func TestTranscriptDeleteRequiresExactBearerIdentityAndIsIdempotent(t *testing.T
 	if response := requestDelete(); response.Code != http.StatusNoContent {
 		t.Fatalf("idempotent delete response = %d %q", response.Code, response.Body.String())
 	}
-	if got := testutil.ToFloat64(metrics.transcriptCleanups.WithLabelValues("deleted")); got != 1 {
-		t.Fatalf("deleted cleanup metric = %v, want 1", got)
+	if got := testutil.ToFloat64(metrics.transcriptCleanups.WithLabelValues("committed")); got != 1 {
+		t.Fatalf("committed cleanup metric = %v, want 1", got)
 	}
-	if got := testutil.ToFloat64(metrics.transcriptCleanups.WithLabelValues("absent")); got != 1 {
-		t.Fatalf("absent cleanup metric = %v, want 1", got)
+	if got := testutil.ToFloat64(metrics.transcriptCleanups.WithLabelValues("already_absent")); got != 1 {
+		t.Fatalf("already-absent cleanup metric = %v, want 1", got)
+	}
+	if got := testutil.ToFloat64(metrics.transcriptReclaimedEvents); got != 1 {
+		t.Fatalf("reclaimed event metric = %v, want 1", got)
+	}
+	if got := testutil.ToFloat64(metrics.transcriptReclaimedBytes); got != float64(wantReclaimedBytes) {
+		t.Fatalf("reclaimed byte metric = %v, want %d", got, wantReclaimedBytes)
 	}
 	access.mu.Lock()
 	calls := append([]ResourceAccess(nil), access.calls...)
@@ -816,9 +823,89 @@ func TestTranscriptDeleteRequiresExactBearerIdentityAndIsIdempotent(t *testing.T
 	}
 }
 
-func TestTranscriptDeleteCancelsExistingStream(t *testing.T) {
+func TestTranscriptDeleteRejectsNonDeletingRunWithoutCutoff(t *testing.T) {
 	resolver := &mutableRunResolver{uid: "run-1-uid"}
 	api := NewServer(nil, ServerOptions{Access: &fakeAccess{}, Runs: resolver, TranscriptStore: NewMemoryTranscriptStore(MemoryTranscriptStoreOptions{})})
+	server := httptest.NewServer(api.Handler())
+	defer server.Close()
+
+	streamRequest, err := http.NewRequest(http.MethodGet, server.URL+transcriptURL, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	streamRequest.Header.Set(RunUIDHeader, "run-1-uid")
+	streamResponse, err := http.DefaultClient.Do(streamRequest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer streamResponse.Body.Close()
+
+	deleteRequest, err := http.NewRequest(http.MethodDelete, server.URL+transcriptURL, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	deleteRequest.Header.Set("Authorization", "Bearer cleanup")
+	deleteRequest.Header.Set(RunUIDHeader, "run-1-uid")
+	deleteRequest.Header.Set(NamespaceUIDHeader, string(testNamespaceUID("project-1")))
+	deleteResponse, err := http.DefaultClient.Do(deleteRequest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	deleteResponse.Body.Close()
+	if deleteResponse.StatusCode != http.StatusConflict {
+		t.Fatalf("non-deleting Run cleanup status = %d, want %d", deleteResponse.StatusCode, http.StatusConflict)
+	}
+
+	run := RunIdentity{Namespace: "project-1", NamespaceUID: testNamespaceUID("project-1"), UID: "run-1-uid"}
+	api.transcriptGate.mu.Lock()
+	entry := api.transcriptGate.entries[run]
+	cutoff, streams := entry != nil && entry.cutoff, 0
+	if entry != nil {
+		streams = len(entry.streams)
+	}
+	api.transcriptGate.mu.Unlock()
+	if entry == nil || cutoff || streams != 1 {
+		t.Fatalf("non-deleting cleanup changed stream admission: entry=%v cutoff=%v streams=%d", entry != nil, cutoff, streams)
+	}
+}
+
+type blockingUnsubscribeTranscriptStore struct {
+	TranscriptStore
+	unsubscribeStarted chan struct{}
+	releaseUnsubscribe chan struct{}
+	deleteStarted      chan struct{}
+	unsubscribeOnce    sync.Once
+	deleteOnce         sync.Once
+}
+
+func (s *blockingUnsubscribeTranscriptStore) Subscribe(ctx context.Context, run RunIdentity, cursor string) (TranscriptSubscription, error) {
+	subscription, err := s.TranscriptStore.Subscribe(ctx, run, cursor)
+	if err != nil {
+		return TranscriptSubscription{}, err
+	}
+	unsubscribe := subscription.Unsubscribe
+	subscription.Unsubscribe = func() {
+		s.unsubscribeOnce.Do(func() { close(s.unsubscribeStarted) })
+		<-s.releaseUnsubscribe
+		unsubscribe()
+	}
+	return subscription, nil
+}
+
+func (s *blockingUnsubscribeTranscriptStore) Delete(ctx context.Context, run RunIdentity) (DeleteTranscriptResult, error) {
+	s.deleteOnce.Do(func() { close(s.deleteStarted) })
+	return s.TranscriptStore.Delete(ctx, run)
+}
+
+func TestTranscriptDeleteCancelsExistingStream(t *testing.T) {
+	resolver := &mutableRunResolver{uid: "run-1-uid"}
+	store := &blockingUnsubscribeTranscriptStore{
+		TranscriptStore:    NewMemoryTranscriptStore(MemoryTranscriptStoreOptions{}),
+		unsubscribeStarted: make(chan struct{}),
+		releaseUnsubscribe: make(chan struct{}),
+		deleteStarted:      make(chan struct{}),
+	}
+	api := NewServer(nil, ServerOptions{Access: &fakeAccess{}, Runs: resolver, TranscriptStore: store})
 	server := httptest.NewServer(api.Handler())
 	defer server.Close()
 
@@ -840,10 +927,31 @@ func TestTranscriptDeleteCancelsExistingStream(t *testing.T) {
 	deleteRequest.Header.Set("Authorization", "Bearer cleanup")
 	deleteRequest.Header.Set(RunUIDHeader, "run-1-uid")
 	deleteRequest.Header.Set(NamespaceUIDHeader, string(testNamespaceUID("project-1")))
-	deleteResponse, err := http.DefaultClient.Do(deleteRequest)
-	if err != nil {
-		t.Fatal(err)
+	type responseResult struct {
+		response *http.Response
+		err      error
 	}
+	deleteDone := make(chan responseResult, 1)
+	go func() {
+		response, err := http.DefaultClient.Do(deleteRequest)
+		deleteDone <- responseResult{response: response, err: err}
+	}()
+	select {
+	case <-store.unsubscribeStarted:
+	case <-time.After(time.Second):
+		t.Fatal("cutoff did not begin stream unsubscription")
+	}
+	select {
+	case <-store.deleteStarted:
+		t.Fatal("store deletion started before stream unsubscription returned")
+	case <-time.After(20 * time.Millisecond):
+	}
+	close(store.releaseUnsubscribe)
+	result := <-deleteDone
+	if result.err != nil {
+		t.Fatal(result.err)
+	}
+	deleteResponse := result.response
 	deleteResponse.Body.Close()
 	if deleteResponse.StatusCode != http.StatusNoContent {
 		t.Fatalf("delete status = %d", deleteResponse.StatusCode)

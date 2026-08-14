@@ -64,10 +64,12 @@ type AppendTranscriptResult struct {
 	Replayed bool
 }
 
-// DeleteTranscriptResult reports whether exact retained state was removed.
-// It deliberately exposes no identity or unbounded row/byte counts.
+// DeleteTranscriptResult reports whether exact retained state was removed and
+// fixed-width reclaimed accounting. It deliberately exposes no identity.
 type DeleteTranscriptResult struct {
-	Deleted bool
+	Deleted         bool
+	ReclaimedEvents uint64
+	ReclaimedBytes  uint64
 }
 
 // TranscriptGap describes an explicitly skipped portion of retained history.
@@ -361,7 +363,10 @@ func (s *memoryTranscriptStore) Delete(_ context.Context, run RunIdentity) (Dele
 	defer s.mu.Unlock()
 
 	state, deleted := s.runs[run]
+	var reclaimedEvents, reclaimedBytes uint64
 	if deleted {
+		reclaimedEvents = uint64(len(state.events))
+		reclaimedBytes = uint64(state.bytes)
 		s.totalEvents -= len(state.events)
 		s.totalBytes -= state.bytes
 		delete(s.runs, run)
@@ -374,7 +379,7 @@ func (s *memoryTranscriptStore) Delete(_ context.Context, run RunIdentity) (Dele
 		s.totalSubscribers--
 	}
 	delete(s.subscribers, run)
-	return DeleteTranscriptResult{Deleted: deleted}, nil
+	return DeleteTranscriptResult{Deleted: deleted, ReclaimedEvents: reclaimedEvents, ReclaimedBytes: reclaimedBytes}, nil
 }
 
 func (s *memoryTranscriptStore) unsubscribe(run RunIdentity, subscriber *memorySubscriber) {

@@ -103,8 +103,10 @@ or live events with low lag, terminal grants, and allowed authentication reviews
 | `swe_control_plane_transcript_sse_subscribers` | none |
 | `swe_control_plane_transcript_sse_deliveries_total` | `kind`: `replay`, `live`, `gap`; `outcome`: `delivered`, `error`, plus `dropped` for live delivery |
 | `swe_control_plane_transcript_sse_delivery_lag_seconds` | `kind`: `replay`, `live` |
-| `swe_control_plane_transcript_cleanups_total` | `outcome`: `deleted`, `absent`, `already_complete`, `error` |
+| `swe_control_plane_transcript_cleanup_total` | `outcome`: `committed`, `already_absent`, `rejected`, `error` |
 | `swe_control_plane_transcript_cleanup_duration_seconds` | same `outcome` values |
+| `swe_control_plane_transcript_cleanup_reclaimed_events_total` | none |
+| `swe_control_plane_transcript_cleanup_reclaimed_bytes_total` | none |
 | `swe_control_plane_terminal_lease_grants_total` | `outcome`: `granted`, `failed` |
 | `swe_control_plane_terminal_lease_revocations_total` | `reason`: `run_association_changed`, `environment_changed`, `execution_changed`, `hold_policy_changed` |
 | `swe_control_plane_token_reviews_total` | `outcome`: `authenticated`, `denied`, `error` |
