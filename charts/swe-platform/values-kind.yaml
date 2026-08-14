@@ -23,6 +23,11 @@ controlPlane:
 
 leaderElection: false
 
+# Explicit non-production selection; this contract is inert in this release.
+installation:
+  isolation:
+    mode: UnrestrictedDevelopment
+
 # Deliberate local-development authority. The primary e2e overrides this to
 # scoped and onboards a distinct Project namespace.
 tenancy:

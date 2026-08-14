@@ -117,6 +117,17 @@ kind fixture, with an allowed connection as a positive control. The operator doe
 that a production cluster's CNI enforces NetworkPolicy, and Environment status does not claim
 effective CNI enforcement.
 
+`Installation.spec.isolation` now admits one explicit installation-administrator selection with
+no default: `UnrestrictedDevelopment` or the future
+`RestrictedProductionCalicoV3_32_1`. Omission is retained only for staged legacy migration.
+Development mode carries no restricted inputs. Restricted mode references the immutable #68
+policy ConfigMap and exact RuntimeClass name/handler and StorageClass name/CSI-driver
+expectations; it does not duplicate the ConfigMap's network policy fields. The schema and inert
+canonical revision helper do not activate, verify, or enforce either mode, and no controller
+writes the reserved Installation isolation status. Installation UID remains namespace-claim
+authority. The local kind and Argo presets explicitly choose unrestricted development; current
+production presets remain legacy-unclassified and make no restricted-isolation claim.
+
 Default-deny egress and the per-project egress proxy are not implemented. The admitted v1
 `Project.spec.egressAllowlist` contract is a set of at most 64 exact lowercase ASCII FQDN tenant
 selections, not an autonomous grant. Each entry is 1–253 bytes, has at least two labels, uses only

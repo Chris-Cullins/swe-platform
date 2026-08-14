@@ -1,3 +1,4 @@
+{{- $isolationMode := include "swe-platform.installationIsolationMode" . -}}
 apiVersion: swe.dev/v1alpha1
 kind: Installation
 metadata:
@@ -12,4 +13,19 @@ metadata:
     swe.dev/control-plane-service-account: {{ include "swe-platform.controlPlaneFullname" . | quote }}
     swe.dev/control-plane-cluster-role: {{ include "swe-platform.controlPlaneClusterFullname" . | quote }}
     {{- end }}
+{{- if $isolationMode }}
+spec:
+  isolation:
+    mode: {{ $isolationMode }}
+  {{- if eq $isolationMode "RestrictedProductionCalicoV3_32_1" }}
+    policyConfigMapName: {{ .Values.installation.isolation.policyConfigMapName | quote }}
+    runtimeClass:
+      name: {{ .Values.installation.isolation.runtimeClass.name | quote }}
+      handler: {{ .Values.installation.isolation.runtimeClass.handler | quote }}
+    storageClass:
+      name: {{ .Values.installation.isolation.storageClass.name | quote }}
+      csiDriver: {{ .Values.installation.isolation.storageClass.csiDriver | quote }}
+  {{- end }}
+{{- else }}
 spec: {}
+{{- end }}

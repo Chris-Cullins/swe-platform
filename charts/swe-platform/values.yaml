@@ -101,6 +101,20 @@ serviceAccount:
 
 leaderElection: true
 
+# Optional only for staged legacy migration and deliberately non-defaulted.
+# RestrictedProductionCalicoV3_32_1 is an inert API contract in this release;
+# selecting it does not activate an isolation runtime.
+installation:
+  isolation:
+    mode: ""
+    policyConfigMapName: ""
+    runtimeClass:
+      name: ""
+      handler: ""
+    storageClass:
+      name: ""
+      csiDriver: ""
+
 # Tenancy mode is intentionally required. Scoped mode watches only the exact
 # claimed Project namespaces listed here. Adding or removing a namespace is a
 # controlled Helm upgrade/operator restart operation. trusted-admin restores

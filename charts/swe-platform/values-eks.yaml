@@ -1,6 +1,11 @@
 # Production baseline for EKS with the EBS CSI driver and a default StorageClass.
 # Images inherit the chart appVersion as one coordinated release. EKS has no
 # standard gVisor RuntimeClass; configure one explicitly if installed.
+# Restricted activation is unsupported; omission preserves LegacyUnclassified.
+installation:
+  isolation:
+    mode: ""
+
 tenancy:
   mode: scoped
 
