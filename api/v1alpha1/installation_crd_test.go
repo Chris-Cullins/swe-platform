@@ -49,6 +49,9 @@ func TestGeneratedInstallationCRDIsolationContract(t *testing.T) {
 	if got := status.Properties["isolationState"].Enum; !slices.Equal(got, wantStates) {
 		t.Fatalf("status.isolationState enum = %#v, want %#v", got, wantStates)
 	}
+	if csiDriver, ok := status.Properties["csiDriver"]; !ok || len(csiDriver.XValidations) != 1 {
+		t.Fatalf("status.csiDriver exact-identity validation = present %v, validations %#v", ok, csiDriver.XValidations)
+	}
 	conditions := status.Properties["conditions"]
 	if conditions.MaxItems == nil || *conditions.MaxItems != 16 {
 		t.Fatalf("status.conditions maxItems = %v, want 16", conditions.MaxItems)

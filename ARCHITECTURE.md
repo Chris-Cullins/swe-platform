@@ -787,9 +787,9 @@ network mode, Calico profile/CIDRs/resolvers, ceiling/baseline, proxy image, and
 
 The inert `internal/isolation` helper validates that cross-field contract and derives a
 domain-separated SHA-256 revision from the Installation UID, canonical selection, fixed API and
-revision domains, and exact policy ConfigMap, RuntimeClass, and StorageClass UIDs plus canonical
-policy content hash and observed handler/driver. There is no administrator-entered security
-revision. No reconciler calls the helper, looks up those objects, changes Environment/Run/warm
+revision domains, and exact policy ConfigMap, RuntimeClass, StorageClass, and CSIDriver UIDs plus
+canonical policy content hash and observed handler/driver. There is no administrator-entered
+security revision. No reconciler calls the helper, looks up those objects, changes Environment/Run/warm
 pool behavior, or writes Installation status. In particular,
 `RestrictedProductionCalicoV3_32_1` is admitted configuration, not an active or production-ready
 profile. Activation still requires the complete #68 currentness, identity, proxy, path-forcing,
