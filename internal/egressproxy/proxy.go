@@ -20,10 +20,10 @@ type Authorization struct {
 	ExecutionKey, ProjectKey string
 	DeniedPrefixes           []netip.Prefix
 	// Currentness closes after any failed recheck for this certificate
-	// fingerprint. The disabled transport does not yet consume this signal.
+	// fingerprint. The transport closes the tunnel when this signal closes.
 	Currentness <-chan struct{}
-	// ReleaseCurrentness releases this authorization's lifecycle lease. Future
-	// transport wiring must call it when replacing or closing a tunnel lease.
+	// ReleaseCurrentness releases this authorization's lifecycle lease. The
+	// transport calls it when replacing or closing a tunnel lease.
 	ReleaseCurrentness func()
 }
 type Authorizer interface {
@@ -119,19 +119,39 @@ func (s *Server) handleWithPreAuth(c net.Conn, releasePreAuth func()) {
 		s.deny(c)
 		return
 	}
+	if e = validateCurrentAuthorization(a); e != nil {
+		if a.ReleaseCurrentness != nil {
+			a.ReleaseCurrentness()
+		}
+		s.deny(c)
+		return
+	}
+	defer a.ReleaseCurrentness()
+	operationCtx, operationCancel := context.WithCancel(context.Background())
+	defer operationCancel()
+	handlerDone := make(chan struct{})
+	defer close(handlerDone)
+	go func() {
+		select {
+		case <-a.Currentness:
+			operationCancel()
+			_ = c.Close()
+		case <-handlerDone:
+		}
+	}()
 	reservation, e := s.quota().Reserve(a.ExecutionKey, a.ProjectKey)
 	if e != nil {
 		s.deny(c)
 		return
 	}
 	defer reservation.Release()
-	ips, e := Resolve(context.Background(), s.Resolver, name, a.DeniedPrefixes)
+	ips, e := Resolve(operationCtx, s.Resolver, name, a.DeniedPrefixes)
 	if e != nil {
 		s.deny(c)
 		return
 	}
 	var out net.Conn
-	dialCtx, dialCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	dialCtx, dialCancel := context.WithTimeout(operationCtx, 5*time.Second)
 	for _, ip := range ips {
 		ctx := dialCtx
 		out, e = s.dialer()(ctx, "tcp", net.JoinHostPort(ip.String(), "443"))
@@ -164,6 +184,19 @@ func (s *Server) handleWithPreAuth(c net.Conn, releasePreAuth func()) {
 	_ = out.SetDeadline(time.Time{})
 	relay(c, out, 5*time.Minute, time.Hour)
 }
+
+func validateCurrentAuthorization(authorization Authorization) error {
+	if authorization.ExecutionKey == "" || authorization.ProjectKey == "" || authorization.Currentness == nil || authorization.ReleaseCurrentness == nil {
+		return errors.New("complete currentness authorization required")
+	}
+	select {
+	case <-authorization.Currentness:
+		return errors.New("currentness authorization is already revoked")
+	default:
+		return nil
+	}
+}
+
 func (s *Server) deny(c net.Conn) {
 	_ = c.SetWriteDeadline(time.Now().Add(5 * time.Second))
 	_ = writeStatus(c, false)

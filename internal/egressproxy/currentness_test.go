@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -29,10 +30,22 @@ type staticIdentityLookup struct {
 	claims   []byte
 	err      error
 	wait     bool
-	deadline time.Duration
+	deadline atomic.Int64
+}
+
+type secondCycleFailureLookup struct {
+	claims         []byte
+	calls          atomic.Int32
+	firstProofDone chan struct{}
+	started        chan time.Duration
 }
 
 type failingReader struct{ client.Reader }
+
+type switchableFailingReader struct {
+	client.Reader
+	fail atomic.Bool
+}
 
 type mutatingReader struct {
 	client.Client
@@ -45,6 +58,20 @@ func (failingReader) Get(context.Context, client.ObjectKey, client.Object, ...cl
 
 func (failingReader) List(context.Context, client.ObjectList, ...client.ListOption) error {
 	return errors.New("Kubernetes API unavailable")
+}
+
+func (r *switchableFailingReader) Get(ctx context.Context, key client.ObjectKey, object client.Object, options ...client.GetOption) error {
+	if r.fail.Load() {
+		return errors.New("Kubernetes API unavailable")
+	}
+	return r.Reader.Get(ctx, key, object, options...)
+}
+
+func (r *switchableFailingReader) List(ctx context.Context, list client.ObjectList, options ...client.ListOption) error {
+	if r.fail.Load() {
+		return errors.New("Kubernetes API unavailable")
+	}
+	return r.Reader.List(ctx, list, options...)
 }
 
 func (m *mutatingReader) Get(ctx context.Context, key client.ObjectKey, object client.Object, options ...client.GetOption) error {
@@ -66,13 +93,31 @@ func (m *mutatingReader) Get(ctx context.Context, key client.ObjectKey, object c
 
 func (s *staticIdentityLookup) Lookup(ctx context.Context, _ [sha256.Size]byte) ([]byte, error) {
 	if deadline, ok := ctx.Deadline(); ok {
-		s.deadline = time.Until(deadline)
+		s.deadline.Store(int64(time.Until(deadline)))
 	}
 	if s.wait {
 		<-ctx.Done()
 		return nil, ctx.Err()
 	}
 	return append([]byte(nil), s.claims...), s.err
+}
+
+func (b *secondCycleFailureLookup) Lookup(ctx context.Context, _ [sha256.Size]byte) ([]byte, error) {
+	call := b.calls.Add(1)
+	if call <= 4 {
+		if call == 4 {
+			close(b.firstProofDone)
+		}
+		return append([]byte(nil), b.claims...), nil
+	}
+	if deadline, ok := ctx.Deadline(); ok {
+		select {
+		case b.started <- time.Until(deadline):
+		default:
+		}
+	}
+	<-ctx.Done()
+	return nil, ctx.Err()
 }
 
 type currentnessFixture struct {
@@ -349,13 +394,16 @@ func TestCurrentnessAuthorizerForgedClaimsAndAPIUncertainty(t *testing.T) {
 	if _, err := authorizer.Authorize(ctx, f.hint, "api.example.com"); err == nil {
 		t.Fatal("timeout accepted")
 	}
-	if waiting.deadline <= 0 || waiting.deadline > CurrentnessTimeout {
-		t.Fatalf("evaluation deadline = %v", waiting.deadline)
+	waitingDeadline := time.Duration(waiting.deadline.Load())
+	if waitingDeadline <= 0 || waitingDeadline > CurrentnessTimeout {
+		t.Fatalf("evaluation deadline = %v", waitingDeadline)
 	}
 	bounded := &staticIdentityLookup{claims: canonical, err: errors.New("stop")}
 	authorizer.Identities = bounded
-	if _, err := authorizer.Authorize(context.Background(), f.hint, "api.example.com"); err == nil || bounded.deadline <= CurrentnessTimeout-time.Second || bounded.deadline > CurrentnessTimeout {
-		t.Fatalf("authorizer-owned deadline = %v, err = %v", bounded.deadline, err)
+	_, err := authorizer.Authorize(context.Background(), f.hint, "api.example.com")
+	boundedDeadline := time.Duration(bounded.deadline.Load())
+	if err == nil || boundedDeadline <= CurrentnessTimeout-time.Second || boundedDeadline > CurrentnessTimeout {
+		t.Fatalf("authorizer-owned deadline = %v, err = %v", boundedDeadline, err)
 	}
 }
 
@@ -408,7 +456,8 @@ func TestCurrentnessAuthorizerStateCapacity(t *testing.T) {
 func TestCurrentnessAuthorizerFailedRecheckRevokes(t *testing.T) {
 	f := newCurrentnessFixture(t)
 	reader := fake.NewClientBuilder().WithScheme(currentnessScheme(t)).WithObjects(f.objects()...).Build()
-	authorizer := f.authorizer(t, reader)
+	switchingReader := &switchableFailingReader{Reader: reader}
+	authorizer := f.authorizer(t, switchingReader)
 	first, err := authorizer.Authorize(context.Background(), f.hint, "api.example.com")
 	if err != nil {
 		t.Fatal(err)
@@ -438,7 +487,7 @@ func TestCurrentnessAuthorizerFailedRecheckRevokes(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer second.ReleaseCurrentness()
-	authorizer.Reader = failingReader{Reader: reader}
+	switchingReader.fail.Store(true)
 	if _, err := authorizer.Authorize(context.Background(), f.hint, "api.example.com"); err == nil || !isClosed(second.Currentness) {
 		t.Fatal("API uncertainty retained a previous authorization")
 	}
@@ -448,16 +497,77 @@ func TestCurrentnessAuthorizerReleaseReclaimsSuccessfulState(t *testing.T) {
 	f := newCurrentnessFixture(t)
 	reader := fake.NewClientBuilder().WithScheme(currentnessScheme(t)).WithObjects(f.objects()...).Build()
 	authorizer := f.authorizer(t, reader)
+	authorizer.currentnessWindow = time.Hour
+	first, err := authorizer.Authorize(context.Background(), f.hint, "api.example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := authorizer.Authorize(context.Background(), f.hint, "git.example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.Currentness != second.Currentness {
+		t.Fatal("same execution tunnels did not share currentness")
+	}
+	record := authorizer.records[f.hint.Fingerprint]
+	record.mu.Lock()
+	loop := record.loopDone
+	if record.leases != 2 || loop == nil {
+		t.Fatalf("shared currentness state = leases %d, loop %p", record.leases, loop)
+	}
+	record.mu.Unlock()
+	if len(authorizer.records) != 1 {
+		t.Fatalf("currentness records = %d, want 1", len(authorizer.records))
+	}
+	first.ReleaseCurrentness()
+	record.mu.Lock()
+	if record.leases != 1 || record.loopDone != loop || isClosed(second.Currentness) {
+		t.Fatalf("first release stopped shared state: leases=%d sameLoop=%t closed=%t", record.leases, record.loopDone == loop, isClosed(second.Currentness))
+	}
+	record.mu.Unlock()
+	second.ReleaseCurrentness()
+	second.ReleaseCurrentness()
+	if !isClosed(second.Currentness) || len(authorizer.records) != 0 {
+		t.Fatalf("final release retained currentness: closed=%t records=%d", isClosed(second.Currentness), len(authorizer.records))
+	}
+}
+
+func TestCurrentnessAuthorizerSharedLoopUsesOneBoundedCycleDeadline(t *testing.T) {
+	f := newCurrentnessFixture(t)
+	reader := fake.NewClientBuilder().WithScheme(currentnessScheme(t)).WithObjects(f.objects()...).Build()
+	canonical, err := f.claims.CanonicalBytes()
+	if err != nil {
+		t.Fatal(err)
+	}
+	lookup := &secondCycleFailureLookup{claims: canonical, firstProofDone: make(chan struct{}), started: make(chan time.Duration, 1)}
+	authorizer := f.authorizer(t, reader)
+	authorizer.Identities = lookup
+	authorizer.currentnessWindow = 250 * time.Millisecond
 	authorization, err := authorizer.Authorize(context.Background(), f.hint, "api.example.com")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(authorizer.records) != 1 {
-		t.Fatalf("currentness records = %d, want 1", len(authorizer.records))
+	defer authorization.ReleaseCurrentness()
+	select {
+	case <-lookup.firstProofDone:
+	case <-time.After(time.Second):
+		t.Fatal("first shared proof did not complete")
 	}
-	authorization.ReleaseCurrentness()
-	authorization.ReleaseCurrentness()
-	if !isClosed(authorization.Currentness) || len(authorizer.records) != 0 {
-		t.Fatalf("released currentness remained live: closed=%t records=%d", isClosed(authorization.Currentness), len(authorizer.records))
+	uncertainAt := time.Now()
+	select {
+	case deadline := <-lookup.started:
+		if deadline <= 0 || deadline > authorizer.currentnessWindow/2 {
+			t.Fatalf("shared proof deadline = %v, want half of the complete currentness window", deadline)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("second shared proof did not start")
+	}
+	select {
+	case <-authorization.Currentness:
+		if elapsed := time.Since(uncertainAt); elapsed > 5*authorizer.currentnessWindow/4 {
+			t.Fatalf("API uncertainty exceeded the complete currentness window: %v", elapsed)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("API uncertainty did not revoke currentness")
 	}
 }

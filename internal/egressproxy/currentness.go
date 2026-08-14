@@ -39,10 +39,11 @@ type IdentityLookup interface {
 // be an uncached API reader in future production wiring. The shipped command
 // deliberately does not construct this type.
 type CurrentnessAuthorizer struct {
-	Reader          client.Reader
-	Identities      IdentityLookup
-	Installation    tenancy.InstallationIdentity
-	PolicyConfigMap types.NamespacedName
+	Reader            client.Reader
+	Identities        IdentityLookup
+	Installation      tenancy.InstallationIdentity
+	PolicyConfigMap   types.NamespacedName
+	currentnessWindow time.Duration
 
 	mu      sync.Mutex
 	records map[[sha256.Size]byte]*executionRecord
@@ -54,18 +55,21 @@ type executionState struct {
 }
 
 type executionRecord struct {
-	mu     sync.Mutex
-	state  *executionState
-	users  int
-	leases int
+	mu         sync.Mutex
+	state      *executionState
+	users      int
+	leases     int
+	loopCancel context.CancelFunc
+	loopDone   chan struct{}
 }
 
 func newExecutionState() *executionState { return &executionState{done: make(chan struct{})} }
 func (s *executionState) revoke()        { s.once.Do(func() { close(s.done) }) }
 
-// Authorize performs a complete uncached proof on every call. Any failure
-// revokes the fingerprint's previously returned currentness signal; no cached
-// authorization survives uncertainty.
+// Authorize performs a complete uncached proof for every new target. Any
+// failure revokes the fingerprint's previously returned currentness signal.
+// Successful leases share one immediate, deadline-bounded proof loop until the
+// final lease releases it; no cached authorization survives uncertainty.
 func (a *CurrentnessAuthorizer) Authorize(ctx context.Context, hint Identity, target string) (Authorization, error) {
 	if a == nil || a.Reader == nil || a.Identities == nil || a.Installation.Key.Namespace == "" || a.Installation.Key.Name == "" || a.Installation.UID == "" || a.PolicyConfigMap.Namespace == "" || a.PolicyConfigMap.Name == "" {
 		return Authorization{}, errors.New("currentness authorizer is not configured")
@@ -79,22 +83,79 @@ func (a *CurrentnessAuthorizer) Authorize(ctx context.Context, hint Identity, ta
 	if err != nil {
 		return Authorization{}, err
 	}
-	record.mu.Lock()
 	defer func() {
-		record.mu.Unlock()
 		a.release(hint.Fingerprint, record)
 	}()
 	authorization, err := a.authorize(evaluationCtx, hint, target)
+	record.mu.Lock()
+	defer record.mu.Unlock()
 	if err != nil {
 		record.state.revoke()
+		if record.loopCancel != nil {
+			record.loopCancel()
+		}
 		return Authorization{}, err
 	}
 	if isClosed(record.state.done) {
+		if record.leases != 0 {
+			return Authorization{}, errors.New("revoked currentness leases are still draining")
+		}
 		record.state = newExecutionState()
 	}
 	authorization.Currentness = record.state.done
-	authorization.ReleaseCurrentness = a.acquireLease(hint.Fingerprint, record)
+	authorization.ReleaseCurrentness = a.acquireLeaseLocked(hint.Fingerprint, record, record.state, hint, target)
 	return authorization, nil
+}
+
+func (a *CurrentnessAuthorizer) acquireLeaseLocked(fingerprint [sha256.Size]byte, record *executionRecord, state *executionState, hint Identity, target string) func() {
+	record.leases++
+	if record.leases == 1 {
+		ctx, cancel := context.WithCancel(context.Background())
+		record.loopCancel = cancel
+		record.loopDone = make(chan struct{})
+		go a.runCurrentnessLoop(ctx, record, state, hint, target, record.loopDone)
+	}
+	return sync.OnceFunc(func() { a.releaseLease(fingerprint, record, state) })
+}
+
+func (a *CurrentnessAuthorizer) runCurrentnessLoop(ctx context.Context, record *executionRecord, state *executionState, hint Identity, target string, done chan struct{}) {
+	defer close(done)
+	window := a.currentnessWindow
+	if window <= 0 {
+		window = CurrentnessTimeout
+	}
+	// Polling cannot bound staleness to interval if it waits interval and then
+	// grants a proof another interval. Split the complete currentness window
+	// equally between time to the next proof and that proof's API deadline.
+	cycle := window / 2
+	if cycle <= 0 {
+		cycle = window
+	}
+	for {
+		cycleDeadline := time.Now().Add(cycle)
+		proofCtx, cancel := context.WithDeadline(ctx, cycleDeadline)
+		_, err := a.authorize(proofCtx, hint, target)
+		cancel()
+		if err != nil {
+			if ctx.Err() == nil {
+				record.mu.Lock()
+				if record.state == state {
+					state.revoke()
+				}
+				record.mu.Unlock()
+			}
+			return
+		}
+		wait := time.NewTimer(time.Until(cycleDeadline))
+		select {
+		case <-ctx.Done():
+			if !wait.Stop() {
+				<-wait.C
+			}
+			return
+		case <-wait.C:
+		}
+	}
 }
 
 func (a *CurrentnessAuthorizer) authorize(ctx context.Context, hint Identity, target string) (Authorization, error) {
@@ -304,6 +365,8 @@ func (a *CurrentnessAuthorizer) record(fingerprint [sha256.Size]byte) (*executio
 }
 
 func (a *CurrentnessAuthorizer) release(fingerprint [sha256.Size]byte, record *executionRecord) {
+	record.mu.Lock()
+	defer record.mu.Unlock()
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	record.users--
@@ -312,26 +375,34 @@ func (a *CurrentnessAuthorizer) release(fingerprint [sha256.Size]byte, record *e
 	}
 }
 
-func (a *CurrentnessAuthorizer) acquireLease(fingerprint [sha256.Size]byte, record *executionRecord) func() {
+func (a *CurrentnessAuthorizer) releaseLease(fingerprint [sha256.Size]byte, record *executionRecord, state *executionState) {
+	record.mu.Lock()
+	if record.state != state || record.leases == 0 {
+		record.mu.Unlock()
+		return
+	}
+	record.leases--
+	if record.leases != 0 {
+		record.mu.Unlock()
+		return
+	}
+	state.revoke()
+	cancel, done := record.loopCancel, record.loopDone
+	record.loopCancel, record.loopDone = nil, nil
+	record.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+	if done != nil {
+		<-done
+	}
+	record.mu.Lock()
+	defer record.mu.Unlock()
 	a.mu.Lock()
-	record.leases++
-	a.mu.Unlock()
-	return sync.OnceFunc(func() {
-		record.mu.Lock()
-		defer record.mu.Unlock()
-		a.mu.Lock()
-		defer a.mu.Unlock()
-		if record.leases == 0 {
-			return
-		}
-		record.leases--
-		if record.leases == 0 {
-			record.state.revoke()
-		}
-		if record.users == 0 && record.leases == 0 && a.records[fingerprint] == record {
-			delete(a.records, fingerprint)
-		}
-	})
+	defer a.mu.Unlock()
+	if record.state == state && record.users == 0 && record.leases == 0 && a.records[fingerprint] == record {
+		delete(a.records, fingerprint)
+	}
 }
 
 func isClosed(done <-chan struct{}) bool {

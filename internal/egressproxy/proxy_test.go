@@ -14,6 +14,7 @@ import (
 	"io"
 	"math/big"
 	"net"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"testing"
@@ -116,6 +117,10 @@ func TestDisabledAndLoopback(t *testing.T) {
 	if got := hostOnly(net.JoinHostPort("127.0.0.1", "443")); got != "127.0.0.1" {
 		t.Fatalf("hostOnly=%q", got)
 	}
+}
+
+func testCurrentAuthorization(release func()) Authorization {
+	return Authorization{ExecutionKey: "execution", ProjectKey: "project", Currentness: make(chan struct{}), ReleaseCurrentness: release}
 }
 
 func TestForwarderMaxConnections(t *testing.T) {
@@ -301,12 +306,13 @@ func TestServerReleasesPreAuthSlotBeforeResolution(t *testing.T) {
 	serverCert := testCertificate(t, "server")
 	clientCert := testCertificate(t, "execution")
 	released := make(chan struct{})
+	authorizationReleased := make(chan struct{})
 	s := &Server{
 		TLSConfig: &tls.Config{Certificates: []tls.Certificate{serverCert}, ClientAuth: tls.RequireAnyClientCert, MinVersion: tls.VersionTLS13, MaxVersion: tls.VersionTLS13, SessionTicketsDisabled: true},
 		Resolver:  releaseCheckingResolver{released: released, t: t},
 		Quotas:    NewQuotaManager(),
 		Authorizer: authorizerFunc(func(context.Context, Identity, string) (Authorization, error) {
-			return Authorization{ExecutionKey: "execution", ProjectKey: "project"}, nil
+			return testCurrentAuthorization(sync.OnceFunc(func() { close(authorizationReleased) })), nil
 		}),
 	}
 	serverSide, clientSide := net.Pipe()
@@ -327,6 +333,80 @@ func TestServerReleasesPreAuthSlotBeforeResolution(t *testing.T) {
 	}
 	_ = c.Close()
 	<-done
+	select {
+	case <-authorizationReleased:
+	default:
+		t.Fatal("handler did not release currentness after resolution failure")
+	}
+}
+
+func TestServerClosesEstablishedTunnelAndReleasesOnCurrentnessRevocation(t *testing.T) {
+	serverCert := testCertificate(t, "server")
+	clientCert := testCertificate(t, "execution")
+	currentness := make(chan struct{})
+	released := make(chan struct{})
+	upstreamServer, upstreamPeer := net.Pipe()
+	defer upstreamPeer.Close()
+	s := &Server{
+		TLSConfig: &tls.Config{Certificates: []tls.Certificate{serverCert}, ClientAuth: tls.RequireAnyClientCert, MinVersion: tls.VersionTLS13, MaxVersion: tls.VersionTLS13, SessionTicketsDisabled: true},
+		Resolver: &fakeResolver{answers: map[string][]dnsmessage.Resource{
+			"api.example.com./TypeA": {a("api.example.com.", [4]byte{8, 8, 8, 8})},
+		}},
+		Quotas: NewQuotaManager(),
+		Authorizer: authorizerFunc(func(context.Context, Identity, string) (Authorization, error) {
+			return Authorization{ExecutionKey: "execution", ProjectKey: "project", Currentness: currentness, ReleaseCurrentness: sync.OnceFunc(func() { close(released) })}, nil
+		}),
+		Dialer: func(context.Context, string, string) (net.Conn, error) { return upstreamServer, nil },
+	}
+	serverSide, clientSide := net.Pipe()
+	handlerDone := make(chan struct{})
+	go func() {
+		s.handle(tls.Server(serverSide, s.TLSConfig))
+		close(handlerDone)
+	}()
+	client := tls.Client(clientSide, &tls.Config{Certificates: []tls.Certificate{clientCert}, InsecureSkipVerify: true, MinVersion: tls.VersionTLS13, MaxVersion: tls.VersionTLS13})
+	if err := client.Handshake(); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeRequest(client, "api.example.com"); err != nil {
+		t.Fatal(err)
+	}
+	if err := readStatus(client); err != nil {
+		t.Fatal(err)
+	}
+	clientHello := hello("api.example.com")
+	upstreamReceived := make(chan error, 1)
+	go func() {
+		got := make([]byte, len(clientHello))
+		_, err := io.ReadFull(upstreamPeer, got)
+		if err == nil && !bytes.Equal(got, clientHello) {
+			err = errors.New("upstream ClientHello changed")
+		}
+		upstreamReceived <- err
+	}()
+	if _, err := client.Write(clientHello); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-upstreamReceived; err != nil {
+		t.Fatal(err)
+	}
+	close(currentness)
+	_ = client.SetReadDeadline(time.Now().Add(2 * time.Second))
+	if _, err := client.Read(make([]byte, 1)); err == nil {
+		t.Fatal("revoked tunnel remained open")
+	} else if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+		t.Fatalf("revoked tunnel remained open until timeout: %v", err)
+	}
+	select {
+	case <-handlerDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("revoked handler did not stop")
+	}
+	select {
+	case <-released:
+	default:
+		t.Fatal("revoked handler did not release final currentness lease")
+	}
 }
 
 func testCertificate(t *testing.T, cn string) tls.Certificate {

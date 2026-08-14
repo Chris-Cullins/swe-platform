@@ -819,10 +819,15 @@ sole Project, frozen Project-bound ready Environment execution, controlled non-d
 and immutable policy ConfigMap. It independently recomputes policy and revision, checks the Pod's
 execution, policy, forwarder, and certificate-fingerprint annotations, and rejects API
 uncertainty. Each successful fingerprint receives a currentness signal that closes after any
-failed recheck so future tunnel wiring can revoke established connections without caching
-authority. Every successful authorization also returns a one-shot lifecycle release; future
-transport wiring must release the prior lease when a recheck replaces it and release the final
-lease when the tunnel closes. The final release closes the signal and reclaims its bounded state.
+failed recheck. While any leases exist, the authorizer owns one shared per-fingerprint proof loop:
+it starts a proof immediately, then splits the two-second stale-authority window equally between
+the next poll cadence and that proof's API deadline. It never waits two seconds and then grants a
+proof another two-second timeout.
+New targets still receive a complete initial proof. Any shared proof failure, API uncertainty, or
+authority mismatch closes every tunnel's signal within the two-second currentness window. The
+disabled transport requires the signal and one-shot release, cancels resolution and dialing,
+closes an established tunnel on revocation, and releases its lease on every exit. Final release
+stops the shared loop, closes the signal, and reclaims the bounded fingerprint state.
 No command constructs this authorizer; `egress-proxy serve` still uses the deny-all
 `DisabledAuthorizer`. A separate self-signed ECDSA ClientAuth keypair is generated for each
 execution and is not sandboxd ServerAuth material.

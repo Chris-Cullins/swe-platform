@@ -152,10 +152,15 @@ two-second-bounded proof of the exact Installation, active Namespace claim and s
 frozen Project-bound ready Environment execution, controlled non-deleting Pod, and live effective
 policy revision. API errors, replacements, malformed or out-of-ceiling policy, and stale
 execution/policy/forwarder/fingerprint values deny and close a per-fingerprint currentness signal
-suitable for future tunnel revocation. Successful authorizations carry a one-shot lifecycle
-release that future transport wiring must call when replacing a recheck lease and when closing the
-last tunnel; final release closes the signal and reclaims its bounded state. The shipped serve
-command still installs only the deny-all authorizer.
+suitable for tunnel revocation. The authorizer runs one shared proof loop per fingerprint while
+leases exist. It starts a proof immediately and divides the two-second stale-authority bound equally
+between poll cadence and the next proof's API deadline. It never composes a two-second wait with a
+second two-second timeout; failure, API uncertainty, or authority mismatch closes every shared
+signal within the complete window. New targets still require a complete initial proof.
+The disabled transport requires complete signal/release pairs, cancels resolution and dialing,
+closes established tunnels on signal revocation, and releases on every exit. Final release stops
+the shared loop, closes the signal, and reclaims its bounded state. The shipped serve command
+still installs only the deny-all authorizer.
 
 The policy library now also validates a future immutable, content-addressed ConfigMap document:
 canonical schema v1, `unrestricted|restricted` mode, bounded ceiling/baseline, digest-qualified
