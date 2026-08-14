@@ -279,7 +279,8 @@ func (s *PostgresTranscriptStore) Delete(ctx context.Context, run RunIdentity) (
 		return DeleteTranscriptResult{}, fmt.Errorf("associate legacy transcript for deletion: %w", err)
 	}
 	var namespaceUID string
-	err = tx.QueryRow(ctx, `SELECT namespace_uid FROM transcript_runs WHERE namespace = $1 AND run_uid = $2 FOR UPDATE`, run.Namespace, string(run.UID)).Scan(&namespaceUID)
+	var retainedEvents, retainedBytes int64
+	err = tx.QueryRow(ctx, `SELECT namespace_uid, retained_events, retained_bytes FROM transcript_runs WHERE namespace = $1 AND run_uid = $2 FOR UPDATE`, run.Namespace, string(run.UID)).Scan(&namespaceUID, &retainedEvents, &retainedBytes)
 	if errors.Is(err, pgx.ErrNoRows) {
 		if err := tx.Commit(ctx); err != nil {
 			return DeleteTranscriptResult{}, fmt.Errorf("commit absent transcript delete: %w", err)
@@ -302,7 +303,7 @@ func (s *PostgresTranscriptStore) Delete(ctx context.Context, run RunIdentity) (
 	if err := tx.Commit(ctx); err != nil {
 		return DeleteTranscriptResult{}, fmt.Errorf("commit transcript delete: %w", err)
 	}
-	return DeleteTranscriptResult{Deleted: true}, nil
+	return DeleteTranscriptResult{Deleted: true, ReclaimedEvents: uint64(retainedEvents), ReclaimedBytes: uint64(retainedBytes)}, nil
 }
 
 type postgresQuery interface {

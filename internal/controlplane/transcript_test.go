@@ -363,6 +363,7 @@ func TestMemoryTranscriptStoreDeleteIsExactIdempotentAndReclaimsCapacity(t *test
 	store := NewMemoryTranscriptStore(options).(*memoryTranscriptStore)
 	run := RunIdentity{Namespace: "project-a", NamespaceUID: "namespace-uid", UID: "run-uid"}
 	appendStoreEvent(t, store, run, "first")
+	wantReclaimedBytes := store.runs[run].bytes
 	subscription, err := store.Subscribe(context.Background(), run, "")
 	if err != nil {
 		t.Fatal(err)
@@ -379,7 +380,7 @@ func TestMemoryTranscriptStoreDeleteIsExactIdempotentAndReclaimsCapacity(t *test
 	}
 
 	result, err = store.Delete(context.Background(), run)
-	if err != nil || !result.Deleted {
+	if err != nil || !result.Deleted || result.ReclaimedEvents != 1 || result.ReclaimedBytes != uint64(wantReclaimedBytes) {
 		t.Fatalf("exact delete = %#v, %v", result, err)
 	}
 	select {
@@ -419,7 +420,6 @@ func TestTranscriptGateBoundsStateCutsOffStreamsAndDrainsAppends(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	cutoff.validate()
 	select {
 	case <-streamContext.Done():
 	case <-time.After(time.Second):
@@ -442,6 +442,12 @@ func TestTranscriptGateBoundsStateCutsOffStreamsAndDrainsAppends(t *testing.T) {
 	appendAdmission.release()
 	select {
 	case err := <-drained:
+		t.Fatalf("cleanup did not wait for canceled stream: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+	stream.release()
+	select {
+	case err := <-drained:
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -452,7 +458,6 @@ func TestTranscriptGateBoundsStateCutsOffStreamsAndDrainsAppends(t *testing.T) {
 	if _, _, err := gate.admit(context.Background(), run, false); !errors.Is(err, ErrTranscriptCutoff) {
 		t.Fatalf("failed cleanup cutoff error = %v, want %v", err, ErrTranscriptCutoff)
 	}
-	stream.release()
 }
 
 func appendStoreEvent(t *testing.T, store TranscriptStore, run RunIdentity, key string) AppendTranscriptResult {

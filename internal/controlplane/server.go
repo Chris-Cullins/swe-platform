@@ -410,16 +410,8 @@ func (s *Server) handleTranscript(w http.ResponseWriter, r *http.Request, namesp
 	identity := RunIdentity{Namespace: namespace, NamespaceUID: namespaceUID, UID: expectedUID}
 
 	var admission *transcriptAdmission
-	var cutoff *transcriptCutoff
 	var err error
-	if r.Method == http.MethodDelete {
-		cutoff, err = s.transcriptGate.cutoff(identity)
-		if err != nil {
-			writeTranscriptStoreError(w, err)
-			return
-		}
-		defer cutoff.abort()
-	} else {
+	if r.Method != http.MethodDelete {
 		var admittedContext context.Context
 		admittedContext, admission, err = s.transcriptGate.admit(r.Context(), identity, r.Method == http.MethodGet)
 		if err != nil {
@@ -459,7 +451,11 @@ func (s *Server) handleTranscript(w http.ResponseWriter, r *http.Request, namesp
 			writeTranscriptProblem(w, http.StatusConflict, "run-not-deleting", "Run is not deleting")
 			return
 		}
-		cutoff.validate()
+		cutoff, err := s.transcriptGate.cutoff(identity)
+		if err != nil {
+			writeTranscriptStoreError(w, err)
+			return
+		}
 		s.deleteTranscript(w, r, identity, ResourceAccess{Namespace: namespace, Verb: "delete", Resource: "runs", Subresource: "transcript", Name: run}, cutoff)
 		return
 	}
@@ -476,12 +472,12 @@ func (s *Server) deleteTranscript(w http.ResponseWriter, r *http.Request, run Ru
 	started := time.Now()
 	completed, err := cutoff.beginCleanup(r.Context())
 	if err != nil {
-		s.metrics.observeCleanup(started, "error")
+		s.metrics.observeCleanup(started, "error", DeleteTranscriptResult{})
 		writeTranscriptStoreError(w, err)
 		return
 	}
 	if completed {
-		s.metrics.observeCleanup(started, "already_complete")
+		s.metrics.observeCleanup(started, "already_absent", DeleteTranscriptResult{})
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
@@ -489,20 +485,28 @@ func (s *Server) deleteTranscript(w http.ResponseWriter, r *http.Request, run Ru
 	// tenancy/Namespace -> deleting Run proof immediately before physical deletion.
 	if err := s.access.Authorize(r, authorization, false); err != nil {
 		cutoff.finish(false)
-		s.metrics.observeCleanup(started, "error")
+		outcome := "error"
+		if errors.Is(err, errUnauthenticated) || errors.Is(err, errForbidden) {
+			outcome = "rejected"
+		}
+		s.metrics.observeCleanup(started, outcome, DeleteTranscriptResult{})
 		writeAccessError(w, err)
 		return
 	}
 	if namespaceUIDFromRequest(r) != run.NamespaceUID {
 		cutoff.finish(false)
-		s.metrics.observeCleanup(started, "error")
+		s.metrics.observeCleanup(started, "rejected", DeleteTranscriptResult{})
 		writeTranscriptProblem(w, http.StatusConflict, "namespace_uid_mismatch", "Namespace UID mismatch")
 		return
 	}
 	resolved, err := s.runs.ResolveRun(r.Context(), run.Namespace, authorization.Name)
 	if err != nil || resolved.UID != run.UID || !resolved.Deleting {
 		cutoff.finish(false)
-		s.metrics.observeCleanup(started, "error")
+		outcome := "rejected"
+		if err != nil {
+			outcome = "error"
+		}
+		s.metrics.observeCleanup(started, outcome, DeleteTranscriptResult{})
 		if err != nil {
 			s.log.Warn("revalidate deleting transcript run", "namespace", run.Namespace, "run", authorization.Name, "error", err)
 			http.Error(w, "run resolver is unavailable", http.StatusServiceUnavailable)
@@ -515,24 +519,28 @@ func (s *Server) deleteTranscript(w http.ResponseWriter, r *http.Request, run Ru
 	}
 	if s.store == nil {
 		cutoff.finish(true)
-		s.metrics.observeCleanup(started, "absent")
+		s.metrics.observeCleanup(started, "already_absent", DeleteTranscriptResult{})
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
 	result, err := s.store.Delete(r.Context(), run)
 	if err != nil {
 		cutoff.finish(false)
-		s.metrics.observeCleanup(started, "error")
+		outcome := "error"
+		if isTranscriptContractError(err) {
+			outcome = "rejected"
+		}
+		s.metrics.observeCleanup(started, outcome, DeleteTranscriptResult{})
 		s.log.Error("delete transcript", "namespace", run.Namespace, "runUID", run.UID, "error", err)
 		writeTranscriptStoreError(w, err)
 		return
 	}
 	cutoff.finish(true)
-	outcome := "absent"
+	outcome := "already_absent"
 	if result.Deleted {
-		outcome = "deleted"
+		outcome = "committed"
 	}
-	s.metrics.observeCleanup(started, outcome)
+	s.metrics.observeCleanup(started, outcome, result)
 	w.WriteHeader(http.StatusNoContent)
 }
 

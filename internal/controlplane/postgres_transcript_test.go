@@ -178,6 +178,10 @@ func TestPostgresTranscriptStoreContract(t *testing.T) {
 		replacementRun := run
 		replacementRun.UID = "replacement-run-uid"
 		appendStoreEvent(t, store, replacementRun, "replacement")
+		var wantReclaimedEvents, wantReclaimedBytes int64
+		if err := store.pool.QueryRow(ctx, `SELECT retained_events, retained_bytes FROM transcript_runs WHERE namespace = $1 AND namespace_uid = $2 AND run_uid = $3`, run.Namespace, string(run.NamespaceUID), string(run.UID)).Scan(&wantReclaimedEvents, &wantReclaimedBytes); err != nil {
+			t.Fatal(err)
+		}
 
 		wrongNamespace := run
 		wrongNamespace.NamespaceUID = "replacement-namespace-uid"
@@ -185,7 +189,7 @@ func TestPostgresTranscriptStoreContract(t *testing.T) {
 			t.Fatalf("replacement Namespace delete error = %v, want %v", err, ErrTranscriptIdentity)
 		}
 		result, err := store.Delete(ctx, run)
-		if err != nil || !result.Deleted {
+		if err != nil || !result.Deleted || result.ReclaimedEvents != uint64(wantReclaimedEvents) || result.ReclaimedBytes != uint64(wantReclaimedBytes) {
 			t.Fatalf("exact delete = %#v, %v", result, err)
 		}
 		var runRows, eventRows int

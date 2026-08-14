@@ -19,7 +19,6 @@ type transcriptGate struct {
 
 type transcriptGateEntry struct {
 	cutoff    bool
-	validated bool
 	completed bool
 	cleaning  bool
 	appends   int
@@ -36,10 +35,9 @@ type transcriptAdmission struct {
 }
 
 type transcriptCutoff struct {
-	gate    *transcriptGate
-	run     RunIdentity
-	entry   *transcriptGateEntry
-	created bool
+	gate  *transcriptGate
+	run   RunIdentity
+	entry *transcriptGateEntry
 }
 
 func newTranscriptGate(maxEntries int) *transcriptGate {
@@ -86,6 +84,7 @@ func (a *transcriptAdmission) release() {
 			if cancel, ok := a.entry.streams[a]; ok {
 				delete(a.entry.streams, a)
 				cancel()
+				a.gate.signal(a.entry)
 			}
 		} else {
 			a.entry.appends--
@@ -100,44 +99,23 @@ func (g *transcriptGate) cutoff(run RunIdentity) (*transcriptCutoff, error) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	entry := g.entries[run]
-	created := false
 	if entry == nil {
 		if len(g.entries) >= g.maxEntries {
 			return nil, ErrTranscriptGateLimit
 		}
 		entry = &transcriptGateEntry{streams: make(map[*transcriptAdmission]context.CancelFunc), changed: make(chan struct{})}
 		g.entries[run] = entry
-		created = true
 	}
 	entry.cutoff = true
 	for _, cancel := range entry.streams {
 		cancel()
 	}
-	return &transcriptCutoff{gate: g, run: run, entry: entry, created: created}, nil
+	return &transcriptCutoff{gate: g, run: run, entry: entry}, nil
 }
 
-// abort releases only a provisional cutoff that never proved exact deleting
-// Run currentness. Validated and pre-existing failed cutoffs remain fail closed.
-func (c *transcriptCutoff) abort() {
-	if c == nil || !c.created {
-		return
-	}
-	c.gate.mu.Lock()
-	if !c.entry.validated && !c.entry.cleaning {
-		c.entry.cutoff = false
-		c.gate.removeIdle(c.run, c.entry)
-	}
-	c.gate.mu.Unlock()
-}
-
-func (c *transcriptCutoff) validate() {
-	c.gate.mu.Lock()
-	c.entry.validated = true
-	c.gate.mu.Unlock()
-}
-
-// beginCleanup waits for every append admitted before cutoff and serializes
-// cleanup retries. A completed process-local cleanup is an idempotent success.
+// beginCleanup waits for every request admitted before cutoff, including
+// canceled streams, and serializes cleanup retries. A completed process-local
+// cleanup is an idempotent success.
 func (c *transcriptCutoff) beginCleanup(ctx context.Context) (bool, error) {
 	for {
 		c.gate.mu.Lock()
@@ -145,7 +123,7 @@ func (c *transcriptCutoff) beginCleanup(ctx context.Context) (bool, error) {
 			c.gate.mu.Unlock()
 			return true, nil
 		}
-		if c.entry.appends == 0 && !c.entry.cleaning {
+		if c.entry.appends == 0 && len(c.entry.streams) == 0 && !c.entry.cleaning {
 			c.entry.cleaning = true
 			c.gate.mu.Unlock()
 			return false, nil
