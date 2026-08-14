@@ -123,6 +123,18 @@ type InstallationStorageClassIdentity struct {
 	CSIDriver string `json:"csiDriver"`
 }
 
+// InstallationCSIDriverIdentity records the exact non-secret CSIDriver
+// incarnation selected by the StorageClass expectation.
+// +kubebuilder:validation:XValidation:rule="size(self.uid) > 0 && size(self.uid) <= 128",message="object UID must be 1-128 bytes"
+type InstallationCSIDriverIdentity struct {
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=63
+	// +kubebuilder:validation:Pattern=`^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$`
+	Name string `json:"name"`
+
+	UID types.UID `json:"uid"`
+}
+
 // InstallationPolicyConfigMapIdentity records the exact immutable policy
 // ConfigMap incarnation and canonical content digest.
 // +kubebuilder:validation:XValidation:rule="size(self.uid) > 0 && size(self.uid) <= 128",message="ConfigMap UID must be 1-128 bytes"
@@ -162,6 +174,9 @@ type InstallationStatus struct {
 
 	// +optional
 	StorageClass *InstallationStorageClassIdentity `json:"storageClass,omitempty"`
+
+	// +optional
+	CSIDriver *InstallationCSIDriverIdentity `json:"csiDriver,omitempty"`
 
 	// +optional
 	// +listType=map

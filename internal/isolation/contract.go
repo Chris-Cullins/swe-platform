@@ -23,6 +23,7 @@ const (
 	configMapAPIVersion    = "v1"
 	runtimeClassAPIVersion = "node.k8s.io/v1"
 	storageClassAPIVersion = "storage.k8s.io/v1"
+	csiDriverAPIVersion    = "storage.k8s.io/v1"
 )
 
 // PolicyConfigMapIdentity is the exact immutable policy object and canonical
@@ -45,6 +46,12 @@ type StorageClassIdentity struct {
 	CSIDriver string
 }
 
+// CSIDriverIdentity is the exact CSIDriver object selected by the observed
+// StorageClass provisioner.
+type CSIDriverIdentity struct {
+	UID types.UID
+}
+
 // RevisionInputs are the selected Installation contract and exact objects that
 // resolved it. Restricted identities are absent for unrestricted development.
 type RevisionInputs struct {
@@ -54,6 +61,7 @@ type RevisionInputs struct {
 	PolicyConfigMap *PolicyConfigMapIdentity
 	RuntimeClass    *RuntimeClassIdentity
 	StorageClass    *StorageClassIdentity
+	CSIDriver       *CSIDriverIdentity
 }
 
 // Revision is the SHA-256 digest of canonical installation isolation inputs.
@@ -111,8 +119,8 @@ func dnsSubdomain(field, value string, maximum int) error {
 
 // CanonicalBytes validates and serializes revision inputs deterministically.
 func (in RevisionInputs) CanonicalBytes() ([]byte, error) {
-	if in.InstallationUID == "" {
-		return nil, errors.New("Installation UID is required")
+	if err := boundedUID("Installation UID", in.InstallationUID); err != nil {
+		return nil, err
 	}
 	if err := ValidateSelection(&in.Selection); err != nil {
 		return nil, err
@@ -143,6 +151,7 @@ func (in RevisionInputs) CanonicalBytes() ([]byte, error) {
 		PolicyConfigMap             *canonicalObject   `json:"policyConfigMap,omitempty"`
 		RuntimeClass                *canonicalObject   `json:"runtimeClass,omitempty"`
 		StorageClass                *canonicalObject   `json:"storageClass,omitempty"`
+		CSIDriver                   *canonicalObject   `json:"csiDriver,omitempty"`
 	}
 
 	canonical := canonicalInputs{
@@ -154,15 +163,28 @@ func (in RevisionInputs) CanonicalBytes() ([]byte, error) {
 	}
 	switch in.Selection.Mode {
 	case platformv1alpha1.InstallationIsolationModeUnrestrictedDevelopment:
-		if in.PolicyConfigMap != nil || in.RuntimeClass != nil || in.StorageClass != nil {
+		if in.PolicyConfigMap != nil || in.RuntimeClass != nil || in.StorageClass != nil || in.CSIDriver != nil {
 			return nil, errors.New("unrestricted development revision must omit resolved restricted objects")
 		}
 	case platformv1alpha1.InstallationIsolationModeRestrictedProductionCalicoV3_32_1:
-		if in.PolicyConfigMap == nil || in.RuntimeClass == nil || in.StorageClass == nil {
+		if in.PolicyConfigMap == nil || in.RuntimeClass == nil || in.StorageClass == nil || in.CSIDriver == nil {
 			return nil, errors.New("restricted isolation revision requires all resolved object identities")
 		}
-		if in.PolicyConfigMap.UID == "" || in.PolicyConfigMap.ContentSHA256 == ([sha256.Size]byte{}) || in.RuntimeClass.UID == "" || in.StorageClass.UID == "" {
-			return nil, errors.New("restricted isolation revision requires exact non-empty object identities and policy content SHA-256")
+		for _, identity := range []struct {
+			field string
+			uid   types.UID
+		}{
+			{field: "policy ConfigMap UID", uid: in.PolicyConfigMap.UID},
+			{field: "RuntimeClass UID", uid: in.RuntimeClass.UID},
+			{field: "StorageClass UID", uid: in.StorageClass.UID},
+			{field: "CSIDriver UID", uid: in.CSIDriver.UID},
+		} {
+			if err := boundedUID(identity.field, identity.uid); err != nil {
+				return nil, err
+			}
+		}
+		if in.PolicyConfigMap.ContentSHA256 == ([sha256.Size]byte{}) {
+			return nil, errors.New("restricted isolation revision requires a non-zero policy content SHA-256")
 		}
 		if in.RuntimeClass.Handler != in.Selection.RuntimeClass.Handler {
 			return nil, errors.New("observed RuntimeClass handler does not match the selected expectation")
@@ -180,8 +202,16 @@ func (in RevisionInputs) CanonicalBytes() ([]byte, error) {
 		canonical.PolicyConfigMap = &canonicalObject{APIVersion: configMapAPIVersion, Kind: "ConfigMap", Name: in.Selection.PolicyConfigMapName, UID: in.PolicyConfigMap.UID, SHA256: hex.EncodeToString(in.PolicyConfigMap.ContentSHA256[:])}
 		canonical.RuntimeClass = &canonicalObject{APIVersion: runtimeClassAPIVersion, Kind: "RuntimeClass", Name: in.Selection.RuntimeClass.Name, UID: in.RuntimeClass.UID, Value: in.RuntimeClass.Handler}
 		canonical.StorageClass = &canonicalObject{APIVersion: storageClassAPIVersion, Kind: "StorageClass", Name: in.Selection.StorageClass.Name, UID: in.StorageClass.UID, Value: in.StorageClass.CSIDriver}
+		canonical.CSIDriver = &canonicalObject{APIVersion: csiDriverAPIVersion, Kind: "CSIDriver", Name: in.Selection.StorageClass.CSIDriver, UID: in.CSIDriver.UID}
 	}
 	return json.Marshal(canonical)
+}
+
+func boundedUID(field string, uid types.UID) error {
+	if len(uid) == 0 || len(uid) > 128 {
+		return fmt.Errorf("%s must be 1-128 bytes", field)
+	}
+	return nil
 }
 
 // DeriveRevision returns SHA-256 over CanonicalBytes.

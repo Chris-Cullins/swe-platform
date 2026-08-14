@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	platformv1alpha1 "github.com/Chris-Cullins/swe-platform/api/v1alpha1"
+	"k8s.io/apimachinery/pkg/types"
 )
 
 func restrictedSelection() platformv1alpha1.InstallationIsolationSpec {
@@ -24,6 +25,7 @@ func restrictedInputs() RevisionInputs {
 		PolicyConfigMap: &PolicyConfigMapIdentity{UID: "policy-uid", ContentSHA256: sha256.Sum256([]byte("canonical policy"))},
 		RuntimeClass:    &RuntimeClassIdentity{UID: "runtime-uid", Handler: "runsc"},
 		StorageClass:    &StorageClassIdentity{UID: "storage-uid", CSIDriver: "csi.example.com"},
+		CSIDriver:       &CSIDriverIdentity{UID: "csi-driver-uid"},
 	}
 }
 
@@ -74,7 +76,7 @@ func TestRevisionCanonicalStabilityAndDomain(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := `{"domain":"swe.dev/isolation/installation-revision/v1","egressPolicyAPIVersion":"swe.dev/egress-policy/v1","egressRuntimeRevisionDomain":"swe.dev/egress-policy/runtime-revision/v1","installationUID":"installation-uid","selection":{"mode":"RestrictedProductionCalicoV3_32_1","policyConfigMapName":"egress-policy","runtimeClassName":"gvisor","runtimeClassHandler":"runsc","storageClassName":"workspace","storageClassDriver":"csi.example.com"},"policyConfigMap":{"apiVersion":"v1","kind":"ConfigMap","name":"egress-policy","uid":"policy-uid","sha256":"6c6f75f2824d3a495045e88a743c5d94fc218fc6b9439acb73174bc316afc5ec"},"runtimeClass":{"apiVersion":"node.k8s.io/v1","kind":"RuntimeClass","name":"gvisor","uid":"runtime-uid","value":"runsc"},"storageClass":{"apiVersion":"storage.k8s.io/v1","kind":"StorageClass","name":"workspace","uid":"storage-uid","value":"csi.example.com"}}`
+	want := `{"domain":"swe.dev/isolation/installation-revision/v1","egressPolicyAPIVersion":"swe.dev/egress-policy/v1","egressRuntimeRevisionDomain":"swe.dev/egress-policy/runtime-revision/v1","installationUID":"installation-uid","selection":{"mode":"RestrictedProductionCalicoV3_32_1","policyConfigMapName":"egress-policy","runtimeClassName":"gvisor","runtimeClassHandler":"runsc","storageClassName":"workspace","storageClassDriver":"csi.example.com"},"policyConfigMap":{"apiVersion":"v1","kind":"ConfigMap","name":"egress-policy","uid":"policy-uid","sha256":"6c6f75f2824d3a495045e88a743c5d94fc218fc6b9439acb73174bc316afc5ec"},"runtimeClass":{"apiVersion":"node.k8s.io/v1","kind":"RuntimeClass","name":"gvisor","uid":"runtime-uid","value":"runsc"},"storageClass":{"apiVersion":"storage.k8s.io/v1","kind":"StorageClass","name":"workspace","uid":"storage-uid","value":"csi.example.com"},"csiDriver":{"apiVersion":"storage.k8s.io/v1","kind":"CSIDriver","name":"csi.example.com","uid":"csi-driver-uid"}}`
 	if string(canonical) != want {
 		t.Fatalf("canonical bytes changed:\n got %s\nwant %s", canonical, want)
 	}
@@ -82,7 +84,7 @@ func TestRevisionCanonicalStabilityAndDomain(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got, want := revision.String(), "ddaaa8cc5533c87f328a9cfc7e273d11f7c00cabab74467fe8df17c6dd3b6b7b"; got != want {
+	if got, want := revision.String(), "d9bb18e54f01211845e18e4a99a06743116f35994b5a531a1c94b234e37cdde3"; got != want {
 		t.Fatalf("revision = %s, want %s", got, want)
 	}
 	withoutDomain := strings.Replace(string(canonical), `"domain":"`+RevisionDomain+`",`, "", 1)
@@ -103,9 +105,14 @@ func TestRevisionBindsEveryAuthorityInput(t *testing.T) {
 		"policy content":    func(in *RevisionInputs) { in.PolicyConfigMap.ContentSHA256 = sha256.Sum256([]byte("other policy")) },
 		"RuntimeClass UID":  func(in *RevisionInputs) { in.RuntimeClass.UID = "other-runtime" },
 		"StorageClass UID":  func(in *RevisionInputs) { in.StorageClass.UID = "other-storage" },
+		"CSIDriver UID":     func(in *RevisionInputs) { in.CSIDriver.UID = "other-csi-driver" },
 		"RuntimeClass name": func(in *RevisionInputs) { in.Selection.RuntimeClass.Name = "gvisor-alt" },
 		"StorageClass name": func(in *RevisionInputs) { in.Selection.StorageClass.Name = "workspace-alt" },
-		"policy ConfigMap":  func(in *RevisionInputs) { in.Selection.PolicyConfigMapName = "egress-policy-alt" },
+		"CSI driver name": func(in *RevisionInputs) {
+			in.Selection.StorageClass.CSIDriver = "other.example.com"
+			in.StorageClass.CSIDriver = "other.example.com"
+		},
+		"policy ConfigMap": func(in *RevisionInputs) { in.Selection.PolicyConfigMapName = "egress-policy-alt" },
 	}
 	for name, mutate := range mutations {
 		t.Run(name, func(t *testing.T) {
@@ -145,7 +152,9 @@ func TestRevisionRejectsAmbiguousOrMismatchedInputs(t *testing.T) {
 
 	for name, mutate := range map[string]func(*RevisionInputs){
 		"missing Installation UID": func(in *RevisionInputs) { in.InstallationUID = "" },
+		"oversized object UID":     func(in *RevisionInputs) { in.RuntimeClass.UID = types.UID(strings.Repeat("u", 129)) },
 		"missing policy identity":  func(in *RevisionInputs) { in.PolicyConfigMap = nil },
+		"missing CSI identity":     func(in *RevisionInputs) { in.CSIDriver = nil },
 		"zero policy hash":         func(in *RevisionInputs) { in.PolicyConfigMap.ContentSHA256 = [sha256.Size]byte{} },
 		"handler mismatch":         func(in *RevisionInputs) { in.RuntimeClass.Handler = "other" },
 		"CSI driver mismatch":      func(in *RevisionInputs) { in.StorageClass.CSIDriver = "other.example.com" },
