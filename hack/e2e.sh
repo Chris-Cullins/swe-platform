@@ -3252,6 +3252,16 @@ if [[ -n "$(kubectl get environment "$ENV_NAME" -o jsonpath='{.spec.services[?(@
 	echo "FAIL: Codex credential-scope repository service was not cleaned up"
 	exit 1
 fi
+for _ in $(seq 1 60); do
+	if manage_observation_listener service-state "$CODEX_POD_NAME" "$REPOSITORY_PROCESS_OWNER" repository-web stopped >/dev/null 2>&1; then
+		break
+	fi
+	sleep 1
+done
+if ! manage_observation_listener service-state "$CODEX_POD_NAME" "$REPOSITORY_PROCESS_OWNER" repository-web stopped; then
+	echo "FAIL: Codex credential-scope repository process was not stopped"
+	exit 1
+fi
 kubectl delete run "$CODEX_RUN_NAME" --wait=true >/dev/null
 
 echo "==> verifying fake Codex terminal failure through the real controller"
