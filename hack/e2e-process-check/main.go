@@ -80,7 +80,7 @@ func run() error {
 	ordinary, err := client.Start(ctx, &sandboxdv1.StartProcessRequest{
 		Key: &sandboxdv1.ProcessKey{OwnerId: "e2e-ordinary-" + os.Args[5], Role: "credential-check"},
 		Spec: &sandboxdv1.ProcessSpec{
-			Argv: []string{"sh", "-c", `if [ -n "${ANTHROPIC_API_KEY+x}" ] || [ -n "${AMP_API_KEY+x}" ]; then exit 86; fi; printf ordinary-process-credential-absent`},
+			Argv: []string{"sh", "-c", `if [ -n "${ANTHROPIC_API_KEY+x}" ] || [ -n "${AMP_API_KEY+x}" ] || [ -n "${CODEX_API_KEY+x}" ]; then exit 86; fi; printf ordinary-process-credential-absent`},
 		},
 	})
 	if err != nil {
