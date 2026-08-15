@@ -269,17 +269,23 @@ The scoped operator cache is restart-bound to the explicit `tenancy.namespaces` 
 reconcile entry, and every mutation revalidate the Installation and exact Namespace/Project
 claim through uncached reads. The control plane first performs its existing TokenReview and
 SubjectAccessReview checks, then independently requires allowlist membership and an uncached
-active-claim proof. A second release has different Installation and cluster-role identities and
-an Installation-UID-derived leader lease; it cannot satisfy or receive another release's
-namespaced workload authority. `trusted-admin` is a separate explicit cluster-wide mode; absent
-or invalid mode configuration never enables it. Its cache and RBAC are cluster-wide, but exact
-Installation/Namespace/Project claims remain mandatory at mutation boundaries.
+active-claim proof, with one narrow retention exception: an explicit-bearer, exact-name `delete`
+on `runs/transcript` may also pass during `LifecycleFencing` + `OperationOffboarding` so its
+required post-drain authorization can finish. The exception admits no session, GET/POST/SSE,
+other resource tuple, onboarding fencing, or fenced claim. A second release has different
+Installation and cluster-role identities and an Installation-UID-derived leader lease; it
+cannot satisfy or receive another release's namespaced workload authority. `trusted-admin` is a
+separate explicit cluster-wide mode; absent or invalid mode configuration never enables it. Its
+cache and RBAC are cluster-wide, but exact Installation/Namespace/Project claims remain
+mandatory at mutation boundaries.
 
 Onboarding installs an ingress-only default-deny NetworkPolicy and a tokenless Environment
 ServiceAccount. The existing Environment-specific policy adds only the sandboxd ingress needed
 from the installation's system components. These policies do not restrict egress. Offboarding
 fences before drain and retains the Namespace, workspace PVCs, credential profiles and their
-owned Secrets, and transcript data. Suspending an Environment still revokes its ephemeral
+owned Secrets, and transcript data; it does not trigger transcript cleanup. An independently
+deleting Run may complete its already-exact transcript cleanup during offboarding fencing, but
+not after the claim becomes fenced. Suspending an Environment still revokes its ephemeral
 per-pod sandboxd credential Secret as described above. Destructive Project purge is not
 implemented.
 

@@ -1,15 +1,18 @@
 package controlplane
 
 import (
+	"context"
 	"errors"
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	platformv1alpha1 "github.com/Chris-Cullins/swe-platform/api/v1alpha1"
@@ -35,6 +38,16 @@ func (a *orderedAccess) AuthenticatePrincipal(*http.Request, bool) (string, erro
 
 func tenancyAccessFixture(t *testing.T, lifecycle tenancy.Lifecycle, claimed bool) *tenancy.Verifier {
 	t.Helper()
+	operation := ""
+	if lifecycle == tenancy.LifecycleFencing {
+		operation = tenancy.OperationOffboarding
+	}
+	verifier, _ := tenancyAccessFixtureForOperation(t, lifecycle, operation, claimed)
+	return verifier
+}
+
+func tenancyAccessFixtureForOperation(t *testing.T, lifecycle tenancy.Lifecycle, operation string, claimed bool) (*tenancy.Verifier, client.Client) {
+	t.Helper()
 	scheme := runtime.NewScheme()
 	if err := corev1.AddToScheme(scheme); err != nil {
 		t.Fatal(err)
@@ -46,10 +59,6 @@ func tenancyAccessFixture(t *testing.T, lifecycle tenancy.Lifecycle, claimed boo
 	namespace := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "team", UID: "namespace-uid"}}
 	objects := []runtime.Object{installation, namespace}
 	if claimed {
-		operation := ""
-		if lifecycle == tenancy.LifecycleFencing {
-			operation = tenancy.OperationOffboarding
-		}
 		namespace.Annotations = map[string]string{
 			tenancy.InstallationNamespaceAnnotation: "system",
 			tenancy.InstallationNameAnnotation:      "main",
@@ -61,8 +70,8 @@ func tenancyAccessFixture(t *testing.T, lifecycle tenancy.Lifecycle, claimed boo
 		}
 		objects = append(objects, &platformv1alpha1.Project{ObjectMeta: metav1.ObjectMeta{Name: "project", Namespace: "team", UID: "project-uid"}})
 	}
-	client := fake.NewClientBuilder().WithScheme(scheme).WithRuntimeObjects(objects...).Build()
-	return &tenancy.Verifier{Reader: client, Installation: tenancy.InstallationIdentity{Key: types.NamespacedName{Namespace: "system", Name: "main"}, UID: "installation-uid"}, Mode: tenancy.ModeScoped}
+	kubeClient := fake.NewClientBuilder().WithScheme(scheme).WithRuntimeObjects(objects...).Build()
+	return &tenancy.Verifier{Reader: kubeClient, Installation: tenancy.InstallationIdentity{Key: types.NamespacedName{Namespace: "system", Name: "main"}, UID: "installation-uid"}, Mode: tenancy.ModeScoped}, kubeClient
 }
 
 func TestTenancyAccessPreservesAuthorizationBeforeScopeValidation(t *testing.T) {
@@ -112,6 +121,54 @@ func TestTenancyAccessRequiresConfiguredExactActiveClaim(t *testing.T) {
 	}
 }
 
+func TestTenancyAccessAllowsOnlyExactOffboardingTranscriptDelete(t *testing.T) {
+	exactDelete := ResourceAccess{Namespace: "team", Verb: "delete", Resource: "runs", Subresource: "transcript", Name: "run"}
+	tests := []struct {
+		name         string
+		lifecycle    tenancy.Lifecycle
+		operation    string
+		access       ResourceAccess
+		allowSession bool
+		bearer       bool
+		configured   bool
+		want         error
+	}{
+		{name: "offboarding exact bearer delete", lifecycle: tenancy.LifecycleFencing, operation: tenancy.OperationOffboarding, access: exactDelete, bearer: true, configured: true},
+		{name: "offboarding session-capable delete", lifecycle: tenancy.LifecycleFencing, operation: tenancy.OperationOffboarding, access: exactDelete, allowSession: true, bearer: true, configured: true, want: errForbidden},
+		{name: "offboarding delete without bearer", lifecycle: tenancy.LifecycleFencing, operation: tenancy.OperationOffboarding, access: exactDelete, configured: true, want: errForbidden},
+		{name: "offboarding transcript get and SSE", lifecycle: tenancy.LifecycleFencing, operation: tenancy.OperationOffboarding, access: ResourceAccess{Namespace: "team", Verb: "get", Resource: "runs", Subresource: "transcript", Name: "run"}, allowSession: true, bearer: true, configured: true, want: errForbidden},
+		{name: "offboarding transcript post", lifecycle: tenancy.LifecycleFencing, operation: tenancy.OperationOffboarding, access: ResourceAccess{Namespace: "team", Verb: "update", Resource: "runs", Subresource: "transcript", Name: "run"}, bearer: true, configured: true, want: errForbidden},
+		{name: "offboarding other resource", lifecycle: tenancy.LifecycleFencing, operation: tenancy.OperationOffboarding, access: ResourceAccess{Namespace: "team", Verb: "delete", Resource: "environments", Subresource: "transcript", Name: "run"}, bearer: true, configured: true, want: errForbidden},
+		{name: "offboarding other subresource", lifecycle: tenancy.LifecycleFencing, operation: tenancy.OperationOffboarding, access: ResourceAccess{Namespace: "team", Verb: "delete", Resource: "runs", Subresource: "terminal", Name: "run"}, bearer: true, configured: true, want: errForbidden},
+		{name: "offboarding unnamed delete", lifecycle: tenancy.LifecycleFencing, operation: tenancy.OperationOffboarding, access: ResourceAccess{Namespace: "team", Verb: "delete", Resource: "runs", Subresource: "transcript"}, bearer: true, configured: true, want: errForbidden},
+		{name: "offboarding unconfigured namespace", lifecycle: tenancy.LifecycleFencing, operation: tenancy.OperationOffboarding, access: exactDelete, bearer: true, want: errForbidden},
+		{name: "onboarding fencing", lifecycle: tenancy.LifecycleFencing, operation: tenancy.OperationOnboarding, access: exactDelete, bearer: true, configured: true, want: errForbidden},
+		{name: "fenced", lifecycle: tenancy.LifecycleFenced, access: exactDelete, bearer: true, configured: true, want: errForbidden},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			verifier, _ := tenancyAccessFixtureForOperation(t, test.lifecycle, test.operation, true)
+			namespaces := map[string]struct{}{}
+			if test.configured {
+				namespaces["team"] = struct{}{}
+			}
+			underlying := &orderedAccess{}
+			controller := TenancyAccessController{Access: underlying, Verifier: verifier, Namespaces: namespaces}
+			request := httptest.NewRequest(http.MethodDelete, "https://api.test/api/v1/namespaces/team/runs/run/transcript", nil)
+			if test.bearer {
+				request.Header.Set("Authorization", "Bearer cleanup")
+			}
+			err := controller.Authorize(request, test.access, test.allowSession)
+			if !underlying.called || !errors.Is(err, test.want) {
+				t.Fatalf("called=%v err=%v want=%v", underlying.called, err, test.want)
+			}
+			if test.want == nil && namespaceUIDFromRequest(request) != "namespace-uid" {
+				t.Fatalf("Namespace UID context = %q", namespaceUIDFromRequest(request))
+			}
+		})
+	}
+}
+
 func TestTenancyAccessTrustedAdminIsExplicit(t *testing.T) {
 	verifier := tenancyAccessFixture(t, tenancy.LifecycleActive, true)
 	verifier.Mode = tenancy.ModeTrustedAdmin
@@ -132,7 +189,7 @@ func TestTenancyAccessTrustedAdminIsExplicit(t *testing.T) {
 	}
 }
 
-func TestTranscriptDeleteRequiresFreshActiveTenancyProof(t *testing.T) {
+func TestTranscriptDeleteRequiresFreshTenancyProof(t *testing.T) {
 	underlying := &orderedAccess{}
 	access := TenancyAccessController{
 		Access: underlying, Verifier: tenancyAccessFixture(t, tenancy.LifecycleActive, true),
@@ -157,9 +214,10 @@ func TestTranscriptDeleteRequiresFreshActiveTenancyProof(t *testing.T) {
 		}
 	}
 
+	onboardingVerifier, _ := tenancyAccessFixtureForOperation(t, tenancy.LifecycleFencing, tenancy.OperationOnboarding, true)
 	deniedAPI := NewServer(nil, ServerOptions{
 		Access: TenancyAccessController{
-			Access: &orderedAccess{}, Verifier: tenancyAccessFixture(t, tenancy.LifecycleFencing, true),
+			Access: &orderedAccess{}, Verifier: onboardingVerifier,
 			Namespaces: map[string]struct{}{"team": {}},
 		},
 		Runs: &fakeRunResolver{uid: "run-uid", deleting: true}, TranscriptStore: NewMemoryTranscriptStore(MemoryTranscriptStoreOptions{}),
@@ -167,6 +225,108 @@ func TestTranscriptDeleteRequiresFreshActiveTenancyProof(t *testing.T) {
 	deniedResponse := httptest.NewRecorder()
 	deniedAPI.Handler().ServeHTTP(deniedResponse, request.Clone(request.Context()))
 	if deniedResponse.Code != http.StatusForbidden || len(deniedAPI.transcriptGate.entries) != 0 {
-		t.Fatalf("fencing tenancy cleanup response/gates = %d/%d", deniedResponse.Code, len(deniedAPI.transcriptGate.entries))
+		t.Fatalf("onboarding-fencing cleanup response/gates = %d/%d", deniedResponse.Code, len(deniedAPI.transcriptGate.entries))
+	}
+}
+
+func TestTranscriptDeleteReauthorizesAcrossOffboardingFencingDuringDrain(t *testing.T) {
+	verifier, kubeClient := tenancyAccessFixtureForOperation(t, tenancy.LifecycleActive, "", true)
+	underlying := &orderedAccess{}
+	access := TenancyAccessController{Access: underlying, Verifier: verifier, Namespaces: map[string]struct{}{"team": {}}}
+	run := RunIdentity{Namespace: "team", NamespaceUID: "namespace-uid", UID: "run-uid"}
+	memory := NewMemoryTranscriptStore(MemoryTranscriptStoreOptions{})
+	appendStoreEvent(t, memory, run, "retained")
+	store := &blockingUnsubscribeTranscriptStore{
+		TranscriptStore:    memory,
+		unsubscribeStarted: make(chan struct{}),
+		releaseUnsubscribe: make(chan struct{}),
+		deleteStarted:      make(chan struct{}),
+	}
+	released := false
+	releaseDrain := func() {
+		if !released {
+			close(store.releaseUnsubscribe)
+			released = true
+		}
+	}
+	resolver := &mutableRunResolver{uid: "run-uid"}
+	api := NewServer(nil, ServerOptions{Access: access, Runs: resolver, TranscriptStore: store})
+	server := httptest.NewServer(api.Handler())
+	defer server.Close()
+
+	streamContext, cancelStream := context.WithCancel(context.Background())
+	defer cancelStream()
+	streamRequest, err := http.NewRequestWithContext(streamContext, http.MethodGet, server.URL+"/api/v1/namespaces/team/runs/run/transcript", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	streamRequest.Header.Set("Authorization", "Bearer reader")
+	streamRequest.Header.Set(RunUIDHeader, "run-uid")
+	streamResponse, err := http.DefaultClient.Do(streamRequest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer streamResponse.Body.Close()
+	defer releaseDrain()
+
+	resolver.setDeleting(true)
+	deleteRequest, err := http.NewRequest(http.MethodDelete, server.URL+"/api/v1/namespaces/team/runs/run/transcript", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	deleteRequest.Header.Set("Authorization", "Bearer cleanup")
+	deleteRequest.Header.Set(RunUIDHeader, "run-uid")
+	deleteRequest.Header.Set(NamespaceUIDHeader, "namespace-uid")
+	type deleteResult struct {
+		response *http.Response
+		err      error
+	}
+	deleteDone := make(chan deleteResult, 1)
+	go func() {
+		response, err := http.DefaultClient.Do(deleteRequest)
+		deleteDone <- deleteResult{response: response, err: err}
+	}()
+	select {
+	case <-store.unsubscribeStarted:
+	case <-time.After(time.Second):
+		t.Fatal("DELETE did not enter transcript drain")
+	}
+
+	var namespace corev1.Namespace
+	if err := kubeClient.Get(context.Background(), types.NamespacedName{Name: "team"}, &namespace); err != nil {
+		t.Fatal(err)
+	}
+	namespace.Annotations[tenancy.LifecycleAnnotation] = string(tenancy.LifecycleFencing)
+	namespace.Annotations[tenancy.LifecycleOperationAnnotation] = tenancy.OperationOffboarding
+	if err := kubeClient.Update(context.Background(), &namespace); err != nil {
+		t.Fatal(err)
+	}
+	releaseDrain()
+
+	var result deleteResult
+	select {
+	case result = <-deleteDone:
+	case <-time.After(time.Second):
+		t.Fatal("DELETE did not finish after offboarding-fencing reauthorization")
+	}
+	if result.err != nil {
+		t.Fatal(result.err)
+	}
+	result.response.Body.Close()
+	if result.response.StatusCode != http.StatusNoContent {
+		t.Fatalf("DELETE status = %d, want %d", result.response.StatusCode, http.StatusNoContent)
+	}
+	deleteProof := ResourceAccess{Namespace: "team", Verb: "delete", Resource: "runs", Subresource: "transcript", Name: "run"}
+	proofs := 0
+	for _, proof := range underlying.access {
+		if proof == deleteProof {
+			proofs++
+		}
+	}
+	if proofs != 2 {
+		t.Fatalf("exact DELETE authorization proofs = %d, want initial and post-drain", proofs)
+	}
+	if _, exists := memory.(*memoryTranscriptStore).runs[run]; exists {
+		t.Fatal("exact transcript remained after offboarding-fencing cleanup")
 	}
 }

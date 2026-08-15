@@ -286,8 +286,9 @@ Tenancy mode is required and has no compatibility default:
   available. Reconcile entry and every client mutation re-read the exact Installation,
   Namespace UID/claim/lifecycle, and sole Project through an uncached reader. The control plane
   performs TokenReview/SAR first, then requires both allowlist membership and the same uncached
-  active-claim proof before any namespaced resource work. Namespaced RoleBindings supply
-  workload authority only after onboarding.
+  active-claim proof before namespaced resource work, subject only to the exact transcript
+  deletion exception below. Namespaced RoleBindings supply workload authority only after
+  onboarding.
 - **`trusted-admin`.** Explicit opt-in cluster-wide cache and workload RBAC, allowing newly
   claimed namespaces to be discovered without a restart-bound list. Exact Installation,
   Namespace, and sole-Project claims remain mandatory, so multiple releases do not reconcile
@@ -301,8 +302,10 @@ Environment hold intents, waits for terminal Runs and suspended podless Environm
 marks the namespace `fenced`. It deletes no Namespace, Project, Template, quota, RBAC, policy,
 credential profile or owned Secret, PVC, Run, Environment, or transcript data. Normal
 Environment suspension still revokes the pod incarnation's ephemeral sandboxd credential
-Secret. After fencing, operators may retain/archive the namespace, remove it from
-`tenancy.namespaces`, and restart the scoped components. Purge is not implemented; it remains
+Secret. Offboarding does not initiate transcript deletion, but exact cleanup for a separately
+deleting Run may finish while the claim remains `fencing` + `offboarding`; `fenced` is denied.
+After fencing, operators may retain/archive the namespace, remove it from `tenancy.namespaces`,
+and restart the scoped components. Purge is not implemented; it remains
 blocked on an exact Namespace-UID-preconditioned durable resumable operation.
 
 ### Environment boundary and backend portability
@@ -541,12 +544,15 @@ only when an authorized request resolves the exact current Run UID; conflicting 
 rejected, and otherwise-unprovable rows are retained indefinitely. The control plane now has an
 internal, explicit-bearer exact transcript DELETE foundation for a deleting Run. It requires
 `delete` authorization on the exact `runs/transcript`, an exact Namespace UID precondition,
-fresh active-tenancy and deleting-Run proof, and a bounded process-local cutoff/drain before the
-store performs idempotent exact `(namespace name, Namespace UID, Run UID)` deletion. PostgreSQL
-uses the existing Namespace-UID association and one transaction; the memory development store
-reclaims its accounting and subscribers. No operator, finalizer, client, CLI, or RBAC wiring
-invokes this capability yet, so transcript rows are not currently garbage-collected when a Run
-or Project is deleted and the existing operational limitation remains.
+fresh tenancy and deleting-Run proof both before and after a bounded process-local cutoff/drain,
+and then idempotent exact `(namespace name, Namespace UID, Run UID)` store deletion. Tenancy must
+be active except that this exact no-session DELETE alone may continue during
+`LifecycleFencing` + `OperationOffboarding`; onboarding fencing, fenced claims, GET/POST/SSE,
+and every other namespaced operation remain denied. PostgreSQL uses the existing Namespace-UID
+association and one transaction; the memory development store reclaims its accounting and
+subscribers. No operator, finalizer, client, CLI, or RBAC wiring invokes this capability yet, so
+transcript rows are not currently garbage-collected when a Run or Project is deleted and the
+existing operational limitation remains.
 
 ### Authentication and exact identity fences
 

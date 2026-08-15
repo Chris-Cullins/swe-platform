@@ -15,6 +15,8 @@ type namespaceUIDContextKey struct{}
 
 // TenancyAccessController preserves the existing authentication/SAR ordering,
 // then rejects namespaced work outside the exact active Installation claim.
+// The sole transition exception admits an explicit-bearer exact transcript
+// deletion during offboarding fencing.
 type TenancyAccessController struct {
 	Access     AccessController
 	Verifier   *tenancy.Verifier
@@ -65,11 +67,20 @@ func (a TenancyAccessController) AuthorizePrincipal(r *http.Request, access Reso
 		}
 		return "", fmt.Errorf("authorize namespace scope: %w", err)
 	}
-	if claim.Lifecycle != tenancy.LifecycleActive {
+	if claim.Lifecycle != tenancy.LifecycleActive && !allowOffboardingTranscriptDelete(r, access, allowSession, claim) {
 		return "", errForbidden
 	}
 	*r = *r.WithContext(context.WithValue(r.Context(), namespaceUIDContextKey{}, claim.NamespaceUID))
 	return principalKey, nil
+}
+
+func allowOffboardingTranscriptDelete(r *http.Request, access ResourceAccess, allowSession bool, claim tenancy.Claim) bool {
+	if allowSession || claim.Lifecycle != tenancy.LifecycleFencing || claim.Operation != tenancy.OperationOffboarding ||
+		access.Verb != "delete" || access.Resource != "runs" || access.Subresource != "transcript" || access.Name == "" {
+		return false
+	}
+	_, _, err := requestBearerToken(r)
+	return err == nil
 }
 
 func namespaceUIDFromRequest(r *http.Request) types.UID {
