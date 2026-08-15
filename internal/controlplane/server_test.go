@@ -104,6 +104,9 @@ func TestTranscriptReplayAndLiveStream(t *testing.T) {
 	}
 	postEvent(t, server.URL, `{"source":"adapter","idempotencyKey":"second","type":"output","data":{"text":"second"}}`)
 	assertEventText(t, nextLine(t, lines), "second")
+	for deadline := time.Now().Add(time.Second); testutil.ToFloat64(metrics.transcriptDeliveries.WithLabelValues("live", "delivered")) != 1 && time.Now().Before(deadline); {
+		time.Sleep(time.Millisecond)
+	}
 	if got := testutil.ToFloat64(metrics.transcriptDeliveries.WithLabelValues("replay", "delivered")); got != 1 {
 		t.Fatalf("replay delivery metric = %v, want 1", got)
 	}
