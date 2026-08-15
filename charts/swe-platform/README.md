@@ -1096,11 +1096,13 @@ idempotency: after an event is evicted, its key may be reused and creates a new 
 
 The internal `DELETE` on the same exact transcript route is release-sequencing foundation, not a
 current user workflow. It accepts only an explicit bearer credential, requires both the exact
-`SWE-Run-UID` and `SWE-Namespace-UID`, repeats TokenReview, exact `delete` SAR, active tenancy,
-Namespace identity, and exact deleting-Run currentness after draining admitted appends, and
-returns `204` for both committed and already-absent cleanup. Cutoff cancels existing streams and
-causes future reads/appends to return the fixed `410 transcript-retention-cutoff` problem. Failed
-cleanup remains cut off for retry in the current process; after restart, the still-deleting Run
+`SWE-Run-UID` and `SWE-Namespace-UID`, and repeats TokenReview, exact `delete` SAR, Namespace
+identity, and exact deleting-Run currentness after draining admitted appends. Tenancy must be
+active except that this exact no-session DELETE may finish during offboarding fencing; onboarding
+fencing, fenced claims, and all other operations remain denied. Successful cleanup returns `204`
+for both committed and already-absent deletion. Cutoff cancels existing streams and causes future
+reads/appends to return the fixed `410 transcript-retention-cutoff` problem. Failed cleanup
+remains cut off for retry in the current process; after restart, the still-deleting Run
 reestablishes the cutoff before an idempotent store retry. The bounded cleanup metrics above have
 no namespace, name, or UID labels. No supported caller ships in this release.
 
