@@ -54,6 +54,9 @@ rules:
   - apiGroups: ["node.k8s.io"]
     resources: ["runtimeclasses"]
     verbs: ["get", "list", "watch"]
+  - apiGroups: ["storage.k8s.io"]
+    resources: ["storageclasses", "csidrivers"]
+    verbs: ["get", "list", "watch"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
@@ -83,7 +86,13 @@ rules:
     verbs: ["create", "get", "list", "patch", "update", "watch"]
   - apiGroups: ["swe.dev"]
     resources: ["installations"]
-    verbs: ["get"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["swe.dev"]
+    resources: ["installations/status"]
+    verbs: ["get", "patch", "update"]
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get", "list", "watch"]
   - apiGroups: ["swe.dev"]
     resources: ["environmenttemplates"]
     verbs: ["get", "list", "patch", "update"]

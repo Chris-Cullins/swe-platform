@@ -27,7 +27,7 @@ controlPlane:
 
 leaderElection: false
 
-# Explicit non-production selection; this contract is inert in this release.
+# Explicit active but non-production development selection.
 installation:
   isolation:
     mode: UnrestrictedDevelopment

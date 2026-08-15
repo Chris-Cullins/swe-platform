@@ -7,6 +7,14 @@ rules:
 - apiGroups:
   - ""
   resources:
+  - configmaps
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - ""
+  resources:
   - namespaces
   verbs:
   - get
@@ -55,6 +63,15 @@ rules:
   - list
   - watch
 - apiGroups:
+  - storage.k8s.io
+  resources:
+  - csidrivers
+  - storageclasses
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
   - swe.dev
   resources:
   - agentcredentialprofiles
@@ -88,6 +105,7 @@ rules:
   resources:
   - environments/status
   - environmenttemplates/status
+  - installations/status
   - runs/status
   verbs:
   - get

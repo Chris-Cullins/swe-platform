@@ -44,6 +44,8 @@ E2E_SESSION_FIXTURE=""
 SELECTOR_ENV_NAME=""
 LEGACY_CRD_ACTIVE="false"
 LEGACY_ENV_NAMES=""
+ISOLATION_POLICY_CONFIGMAP=""
+ISOLATION_CREATED_RUNTIME_CLASS=""
 
 cleanup() {
 	if [[ "$LEGACY_CRD_ACTIVE" == "true" ]]; then
@@ -107,6 +109,12 @@ cleanup() {
 	kubectl -n "$SYSTEM_NAMESPACE" delete pod swe-ingress-allowed --ignore-not-found --wait=false >/dev/null 2>&1 || true
 	kubectl -n "$SYSTEM_NAMESPACE" delete pod swe-sandboxd-relay --ignore-not-found --wait=false >/dev/null 2>&1 || true
 	kubectl -n "$PROJECT_NAMESPACE" delete pod swe-ingress-denied --ignore-not-found --wait=false >/dev/null 2>&1 || true
+	if [[ -n "$ISOLATION_POLICY_CONFIGMAP" ]]; then
+		kubectl -n "$SYSTEM_NAMESPACE" delete configmap "$ISOLATION_POLICY_CONFIGMAP" --ignore-not-found --wait=false >/dev/null 2>&1 || true
+	fi
+	if [[ -n "$ISOLATION_CREATED_RUNTIME_CLASS" ]]; then
+		kubectl delete runtimeclass "$ISOLATION_CREATED_RUNTIME_CLASS" --ignore-not-found --wait=false >/dev/null 2>&1 || true
+	fi
 	rm -f /tmp/swe-platform-sandboxd-cert-"$$" /tmp/swe-platform-sandboxd-token-"$$" \
 		/tmp/swe-platform-observation-cert-"$$" /tmp/swe-platform-observation-process-token-"$$"
 	if [[ "${KEEP_CLUSTER:-false}" != "true" && "${E2E_USE_EXISTING_CLUSTER:-false}" != "true" ]]; then
@@ -3428,6 +3436,113 @@ if kubectl get secret "run-repository-credential-${GIT_CREDENTIAL_DISABLED_UID}"
 	exit 1
 fi
 kubectl delete run "$GIT_CREDENTIAL_DISABLED_RUN" --wait=true >/dev/null
+
+echo "==> verifying restricted Installation selection fences live execution without activation"
+ISOLATION_POLICY_CONFIGMAP=swe-e2e-restricted-policy
+ISOLATION_RUNTIME_CLASS="${E2E_RUNTIME_CLASS:-swe-e2e-isolation-runtime}"
+if [[ -z "${E2E_RUNTIME_CLASS:-}" ]]; then
+	ISOLATION_CREATED_RUNTIME_CLASS="$ISOLATION_RUNTIME_CLASS"
+	cat <<EOF | kubectl apply -f - >/dev/null
+apiVersion: node.k8s.io/v1
+kind: RuntimeClass
+metadata:
+  name: ${ISOLATION_RUNTIME_CLASS}
+handler: runc
+EOF
+fi
+ISOLATION_RUNTIME_HANDLER=$(kubectl get runtimeclass "$ISOLATION_RUNTIME_CLASS" -o jsonpath='{.handler}')
+ISOLATION_STORAGE_CLASS=csi-hostpath-sc
+ISOLATION_CSI_DRIVER=$(kubectl get storageclass "$ISOLATION_STORAGE_CLASS" -o jsonpath='{.provisioner}')
+kubectl get csidriver "$ISOLATION_CSI_DRIVER" >/dev/null
+ISOLATION_POLICY_JSON=$(jq -cn '
+  {
+    apiVersion:"swe.dev/egress-policy/v1",
+    mode:"restricted",
+    ceiling:[],
+    baseline:[],
+    restrictedProfile:{
+      name:"calico-v3.32.1",
+      resolverIPs:["10.96.0.10"],
+      apiServerCIDRs:["10.0.0.1/32"],
+      podCIDRs:["10.244.0.0/16"],
+      serviceCIDRs:["10.96.0.0/12"],
+      nodeCIDRs:["192.168.0.0/16"],
+      controlPlaneCIDRs:["172.16.0.0/16"],
+      additionalDeniedCIDRs:[]
+    },
+    tlsSecretName:"swe-e2e-egress-proxy-tls",
+    proxyImage:"ghcr.io/chris-cullins/swe-platform/egress-proxy@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  }')
+ISOLATION_POLICY_SHA=$(printf '%s' "$ISOLATION_POLICY_JSON" | sha256sum | awk '{print $1}')
+jq -n --arg policy "$ISOLATION_POLICY_JSON" --arg digest "$ISOLATION_POLICY_SHA" --arg name "$ISOLATION_POLICY_CONFIGMAP" --arg namespace "$SYSTEM_NAMESPACE" '
+  {
+    apiVersion:"v1",
+    kind:"ConfigMap",
+    metadata:{name:$name,namespace:$namespace,annotations:{"swe.dev/egress-policy-content-sha256":$digest}},
+    immutable:true,
+    data:{"policy.json":$policy}
+  }' | kubectl apply -f - >/dev/null
+
+ISOLATION_POD_NAME=$(kubectl get environment "$ENV_NAME" -o jsonpath='{.status.podName}')
+ISOLATION_SECRET_NAME=$(kubectl get pod "$ISOLATION_POD_NAME" -o jsonpath='{.metadata.annotations.swe\.dev/sandboxd-secret-name}')
+ISOLATION_PVC_NAME=$(kubectl get pod "$ISOLATION_POD_NAME" -o jsonpath='{.spec.volumes[?(@.name=="workspace")].persistentVolumeClaim.claimName}')
+ISOLATION_PVC_UID=$(kubectl get pvc "$ISOLATION_PVC_NAME" -o jsonpath='{.metadata.uid}')
+ISOLATION_NETWORK_POLICY="$ISOLATION_SECRET_NAME"
+ISOLATION_NETWORK_POLICY_UID=$(kubectl get networkpolicy "$ISOLATION_NETWORK_POLICY" -o jsonpath='{.metadata.uid}')
+ISOLATION_PATCH=$(jq -cn \
+	--arg policy "$ISOLATION_POLICY_CONFIGMAP" \
+	--arg runtime "$ISOLATION_RUNTIME_CLASS" \
+	--arg handler "$ISOLATION_RUNTIME_HANDLER" \
+	--arg storage "$ISOLATION_STORAGE_CLASS" \
+	--arg driver "$ISOLATION_CSI_DRIVER" '
+  {spec:{isolation:{
+    mode:"RestrictedProductionCalicoV3_32_1",
+    policyConfigMapName:$policy,
+    runtimeClass:{name:$runtime,handler:$handler},
+    storageClass:{name:$storage,csiDriver:$driver}
+  }}}')
+kubectl -n "$SYSTEM_NAMESPACE" patch installation "$INSTALLATION_NAME" --type=merge -p "$ISOLATION_PATCH" >/dev/null
+if ! kubectl -n "$SYSTEM_NAMESPACE" wait --for=jsonpath='{.status.isolationState}'=Blocked installation/"$INSTALLATION_NAME" --timeout=2m; then
+	echo "FAIL: restricted Installation selection did not settle Blocked" >&2
+	kubectl -n "$SYSTEM_NAMESPACE" get installation "$INSTALLATION_NAME" -o yaml >&2 || true
+	kubectl get environments,pods -o wide >&2 || true
+	kubectl -n "$SYSTEM_NAMESPACE" logs deployment/"$INSTALLATION_NAME" --tail=200 >&2 || true
+	exit 1
+fi
+for _ in $(seq 1 120); do
+	if ! kubectl get pod "$ISOLATION_POD_NAME" >/dev/null 2>&1 && ! kubectl get secret "$ISOLATION_SECRET_NAME" >/dev/null 2>&1; then
+		break
+	fi
+	sleep 1
+done
+sleep 5
+ISOLATION_STATUS=$(kubectl -n "$SYSTEM_NAMESPACE" get installation "$INSTALLATION_NAME" -o json)
+if kubectl get pod "$ISOLATION_POD_NAME" >/dev/null 2>&1 || kubectl get secret "$ISOLATION_SECRET_NAME" >/dev/null 2>&1 ||
+	[[ -n "$(kubectl get environment "$ENV_NAME" -o jsonpath='{.status.podName}')" ]] ||
+	[[ "$(kubectl get environment "$ENV_NAME" -o jsonpath='{.status.conditions[?(@.type=="Ready")].reason}')" != "InvalidConfiguration" ]] ||
+	[[ "$(kubectl get pvc "$ISOLATION_PVC_NAME" -o jsonpath='{.metadata.uid}')" != "$ISOLATION_PVC_UID" ]] ||
+	[[ "$(kubectl get networkpolicy "$ISOLATION_NETWORK_POLICY" -o jsonpath='{.metadata.uid}')" != "$ISOLATION_NETWORK_POLICY_UID" ]] ||
+	! jq -e '
+    .status.isolationState == "Blocked" and
+    (.status.isolationRevision | test("^[a-f0-9]{64}$")) and
+    .status.policyConfigMap.uid != "" and .status.runtimeClass.uid != "" and
+    .status.storageClass.uid != "" and .status.csiDriver.uid != "" and
+    any(.status.conditions[]; .type == "IsolationReady" and .status == "False" and .reason == "RuntimeActivationUnavailable")
+  ' <<<"$ISOLATION_STATUS" >/dev/null; then
+	echo "FAIL: restricted Installation did not fence exactly without replacement or retain durable children" >&2
+	kubectl -n "$SYSTEM_NAMESPACE" get installation "$INSTALLATION_NAME" -o yaml >&2 || true
+	kubectl get environment "$ENV_NAME" -o yaml >&2 || true
+	kubectl get pods,pvc,networkpolicy >&2 || true
+	exit 1
+fi
+
+# Restore the explicit development selection for KEEP_CLUSTER and the final
+# sandboxd log check. A replacement is permitted only after this intent change.
+kubectl -n "$SYSTEM_NAMESPACE" patch installation "$INSTALLATION_NAME" --type=merge \
+	-p '{"spec":{"isolation":{"mode":"UnrestrictedDevelopment","policyConfigMapName":null,"runtimeClass":null,"storageClass":null}}}' >/dev/null
+kubectl -n "$SYSTEM_NAMESPACE" wait --for=jsonpath='{.status.isolationState}'=Active installation/"$INSTALLATION_NAME" --timeout=2m
+kubectl wait --for=jsonpath='{.status.phase}'=Ready environment/"$ENV_NAME" --timeout=3m
+POD_NAME=$(kubectl get environment "$ENV_NAME" -o jsonpath='{.status.podName}')
 
 echo "==> sandboxd logs from the environment pod"
 kubectl logs "$POD_NAME" -c environment | head -3

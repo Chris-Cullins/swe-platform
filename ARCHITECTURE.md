@@ -76,7 +76,7 @@ All current CRDs are namespaced:
 
 | Resource | Current contract |
 |---|---|
-| `Installation` | System-namespace identity whose immutable Kubernetes UID remains the stable identity used by namespace claims, catalog sources, managed Template copies, and baseline resources. An optional, non-defaulted installation-wide `isolation` selection admits only explicit unrestricted development or the future Calico v3.32.1 restricted contract; omission exists only for staged legacy migration. Reserved status has bounded `LegacyUnclassified`, `Fencing`, `Blocked`, or `Active` vocabulary plus exact non-secret observed selection/object identities, a derived isolation revision, and conditions. No controller reads the selection or writes this status yet. |
+| `Installation` | System-namespace identity whose immutable Kubernetes UID remains the stable identity used by namespace claims, catalog sources, managed Template copies, and baseline resources. An optional, non-defaulted installation-wide `isolation` selection admits only explicit unrestricted development or the future Calico v3.32.1 restricted contract; omission exists only for staged legacy migration. The isolation controller publishes bounded `LegacyUnclassified`, `Fencing`, `Blocked`, or `Active` status, fixed conditions, exact non-secret observed object identities, and a canonical revision. Unrestricted development can be active but is explicitly non-production. Restricted selection fences every Environment and warm pool, then remains blocked because runtime activation is not implemented. |
 | `Project` | One repository URL (represented as a one-item list), a same-namespace default Template reference, changes-workflow metadata, and up to 64 exact lowercase-ASCII FQDN egress selections. The selection contract is admitted, but a non-empty selection remains rejected when an Environment uses the Project because runtime egress enforcement is not enabled. |
 | `EnvironmentTemplate` | Pod image, size/resources, disk, runtime class, idle timeout, warm-pool minimum, and backend. Admission currently permits only the `pod` backend. Chart-owned system-namespace objects are inert catalog sources; execution accepts only installation-managed same-namespace copies bound to exact Installation, source, and Project identities. |
 | `Environment` | Immutable Template selection, an immutable optional backend override, one-way empty-to-nonempty Project binding, explicit hold policy, bounded wake/suspend/activity intents, and up to 32 API- or Repository-owned service declarations. New declarations have an immutable-per-incarnation random `instanceID`; upgrade-retained legacy declarations may omit it, receive no portal route, and can add it only with a higher revision. Omitted legacy service ownership defaults only to `API` and is immutable thereafter. Controller-owned status includes the immutable resolved `provisioning` snapshot, readiness, lifecycle/execution, claim, observations, activity, and nested backend-neutral recovery state; recovery records attempts, exhaustion, the exact failed execution generation being accounted, and the next allowed attempt time, while generation zero means no recovery identity. The gateway owns bounded `portalRoutes` and monotonic `nextPortalRouteGeneration`; inactive routes are denial tombstones preserved by other status writers. |
@@ -87,9 +87,10 @@ The current ownership/reference shape is:
 
 `Installation.spec.isolation` is installation-administrator authority; tenant resources cannot
 select or weaken it. The chart renders it only from explicit bounded values and otherwise keeps
-the legacy field omitted. `Installation.status` remains controller-owned but has no writer in the
-current inert slice. Neither configuration nor reserved status changes the Installation UID or
-the Namespace-claim authority derived from it.
+the legacy field omitted. One system-scoped controller owns `Installation.status`; it resolves
+restricted dependencies through uncached reads and publishes only bounded non-secret observations.
+Neither configuration nor status changes the Installation UID or the Namespace-claim authority
+derived from it.
 
 Environment status is controller-owned: the operator and its Run controller retain status
 subresource authority. The control plane has update-only `environments/status` authority for
@@ -732,11 +733,11 @@ durable across replacement, but open streams disconnect and clients must reconne
 multi-replica or control-plane HA claim is made.
 
 - `values-kind.yaml` deliberately opts into trusted-admin for isolated local development,
-  explicitly selects the inert `UnrestrictedDevelopment` isolation contract, and uses local
+  explicitly selects active but non-production `UnrestrictedDevelopment`, and uses local
   `:dev` images and explicit memory-backed insecure HTTP sessions. Primary
   acceptance overrides it to scoped mode with distinct system and Project namespaces.
 - `values-argocd.yaml` deliberately opts into trusted-admin in the isolated Argo mirror,
-  explicitly selects the inert `UnrestrictedDevelopment` isolation contract, and uses mutable
+  explicitly selects active but non-production `UnrestrictedDevelopment`, and uses mutable
   `:latest` images and explicit memory-backed sessions. Base/default values also
   select memory for development.
 - `values-k3s.yaml`, `values-gke.yaml`, and `values-eks.yaml` use coordinated immutable chart
@@ -787,9 +788,9 @@ Hold, Requested suspension, stale association/declaration/route/execution, and u
 the same 404 as an unknown locator. Idle requests wake and await a fresh execution. The proxy
 strips credentials, session cookies, and hop-by-hop headers and supports WebSocket upgrade.
 
-### Approved installation isolation selection
+### Implemented installation isolation selection lifecycle
 
-The first inert issue #10 contract adds one Installation-owned selection rather than an
+The issue #10 contract adds one Installation-owned selection rather than an
 `IsolationProfile` CRD. `spec.isolation` has no default and is optional only for staged legacy
 migration. Its exact modes are `UnrestrictedDevelopment` and
 `RestrictedProductionCalicoV3_32_1`. Development mode has no restricted inputs. Restricted mode
@@ -797,21 +798,42 @@ references the existing immutable #68 policy ConfigMap and states exact RuntimeC
 name/handler and StorageClass name/CSI-driver expectations. The ConfigMap remains sole owner of
 network mode, Calico profile/CIDRs/resolvers, ceiling/baseline, proxy image, and TLS reference.
 
-The inert `internal/isolation` helper validates that cross-field contract and derives a
+The `internal/isolation` helper validates that cross-field contract and derives a
 domain-separated SHA-256 revision from the Installation UID, canonical selection, fixed API and
 revision domains, and exact policy ConfigMap, RuntimeClass, StorageClass, and CSIDriver UIDs plus
 canonical policy content hash and observed handler/driver. There is no administrator-entered
-security revision. No reconciler calls the helper, looks up those objects, changes Environment/Run/warm
-pool behavior, or writes Installation status. In particular,
+security revision. The Installation isolation controller uses uncached reads to resolve the exact
+immutable canonical policy ConfigMap, RuntimeClass handler/UID, StorageClass provisioner/UID, and
+CSIDriver UID. It publishes the exact selection and validated identities plus the derived revision;
+missing, replaced, deleting, malformed, mismatched, or uncertain authority never permits execution.
+For a new or changed restricted selection it durably publishes unresolved `Fencing` before the
+first dependency read. From established `Blocked`, any resolved identity/revision change or loss
+also publishes `Fencing` before the replacement or empty authority can return to `Blocked`.
+In particular,
 `RestrictedProductionCalicoV3_32_1` is admitted configuration, not an active or production-ready
 profile. Activation still requires the complete #68 currentness, identity, proxy, path-forcing,
 and Calico v3.32.1 enforcement path; generic restricted profiles remain unsupported.
 
-The reserved Installation status state vocabulary is `LegacyUnclassified`, `Fencing`,
-`Blocked`, and `Active`, with exact non-secret observed selection/object identities, derived
-revision, and conditions. It is schema only. A later compatibility release must explicitly
-activate selection and fence installation-wide execution; restricted mode must never adopt a
-live legacy execution. Installation UID remains tenancy identity throughout migration.
+The Installation status state vocabulary is `LegacyUnclassified`, `Fencing`, `Blocked`, and
+`Active`. Omitted selection remains legacy-unclassified. Explicit unrestricted development can
+become active, while `ProductionReady=False` makes its non-production contract explicit.
+Restricted selection first publishes `Fencing`; an Environment outer gate ahead of Project,
+Template, and provisioning dependencies withdraws readiness and reuses exact-owned Pod-then-
+credential invalid-configuration teardown while retaining PVCs, transcripts, and ingress policy.
+The warm-pool controller reports no ready capacity and neither replenishes nor cleans up warm
+Environment objects during this installation fence; each retained Environment's outer gate fences
+its execution. This applies before Project lookup, including empty
+allowlists and Project-less Environments. Only after every configured-scope Environment has no
+published connection or exact-owned Pod/credential does Installation status settle at `Blocked`
+with `IsolationReady=False/RuntimeActivationUnavailable`; restricted mode never becomes `Active`.
+Trusted-admin proof lists cluster-wide but uncached-classifies each Environment Namespace by exact
+Installation namespace/name/UID: exact foreign claims are ignored, while this Installation's or
+uncertain ownership fails closed. Switching a non-legacy lifecycle to unrestricted development (or
+back to omission) likewise publishes `Fencing` and proves its exact-owned execution absent before
+`Active` (or `LegacyUnclassified`) can reopen execution. Initial and `LegacyUnclassified` adoption
+of unrestricted development remains behavior-identical and does not tear down legacy execution.
+Dependency identity and revision publication are observations, not runtime authority. Installation
+UID remains tenancy identity throughout migration.
 
 ### Approved fail-closed proxy-only egress contract
 

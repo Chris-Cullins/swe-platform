@@ -69,6 +69,19 @@ func (r *EnvironmentReconciler) runtimeClassReferenceRequests(ctx context.Contex
 	return requests
 }
 
+func (r *EnvironmentReconciler) installationIsolationRequests(ctx context.Context, _ client.Object) []reconcile.Request {
+	var environments platformv1alpha1.EnvironmentList
+	if err := r.List(ctx, &environments); err != nil {
+		log.FromContext(ctx).Error(err, "list environments for Installation isolation")
+		return nil
+	}
+	requests := make([]reconcile.Request, 0, len(environments.Items))
+	for i := range environments.Items {
+		requests = append(requests, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(&environments.Items[i])})
+	}
+	return requests
+}
+
 // SetupWithManager registers the controller with the manager.
 func (r *EnvironmentReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	r.APIReader = mgr.GetAPIReader()
@@ -107,5 +120,6 @@ func (r *EnvironmentReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Watches(&nodev1.RuntimeClass{}, handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, object client.Object) []reconcile.Request {
 			return r.runtimeClassReferenceRequests(ctx, object.GetName())
 		})).
+		Watches(&platformv1alpha1.Installation{}, handler.EnqueueRequestsFromMapFunc(r.installationIsolationRequests)).
 		Complete(r)
 }

@@ -82,6 +82,7 @@ var environmentReconcilePhases = []environmentReconcilePhase{
 	{name: "lifecycle", run: reconcileEnvironmentLifecycleGate},
 	{name: "legacy-provisioning-migration", run: reconcileEnvironmentLegacyProvisioningMigrationGate},
 	{name: "provisioning-fence", run: reconcileEnvironmentProvisioningFenceGate},
+	{name: "installation-isolation", run: reconcileEnvironmentInstallationIsolationGate},
 	{name: "project-resolution", run: reconcileEnvironmentProjectResolutionGate},
 	{name: "suspension", run: reconcileEnvironmentSuspensionGate},
 	{name: "project-validation", run: reconcileEnvironmentProjectValidationGate},
@@ -232,6 +233,27 @@ func reconcileEnvironmentLegacyProvisioningMigrationGate(r *EnvironmentReconcile
 		return phaseHandled(result, err)
 	}
 	return phaseContinue()
+}
+
+func reconcileEnvironmentInstallationIsolationGate(r *EnvironmentReconciler, ctx context.Context, state *environmentReconcileState) environmentPhaseOutcome {
+	identity, configured := installationIdentity(r.Scope)
+	if !configured {
+		return phaseContinue()
+	}
+	allowed, isolationErr := installationExecutionAllowed(ctx, r.apiReader(), identity)
+	if allowed {
+		return phaseContinue()
+	}
+	result, fenceErr := r.reconcileInvalidProvisioningConfiguration(ctx, &state.env, installationIsolationBlockedMessage)
+	if fenceErr != nil {
+		return phaseHandled(result, fenceErr)
+	}
+	// Progress readiness withdrawal and ordered Pod/credential teardown before
+	// surfacing API uncertainty through controller-runtime's retry path.
+	if isolationErr != nil && result == (ctrl.Result{}) {
+		return phaseHandled(ctrl.Result{}, isolationErr)
+	}
+	return phaseHandled(result, nil)
 }
 
 func reconcileEnvironmentProjectResolutionGate(r *EnvironmentReconciler, ctx context.Context, state *environmentReconcileState) environmentPhaseOutcome {
