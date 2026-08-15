@@ -441,14 +441,10 @@ if [ "${12}" = 'fake Codex failure smoke test' ]; then
 fi
 test "${12}" = 'fake Codex lifecycle smoke test'
 test "${CODEX_API_KEY:-}" = '!!SWE-E2E-CODEX-API-KEY-DO-NOT-USE!!'
-printf '%s\n' codex-credential-present
-attempt=0
-while [ "$attempt" -lt 180 ]; do
-	if [ -f /workspace/codex-credential-checks-complete ]; then break; fi
-	attempt=$((attempt + 1))
+printf '%s\n' '{"type":"item.completed","message":"codex-credential-present"}'
+while [ ! -f /workspace/codex-credential-checks-complete ]; do
 	sleep 1
 done
-test -f /workspace/codex-credential-checks-complete
 printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":1,"output_tokens":2}}'
 EOF
 chmod 0755 "$FAKE_ENV_CONTEXT/codex"
@@ -3214,10 +3210,11 @@ if ! jq -e '.marker == "codex-credential-check" and .forbidden == []' <<<"${CODE
 fi
 printf '%s\n' "$CODEX_SERVICE_BODY" > /tmp/swe-platform-codex-service.json
 
-printf 'if [ -n "${CODEX_API_KEY+x}" ]; then printf codex-terminal-credential-present; else printf codex-terminal-credential-absent; fi; exit\n' | \
+printf 'if [ -n "${CODEX_API_KEY+x}" ]; then printf "codex-terminal-%%s" credential-present; else printf "codex-terminal-%%s" scope-ok; fi; exit\n' | \
 	SWE_CONTROL_PLANE_URL=http://127.0.0.1:18080 SWE_CONTROL_PLANE_TOKEN="$TERMINAL_TOKEN" \
 	bin/swe --namespace "$PROJECT_NAMESPACE" attach "$ENV_NAME" --environment-uid "$ENV_UID" > /tmp/swe-platform-codex-terminal.out
-if ! grep -Fq codex-terminal-credential-absent /tmp/swe-platform-codex-terminal.out; then
+if ! grep -Fq codex-terminal-scope-ok /tmp/swe-platform-codex-terminal.out || \
+	grep -Fq codex-terminal-credential-present /tmp/swe-platform-codex-terminal.out; then
 	echo "FAIL: shared terminal inherited CODEX_API_KEY"
 	cat /tmp/swe-platform-codex-terminal.out
 	exit 1

@@ -195,7 +195,7 @@ runs both via `make` targets:
   the local stdio MCP tool list plus UID-fenced bounded transcript read,
   actual-listener service observation through healthy/unhealthy/restart/pause/resume/removal
   transitions with declaration and fresh-execution correlation and no URL,
-  declared-service portal allocation/proxy authorization and lifecycle fencing, process-scoped fake Claude and Amp API-key delivery without ambient
+  declared-service portal allocation/proxy authorization and lifecycle fencing, process-scoped fake Claude, Amp, and Codex API-key delivery without ambient
   setup/resume/sandboxd exposure, and Secret-only sandboxd process/service-observation/portal
   capability tokens without Environment pod projection.
   Runs in CI as the `e2e` workflow on relevant PRs and via `workflow_dispatch`.
