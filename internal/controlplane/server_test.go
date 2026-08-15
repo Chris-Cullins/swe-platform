@@ -433,6 +433,48 @@ func TestTranscriptAppendIsIdempotent(t *testing.T) {
 	}
 }
 
+func TestUsageLookingTranscriptRemainsOpaqueAndDoesNotUpdateRunUsage(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := platformv1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	run := &platformv1alpha1.Run{ObjectMeta: metav1.ObjectMeta{Namespace: "project-1", Name: "run-1", UID: "run-1-uid"}}
+	client := fake.NewClientBuilder().WithScheme(scheme).WithObjects(run).Build()
+	store := NewMemoryTranscriptStore(MemoryTranscriptStoreOptions{})
+	api := NewServer(nil, ServerOptions{Access: &fakeAccess{}, Runs: KubernetesRunResolver{Client: client}, TranscriptStore: store})
+	raw := []byte(`{ "usage" : {"input_tokens":101,"output_tokens":37}, "cost_usd" : 0.42 }`)
+	body := append([]byte(`{"source":"adapter","idempotencyKey":"usage-like","type":"adapter.process-output","data":`), raw...)
+	body = append(body, '}')
+	request := httptest.NewRequest(http.MethodPost, transcriptURL, bytes.NewReader(body))
+	request.Header.Set("Authorization", "Bearer producer")
+	request.Header.Set(RunUIDHeader, "run-1-uid")
+	response := httptest.NewRecorder()
+	api.Handler().ServeHTTP(response, request)
+	if response.Code != http.StatusCreated {
+		t.Fatalf("append status = %d, want %d: %s", response.Code, http.StatusCreated, response.Body.String())
+	}
+
+	identity := RunIdentity{Namespace: "project-1", NamespaceUID: testNamespaceUID("project-1"), UID: "run-1-uid"}
+	subscription, err := store.Subscribe(context.Background(), identity, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer subscription.Unsubscribe()
+	if len(subscription.History) != 1 {
+		t.Fatalf("stored events = %d, want 1", len(subscription.History))
+	}
+	if !bytes.Equal(subscription.History[0].Data, raw) {
+		t.Fatalf("stored opaque data = %q, want exact %q", subscription.History[0].Data, raw)
+	}
+	var persisted platformv1alpha1.Run
+	if err := client.Get(context.Background(), types.NamespacedName{Namespace: run.Namespace, Name: run.Name}, &persisted); err != nil {
+		t.Fatal(err)
+	}
+	if persisted.Status.Usage != (platformv1alpha1.RunUsage{}) {
+		t.Fatalf("Run status usage was projected from transcript: %#v", persisted.Status.Usage)
+	}
+}
+
 func TestTranscriptLegacyAppendRemainsNonIdempotent(t *testing.T) {
 	api := newTestServer(&fakeAccess{})
 	body := `{"type":"output","data":{"text":"legacy"}}`

@@ -242,6 +242,24 @@ func TestObservationMessagesExcludeAgentControlledDetails(t *testing.T) {
 	}
 }
 
+func TestUsageLookingOutputRemainsOpaque(t *testing.T) {
+	exit0 := int32(0)
+	raw := []byte(`{"type":"agent_end","messages":[{"role":"assistant","stopReason":"stop","usage":{"input":41,"output":13},"cost":0.03}]}` + "\n")
+	client := &processClient{process: &sandboxdv1.Process{State: sandboxdv1.ProcessState_PROCESS_STATE_EXITED, ExitCode: &exit0, ExecutionId: "execution"}, stdout: raw}
+	var event agent.AdapterEvent
+	sandbox := processSandbox(client, "epoch")
+	sandbox.EmitEvent = func(_ context.Context, got agent.AdapterEvent) error { event = got; return nil }
+
+	observation, message, err := (&Adapter{}).Observe(context.Background(), agent.AdapterTask{ID: "run"}, sandbox)
+	if err != nil || observation != agent.AdapterObservationSucceeded || message != observation.StatusMessage() {
+		t.Fatalf("Observe = (%q, %q, %v)", observation, message, err)
+	}
+	var output outputEvent
+	if err := json.Unmarshal(event.Data, &output); err != nil || event.Source != "pi" || event.Type != "pi.process-output" || !bytes.Equal(output.Data, raw) {
+		t.Fatalf("opaque output event = %#v, output = %#v, error = %v", event, output, err)
+	}
+}
+
 func TestTerminalValidationFailsOnRetainedOutputGap(t *testing.T) {
 	exit0 := int32(0)
 	client := &processClient{process: &sandboxdv1.Process{State: sandboxdv1.ProcessState_PROCESS_STATE_EXITED, ExecutionId: "e", ExitCode: &exit0}, stdout: []byte(`{"type":"agent_end","messages":[]}`), retainedFrom: 41}

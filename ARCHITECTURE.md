@@ -346,6 +346,12 @@ other agent-controlled bytes remain only in adapter-owned opaque transcript even
 adapter rejection and cancellation conditions likewise use fixed platform messages. Reconcile
 also normalizes legacy adapter observation/rejection messages before terminal or deletion cleanup.
 
+`Run.status.usage` is currently an unwritten compatibility placeholder. Lifecycle wall duration
+is derivable as `FinishedAt - StartedAt`; it includes `Paused` and `NeedsInput` intervals and is
+unavailable for Runs that were never accepted because `StartedAt` remains absent. Usage-, token-,
+or cost-looking provider data in transcript events remains adapter-owned opaque bytes. The
+platform does not normalize or project it into Run status, and it is not accounting truth.
+
 One Environment controller owns suspension transitions. Explicit user/admin policy is a
 revisioned `spec.lifecycle.hold`; ordinary callers publish UID- and hold-revision-fenced wake,
 suspend, or source-keyed activity intents. The controller owns observed suspension state.

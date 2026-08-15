@@ -328,6 +328,24 @@ func TestObservationMessagesExcludeAgentControlledDetails(t *testing.T) {
 	}
 }
 
+func TestUsageLookingOutputRemainsOpaque(t *testing.T) {
+	exit0 := int32(0)
+	raw := []byte(`{"type":"result","subtype":"success","is_error":false,"usage":{"inputTokens":23,"outputTokens":8},"cost":{"amount":0.01}}` + "\n")
+	client := &fakeClient{process: &sandboxdv1.Process{State: sandboxdv1.ProcessState_PROCESS_STATE_EXITED, ExitCode: &exit0, ExecutionId: "execution"}, stdout: raw}
+	var event agent.AdapterEvent
+	sandbox := testSandbox(client)
+	sandbox.EmitEvent = func(_ context.Context, got agent.AdapterEvent) error { event = got; return nil }
+
+	observation, message, err := (&Adapter{}).Observe(context.Background(), agent.AdapterTask{ID: "run"}, sandbox)
+	if err != nil || observation != agent.AdapterObservationSucceeded || message != observation.StatusMessage() {
+		t.Fatalf("Observe = (%q, %q, %v)", observation, message, err)
+	}
+	var output outputEvent
+	if err := json.Unmarshal(event.Data, &output); err != nil || event.Source != "amp" || event.Type != "amp.process-output" || !bytes.Equal(output.Data, raw) {
+		t.Fatalf("opaque output event = %#v, output = %#v, error = %v", event, output, err)
+	}
+}
+
 func TestCancellationAndBoundedIdempotentOutput(t *testing.T) {
 	client := &fakeClient{process: &sandboxdv1.Process{State: sandboxdv1.ProcessState_PROCESS_STATE_RUNNING, ExecutionId: "execution"}, stdout: []byte("stdout"), stderr: []byte("stderr")}
 	var events []agent.AdapterEvent

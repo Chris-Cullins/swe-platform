@@ -2,6 +2,7 @@ package claudecode
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"reflect"
 	"strings"
@@ -279,6 +280,24 @@ func TestObservationMessagesExcludeAgentControlledDetails(t *testing.T) {
 				t.Fatalf("Observe() = (%q, %q, %v), want fixed %q message", observation, message, err, test.want)
 			}
 		})
+	}
+}
+
+func TestUsageLookingOutputRemainsOpaque(t *testing.T) {
+	exit0 := int32(0)
+	raw := []byte(`{"type":"result","subtype":"success","is_error":false,"usage":{"input_tokens":17,"output_tokens":5},"total_cost_usd":0.0042}` + "\n")
+	client := &fakeProcessClient{process: &sandboxdv1.Process{State: sandboxdv1.ProcessState_PROCESS_STATE_EXITED, ExitCode: &exit0, ExecutionId: "execution"}, stdout: raw}
+	var event agent.AdapterEvent
+	sandbox := sandboxFor(client)
+	sandbox.EmitEvent = func(_ context.Context, got agent.AdapterEvent) error { event = got; return nil }
+
+	observation, message, err := (&Adapter{}).Observe(context.Background(), agent.AdapterTask{ID: "run"}, sandbox)
+	if err != nil || observation != agent.AdapterObservationSucceeded || message != observation.StatusMessage() {
+		t.Fatalf("Observe() = (%q, %q, %v)", observation, message, err)
+	}
+	var output outputEvent
+	if err := json.Unmarshal(event.Data, &output); err != nil || event.Source != "claude-code" || event.Type != "claude-code.process-output" || !reflect.DeepEqual(output.Data, raw) {
+		t.Fatalf("opaque output event = %#v, output = %#v, error = %v", event, output, err)
 	}
 }
 
