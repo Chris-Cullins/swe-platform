@@ -2633,9 +2633,17 @@ fi
 printf '%s' $'version: 1\nservices:\n  repository-web:\n    command: ["node", ".swe/service.js", "v1"]\n  manual-api:\n    command: ["node", ".swe/service.js", "collision"]\n' |
 	kubectl exec -i "$POD_NAME" -- sh -c 'cat > /workspace/.swe/services.yaml'
 sleep 25
+for _ in $(seq 1 30); do
+	if [[ "$(kubectl get environment "$ENV_NAME" -o jsonpath='{.spec.services[?(@.name=="manual-api")].source}')" == "API" &&
+		"$(kubectl get environment "$ENV_NAME" -o jsonpath='{.spec.services[?(@.name=="repository-web")].revision}')" == "1" ]]; then
+		break
+	fi
+	sleep 1
+done
 if [[ "$(kubectl get environment "$ENV_NAME" -o jsonpath='{.spec.services[?(@.name=="manual-api")].source}')" != "API" ||
 	"$(kubectl get environment "$ENV_NAME" -o jsonpath='{.spec.services[?(@.name=="repository-web")].revision}')" != "1" ]]; then
 	echo "FAIL: repository/API same-name collision did not preserve canonical intent"
+	kubectl get environment "$ENV_NAME" -o yaml
 	exit 1
 fi
 printf '%s' $'version: 1\nservices:\n  repository-web:\n    command: ["node", ".swe/service.js", "v1"]\n' |
