@@ -787,8 +787,10 @@ This permits producer credentials to be restricted to one Run using an RBAC Role
 authoritative only after RBAC authorizes that exact namespaced identity. In scoped mode,
 authorization happens first and is then supplemented by the restart-bound
 `tenancy.namespaces` allowlist and an uncached proof of the exact active Installation UID,
-Namespace UID, Namespace annotations, sole Project name/UID, and lifecycle. TokenReview/SAR is
-never replaced by labels or claims. Unknown Runs are
+Namespace UID, Namespace annotations, sole Project name/UID, and lifecycle. The sole lifecycle
+exception is the explicit-bearer, exact-name deleting-Run transcript cleanup above during exact
+offboarding fencing; it does not admit sessions or any other operation. TokenReview/SAR is never
+replaced by labels or claims. Unknown Runs are
 rejected before transcript state is allocated; every transcript read and append additionally
 requires the exact `SWE-Run-UID` header so a recreated Run never receives stale events or
 readers. An already-open stream is not continuously reauthorized or closed when its Run is
