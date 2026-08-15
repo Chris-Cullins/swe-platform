@@ -62,6 +62,27 @@ func (r *WarmPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 			return ctrl.Result{}, err
 		}
 	}
+	if identity, configured := installationIdentity(r.Scope); configured {
+		allowed, isolationErr := installationExecutionAllowed(ctx, r.reader(), identity)
+		if !allowed {
+			if tmpl.Status.WarmPoolReady != 0 {
+				if current, err := r.templateCurrent(ctx, &tmpl); err != nil {
+					return ctrl.Result{}, err
+				} else if !current {
+					return ctrl.Result{Requeue: true}, nil
+				}
+				before := tmpl.DeepCopy()
+				tmpl.Status.WarmPoolReady = 0
+				if err := r.Status().Patch(ctx, &tmpl, client.MergeFromWithOptions(before, client.MergeFromWithOptimisticLock{})); apierrors.IsConflict(err) || apierrors.IsNotFound(err) {
+					return ctrl.Result{Requeue: true}, nil
+				} else if err != nil {
+					return ctrl.Result{}, fmt.Errorf("clear isolation-blocked warm pool status: %w", err)
+				}
+				return ctrl.Result{Requeue: true}, nil
+			}
+			return ctrl.Result{}, isolationErr
+		}
+	}
 
 	minimum := int32(0)
 	if tmpl.Spec.WarmPool != nil {
@@ -282,19 +303,22 @@ func warmPoolUnusableSince(env *platformv1alpha1.Environment) (time.Time, bool) 
 }
 
 func (r *WarmPoolReconciler) templateCurrent(ctx context.Context, observed *platformv1alpha1.EnvironmentTemplate) (bool, error) {
-	reader := r.APIReader
-	if reader == nil {
-		// Unit tests construct reconcilers without a manager. Production always
-		// installs the uncached API reader in SetupWithManager.
-		reader = r.Client
-	}
 	var current platformv1alpha1.EnvironmentTemplate
-	if err := reader.Get(ctx, client.ObjectKeyFromObject(observed), &current); apierrors.IsNotFound(err) {
+	if err := r.reader().Get(ctx, client.ObjectKeyFromObject(observed), &current); apierrors.IsNotFound(err) {
 		return false, nil
 	} else if err != nil {
 		return false, fmt.Errorf("revalidate environment template: %w", err)
 	}
 	return current.UID == observed.UID && current.Generation == observed.Generation && current.DeletionTimestamp.IsZero(), nil
+}
+
+func (r *WarmPoolReconciler) reader() client.Reader {
+	if r.APIReader != nil {
+		return r.APIReader
+	}
+	// Unit tests construct reconcilers without a manager. Production always
+	// installs the uncached API reader in SetupWithManager.
+	return r.Client
 }
 
 func warmPoolTemplateRequests(object client.Object) []reconcile.Request {
@@ -315,6 +339,18 @@ func warmPoolTemplateRequests(object client.Object) []reconcile.Request {
 	return requests
 }
 
+func (r *WarmPoolReconciler) installationTemplateRequests(ctx context.Context, _ client.Object) []reconcile.Request {
+	var templates platformv1alpha1.EnvironmentTemplateList
+	if err := r.List(ctx, &templates); err != nil {
+		return nil
+	}
+	requests := make([]reconcile.Request, 0, len(templates.Items))
+	for i := range templates.Items {
+		requests = append(requests, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(&templates.Items[i])})
+	}
+	return requests
+}
+
 // SetupWithManager registers the warm-pool controller with the manager.
 func (r *WarmPoolReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	r.APIReader = mgr.GetAPIReader()
@@ -329,6 +365,7 @@ func (r *WarmPoolReconciler) SetupWithManager(mgr ctrl.Manager) error {
 			new, ok2 := e.ObjectNew.(*platformv1alpha1.Environment)
 			return !ok1 || !ok2 || warmPoolRelevantEnvironmentUpdate(old, new)
 		}})).
+		Watches(&platformv1alpha1.Installation{}, handler.EnqueueRequestsFromMapFunc(r.installationTemplateRequests)).
 		Complete(r)
 }
 

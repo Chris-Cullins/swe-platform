@@ -102,8 +102,8 @@ serviceAccount:
 leaderElection: true
 
 # Optional only for staged legacy migration and deliberately non-defaulted.
-# RestrictedProductionCalicoV3_32_1 is an inert API contract in this release;
-# selecting it does not activate an isolation runtime.
+# RestrictedProductionCalicoV3_32_1 fences execution and remains Blocked in
+# this release; selecting it does not activate an isolation runtime.
 installation:
   isolation:
     mode: ""

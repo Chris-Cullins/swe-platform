@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -19,6 +20,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
 	platformv1alpha1 "github.com/Chris-Cullins/swe-platform/api/v1alpha1"
+	"github.com/Chris-Cullins/swe-platform/internal/tenancy"
 )
 
 func TestWarmPoolReconcileCreatesMinimum(t *testing.T) {
@@ -946,6 +948,66 @@ func TestWarmPoolTemplateReplacementAfterMemberCreateDeletesOldOwnerMember(t *te
 	}
 	if len(members.Items) != 0 {
 		t.Fatalf("old-owner member survived post-Create replacement: %#v", members.Items)
+	}
+}
+
+func TestRestrictedInstallationStopsWarmReplenishmentAndCleanup(t *testing.T) {
+	scheme := isolationTestScheme(t)
+	installation := &platformv1alpha1.Installation{
+		ObjectMeta: metav1.ObjectMeta{Name: "main", Namespace: "system", UID: "installation-uid"},
+		Spec:       platformv1alpha1.InstallationSpec{Isolation: restrictedIsolationSelection()},
+	}
+	project := &platformv1alpha1.Project{ObjectMeta: metav1.ObjectMeta{Name: "project", Namespace: "default", UID: "project-uid"}}
+	namespace := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "default", UID: "namespace-uid", Annotations: map[string]string{
+		tenancy.InstallationNamespaceAnnotation: installation.Namespace,
+		tenancy.InstallationNameAnnotation:      installation.Name,
+		tenancy.InstallationUIDAnnotation:       string(installation.UID),
+		tenancy.ProjectNameAnnotation:           project.Name,
+		tenancy.ProjectUIDAnnotation:            string(project.UID),
+		tenancy.LifecycleAnnotation:             string(tenancy.LifecycleActive),
+	}}}
+	template := &platformv1alpha1.EnvironmentTemplate{
+		ObjectMeta: metav1.ObjectMeta{Name: "small", Namespace: namespace.Name, UID: "template-uid", Generation: 1, Annotations: map[string]string{
+			tenancy.InstallationNamespaceAnnotation: installation.Namespace,
+			tenancy.InstallationNameAnnotation:      installation.Name,
+			tenancy.InstallationUIDAnnotation:       string(installation.UID),
+			tenancy.ProjectNameAnnotation:           project.Name,
+			tenancy.ProjectUIDAnnotation:            string(project.UID),
+			tenancy.CatalogNameAnnotation:           "small",
+			tenancy.CatalogRevisionAnnotation:       "revision-1",
+			tenancy.CatalogSourceUIDAnnotation:      "source-uid",
+		}},
+		Spec:   platformv1alpha1.EnvironmentTemplateSpec{WarmPool: &platformv1alpha1.WarmPoolSpec{Min: 1}},
+		Status: platformv1alpha1.EnvironmentTemplateStatus{WarmPoolReady: 1},
+	}
+	member := &platformv1alpha1.Environment{
+		ObjectMeta: metav1.ObjectMeta{Name: "warm-small", Namespace: namespace.Name, UID: "environment-uid", Labels: map[string]string{warmPoolLabel: template.Name}},
+		Spec:       platformv1alpha1.EnvironmentSpec{TemplateRef: template.Name},
+		Status:     platformv1alpha1.EnvironmentStatus{ObservedGeneration: 1, Phase: platformv1alpha1.EnvironmentPhaseFailed},
+	}
+	setWarmPoolOwner(t, scheme, template, member)
+	kubeClient := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(template, member).WithObjects(installation, namespace, project, template, member).Build()
+	identity := tenancy.InstallationIdentity{Key: client.ObjectKeyFromObject(installation), UID: installation.UID}
+	verifier := &tenancy.Verifier{Reader: kubeClient, Installation: identity, Mode: tenancy.ModeScoped}
+	reconciler := &WarmPoolReconciler{Client: kubeClient, APIReader: kubeClient, Scheme: scheme, Scope: &tenancy.ReconcileScope{Verifier: verifier}}
+
+	if result, err := reconciler.Reconcile(context.Background(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(template)}); err != nil || !result.Requeue {
+		t.Fatalf("Reconcile() = (%#v, %v)", result, err)
+	}
+	var updatedTemplate platformv1alpha1.EnvironmentTemplate
+	if err := kubeClient.Get(context.Background(), client.ObjectKeyFromObject(template), &updatedTemplate); err != nil {
+		t.Fatal(err)
+	}
+	var retained platformv1alpha1.Environment
+	if err := kubeClient.Get(context.Background(), client.ObjectKeyFromObject(member), &retained); err != nil {
+		t.Fatal("restricted isolation deleted an existing warm Environment")
+	}
+	var members platformv1alpha1.EnvironmentList
+	if err := kubeClient.List(context.Background(), &members, client.InNamespace(namespace.Name), client.MatchingLabels{warmPoolLabel: template.Name}); err != nil {
+		t.Fatal(err)
+	}
+	if updatedTemplate.Status.WarmPoolReady != 0 || len(members.Items) != 1 || retained.Annotations[warmPoolCleanupAnnotation] != "" {
+		t.Fatalf("restricted warm pool status=%d members=%d retained=%#v", updatedTemplate.Status.WarmPoolReady, len(members.Items), retained)
 	}
 }
 

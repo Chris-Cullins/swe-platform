@@ -120,19 +120,7 @@ func main() {
 		setupLog.Error(err, "validate configured Project namespaces")
 		os.Exit(1)
 	}
-	cacheOptions := cache.Options{}
-	if mode == tenancy.ModeScoped {
-		cacheOptions.DefaultNamespaces = make(map[string]cache.Config, len(tenancyNamespaces))
-		for _, namespace := range tenancyNamespaces {
-			cacheOptions.DefaultNamespaces[namespace] = cache.Config{}
-		}
-		// An initial scoped install has no Project namespaces until onboarding.
-		// Keep its otherwise-unused cache restricted to the system namespace;
-		// no workload controllers are registered below until a claim is listed.
-		if len(cacheOptions.DefaultNamespaces) == 0 {
-			cacheOptions.DefaultNamespaces[installationNamespace] = cache.Config{}
-		}
-	}
+	cacheOptions := operatorCacheOptions(mode, tenancyNamespaces, installationNamespace)
 	mgr, err := ctrl.NewManager(restConfig, ctrl.Options{
 		Scheme: scheme,
 		Cache:  cacheOptions,
@@ -153,6 +141,16 @@ func main() {
 	verifier.Reader = mgr.GetAPIReader()
 	scope := &tenancy.ReconcileScope{Verifier: verifier}
 	guardedClient := tenancy.GuardedClient{Client: mgr.GetClient(), Verifier: verifier}
+	if err := (&controllers.InstallationIsolationReconciler{
+		Client:       mgr.GetClient(),
+		APIReader:    mgr.GetAPIReader(),
+		Installation: identity,
+		Mode:         mode,
+		Namespaces:   []string(tenancyNamespaces),
+	}).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "unable to create controller", "controller", "InstallationIsolation")
+		os.Exit(1)
+	}
 	processConnections := sandboxclient.NewProcessConnectionPool(mgr.GetAPIReader())
 	if err := mgr.Add(processConnections); err != nil {
 		setupLog.Error(err, "unable to register sandboxd process connection pool")
@@ -262,6 +260,30 @@ func main() {
 }
 
 type stringListFlag []string
+
+func operatorCacheOptions(mode tenancy.Mode, projectNamespaces []string, installationNamespace string) cache.Options {
+	systemNamespaces := map[string]cache.Config{installationNamespace: {}}
+	options := cache.Options{ByObject: map[client.Object]cache.ByObject{
+		// These watches and their RBAC are intentionally system-namespace-only.
+		&corev1.ConfigMap{}:              {Namespaces: systemNamespaces},
+		&platformv1alpha1.Installation{}: {Namespaces: systemNamespaces},
+	}}
+	if mode != tenancy.ModeScoped {
+		return options
+	}
+	options.DefaultNamespaces = make(map[string]cache.Config, len(projectNamespaces))
+	for _, namespace := range projectNamespaces {
+		options.DefaultNamespaces[namespace] = cache.Config{}
+	}
+	// An initial scoped install has no Project namespaces until onboarding.
+	// Keep its otherwise-unused default cache restricted to the system
+	// namespace; Installation and ConfigMap watches are restricted above even
+	// after explicitly configured Project namespaces replace this default.
+	if len(options.DefaultNamespaces) == 0 {
+		options.DefaultNamespaces[installationNamespace] = cache.Config{}
+	}
+	return options
+}
 
 func (f *stringListFlag) String() string { return strings.Join(*f, ",") }
 

@@ -122,11 +122,28 @@ no default: `UnrestrictedDevelopment` or the future
 `RestrictedProductionCalicoV3_32_1`. Omission is retained only for staged legacy migration.
 Development mode carries no restricted inputs. Restricted mode references the immutable #68
 policy ConfigMap and exact RuntimeClass name/handler and StorageClass name/CSI-driver
-expectations; it does not duplicate the ConfigMap's network policy fields. The schema and inert
-canonical revision helper do not activate, verify, or enforce either mode, and no controller
-writes the reserved Installation isolation status. Installation UID remains namespace-claim
-authority. The local kind and Argo presets explicitly choose unrestricted development; current
-production presets remain legacy-unclassified and make no restricted-isolation claim.
+expectations; it does not duplicate the ConfigMap's network policy fields. A system-scoped
+controller uncached-resolves those exact objects, strictly parses the canonical ConfigMap, derives
+the revision, and publishes bounded non-secret identities and fixed conditions. Omission remains
+`LegacyUnclassified`; explicit unrestricted development may be `Active` but always reports
+`ProductionReady=False`. Restricted selection never becomes active: it enters `Fencing`, blocks
+warm replenishment and every Environment before Project/Template/provisioning dependencies, uses
+the existing readiness-withdrawal and exact Pod-then-credential teardown, and settles at `Blocked`
+with `RuntimeActivationUnavailable` only after execution is absent. API uncertainty and identity,
+handler, or provisioner mismatch fail closed. A new restricted selection publishes unresolved
+`Fencing` before dependency reads; replacement, loss, or uncertainty in established observed
+authority re-enters `Fencing` before returning to `Blocked`. Trusted-admin fence proof ignores only
+Namespaces with a complete exact foreign Installation namespace/name/UID claim; own or uncertain
+ownership fails closed. A non-legacy lifecycle cannot reopen from an unrestricted spec alone:
+current exact `Active` observed selection/revision and generation are required, and transition from
+restricted or invalid status remains in `Fencing` until exact-owned execution absence is proven.
+Only initial or `LegacyUnclassified` adoption bypasses that behavior-identical teardown. PVCs,
+transcripts, and ingress policy are retained.
+This compatibility lifecycle does not activate currentness authorization, proxy identity, a
+forced egress path, Calico enforcement, or any restricted-runtime claim. Installation UID remains
+namespace-claim authority. The local kind and Argo presets explicitly choose unrestricted
+development; current production presets remain legacy-unclassified and make no restricted-
+isolation claim.
 
 Default-deny egress and the per-project egress proxy are not implemented. The admitted v1
 `Project.spec.egressAllowlist` contract is a set of at most 64 exact lowercase ASCII FQDN tenant

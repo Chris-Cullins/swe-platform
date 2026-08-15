@@ -77,8 +77,8 @@ type InstallationSpec struct {
 	Isolation *InstallationIsolationSpec `json:"isolation,omitempty"`
 }
 
-// InstallationIsolationState is bounded controller-owned vocabulary reserved
-// for the staged activation flow. No controller writes it yet.
+// InstallationIsolationState is bounded controller-owned vocabulary for the
+// staged selection lifecycle.
 // +kubebuilder:validation:Enum=LegacyUnclassified;Fencing;Blocked;Active
 type InstallationIsolationState string
 
@@ -87,6 +87,10 @@ const (
 	InstallationIsolationStateFencing            InstallationIsolationState = "Fencing"
 	InstallationIsolationStateBlocked            InstallationIsolationState = "Blocked"
 	InstallationIsolationStateActive             InstallationIsolationState = "Active"
+
+	InstallationConditionIsolationDependenciesResolved = "IsolationDependenciesResolved"
+	InstallationConditionIsolationReady                = "IsolationReady"
+	InstallationConditionProductionReady               = "ProductionReady"
 )
 
 // InstallationRuntimeClassIdentity records an exact non-secret RuntimeClass
@@ -150,8 +154,8 @@ type InstallationPolicyConfigMapIdentity struct {
 	ContentSHA256 string `json:"contentSHA256"`
 }
 
-// InstallationStatus contains bounded non-secret observations reserved for the
-// future installation isolation controller. This slice does not write status.
+// InstallationStatus contains bounded non-secret observations from the
+// installation isolation selection controller.
 type InstallationStatus struct {
 	// +optional
 	IsolationState InstallationIsolationState `json:"isolationState,omitempty"`

@@ -109,6 +109,31 @@ for mode in scoped trusted-admin; do
 		echo "$mode render must let the operator watch owned credential Secret teardown" >&2
 		exit 1
 	fi
+	operator_scope_role=$(awk -v RS='---' '
+		/kind: ClusterRole\n/ && /resources: \["runtimeclasses"\]/ &&
+		/resources: \["storageclasses", "csidrivers"\]/ { print; exit }
+	' <<<"$render")
+	operator_system_role=$(awk -v RS='---' '
+		/kind: Role\n/ && /resources: \["installations"\]/ &&
+		/resources: \["installations\/status"\]/ && /resources: \["configmaps"\]/ { print; exit }
+	' <<<"$render")
+	if [[ -z "$operator_scope_role" || -z "$operator_system_role" ]]; then
+		echo "$mode render lacks Installation isolation dependency watches or system status authority" >&2
+		exit 1
+	fi
+	installation_status_rule=$(awk -v RS='  - apiGroups:' '
+		/\["swe.dev"\]/ && /resources: \["installations\/status"\]/ { print; exit }
+	' <<<"$operator_system_role")
+	configmap_rule=$(awk -v RS='  - apiGroups:' '
+		/\[""\]/ && /resources: \["configmaps"\]/ { print; exit }
+	' <<<"$operator_system_role")
+	if grep -Eq 'resources: \["(installations|installations/status|configmaps)"\]' <<<"$operator_role$operator_scope_role" ||
+		grep -Eq '"(create|delete|patch|update)"' <<<"$operator_scope_role" ||
+		grep -Eq '"(create|delete|list|watch)"' <<<"$installation_status_rule" ||
+		grep -Eq '"(create|delete|patch|update)"' <<<"$configmap_rule"; then
+		echo "$mode render grants Installation isolation authority beyond exact system status and dependency observation" >&2
+		exit 1
+	fi
 	disabled_status_rule=$(awk -v RS='  - apiGroups:' '
 		/\["swe.dev"\]/ && /resources: \["environments\/status"\]/ { print; exit }
 	' <<<"$control_plane_role")

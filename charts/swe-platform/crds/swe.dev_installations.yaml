@@ -119,8 +119,8 @@ spec:
             type: object
           status:
             description: |-
-              InstallationStatus contains bounded non-secret observations reserved for the
-              future installation isolation controller. This slice does not write status.
+              InstallationStatus contains bounded non-secret observations from the
+              installation isolation selection controller.
             properties:
               conditions:
                 items:
@@ -213,8 +213,8 @@ spec:
                 type: string
               isolationState:
                 description: |-
-                  InstallationIsolationState is bounded controller-owned vocabulary reserved
-                  for the staged activation flow. No controller writes it yet.
+                  InstallationIsolationState is bounded controller-owned vocabulary for the
+                  staged selection lifecycle.
                 enum:
                 - LegacyUnclassified
                 - Fencing

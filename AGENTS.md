@@ -40,6 +40,13 @@ registered and use sandboxd managed processes. API-key profiles use process-scop
 material as `ANTHROPIC_API_KEY`,
 `AMP_API_KEY`, or `CODEX_API_KEY`; tests use fake process services and no provider credentials.
 Pi deliberately supports no credential profiles or credential injection.
+The Installation isolation lifecycle reports legacy or explicit development selection and
+uncached-resolves the future restricted dependency identities. Restricted selection fences every
+Environment through the existing ordered teardown and blocks warm replenishment, then remains
+`Blocked`; publish `Fencing` before dependency reads and again on observed authority drift. A
+non-legacy lifecycle may reopen development execution only from current exact `Active` status after
+fence proof. Trusted-admin fence proof ignores only exact foreign Installation namespace claims.
+This does not activate or claim restricted runtime or egress enforcement.
 
 ## Architecture invariants — do not violate these
 
@@ -82,7 +89,8 @@ Pi deliberately supports no credential profiles or credential injection.
   the sole owners of observed lifecycle transitions. Environment reconciliation is split
   within `internal/controllers/` into ordered gate orchestration, lifecycle intent,
   provisioning/resources, pod recovery, status, and manager setup files; keep gate names
-  bounded and preserve the ordering contract in its direct test. `sandboxd/` is a
+  bounded, keep the Installation isolation gate before Project/Template/provisioning dependencies,
+  and preserve the ordering contract in its direct test. `sandboxd/` is a
   **separate Go module** with its own `go.mod`: keep its dependencies minimal so it stays
   portable and the environment base image stays small.
   Generated protobuf code lives in `sandboxd/gen/` and is committed.
