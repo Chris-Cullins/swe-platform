@@ -292,6 +292,24 @@ func TestObservationMessagesExcludeAgentControlledDetails(t *testing.T) {
 	}
 }
 
+func TestUsageObjectCountsRemainOpaque(t *testing.T) {
+	exit0 := int32(0)
+	raw := []byte(`{"type":"thread.started","thread_id":"thread-1"}` + "\n" + `{"type":"turn.completed","usage":{"input_tokens":31,"cached_input_tokens":7,"output_tokens":11,"cost_usd":0.02}}` + "\n")
+	client := &fakeProcessClient{process: &sandboxdv1.Process{State: sandboxdv1.ProcessState_PROCESS_STATE_EXITED, ExitCode: &exit0, ExecutionId: "execution"}, stdout: raw}
+	var event agent.AdapterEvent
+	sandbox := processSandbox(client, "epoch")
+	sandbox.EmitEvent = func(_ context.Context, got agent.AdapterEvent) error { event = got; return nil }
+
+	observation, message, err := (&Adapter{}).Observe(context.Background(), agent.AdapterTask{ID: "run"}, sandbox)
+	if err != nil || observation != agent.AdapterObservationSucceeded || message != observation.StatusMessage() {
+		t.Fatalf("Observe = (%q, %q, %v)", observation, message, err)
+	}
+	var output outputEvent
+	if err := json.Unmarshal(event.Data, &output); err != nil || event.Source != "codex" || event.Type != "codex.process-output" || !bytes.Equal(output.Data, raw) {
+		t.Fatalf("opaque output event = %#v, output = %#v, error = %v", event, output, err)
+	}
+}
+
 func TestTerminalObservationFailsOnRetainedOutputGap(t *testing.T) {
 	exit0 := int32(0)
 	client := &fakeProcessClient{
