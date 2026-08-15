@@ -27,6 +27,7 @@ CONTROL_PLANE_IMAGE="ghcr.io/chris-cullins/swe-platform/control-plane:dev"
 E2E_AGENT_API_KEY='!!SWE-E2E-AGENT-API-KEY-DO-NOT-USE!!'
 E2E_ROTATED_AGENT_API_KEY='!!SWE-E2E-ROTATED-AGENT-API-KEY-DO-NOT-USE!!'
 E2E_AMP_API_KEY='!!SWE-E2E-AMP-API-KEY-DO-NOT-USE!!'
+E2E_CODEX_API_KEY='!!SWE-E2E-CODEX-API-KEY-DO-NOT-USE!!'
 PORT_FORWARD_PID=""
 SANDBOXD_PORT_FORWARD_PID=""
 POSTGRES_PORT_FORWARD_PID=""
@@ -116,7 +117,7 @@ trap cleanup EXIT
 
 contains_e2e_key() {
 	grep -aFq -- "$E2E_AGENT_API_KEY" "$1" || grep -aFq -- "$E2E_ROTATED_AGENT_API_KEY" "$1" || \
-		grep -aFq -- "$E2E_AMP_API_KEY" "$1"
+		grep -aFq -- "$E2E_AMP_API_KEY" "$1" || grep -aFq -- "$E2E_CODEX_API_KEY" "$1"
 }
 
 wait_for_resource_quota_observation() {
@@ -431,15 +432,23 @@ test "$8" = --color
 test "$9" = never
 test "${10}" = --skip-git-repo-check
 test "${11}" = --
-test -z "${CODEX_API_KEY+x}"
 printf '%s\n' '{"type":"thread.started","thread_id":"fake-codex-thread"}'
 printf '%s\n' 'fake-codex-stderr-marker' >&2
 if [ "${12}" = 'fake Codex failure smoke test' ]; then
+	test -z "${CODEX_API_KEY+x}"
 	printf '%s\n' '{"type":"turn.failed","error":{"message":"fake Codex failed"}}'
 	exit 0
 fi
 test "${12}" = 'fake Codex lifecycle smoke test'
-sleep 5
+test "${CODEX_API_KEY:-}" = '!!SWE-E2E-CODEX-API-KEY-DO-NOT-USE!!'
+printf '%s\n' codex-credential-present
+attempt=0
+while [ "$attempt" -lt 180 ]; do
+	if [ -f /workspace/codex-credential-checks-complete ]; then break; fi
+	attempt=$((attempt + 1))
+	sleep 1
+done
+test -f /workspace/codex-credential-checks-complete
 printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":1,"output_tokens":2}}'
 EOF
 chmod 0755 "$FAKE_ENV_CONTEXT/codex"
@@ -1449,11 +1458,11 @@ git -C "$PROJECT_WORKTREE" config user.name "swe e2e"
 git -C "$PROJECT_WORKTREE" config user.email "swe-e2e@example.invalid"
 mkdir -p "$PROJECT_WORKTREE/.agents" "$PROJECT_WORKTREE/.swe"
 cat > "$PROJECT_WORKTREE/.agents/setup" <<'EOF'
-if [ -n "${ANTHROPIC_API_KEY+x}" ] || [ -n "${AMP_API_KEY+x}" ] || [ -n "${PORT+x}" ] || [ -n "${PUBLIC_URL+x}" ]; then exit 43; fi
+if [ -n "${ANTHROPIC_API_KEY+x}" ] || [ -n "${AMP_API_KEY+x}" ] || [ -n "${CODEX_API_KEY+x}" ] || [ -n "${PORT+x}" ] || [ -n "${PUBLIC_URL+x}" ]; then exit 43; fi
 printf '%s\n' credential-absent >> setup-result
 EOF
 cat > "$PROJECT_WORKTREE/.agents/resume" <<'EOF'
-if [ -n "${ANTHROPIC_API_KEY+x}" ] || [ -n "${AMP_API_KEY+x}" ] || [ -n "${PORT+x}" ] || [ -n "${PUBLIC_URL+x}" ]; then exit 44; fi
+if [ -n "${ANTHROPIC_API_KEY+x}" ] || [ -n "${AMP_API_KEY+x}" ] || [ -n "${CODEX_API_KEY+x}" ] || [ -n "${PORT+x}" ] || [ -n "${PUBLIC_URL+x}" ]; then exit 44; fi
 printf '%s\n' credential-absent >> resume-result
 EOF
 cat > "$PROJECT_WORKTREE/.swe/services.yaml" <<'EOF'
@@ -2370,7 +2379,7 @@ if [[ "$MISSING_TERMINAL_UID_STATUS" != "400" || "$UNAUTHORIZED_TERMINAL_STATUS"
 	echo "FAIL: direct terminal auth/identity ordering statuses missing=${MISSING_TERMINAL_UID_STATUS} unauthorized=${UNAUTHORIZED_TERMINAL_STATUS}"
 	exit 1
 fi
-printf 'printf terminal-e2e-ok; if [ -n "${ANTHROPIC_API_KEY+x}" ]; then printf credential-present; else printf credential-absent; fi; exit\n' | \
+printf 'printf terminal-e2e-ok; if [ -n "${ANTHROPIC_API_KEY+x}" ] || [ -n "${AMP_API_KEY+x}" ] || [ -n "${CODEX_API_KEY+x}" ]; then printf credential-present; else printf credential-absent; fi; exit\n' | \
 	SWE_CONTROL_PLANE_URL=http://127.0.0.1:18080 SWE_CONTROL_PLANE_TOKEN="$TERMINAL_TOKEN" \
 	bin/swe --namespace "$PROJECT_NAMESPACE" attach "$ENV_NAME" --environment-uid "$ENV_UID" > /tmp/swe-platform-terminal.out
 if ! grep -q 'terminal-e2e-ok' /tmp/swe-platform-terminal.out; then
@@ -3148,12 +3157,65 @@ kubectl wait --for=jsonpath='{.status.state}'=Running run/"$AMP_CREDENTIALLESS_R
 kubectl wait --for=jsonpath='{.status.state}'=Succeeded run/"$AMP_CREDENTIALLESS_RUN_NAME" --timeout=3m
 kubectl delete run "$AMP_CREDENTIALLESS_RUN_NAME" --wait=true >/dev/null
 
-echo "==> verifying fake Codex real Run lifecycle without credentials or network"
+echo "==> verifying credentialed fake Codex process scope without network"
 CODEX_RUN_NAME=e2e-fake-codex-run
-bin/swe --namespace "$PROJECT_NAMESPACE" run "fake Codex lifecycle smoke test" --name "$CODEX_RUN_NAME" --environment "$ENV_NAME" --agent codex --wait=false
+rm -f /tmp/swe-platform-codex-*.out /tmp/swe-platform-codex-*.log /tmp/swe-platform-codex-*.yaml \
+	/tmp/swe-platform-codex-*.json /tmp/swe-platform-codex-workspace.tar
+kubectl exec "$POD_NAME" -- rm -f /workspace/codex-credential-checks-complete
+printf '%s' "$E2E_CODEX_API_KEY" | bin/swe --namespace "$PROJECT_NAMESPACE" credentials create e2e-codex --agent codex --api-key-stdin
+bin/swe --namespace "$PROJECT_NAMESPACE" run "fake Codex lifecycle smoke test" --name "$CODEX_RUN_NAME" --environment "$ENV_NAME" \
+	--agent codex --credential-profile e2e-codex --wait=false
 kubectl wait --for=jsonpath='{.status.state}'=Running run/"$CODEX_RUN_NAME" --timeout=3m
-kubectl wait --for=jsonpath='{.status.state}'=Succeeded run/"$CODEX_RUN_NAME" --timeout=3m
 CODEX_RUN_UID=$(kubectl get run "$CODEX_RUN_NAME" -o jsonpath='{.metadata.uid}')
+CODEX_POD_NAME=$(kubectl get environment "$ENV_NAME" -o jsonpath='{.status.podName}')
+if ! kubectl exec "$CODEX_POD_NAME" -- sh -c \
+	'test "$(wc -l < /workspace/setup-result)" -eq 1 && ! grep -vx credential-absent /workspace/setup-result && test "$(wc -l < /workspace/resume-result)" -eq 2 && ! grep -vx credential-absent /workspace/resume-result && test -z "${CODEX_API_KEY+x}" && ! tr "\000" "\n" < /proc/1/environ | grep -q "^CODEX_API_KEY="'; then
+	echo "FAIL: CODEX_API_KEY reached a lifecycle hook or ambient environment process"
+	exit 1
+fi
+check_sandboxd_process "$CODEX_POD_NAME" "$CODEX_RUN_UID" "$E2E_CODEX_API_KEY"
+
+printf '%s' $'version: 1\nservices:\n  repository-web:\n    command: ["node", ".swe/service.js", "codex-credential-check"]\n' |
+	kubectl exec -i "$CODEX_POD_NAME" -- sh -c 'cat > /workspace/.swe/services.yaml'
+for _ in $(seq 1 90); do
+	CODEX_SERVICE=$(kubectl get environment "$ENV_NAME" -o json | jq -c '.spec.services[]? | select(.name == "repository-web")')
+	if [[ -n "${CODEX_SERVICE:-}" ]] && jq -e '.source == "Repository" and .launch.argv == ["node", ".swe/service.js", "codex-credential-check"]' <<<"$CODEX_SERVICE" >/dev/null 2>&1; then
+		break
+	fi
+	sleep 1
+done
+if [[ -z "${CODEX_SERVICE:-}" ]] || ! jq -e '.source == "Repository" and .launch.argv == ["node", ".swe/service.js", "codex-credential-check"]' <<<"$CODEX_SERVICE" >/dev/null 2>&1; then
+	echo "FAIL: Codex credential-scope repository service did not converge"
+	exit 1
+fi
+CODEX_SERVICE_REVISION=$(jq -r '.revision' <<<"$CODEX_SERVICE")
+wait_service_observation "$ENV_NAME" repository-web "$CODEX_SERVICE_REVISION" Healthy
+CODEX_SERVICE_URL=$(SWE_CONTROL_PLANE_URL=http://127.0.0.1:18080 SWE_CONTROL_PLANE_TOKEN="$CONSOLE_TOKEN" \
+	bin/swe --namespace "$PROJECT_NAMESPACE" portal "$ENV_NAME" repository-web)
+CODEX_SERVICE_HOST=${CODEX_SERVICE_URL#http://}
+for _ in $(seq 1 60); do
+	CODEX_SERVICE_BODY=$(curl --silent --fail -H "Host: $CODEX_SERVICE_HOST" -H "Authorization: Bearer $CONSOLE_TOKEN" http://127.0.0.1:18080/ 2>/dev/null || true)
+	if jq -e '.marker == "codex-credential-check" and .forbidden == []' <<<"$CODEX_SERVICE_BODY" >/dev/null 2>&1; then
+		break
+	fi
+	sleep 1
+done
+if ! jq -e '.marker == "codex-credential-check" and .forbidden == []' <<<"${CODEX_SERVICE_BODY:-}" >/dev/null 2>&1; then
+	echo "FAIL: declared service inherited CODEX_API_KEY: ${CODEX_SERVICE_BODY:-<empty>}"
+	exit 1
+fi
+printf '%s\n' "$CODEX_SERVICE_BODY" > /tmp/swe-platform-codex-service.json
+
+printf 'if [ -n "${CODEX_API_KEY+x}" ]; then printf codex-terminal-credential-present; else printf codex-terminal-credential-absent; fi; exit\n' | \
+	SWE_CONTROL_PLANE_URL=http://127.0.0.1:18080 SWE_CONTROL_PLANE_TOKEN="$TERMINAL_TOKEN" \
+	bin/swe --namespace "$PROJECT_NAMESPACE" attach "$ENV_NAME" --environment-uid "$ENV_UID" > /tmp/swe-platform-codex-terminal.out
+if ! grep -Fq codex-terminal-credential-absent /tmp/swe-platform-codex-terminal.out; then
+	echo "FAIL: shared terminal inherited CODEX_API_KEY"
+	cat /tmp/swe-platform-codex-terminal.out
+	exit 1
+fi
+kubectl exec "$CODEX_POD_NAME" -- touch /workspace/codex-credential-checks-complete
+kubectl wait --for=jsonpath='{.status.state}'=Succeeded run/"$CODEX_RUN_NAME" --timeout=3m
 set +e
 curl --silent --no-buffer --max-time 2 -H "Authorization: Bearer ${E2E_BOOTSTRAP_TOKEN}" -H "SWE-Run-UID: ${CODEX_RUN_UID}" \
 	"http://127.0.0.1:18080/api/v1/namespaces/${PROJECT_NAMESPACE}/runs/${CODEX_RUN_NAME}/transcript" > /tmp/swe-platform-codex-transcript.out
@@ -3162,7 +3224,34 @@ set -e
 if [[ "$CODEX_TRANSCRIPT_STATUS" != "0" && "$CODEX_TRANSCRIPT_STATUS" != "28" ]]; then echo "FAIL: Codex transcript read failed"; exit 1; fi
 grep -F '"source":"codex"' /tmp/swe-platform-codex-transcript.out | grep -F '"type":"codex.process-output"' | \
 	grep -oE '"data":"[A-Za-z0-9+/=]+"' | sed 's/^"data":"//; s/"$//' | while IFS= read -r encoded; do printf '%s' "$encoded" | base64 --decode || exit 1; done > /tmp/swe-platform-codex-process-output.out
-for marker in fake-codex-thread fake-codex-stderr-marker turn.completed; do grep -Fq "$marker" /tmp/swe-platform-codex-process-output.out || { echo "FAIL: missing Codex marker $marker"; exit 1; }; done
+for marker in fake-codex-thread fake-codex-stderr-marker codex-credential-present turn.completed; do grep -Fq "$marker" /tmp/swe-platform-codex-process-output.out || { echo "FAIL: missing Codex marker $marker"; exit 1; }; done
+kubectl get run "$CODEX_RUN_NAME" -o yaml > /tmp/swe-platform-codex-run.yaml
+kubectl -n "$SYSTEM_NAMESPACE" logs -l app.kubernetes.io/component=control-plane --all-containers --prefix --tail=-1 > /tmp/swe-platform-codex-control-plane.log
+kubectl -n "$SYSTEM_NAMESPACE" logs -l app.kubernetes.io/component=operator --all-containers --prefix --tail=-1 > /tmp/swe-platform-codex-operator.log
+kubectl logs "$CODEX_POD_NAME" -c environment --tail=-1 > /tmp/swe-platform-codex-environment.log
+kubectl exec "$CODEX_POD_NAME" -- tar -C /workspace -cf - . > /tmp/swe-platform-codex-workspace.tar
+for artifact in /tmp/swe-platform-codex-transcript.out /tmp/swe-platform-codex-process-output.out \
+	/tmp/swe-platform-codex-run.yaml /tmp/swe-platform-codex-control-plane.log \
+	/tmp/swe-platform-codex-operator.log /tmp/swe-platform-codex-environment.log \
+	/tmp/swe-platform-codex-service.json /tmp/swe-platform-codex-terminal.out \
+	/tmp/swe-platform-codex-workspace.tar; do
+	if contains_e2e_key "$artifact"; then
+		echo "FAIL: Codex API key leaked through $artifact"
+		exit 1
+	fi
+done
+printf '%s' $'version: 1\nservices: {}\n' |
+	kubectl exec -i "$CODEX_POD_NAME" -- sh -c 'cat > /workspace/.swe/services.yaml'
+for _ in $(seq 1 90); do
+	if [[ -z "$(kubectl get environment "$ENV_NAME" -o jsonpath='{.spec.services[?(@.name=="repository-web")].name}')" ]]; then
+		break
+	fi
+	sleep 1
+done
+if [[ -n "$(kubectl get environment "$ENV_NAME" -o jsonpath='{.spec.services[?(@.name=="repository-web")].name}')" ]]; then
+	echo "FAIL: Codex credential-scope repository service was not cleaned up"
+	exit 1
+fi
 kubectl delete run "$CODEX_RUN_NAME" --wait=true >/dev/null
 
 echo "==> verifying fake Codex terminal failure through the real controller"
