@@ -2049,10 +2049,18 @@ func (r *RunReconciler) adapterAcceptanceSandbox(run *platformv1alpha1.Run, env 
 	dialProcess := sandbox.DialProcess
 	sandbox.DialProcess = func(ctx context.Context) (sandboxdv1.ProcessServiceClient, func() error, error) {
 		// Acceptance can start a new process and deliver launch-only credentials.
-		// Revalidate at the process boundary so an active reconcile cannot start
-		// work after Project offboarding has revoked the active Namespace claim.
+		// Revalidate both authorities at the process boundary so an active
+		// reconcile cannot start work after Project offboarding or installation
+		// isolation has revoked execution authority.
 		if _, err := r.Scope.Revalidate(ctx, run.Namespace, tenancy.LifecycleActive); err != nil {
 			return nil, nil, err
+		}
+		allowed, err := installationExecutionCurrent(ctx, r.apiReader(), r.Scope)
+		if err != nil {
+			return nil, nil, err
+		}
+		if !allowed {
+			return nil, nil, errInstallationIsolationBlocked
 		}
 		return dialProcess(ctx)
 	}
@@ -2080,6 +2088,10 @@ func (r *RunReconciler) resolveAllocatedExecution(ctx context.Context, run *plat
 	}
 	if !environmentReachable(current) {
 		return sandboxclient.Execution{}, false, nil
+	}
+	allowed, err := installationExecutionCurrent(ctx, r.apiReader(), r.Scope)
+	if err != nil || !allowed {
+		return sandboxclient.Execution{}, false, err
 	}
 	execution, err := r.connector().ResolveExecution(ctx, fence)
 	if err != nil {
@@ -2110,6 +2122,10 @@ func (r *RunReconciler) allocatedExecutionCurrent(ctx context.Context, run *plat
 	}
 	if !environmentReachable(current) {
 		return false, nil
+	}
+	allowed, err := installationExecutionCurrent(ctx, r.apiReader(), r.Scope)
+	if err != nil || !allowed {
+		return false, err
 	}
 	currentExecution, err := r.connector().ExecutionCurrent(ctx, fence, execution)
 	if errors.Is(err, lifecycle.ErrExecutionFenceChanged) {

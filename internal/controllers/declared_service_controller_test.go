@@ -9,6 +9,7 @@ import (
 	"strings"
 	"testing"
 
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -22,6 +23,7 @@ import (
 	"github.com/Chris-Cullins/swe-platform/internal/lifecycle"
 	"github.com/Chris-Cullins/swe-platform/internal/sandboxclient"
 	"github.com/Chris-Cullins/swe-platform/internal/serviceconfig"
+	"github.com/Chris-Cullins/swe-platform/internal/tenancy"
 	sandboxdv1 "github.com/Chris-Cullins/swe-platform/sandboxd/gen/proto/sandboxd/v1"
 )
 
@@ -369,6 +371,63 @@ func TestDeclaredServiceReconcilerDiscardsPostRouteRaces(t *testing.T) {
 				t.Fatalf("stale route launched: %#v", connector.reconciles)
 			}
 		})
+	}
+}
+
+func TestDeclaredServiceReconcilerRevalidatesInstallationIsolationBeforeProcessReconcile(t *testing.T) {
+	scheme := isolationTestScheme(t)
+	installation := &platformv1alpha1.Installation{ObjectMeta: metav1.ObjectMeta{Name: "main", Namespace: "system", UID: "installation-uid"}}
+	namespace := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "ns", UID: "namespace-uid", Annotations: map[string]string{
+		tenancy.InstallationNamespaceAnnotation: "system",
+		tenancy.InstallationNameAnnotation:      "main",
+		tenancy.InstallationUIDAnnotation:       "installation-uid",
+		tenancy.ProjectNameAnnotation:           "project",
+		tenancy.ProjectUIDAnnotation:            "project-uid",
+		tenancy.LifecycleAnnotation:             string(tenancy.LifecycleActive),
+	}}}
+	project := &platformv1alpha1.Project{ObjectMeta: metav1.ObjectMeta{Name: "project", Namespace: "ns", UID: "project-uid"}}
+	env := declaredEnvironment()
+	declaration := platformv1alpha1.EnvironmentServiceDeclaration{
+		Name: "web", Source: platformv1alpha1.EnvironmentServiceSourceRepository, InstanceID: "instance-abcdefghijklmnop", Revision: 2, TargetPort: 8080,
+		Protocol: platformv1alpha1.EnvironmentServiceProtocolHTTP, Visibility: platformv1alpha1.EnvironmentServiceVisibilityProject, Readiness: platformv1alpha1.EnvironmentServiceReadinessTCPConnect,
+		Launch: &platformv1alpha1.EnvironmentServiceLaunch{Argv: []platformv1alpha1.EnvironmentServiceLaunchArgument{"serve"}},
+	}
+	env.Spec.Services = []platformv1alpha1.EnvironmentServiceDeclaration{declaration}
+	env.Status.PortalRoutes = []platformv1alpha1.EnvironmentPortalRoute{{Name: declaration.Name, Active: true, DeclarationInstanceID: declaration.InstanceID, DeclarationRevision: declaration.Revision, Generation: 7}}
+	kubeClient := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(env).WithObjects(installation, namespace, project, env).Build()
+	identity := tenancy.InstallationIdentity{Key: client.ObjectKeyFromObject(installation), UID: installation.UID}
+	verifier := &tenancy.Verifier{Reader: kubeClient, Installation: identity, Mode: tenancy.ModeScoped}
+	connector := &declaredConnectorFake{file: sandboxclient.WorkspaceServicesFile{Data: []byte("version: 1\nservices:\n  web:\n    command: [serve]\n    port: 8080\n")}}
+	routes := &declaredRoutesFake{route: controlplaneclient.PortalRoute{URL: "https://web", EnvironmentUID: string(env.UID), Service: declaration.Name, DeclarationInstanceID: declaration.InstanceID, Revision: declaration.Revision, RouteGeneration: 7}}
+	routes.hook = func() {
+		var current platformv1alpha1.Installation
+		if err := kubeClient.Get(context.Background(), client.ObjectKeyFromObject(installation), &current); err != nil {
+			t.Fatal(err)
+		}
+		current.Spec.Isolation = restrictedIsolationSelection()
+		if err := kubeClient.Update(context.Background(), &current); err != nil {
+			t.Fatal(err)
+		}
+	}
+	reconciler := &DeclaredServiceReconciler{
+		Client: tenancy.GuardedClient{Client: kubeClient, Verifier: verifier}, APIReader: kubeClient,
+		Scope: &tenancy.ReconcileScope{Verifier: verifier}, Connector: connector, Routes: routes,
+	}
+
+	result, err := reconciler.Reconcile(context.Background(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(env)})
+	if err != nil || result.RequeueAfter != declaredServiceInterval {
+		t.Fatalf("racing isolation Reconcile() = (%#v, %v)", result, err)
+	}
+	if len(connector.reads) != 1 || routes.calls != 1 || len(connector.reconciles) != 0 {
+		t.Fatalf("racing isolation crossed process boundary: reads=%d routes=%d reconciles=%#v", len(connector.reads), routes.calls, connector.reconciles)
+	}
+
+	result, err = reconciler.Reconcile(context.Background(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(env)})
+	if err != nil || result.RequeueAfter != declaredServiceInterval {
+		t.Fatalf("blocked isolation Reconcile() = (%#v, %v)", result, err)
+	}
+	if len(connector.reads) != 1 || routes.calls != 1 || len(connector.reconciles) != 0 {
+		t.Fatalf("blocked isolation performed service work: reads=%d routes=%d reconciles=%#v", len(connector.reads), routes.calls, connector.reconciles)
 	}
 }
 

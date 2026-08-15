@@ -71,6 +71,13 @@ func (r *DeclaredServiceReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 	if !env.DeletionTimestamp.IsZero() || !serviceEnvironmentActive(&env) {
 		return ctrl.Result{RequeueAfter: declaredServiceInterval}, nil
 	}
+	allowed, err := installationExecutionCurrent(ctx, r.reader(), r.Scope)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if !allowed {
+		return ctrl.Result{RequeueAfter: declaredServiceInterval}, nil
+	}
 	fence := lifecycle.CaptureExecutionFence(&env)
 	file, err := r.Connector.ReadWorkspaceServices(ctx, fence)
 	if err != nil {
@@ -107,7 +114,7 @@ func (r *DeclaredServiceReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		// patch advances metadata.generation to this future intent revision; a
 		// later launch at a positive route revision is therefore strictly newer,
 		// while retries of an uncertain empty-set call remain idempotent.
-		if err := r.Connector.ReconcileRepositoryServices(ctx, fence, append([]platformv1alpha1.EnvironmentServiceDeclaration(nil), current.Spec.Services...), nil, uint64(current.Generation+1), 0, nil); err != nil {
+		if err := r.reconcileRepositoryServices(ctx, fence, append([]platformv1alpha1.EnvironmentServiceDeclaration(nil), current.Spec.Services...), nil, uint64(current.Generation+1), 0, nil); err != nil {
 			ctrl.LoggerFrom(ctx).Error(err, "fence previous repository service processes")
 			return ctrl.Result{RequeueAfter: declaredServiceInterval}, nil
 		}
@@ -150,7 +157,7 @@ func (r *DeclaredServiceReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 			if hasActiveRepositoryRoute(&current) || env.Generation < 1 {
 				return ctrl.Result{RequeueAfter: declaredServiceInterval}, nil
 			}
-			if err := r.Connector.ReconcileRepositoryServices(ctx, fence, append([]platformv1alpha1.EnvironmentServiceDeclaration(nil), env.Spec.Services...), routeProofs, uint64(env.Generation), routeRevision, nil); err != nil {
+			if err := r.reconcileRepositoryServices(ctx, fence, append([]platformv1alpha1.EnvironmentServiceDeclaration(nil), env.Spec.Services...), routeProofs, uint64(env.Generation), routeRevision, nil); err != nil {
 				ctrl.LoggerFrom(ctx).Error(err, "stop repository services for disabled portal authority")
 				return ctrl.Result{RequeueAfter: declaredServiceInterval}, nil
 			}
@@ -168,11 +175,22 @@ func (r *DeclaredServiceReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 	if env.Generation < 1 {
 		return ctrl.Result{RequeueAfter: declaredServiceInterval}, nil
 	}
-	if err := r.Connector.ReconcileRepositoryServices(ctx, fence, append([]platformv1alpha1.EnvironmentServiceDeclaration(nil), env.Spec.Services...), routeProofs, uint64(env.Generation), routeRevision, specs); err != nil {
+	if err := r.reconcileRepositoryServices(ctx, fence, append([]platformv1alpha1.EnvironmentServiceDeclaration(nil), env.Spec.Services...), routeProofs, uint64(env.Generation), routeRevision, specs); err != nil {
 		ctrl.LoggerFrom(ctx).Error(err, "reconcile repository service processes")
 		return ctrl.Result{RequeueAfter: declaredServiceInterval}, nil
 	}
 	return ctrl.Result{RequeueAfter: declaredServiceInterval}, nil
+}
+
+func (r *DeclaredServiceReconciler) reconcileRepositoryServices(ctx context.Context, fence lifecycle.ExecutionFence, declarations []platformv1alpha1.EnvironmentServiceDeclaration, routes []platformv1alpha1.EnvironmentPortalRoute, intentRevision, routeRevision uint64, specs []*sandboxdv1.ManagedServiceSpec) error {
+	allowed, err := installationExecutionCurrent(ctx, r.reader(), r.Scope)
+	if err != nil {
+		return err
+	}
+	if !allowed {
+		return errInstallationIsolationBlocked
+	}
+	return r.Connector.ReconcileRepositoryServices(ctx, fence, declarations, routes, intentRevision, routeRevision, specs)
 }
 
 func (r *DeclaredServiceReconciler) reader() client.Reader {

@@ -50,7 +50,7 @@ func (r *WarmPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 	if tenancy.IsCatalogSource(&tmpl) {
 		return ctrl.Result{}, nil
 	}
-	ctx, claim, err := r.Scope.Begin(ctx, tmpl.Namespace, tenancy.LifecycleActive)
+	ctx, claim, err := r.Scope.Begin(ctx, tmpl.Namespace, tenancy.LifecycleActive, tenancy.LifecycleFencing)
 	if err != nil {
 		if stderrors.Is(err, tenancy.ErrOutOfScope) {
 			return ctrl.Result{}, nil
@@ -82,6 +82,9 @@ func (r *WarmPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 			}
 			return ctrl.Result{}, isolationErr
 		}
+	}
+	if claim.Lifecycle != tenancy.LifecycleActive {
+		return ctrl.Result{}, nil
 	}
 
 	minimum := int32(0)

@@ -951,7 +951,7 @@ func TestWarmPoolTemplateReplacementAfterMemberCreateDeletesOldOwnerMember(t *te
 	}
 }
 
-func TestRestrictedInstallationStopsWarmReplenishmentAndCleanup(t *testing.T) {
+func TestRestrictedInstallationStopsWarmReplenishmentAndCleanupDuringProjectFencing(t *testing.T) {
 	scheme := isolationTestScheme(t)
 	installation := &platformv1alpha1.Installation{
 		ObjectMeta: metav1.ObjectMeta{Name: "main", Namespace: "system", UID: "installation-uid"},
@@ -964,7 +964,8 @@ func TestRestrictedInstallationStopsWarmReplenishmentAndCleanup(t *testing.T) {
 		tenancy.InstallationUIDAnnotation:       string(installation.UID),
 		tenancy.ProjectNameAnnotation:           project.Name,
 		tenancy.ProjectUIDAnnotation:            string(project.UID),
-		tenancy.LifecycleAnnotation:             string(tenancy.LifecycleActive),
+		tenancy.LifecycleAnnotation:             string(tenancy.LifecycleFencing),
+		tenancy.LifecycleOperationAnnotation:    tenancy.OperationOffboarding,
 	}}}
 	template := &platformv1alpha1.EnvironmentTemplate{
 		ObjectMeta: metav1.ObjectMeta{Name: "small", Namespace: namespace.Name, UID: "template-uid", Generation: 1, Annotations: map[string]string{
