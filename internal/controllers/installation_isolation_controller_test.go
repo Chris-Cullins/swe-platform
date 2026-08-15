@@ -452,6 +452,33 @@ func TestInstallationAPIUncertaintyStillWithdrawsEnvironmentReadiness(t *testing
 	}
 }
 
+func TestBackendCreationSourcesRevalidateInstallationIsolation(t *testing.T) {
+	scheme := isolationTestScheme(t)
+	installation := &platformv1alpha1.Installation{ObjectMeta: metav1.ObjectMeta{Name: "main", Namespace: "system", UID: "installation-uid"}}
+	environment := &platformv1alpha1.Environment{ObjectMeta: metav1.ObjectMeta{Name: "environment", Namespace: "project", UID: "environment-uid", Generation: 1}}
+	kubeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(installation, environment).Build()
+	identity := tenancy.InstallationIdentity{Key: client.ObjectKeyFromObject(installation), UID: installation.UID}
+	reconciler := &EnvironmentReconciler{
+		Client: kubeClient, APIReader: kubeClient,
+		Scope: &tenancy.ReconcileScope{Verifier: &tenancy.Verifier{Reader: kubeClient, Installation: identity, Mode: tenancy.ModeScoped}},
+	}
+
+	if current, err := reconciler.backendCreationSourcesCurrent(context.Background(), environment, tenancy.Claim{}); err != nil || !current {
+		t.Fatalf("legacy backend authority = (%t, %v), want current", current, err)
+	}
+	var restricted platformv1alpha1.Installation
+	if err := kubeClient.Get(context.Background(), client.ObjectKeyFromObject(installation), &restricted); err != nil {
+		t.Fatal(err)
+	}
+	restricted.Spec.Isolation = restrictedIsolationSelection()
+	if err := kubeClient.Update(context.Background(), &restricted); err != nil {
+		t.Fatal(err)
+	}
+	if current, err := reconciler.backendCreationSourcesCurrent(context.Background(), environment, tenancy.Claim{}); err != nil || current {
+		t.Fatalf("restricted backend authority = (%t, %v), want fenced", current, err)
+	}
+}
+
 func TestTrustedAdminFenceProofIgnoresForeignInstallationEnvironment(t *testing.T) {
 	installation := &platformv1alpha1.Installation{ObjectMeta: metav1.ObjectMeta{Name: "main", Namespace: "system", UID: "installation-uid"}}
 	foreignInstallation := &platformv1alpha1.Installation{ObjectMeta: metav1.ObjectMeta{Name: "other", Namespace: "foreign-system", UID: "foreign-installation-uid"}}

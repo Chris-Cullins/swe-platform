@@ -33,7 +33,10 @@ const (
 	isolationResolutionRetryDelay       = 5 * time.Second
 )
 
-var errIsolationDependenciesPending = stderrors.New("restricted isolation dependencies have not been resolved")
+var (
+	errInstallationIsolationBlocked = stderrors.New(installationIsolationBlockedMessage)
+	errIsolationDependenciesPending = stderrors.New("restricted isolation dependencies have not been resolved")
+)
 
 // InstallationIsolationReconciler owns the observed selection lifecycle for
 // the one exact Installation loaded at operator startup. Restricted runtime
@@ -511,6 +514,14 @@ func installationIdentity(scope *tenancy.ReconcileScope) (tenancy.InstallationId
 		return tenancy.InstallationIdentity{}, false
 	}
 	return scope.Verifier.Installation, true
+}
+
+func installationExecutionCurrent(ctx context.Context, reader client.Reader, scope *tenancy.ReconcileScope) (bool, error) {
+	identity, configured := installationIdentity(scope)
+	if !configured {
+		return true, nil
+	}
+	return installationExecutionAllowed(ctx, reader, identity)
 }
 
 func (r *InstallationIsolationReconciler) reader() client.Reader {

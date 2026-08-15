@@ -879,6 +879,9 @@ func (r *EnvironmentReconciler) backendCreationSourcesCurrent(ctx context.Contex
 		!platformv1alpha1.ProvisioningSnapshotsEqual(currentEnv.Status.Provisioning, env.Status.Provisioning) {
 		return false, nil
 	}
+	if allowed, err := installationExecutionCurrent(ctx, r.apiReader(), r.Scope); err != nil || !allowed {
+		return false, err
+	}
 	// Direct unit-level callers may exercise the lower-level Pod constructor
 	// without the reconcile pipeline's required provisioning snapshot.
 	if env.Status.Provisioning == nil {

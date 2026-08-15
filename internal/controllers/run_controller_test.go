@@ -1143,12 +1143,14 @@ type blockingObserveAdapter struct {
 }
 
 type fencingDialAdapter struct {
-	mutate func()
+	mutate  func()
+	dialErr error
 }
 
 func (a *fencingDialAdapter) EnsureAccepted(ctx context.Context, _ agent.AdapterTask, sandbox agent.AdapterSandbox, _ *agent.AdapterLaunchMaterial) error {
 	a.mutate()
 	_, _, err := sandbox.DialProcess(ctx)
+	a.dialErr = err
 	return err
 }
 
@@ -4183,6 +4185,74 @@ func TestAdapterAcceptanceDialRevalidatesActiveTenancyClaim(t *testing.T) {
 	}
 	if !retained.Spec.Cancel {
 		t.Fatal("offboarding cancellation was blocked by the acceptance fence")
+	}
+}
+
+func TestAdapterAcceptanceDialRevalidatesInstallationIsolation(t *testing.T) {
+	installation := &platformv1alpha1.Installation{ObjectMeta: metav1.ObjectMeta{Name: "main", Namespace: "system", UID: "installation-uid"}}
+	namespace := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "ns", UID: "namespace-uid", Annotations: map[string]string{
+		tenancy.InstallationNamespaceAnnotation: "system",
+		tenancy.InstallationNameAnnotation:      "main",
+		tenancy.InstallationUIDAnnotation:       "installation-uid",
+		tenancy.ProjectNameAnnotation:           "project",
+		tenancy.ProjectUIDAnnotation:            "project-uid",
+		tenancy.LifecycleAnnotation:             string(tenancy.LifecycleActive),
+	}}}
+	project := &platformv1alpha1.Project{ObjectMeta: metav1.ObjectMeta{Name: "project", Namespace: "ns", UID: "project-uid"}}
+	run := &platformv1alpha1.Run{
+		ObjectMeta: metav1.ObjectMeta{Name: "r", Namespace: "ns", UID: "run-uid", Finalizers: []string{runFinalizer}},
+		Spec:       platformv1alpha1.RunSpec{Agent: "test"},
+		Status: platformv1alpha1.RunStatus{
+			State:          platformv1alpha1.RunStateEnvironmentReady,
+			EnvironmentRef: &platformv1alpha1.RunEnvironmentReference{Name: "env", UID: "env-uid", Ownership: platformv1alpha1.EnvironmentOwnershipOwned},
+			Conditions:     []metav1.Condition{{Type: runConditionAdapterAcceptanceAttempted, Status: metav1.ConditionTrue, Reason: "AcceptancePending"}},
+		},
+	}
+	env := &platformv1alpha1.Environment{
+		ObjectMeta: metav1.ObjectMeta{Name: "env", Namespace: "ns", UID: "env-uid"},
+		Status:     platformv1alpha1.EnvironmentStatus{Phase: platformv1alpha1.EnvironmentPhaseReady},
+	}
+	adapter := &fencingDialAdapter{}
+	r := reconciler(t, adapter, installation, namespace, project, run, env)
+	baseClient := r.Client
+	identity := tenancy.InstallationIdentity{Key: client.ObjectKeyFromObject(installation), UID: installation.UID}
+	verifier := &tenancy.Verifier{Reader: baseClient, Installation: identity, Mode: tenancy.ModeScoped}
+	r.Scope = &tenancy.ReconcileScope{Verifier: verifier}
+	r.Client = tenancy.GuardedClient{Client: baseClient, Verifier: verifier}
+	adapter.mutate = func() {
+		var current platformv1alpha1.Installation
+		if err := baseClient.Get(context.Background(), client.ObjectKeyFromObject(installation), &current); err != nil {
+			t.Fatal(err)
+		}
+		current.Spec.Isolation = restrictedIsolationSelection()
+		if err := baseClient.Update(context.Background(), &current); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	result, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(run)})
+	if err != nil || !result.Requeue {
+		t.Fatalf("acceptance reconcile after restricted selection = (%#v, %v), want clean requeue", result, err)
+	}
+	if !errors.Is(adapter.dialErr, errInstallationIsolationBlocked) {
+		t.Fatalf("acceptance process dial error = %v, want installation isolation fence", adapter.dialErr)
+	}
+	var retained platformv1alpha1.Run
+	if err := baseClient.Get(context.Background(), client.ObjectKeyFromObject(run), &retained); err != nil {
+		t.Fatal(err)
+	}
+	if !acceptanceAttempted(&retained) || runAccepted(&retained) {
+		t.Fatalf("installation fence lost conservative marker or published acceptance: %#v", retained.Status.Conditions)
+	}
+
+	adapter.mutate = func() { t.Fatal("adapter acceptance ran while installation isolation was already blocked") }
+	adapter.dialErr = nil
+	result, err = r.Reconcile(context.Background(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(run)})
+	if err != nil || !result.Requeue {
+		t.Fatalf("acceptance reconcile with restricted selection = (%#v, %v), want clean requeue", result, err)
+	}
+	if adapter.dialErr != nil {
+		t.Fatalf("blocked acceptance reached process dial: %v", adapter.dialErr)
 	}
 }
 
