@@ -2613,8 +2613,15 @@ REPOSITORY_BOOT=$(jq -r '.boot' <<<"$RESTARTED_BODY")
 wait_service_observation "$ENV_NAME" repository-web 1 Healthy
 
 echo "==> verifying malformed and API-colliding repository config fail closed"
+# Publish only the complete malformed input, never a transient valid-empty removal.
 printf '%s' $'version: 1\nservices:\n  repository-web:\n    command: invalid\n' |
-	kubectl exec -i "$POD_NAME" -- sh -c 'cat > /workspace/.swe/services.yaml'
+	kubectl exec -i "$POD_NAME" -- sh -ec '
+		temporary=$(mktemp /workspace/.swe/.services-malformed-XXXXXX)
+		trap "rm -f \"$temporary\"" EXIT
+		trap "exit 1" HUP INT TERM
+		cat > "$temporary"
+		mv "$temporary" /workspace/.swe/services.yaml
+	'
 sleep 25
 REPOSITORY_REVISION_STATUS=0
 REPOSITORY_REVISION=$(kubectl --request-timeout=10s get environment "$ENV_NAME" \
