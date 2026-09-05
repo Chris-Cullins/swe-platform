@@ -596,7 +596,9 @@ Only `update runs/changes` permits capture; cookie sessions cannot invoke it. Th
 uncached-proves the exact owned/claimed allocation and uses the connector's dedicated private
 `changes` capability to invoke sandboxd `ChangesService.Snapshot`. This is neither generic Exec
 nor adapter transcript parsing. sandboxd's bounded Git listing disables fsmonitor/optional locks
-and ambient Git configuration; portable `os.Root` handles confine file reads. Root/repository
+and ambient Git configuration. Command-scoped `safe.directory` names only the configured workspace
+root, supporting CSI group-writable ownership without writing configuration or trusting other
+repositories. Portable `os.Root` handles confine file reads. Root/repository
 replacement within a daemon, path-list drift and observed file identity/size/mtime drift fail
 unavailable. Captures are bounded observations, not filesystem-atomic checkpoints; concurrent
 writers that restore metadata cannot be exhaustively detected.

@@ -94,7 +94,10 @@ func (s *ChangesServer) capture(ctx context.Context, baselinePaths []string) cha
 		return unavailable
 	}
 	list := func() ([]string, error) {
-		cmd := exec.CommandContext(ctx, "git", "-c", "core.fsmonitor=false", "-c", "core.untrackedCache=false", "ls-files", "--cached", "--others", "--exclude-standard", "-z")
+		// CSI may grant workspace access via fsGroup rather than owner UID.
+		// Trust only this configured root for this read-only command, as the
+		// project-hook contract does; never write global configuration or use *.
+		cmd := exec.CommandContext(ctx, "git", "-c", "safe.directory="+s.Workspace, "-c", "core.fsmonitor=false", "-c", "core.untrackedCache=false", "ls-files", "--cached", "--others", "--exclude-standard", "-z")
 		cmd.Dir = s.Workspace
 		// Discard all ambient Git command/config injection and credentials.
 		cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "SystemRoot=" + os.Getenv("SystemRoot"), "GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL=" + os.DevNull, "GIT_OPTIONAL_LOCKS=0", "GIT_TERMINAL_PROMPT=0"}
