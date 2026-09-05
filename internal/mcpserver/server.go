@@ -94,7 +94,7 @@ func New(client *controlplaneclient.Client, namespace string) *mcp.Server {
 }
 
 func newServer(client controlPlaneClient, namespace string) *mcp.Server {
-	server := mcp.NewServer(&mcp.Implementation{Name: "swe-platform", Version: "0.1.0"}, nil)
+	server := mcp.NewServer(&mcp.Implementation{Name: "swe-platform", Version: "0.2.0"}, nil)
 	mcp.AddTool(server, &mcp.Tool{
 		Name:         "create_run",
 		Description:  "Create one Run, or recover an exact-intent same-name retry while that Run exists, in namespace " + namespace + " through the authenticated control-plane API. Returns the immutable Run UID required by other tools.",

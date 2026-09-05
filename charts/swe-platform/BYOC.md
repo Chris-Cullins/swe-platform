@@ -21,11 +21,15 @@ runbooks must not be adapted into a Windows-hosted offering by changing node sel
 
 ## Choose and pin an input
 
-The repository does not currently publish a Helm package or GitHub Release. The image workflow
-publishes coordinated `sha-<short SHA>` image tags for each successful main build and stores a
-workflow artifact containing all three image digests. Therefore a latest-main installation must
-use an exact commit checkout and its successful `publish-images` run, never the mutable `latest`
-tag. A tagged release may instead use the chart's `appVersion` defaults.
+The foundation [v0.1.0](https://github.com/Chris-Cullins/swe-platform/releases/tag/v0.1.0)
+is published; `0.2.0` is release preparation and needs separate publication before installation.
+Use the chart from the exact release commit and its release manifest; there is no separately
+published Helm package. The image workflow also publishes coordinated `sha-<short SHA>` image
+tags for each successful main build and stores a workflow artifact containing all three image
+digests. A latest-main installation must use an exact commit checkout and its successful
+`publish-images` run, never mutable `latest`. A tagged release may instead use the chart's
+`appVersion` defaults. All upgrades across the cleanup boundary must follow the
+[two-stage procedure below](#cleanup-release-order-and-rollback-boundary), even when using digests.
 
 ```sh
 set -euo pipefail
@@ -241,6 +245,84 @@ existing multi-Project installation.
 
 ## Upgrade
 
+### Cleanup release order and rollback boundary
+
+`v0.1.0` at
+[`77ae942`](https://github.com/Chris-Cullins/swe-platform/commit/77ae94206ca00adb4d2a487d01abdb8a9d63d6ad)
+contains the cleanup endpoint without the new operator deletion dependency. `0.2.0` adds that
+dependency. Publication of the foundation is complete, but each installation must deploy and
+verify it **before** a separate `0.2.0` rollout. Do not substitute a main/SHA image for either
+release or deploy this unreleased chart merely because its version is already `0.2.0`.
+
+1. Preserve the existing release name, namespace/Installation identity, complete scoped namespace
+   list, database, keyring, and private values. Take the backups below. Confirm the Kubernetes
+   context names the intended cluster. Do not offboard or recreate namespaces to perform an upgrade.
+2. In a separate clean checkout, pin the foundation and download its successful tag workflow's
+   manifest (the workflow must be complete and successful):
+
+   ```sh
+   git fetch origin tag v0.1.0
+   git checkout --detach v0.1.0
+   test "$(git rev-parse HEAD)" = 77ae94206ca00adb4d2a487d01abdb8a9d63d6ad
+   test "$(gh run view 33987642471 --json conclusion --jq .conclusion)" = success
+   mkdir -p .release
+   RELEASE_DIR="$(mktemp -d .release/foundation.XXXXXX)"
+   gh run download 33987642471 --pattern 'swe-platform-release-*' --dir "$RELEASE_DIR"
+   mapfile -t manifests < <(find "$RELEASE_DIR" -name release-manifest.json -type f)
+   test "${#manifests[@]}" -eq 1
+   export SWE_RELEASE_MANIFEST="$(realpath "${manifests[0]}")"
+   jq -e '.chartVersion == "0.1.0" and .appVersion == "0.1.0"' "$SWE_RELEASE_MANIFEST"
+   export SWE_CHART="$PWD/charts/swe-platform"
+   unset SWE_IMAGE_TAG
+   ./hack/validate-byoc.sh render "$PROVIDER"
+   mapfile -t IMAGE_ARGS < <(./hack/validate-byoc.sh image-args "$PROVIDER")
+   ```
+
+   Retain a copy of the manifest: Actions artifacts expire. If unavailable, obtain the matching
+   manifest from the release assets or the administrator's retained copy; never guess digests.
+   Run the CRD/Helm commands in **Apply one verified release** below using this checkout and
+   `IMAGE_ARGS` (for a new installation, use the Install procedure instead). Require `installed`
+   validation to succeed: it waits for workloads and checks the manifest-pinned deployed images.
+   Record that successful foundation deployment before proceeding.
+3. Only after `0.2.0` is separately published and approved for deployment, select its exact release
+   commit, successful tag publish run, and matching manifest using **Choose and pin an input**.
+   Resolve `TARGET_COMMIT` from the fetched `v0.2.0` tag and add `--branch v0.2.0` to that
+   procedure's publish workflow lookup so a main build cannot substitute for the tag build.
+   Require both manifest `chartVersion` and `appVersion` to equal `0.2.0`.
+   Change `SWE_CHART` to that checkout and `SWE_RELEASE_MANIFEST` to its manifest; rebuild
+   `IMAGE_ARGS`, render, and apply that release separately. Do not reuse the foundation's pins.
+   Keep the same database/identity/private values and verify `installed` again. Never use automatic
+   rollback on this transition (including Helm 3 `--atomic` or Helm 4 `--rollback-on-failure`).
+
+**Rollback to `0.1.0` or earlier is unsupported; roll forward only.** The older operator can
+remove Run finalizers without the cleanup dependency. A control-plane downgrade alone can also
+break the required endpoint contract. No validated API-wide Run-deletion freeze/drain procedure
+exists in this release. Keep or restore the compatible cleanup-capable operator/control-plane
+pair and repair transport/database failures so pending cleanup can complete; do not strip
+finalizers, disable transcript transport, remove scoped namespaces, or delete Namespace/Project
+resources to escape a blocked deletion. Stopping the operator is not a freeze: Kubernetes still
+accepts deletions, and the older operator can process them after restart.
+
+For incident evidence, an administrator can list pending Run deletions without reading transcript
+content or credentials:
+
+```sh
+kubectl get runs.swe.dev --all-namespaces -o json |
+  jq '[.items[] | select(.metadata.deletionTimestamp != null) |
+       {namespace: .metadata.namespace, name: .metadata.name, uid: .metadata.uid,
+        deletingSince: .metadata.deletionTimestamp}]'
+```
+
+An empty list is only a point-in-time observation, **not rollback permission**. A future validated
+procedure must enforce a freeze on every deletion entry point (including direct Kubernetes
+clients, automation, collection deletion, and namespace teardown), keep it enforced while the
+current compatible cleanup path drains all accepted deletions, prove that drain, and maintain
+the freeze across downgrade until a compatible cleanup path is restored. Ordinary caller RBAC
+changes or a CLI-only pause cannot establish that invariant. Helm rollback also does not restore
+deleted primary transcript rows, downgrade CRDs, or reverse database migrations.
+
+### Apply one verified release
+
 1. Record `helm get values "$SWE_RELEASE" -n "$SWE_SYSTEM_NAMESPACE" --all` and the current
    commit/release manifest. Verify the target commit's publish and CI workflows, download its
    release manifest, reconstruct `IMAGE_ARGS` with the `image-args` command above, and run
@@ -264,9 +346,8 @@ helm upgrade "$SWE_RELEASE" ./charts/swe-platform \
 
 The operator and singleton control plane use `Recreate`; expect open SSE/WebSocket connections
 to reconnect. PostgreSQL preserves transcripts and browser sessions, but this is not control-
-plane HA. `helm rollback` does not downgrade CRDs or database migrations. Roll forward by
-default. Use Helm rollback only when that specific older release documents compatibility with
-the already-forward CRDs/database and the keyring retains every key it may read.
+plane HA. Roll forward on failure. In particular, the cleanup boundary above has no supported
+rollback procedure; a coordinated image set and retained session keyring do not make it safe.
 
 ## PostgreSQL backup and restore
 

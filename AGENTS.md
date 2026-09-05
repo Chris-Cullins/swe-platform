@@ -27,11 +27,14 @@ Run/Environment resource APIs for the console.
 The CLI also provides a local stdio `swe mcp` server with bounded `create_run` and
 UID-fenced `read_transcript` tools that act through the caller's existing explicit
 control-plane bearer credential; interactive terminal attach is intentionally not an MCP tool.
-The next-release `swe delete-run` path uses Kubernetes UID preconditions; the Run cleanup
+The `0.2.0` `swe delete-run` path uses Kubernetes UID preconditions; the Run cleanup
 finalizer requires exact transcript DELETE after work/credential/claim fencing. Configured
-transport failure blocks deletion; explicitly disabled transport is a no-op. This wiring is
-release-blocked until a versioned predecessor provides the cleanup endpoint. Do not combine
-foundation and operator wiring in one rollout; rollback requires a Run-deletion freeze.
+transport failure blocks deletion; explicitly disabled transport is a no-op. The endpoint
+foundation is published as `v0.1.0`; install and verify it before the separately published `0.2.0`
+wiring. Do not combine foundation and operator wiring in one rollout. Cross-boundary rollback is
+unsupported until a deletion-freeze/drain procedure is separately validated; roll forward only.
+Chart version/appVersion, MCP server identity, and private UI package metadata advance together;
+production presets inherit appVersion, while kind/Argo retain dev/latest respectively.
 The control plane also provides the authenticated declared-service portal gateway, with fenced
 wake/currentness checks and a purpose-scoped sandboxd tunnel. Remaining gaps are tracked in
 `ARCHITECTURE.md`, code comments, and linked issues — most notably additional credential forms,

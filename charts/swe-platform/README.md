@@ -366,8 +366,9 @@ foreign fixed-name children are neither adopted nor deleted.
 The production presets create a `medium` catalog source using the published `env-base` image;
 onboarding creates each runnable Project-local Template copy. Operator, control-plane, and
 env-base tags default to the chart
-`appVersion`, keeping a released chart on one tested version set and making Helm rollback
-restore that set. Override all three tags with a coordinated release or traceable SHA tag when
+`appVersion` (`0.2.0` in this release preparation), keeping a released chart on one tested version
+set. This does not establish rollback compatibility; the cleanup boundary below is roll-forward-only.
+Override all three tags with a coordinated release or traceable SHA tag when
 testing a different set; `latest` and `dev` are development-only choices. Use digests below when
 the registry reference must be immutable.
 
@@ -451,6 +452,10 @@ Actions cache and network/runner variation were not disabled. A local rebuild wa
 because this orb has no Docker-compatible builder; registry manifests provide measured evidence
 for both production architectures, while architecture-specific local build CPU cost remains
 unmeasured.
+
+The three production presets below inherit the coordinated chart `appVersion` (`0.2.0`);
+kind and Argo deliberately retain their development tags. Publish `0.2.0` separately before
+using those production defaults, and follow the foundation-first upgrade procedure.
 
 | Preset | Assumptions |
 |---|---|
@@ -611,12 +616,15 @@ or HA claim.
 
 ### Run deletion retention and release order
 
-**Mandatory release blocker:** first publish and deploy a versioned cleanup-capable control-plane
-foundation release. Only a later release whose predecessor supports the endpoint may ship this
-operator finalizer/client/RBAC wiring. No such predecessor release exists yet; this slice remains
-draft-only until that prerequisite is satisfied. Do not combine both in one rollout. Freeze Run
-deletion before rollback across the operator-owning release and keep it frozen until the compatible
-cleanup path is restored; do not strip finalizers or disable transport to work around an outage.
+The cleanup-capable foundation is published as
+[v0.1.0](https://github.com/Chris-Cullins/swe-platform/releases/tag/v0.1.0).
+Install and verify that release before upgrading to the separately published `0.2.0`
+operator finalizer/client/RBAC wiring. The version bump here prepares that later release; it does
+not publish it. Do not combine both in one rollout. The
+[BYOC upgrade procedure](BYOC.md#cleanup-release-order-and-rollback-boundary) pins the foundation
+and requires a separate target manifest. Rollback across the cleanup boundary is unsupported until
+an API-wide deletion-freeze/drain procedure is separately validated: roll forward only, keeping
+the compatible cleanup path available. Do not strip finalizers or disable transport to bypass it.
 
 `swe --namespace PROJECT_NAMESPACE delete-run RUN` uses kubeconfig get/delete authority, reads the
 exact Run UID, and submits an asynchronous UID-preconditioned Kubernetes DELETE. A same-name
