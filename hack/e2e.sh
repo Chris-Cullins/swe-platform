@@ -1486,7 +1486,7 @@ const server = http.createServer((request, response) => {
 server.listen(Number(process.env.PORT), "127.0.0.1");
 EOF
 git -C "$PROJECT_WORKTREE" add .agents/setup .agents/resume .swe/services.yaml .swe/service.js
-git -C "$PROJECT_WORKTREE" commit -m "Add e2e lifecycle hooks and declared service" >/dev/null
+git -C "$PROJECT_WORKTREE" -c commit.gpgsign=false commit -m "Add e2e lifecycle hooks and declared service" >/dev/null
 git -C "$PROJECT_WORKTREE" bundle create "$PROJECT_REPO/repo.bundle" main
 kubectl create configmap e2e-git-repo --from-file="$PROJECT_REPO/repo.bundle"
 kubectl apply -f - <<EOF
