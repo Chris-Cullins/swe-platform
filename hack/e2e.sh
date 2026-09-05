@@ -200,28 +200,23 @@ check_sandboxd_process() {
 	local pod_name="$1"
 	local run_uid="$2"
 	local expected_key="$3"
-	local secret_name identity checked=false forward_namespace="$PROJECT_NAMESPACE" forward_pod="$pod_name"
+	local secret_name identity pod_ip checked=false
 	secret_name=$(kubectl -n "$PROJECT_NAMESPACE" get pod "$pod_name" -o jsonpath='{.metadata.annotations.swe\.dev/sandboxd-secret-name}')
 	identity=$(kubectl -n "$PROJECT_NAMESPACE" get pod "$pod_name" -o jsonpath='{.metadata.annotations.swe\.dev/sandboxd-identity}')
 	kubectl -n "$PROJECT_NAMESPACE" get secret "$secret_name" -o jsonpath='{.data.tls\.crt}' | base64 --decode > /tmp/swe-platform-sandboxd-cert-"$$"
 	kubectl -n "$PROJECT_NAMESPACE" get secret "$secret_name" -o jsonpath='{.data.process-token}' | base64 --decode > /tmp/swe-platform-sandboxd-token-"$$"
-	if [[ -n "${E2E_ENFORCING_CNI:-}" ]]; then
-		# Exercise the exact authenticated RPC through the policy-authorized path;
-		# a runner-to-Environment port-forward is correctly denied by Calico.
-		local pod_ip
-		pod_ip=$(kubectl -n "$PROJECT_NAMESPACE" get pod "$pod_name" -o jsonpath='{.status.podIP}')
-		kubectl -n "$SYSTEM_NAMESPACE" delete pod swe-sandboxd-relay --ignore-not-found --wait=true >/dev/null
-		kubectl -n "$SYSTEM_NAMESPACE" run swe-sandboxd-relay \
-			--image=busybox:1.36.1 --restart=Never \
-			--labels='app.kubernetes.io/name=swe-platform,app.kubernetes.io/instance=swe-platform,app.kubernetes.io/component=control-plane' \
-			-- sh -c "exec nc -ll -p 50051 -e nc '$pod_ip' 50051"
-		kubectl -n "$SYSTEM_NAMESPACE" wait --for=condition=Ready pod/swe-sandboxd-relay --timeout=30s
-		forward_namespace="$SYSTEM_NAMESPACE"
-		forward_pod="swe-sandboxd-relay"
-	fi
+	# Always use the policy-authorized Pod-IP path. Direct Environment port-forward
+	# can be denied by Calico or miss gVisor's userspace network stack, even on kindnet.
+	pod_ip=$(kubectl -n "$PROJECT_NAMESPACE" get pod "$pod_name" -o jsonpath='{.status.podIP}')
+	kubectl -n "$SYSTEM_NAMESPACE" delete pod swe-sandboxd-relay --ignore-not-found --wait=true >/dev/null
+	kubectl -n "$SYSTEM_NAMESPACE" run swe-sandboxd-relay \
+		--image=busybox:1.36.1 --restart=Never \
+		--labels='app.kubernetes.io/name=swe-platform,app.kubernetes.io/instance=swe-platform,app.kubernetes.io/component=control-plane' \
+		-- sh -c "exec nc -ll -p 50051 -e nc '$pod_ip' 50051"
+	kubectl -n "$SYSTEM_NAMESPACE" wait --for=condition=Ready pod/swe-sandboxd-relay --timeout=30s
 	for _ in $(seq 1 5); do
 		: > /tmp/swe-platform-sandboxd-port-forward.log
-		kubectl -n "$forward_namespace" port-forward pod/"$forward_pod" 15051:50051 >/tmp/swe-platform-sandboxd-port-forward.log 2>&1 &
+		kubectl -n "$SYSTEM_NAMESPACE" port-forward pod/swe-sandboxd-relay 15051:50051 >/tmp/swe-platform-sandboxd-port-forward.log 2>&1 &
 		SANDBOXD_PORT_FORWARD_PID=$!
 		for _ in $(seq 1 30); do
 			if kill -0 "$SANDBOXD_PORT_FORWARD_PID" >/dev/null 2>&1 && \
@@ -242,9 +237,7 @@ check_sandboxd_process() {
 		sleep 1
 	done
 	rm -f /tmp/swe-platform-sandboxd-cert-"$$" /tmp/swe-platform-sandboxd-token-"$$"
-	if [[ -n "${E2E_ENFORCING_CNI:-}" ]]; then
-		kubectl -n "$SYSTEM_NAMESPACE" delete pod swe-sandboxd-relay --ignore-not-found --wait=true >/dev/null
-	fi
+	kubectl -n "$SYSTEM_NAMESPACE" delete pod swe-sandboxd-relay --ignore-not-found --wait=true >/dev/null
 	[[ "$checked" == "true" ]]
 }
 
@@ -254,24 +247,20 @@ manage_observation_listener() {
 	local owner="$3"
 	local role="$4"
 	local port="${5:-}"
-	local secret_name identity forward_namespace="$PROJECT_NAMESPACE" forward_pod="$pod_name"
+	local secret_name identity pod_ip
 	secret_name=$(kubectl -n "$PROJECT_NAMESPACE" get pod "$pod_name" -o jsonpath='{.metadata.annotations.swe\.dev/sandboxd-secret-name}')
 	identity=$(kubectl -n "$PROJECT_NAMESPACE" get pod "$pod_name" -o jsonpath='{.metadata.annotations.swe\.dev/sandboxd-identity}')
 	kubectl -n "$PROJECT_NAMESPACE" get secret "$secret_name" -o jsonpath='{.data.tls\.crt}' | base64 --decode > /tmp/swe-platform-observation-cert-"$$"
 	kubectl -n "$PROJECT_NAMESPACE" get secret "$secret_name" -o jsonpath='{.data.process-token}' | base64 --decode > /tmp/swe-platform-observation-process-token-"$$"
-	if [[ -n "${E2E_ENFORCING_CNI:-}" ]]; then
-		local pod_ip
-		pod_ip=$(kubectl -n "$PROJECT_NAMESPACE" get pod "$pod_name" -o jsonpath='{.status.podIP}')
-		kubectl -n "$SYSTEM_NAMESPACE" delete pod swe-sandboxd-relay --ignore-not-found --wait=true >/dev/null
-		kubectl -n "$SYSTEM_NAMESPACE" run swe-sandboxd-relay \
-			--image=busybox:1.36.1 --restart=Never \
-			--labels='app.kubernetes.io/name=swe-platform,app.kubernetes.io/instance=swe-platform,app.kubernetes.io/component=control-plane' \
-			-- sh -c "exec nc -ll -p 50051 -e nc '$pod_ip' 50051"
-		kubectl -n "$SYSTEM_NAMESPACE" wait --for=condition=Ready pod/swe-sandboxd-relay --timeout=30s
-		forward_namespace="$SYSTEM_NAMESPACE"
-		forward_pod="swe-sandboxd-relay"
-	fi
-	kubectl -n "$forward_namespace" port-forward pod/"$forward_pod" 15052:50051 >/tmp/swe-platform-observation-port-forward.log 2>&1 &
+	# Match the process check's runtime-independent, policy-authorized relay path.
+	pod_ip=$(kubectl -n "$PROJECT_NAMESPACE" get pod "$pod_name" -o jsonpath='{.status.podIP}')
+	kubectl -n "$SYSTEM_NAMESPACE" delete pod swe-sandboxd-relay --ignore-not-found --wait=true >/dev/null
+	kubectl -n "$SYSTEM_NAMESPACE" run swe-sandboxd-relay \
+		--image=busybox:1.36.1 --restart=Never \
+		--labels='app.kubernetes.io/name=swe-platform,app.kubernetes.io/instance=swe-platform,app.kubernetes.io/component=control-plane' \
+		-- sh -c "exec nc -ll -p 50051 -e nc '$pod_ip' 50051"
+	kubectl -n "$SYSTEM_NAMESPACE" wait --for=condition=Ready pod/swe-sandboxd-relay --timeout=30s
+	kubectl -n "$SYSTEM_NAMESPACE" port-forward pod/swe-sandboxd-relay 15052:50051 >/tmp/swe-platform-observation-port-forward.log 2>&1 &
 	SANDBOXD_PORT_FORWARD_PID=$!
 	for _ in $(seq 1 30); do
 		if grep -q 'Forwarding from' /tmp/swe-platform-observation-port-forward.log; then
@@ -293,9 +282,7 @@ manage_observation_listener() {
 	wait "$SANDBOXD_PORT_FORWARD_PID" >/dev/null 2>&1 || true
 	SANDBOXD_PORT_FORWARD_PID=""
 	rm -f /tmp/swe-platform-observation-cert-"$$" /tmp/swe-platform-observation-process-token-"$$"
-	if [[ -n "${E2E_ENFORCING_CNI:-}" ]]; then
-		kubectl -n "$SYSTEM_NAMESPACE" delete pod swe-sandboxd-relay --ignore-not-found --wait=true >/dev/null
-	fi
+	kubectl -n "$SYSTEM_NAMESPACE" delete pod swe-sandboxd-relay --ignore-not-found --wait=true >/dev/null
 }
 
 wait_service_observation() {
@@ -1499,7 +1486,7 @@ const server = http.createServer((request, response) => {
 server.listen(Number(process.env.PORT), "127.0.0.1");
 EOF
 git -C "$PROJECT_WORKTREE" add .agents/setup .agents/resume .swe/services.yaml .swe/service.js
-git -C "$PROJECT_WORKTREE" commit -m "Add e2e lifecycle hooks and declared service" >/dev/null
+git -C "$PROJECT_WORKTREE" -c commit.gpgsign=false commit -m "Add e2e lifecycle hooks and declared service" >/dev/null
 git -C "$PROJECT_WORKTREE" bundle create "$PROJECT_REPO/repo.bundle" main
 kubectl create configmap e2e-git-repo --from-file="$PROJECT_REPO/repo.bundle"
 kubectl apply -f - <<EOF

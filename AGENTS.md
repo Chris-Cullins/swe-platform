@@ -211,6 +211,9 @@ runs both via `make` targets:
   declared-service portal allocation/proxy authorization and lifecycle fencing, process-scoped fake Claude, Amp, and Codex API-key delivery without ambient
   setup/resume/sandboxd exposure, and Secret-only sandboxd process/service-observation/portal
   capability tokens without Environment pod projection.
+  Direct sandboxd acceptance RPCs always use the system-namespace policy-authorized relay
+  to the Environment Pod IP, including on kindnet: direct Environment port-forward cannot
+  reach gVisor's userspace listener. Relay cleanup is independent of runtime and CNI selection.
   Runs in CI as the `e2e` workflow on relevant PRs and via `workflow_dispatch`.
 - **CRD installation/upgrades:** `make install-crds` uses server-side apply with force-conflicts;
   plain Helm upgrades must apply the chart's `crds/` directory before `helm upgrade`.
