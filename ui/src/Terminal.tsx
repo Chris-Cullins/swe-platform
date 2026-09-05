@@ -7,9 +7,11 @@ import { api } from './api'
 export default function Terminal({ namespace, run, runUID, environment, environmentUID }: { namespace: string; run: string; runUID: string; environment: string; environmentUID: string }) {
   const host = useRef<HTMLDivElement>(null)
   const [status, setStatus] = useState('Connecting')
+  const [connection, setConnection] = useState(0)
 
   useEffect(() => {
     if (!host.current) return
+    setStatus('Connecting')
     const terminal = new XTerm()
     const fit = new FitAddon()
     terminal.loadAddon(fit)
@@ -61,10 +63,14 @@ export default function Terminal({ namespace, run, runUID, environment, environm
       fit.dispose()
       terminal.dispose()
     }
-  }, [namespace, run, runUID, environment, environmentUID])
+  }, [namespace, run, runUID, environment, environmentUID, connection])
 
   return <section>
     <p role="status" aria-live="polite">Terminal: {status}</p>
+    {status !== 'Connected' && status !== 'Connecting' && <div className="card">
+      <p>Reconnect to the same environment. This may wake an idle environment; it does not restart the agent task.</p>
+      <button onClick={() => setConnection(value => value + 1)}>Reconnect terminal</button>
+    </div>}
     <div className="terminal" ref={host} role="application" aria-label={`Terminal for ${environment}`} />
   </section>
 }

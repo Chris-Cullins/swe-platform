@@ -461,6 +461,12 @@ describe('App frozen API integration', () => {
     })
     show('/namespaces/default/runs/repair-ui/portals')
     expect(await screen.findByText('No authorized declared services.')).toHaveAttribute('role', 'status')
+    expect(screen.getByText('swe environment services')).toBeInTheDocument()
+    expect(screen.getByRole('link', { name: 'View task progress' })).toHaveAttribute('href', '/namespaces/default/runs/repair-ui/transcript')
+    await userEvent.click(screen.getByText('Task · amp'))
+    expect(screen.getByText('Repair UI')).toBeVisible()
+    await userEvent.click(screen.getByRole('link', { name: 'Overview' }))
+    expect(screen.getByText('Task · amp').parentElement).toHaveAttribute('open')
   })
 
   it('retries transient portal failures but stops polling an exact identity conflict', async () => {
@@ -569,10 +575,55 @@ describe('App frozen API integration', () => {
     const { client } = show('/namespaces/default/runs/repair-ui/overview')
     const invalidate = vi.spyOn(client, 'invalidateQueries')
     await userEvent.click(await screen.findByRole('button', { name: 'Cancel run' }))
+    expect(fetch.mock.calls.some(call => String(call[0]).endsWith('/cancel'))).toBe(false)
+    expect(screen.getByRole('button', { name: 'Keep running' })).toHaveFocus()
+    await userEvent.click(screen.getByRole('button', { name: 'Keep running' }))
+    expect(screen.queryByRole('button', { name: 'Confirm cancellation' })).not.toBeInTheDocument()
+    expect(fetch.mock.calls.some(call => String(call[0]).endsWith('/cancel'))).toBe(false)
+    await userEvent.click(screen.getByRole('button', { name: 'Cancel run' }))
+    await userEvent.click(screen.getByRole('button', { name: 'Confirm cancellation' }))
     await waitFor(() => expect(fetch).toHaveBeenCalledWith('/api/v1/namespaces/default/runs/repair-ui/cancel', expect.objectContaining({ method: 'POST' })))
     const cancelInit = fetch.mock.calls.find(call => String(call[0]).endsWith('/cancel'))?.[1]
     expect(JSON.parse(String(cancelInit?.body))).toEqual({ runUID: 'run-uid' })
     expect(invalidate).toHaveBeenCalledWith({ queryKey: ['run', 'default', 'repair-ui', 'run-uid'], exact: true })
     expect(invalidate).not.toHaveBeenCalledWith({ queryKey: ['runs', 'default'] })
+  })
+
+  it('shows cancellation in flight, retains errors, and acknowledges the accepted request', async () => {
+    let detail = run
+    let resolveCancel!: (value: Response) => void
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (path, init) => {
+      if (path === '/api/v1/session') return response({ authenticated: true, username: 'alex' })
+      if (String(path).includes('/environments/')) return response(environment)
+      if (String(path).includes('/portals/')) return response({ items: [] })
+      if (String(path).endsWith('/cancel') && init?.method === 'POST') return new Promise(resolve => { resolveCancel = resolve })
+      return response(detail)
+    })
+    show('/namespaces/default/runs/repair-ui/overview')
+    await userEvent.click(await screen.findByRole('button', { name: 'Cancel run' }))
+    await userEvent.click(screen.getByRole('button', { name: 'Confirm cancellation' }))
+    expect(screen.getByRole('button', { name: 'Requesting cancellation…' })).toBeDisabled()
+    expect(screen.getByRole('button', { name: 'Keep running' })).toBeDisabled()
+    resolveCancel(response({ title: 'Cancellation unavailable', status: 503 }, 503))
+    expect(await screen.findByRole('alert')).toHaveTextContent('Cancellation unavailable')
+    await userEvent.click(screen.getByRole('button', { name: 'Confirm cancellation' }))
+    detail = { ...run, cancelRequested: true }
+    resolveCancel(response(detail))
+    expect(await screen.findByText('Cancellation requested. Waiting for the agent to stop.')).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: /Cancel run|Confirm cancellation/ })).not.toBeInTheDocument()
+    await userEvent.click(screen.getByRole('link', { name: 'Portals' }))
+    expect(screen.getByText('Cancellation requested. Waiting for the agent to stop.')).toBeInTheDocument()
+  })
+
+  it.each(['Succeeded', 'Failed', 'Cancelled'])('does not offer cancellation or claim to be waiting on a %s run', async state => {
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async path => {
+      if (path === '/api/v1/session') return response({ authenticated: true, username: 'alex' })
+      if (String(path).includes('/environments/')) return response(environment)
+      return response({ ...run, state, cancelRequested: true })
+    })
+    show('/namespaces/default/runs/repair-ui/overview')
+    await screen.findByRole('heading', { name: 'repair-ui' })
+    expect(screen.queryByRole('button', { name: 'Cancel run' })).not.toBeInTheDocument()
+    expect(screen.queryByText('Cancellation requested. Waiting for the agent to stop.')).not.toBeInTheDocument()
   })
 })
