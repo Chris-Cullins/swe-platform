@@ -5,7 +5,7 @@
 # No registries or cloud credentials required: env-base is built locally and
 # loaded into the kind cluster directly.
 #
-# Prerequisites: go, docker, kind, kubectl, helm.
+# Prerequisites: go, docker, kind, kubectl, helm, agent-browser 0.33.2 + Chromium.
 # Env: KIND_CLUSTER (default swe-e2e), KEEP_CLUSTER=true to skip teardown,
 # E2E_USE_EXISTING_CLUSTER=true to test a bootstrapped cluster,
 # E2E_RUNTIME_CLASS (for example gvisor) to select its environment runtime, and
@@ -378,7 +378,8 @@ for arg in "$@"; do
 done
 if [ "$WAIT_FOR_BROWSER" = true ]; then
 	attempt=0
-	while [ "$attempt" -lt 60 ]; do
+	# Leave room for cold browser startup and three real terminal reconnects.
+	while [ "$attempt" -lt 180 ]; do
 		if [ -f /workspace/browser-terminal-opened ]; then break; fi
 		attempt=$((attempt + 1))
 		sleep 1
@@ -3052,6 +3053,9 @@ if ! jq -e '.marker == "portal-listener" and .authorization == "" and .portalHea
 fi
 manage_observation_listener service-stop "$POD_NAME" "$OBSERVATION_OWNER" console-portal-listener
 RUN_TERMINAL_PATH="/api/v1/namespaces/${PROJECT_NAMESPACE}/runs/${RESUME_RUN_NAME}/terminal/${RESUME_RUN_UID}/${RESUME_ENV_UID}"
+echo "==> verifying real console terminal disconnect/reconnect and xterm DOM lifecycle"
+SWE_BROWSER_TOKEN="$CONSOLE_TOKEN" ./hack/console-terminal-reconnect_test.sh \
+	http://127.0.0.1:18080 "$PROJECT_NAMESPACE" "$RESUME_RUN_NAME" "$RESUME_RUN_UID" "$RESUME_ENV_UID"
 echo "==> verifying exact browser Run terminal through a same-origin session"
 "$WEB_TERMINAL_CLIENT" http://127.0.0.1:18080 "$CONSOLE_TOKEN" "$RUN_TERMINAL_PATH" \
 	$'touch /workspace/browser-terminal-opened; printf browser-run-terminal-e2e-ok; exit\n' browser-run-terminal-e2e-ok
