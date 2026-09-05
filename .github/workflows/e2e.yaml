@@ -27,6 +27,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24.18.0"
+
+      - name: Install console browser acceptance client
+        run: |
+          npm install --global agent-browser@0.33.2
+          agent-browser install --with-deps
+
       - uses: actions/setup-go@v5
         with:
           go-version: "1.26"
