@@ -24,6 +24,7 @@ COPY internal/tenancy/ internal/tenancy/
 COPY ui/*.go ui/
 COPY --from=console-build /src/ui/dist ui/dist/
 COPY sandboxd/auth/ sandboxd/auth/
+COPY sandboxd/changes/ sandboxd/changes/
 COPY sandboxd/gen/ sandboxd/gen/
 ARG TARGETOS
 ARG TARGETARCH

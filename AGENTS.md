@@ -224,8 +224,10 @@ runs both via `make` targets:
   Runs in CI as the `e2e` workflow on relevant PRs and via `workflow_dispatch`.
 - **CRD installation/upgrades:** `make install-crds` uses server-side apply with force-conflicts;
   plain Helm upgrades must apply the chart's `crds/` directory before `helm upgrade`.
-- **Images:** `make docker-build` (operator + env-base). The env-base image builds
-  its pinned tmux with `images/env-base/tmux-control-output-drain.patch`; keep the
+- **Images:** `make docker-build` (operator + env-base).
+  The operator and control-plane Dockerfiles selectively copy shared sandboxd packages;
+  keep those COPY lists synchronized with imports (including `sandboxd/changes`).
+  The env-base image builds its pinned tmux with `images/env-base/tmux-control-output-drain.patch`; keep the
   source checksum and patch synchronized when upgrading tmux. Its `terminal-test`
   target runs the patched-runtime terminal regression during `hack/e2e.sh`. The image
   also includes version-pinned Claude Code (the default adapter), Amp, Codex, and Pi CLIs. Amp

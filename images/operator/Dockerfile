@@ -10,6 +10,7 @@ COPY api/ api/
 COPY cmd/operator/ cmd/operator/
 COPY internal/ internal/
 COPY sandboxd/auth/ sandboxd/auth/
+COPY sandboxd/changes/ sandboxd/changes/
 COPY sandboxd/gen/proto/sandboxd/v1/ sandboxd/gen/proto/sandboxd/v1/
 ARG TARGETOS
 ARG TARGETARCH
