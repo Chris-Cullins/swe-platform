@@ -800,13 +800,8 @@ cleanup. An unavailable configured transport or database leaves the Run terminat
 never remove its finalizer to bypass that protection. Only explicitly disabled transport is a no-op.
 There is no TTL, global byte cap, whole-Project purge, or backup/legal-hold guarantee.
 
-**Release order:** the cleanup endpoint foundation is published in
-[v0.1.0](https://github.com/Chris-Cullins/swe-platform/releases/tag/v0.1.0).
-Install and verify that predecessor before upgrading to the separately released `0.2.0` operator
-wiring; do not combine foundation and operator wiring in one rollout. The `0.2.0` version here is
-release preparation, not evidence of publication. Rollback across this boundary is unsupported:
-roll forward until a deletion-freeze/drain procedure is separately validated. See the
-[upgrade runbook](charts/swe-platform/BYOC.md#cleanup-release-order-and-rollback-boundary).
+Run deletion removes its exact live-primary transcript rows; it is destructive, and rolling back
+the software does not restore them. See the [retention guidance](charts/swe-platform/README.md#run-deletion-retention).
 
 ## Contributing
 

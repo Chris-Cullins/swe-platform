@@ -569,15 +569,10 @@ never retries a conflict against a replacement UID. Callers need Kubernetes get/
 The control plane remains sole store/ingress owner; operator RBAC adds only transcript delete
 alongside its existing append authority. Existing cleanup metrics remain bounded and identity-free.
 
-**Release boundary:** the cleanup-capable control-plane foundation is published in
-[v0.1.0](https://github.com/Chris-Cullins/swe-platform/releases/tag/v0.1.0), at
-[`77ae942`](https://github.com/Chris-Cullins/swe-platform/commit/77ae94206ca00adb4d2a487d01abdb8a9d63d6ad).
-The additive operator wiring is prepared for `0.2.0`, which requires separate publication and a
-completed, verified `0.1.0` rollout first. Publication of the predecessor does not prove that an
-installation has deployed it. Across this boundary, roll forward only until an API-wide
-Run-deletion freeze and drain procedure is separately validated; stopping the operator or
-observing zero terminating Runs is not a freeze. See the
-[operational runbook](charts/swe-platform/BYOC.md#cleanup-release-order-and-rollback-boundary).
+**Pre-live decision:** the maintainer superseded the earlier staged-rollout requirement because
+there are no live installations; feature completeness and UX now take priority. The `0.2.0`
+cleanup implementation is not gated on a foundation-first deployment. This changes deployment
+planning, not the exact-identity/authentication fences or fail-closed cleanup contract above.
 Retention lasts for the exact Run's lifetime; there is no TTL, hard global
 byte budget, whole-Project purge, legal hold, or backup/restore cleanup guarantee.
 

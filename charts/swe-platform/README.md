@@ -366,8 +366,7 @@ foreign fixed-name children are neither adopted nor deleted.
 The production presets create a `medium` catalog source using the published `env-base` image;
 onboarding creates each runnable Project-local Template copy. Operator, control-plane, and
 env-base tags default to the chart
-`appVersion` (`0.2.0` in this release preparation), keeping a released chart on one tested version
-set. This does not establish rollback compatibility; the cleanup boundary below is roll-forward-only.
+`appVersion` (`0.2.0`), keeping a released chart on one tested version set.
 Override all three tags with a coordinated release or traceable SHA tag when
 testing a different set; `latest` and `dev` are development-only choices. Use digests below when
 the registry reference must be immutable.
@@ -454,8 +453,7 @@ for both production architectures, while architecture-specific local build CPU c
 unmeasured.
 
 The three production presets below inherit the coordinated chart `appVersion` (`0.2.0`);
-kind and Argo deliberately retain their development tags. Publish `0.2.0` separately before
-using those production defaults, and follow the foundation-first upgrade procedure.
+kind and Argo deliberately retain their development tags.
 
 | Preset | Assumptions |
 |---|---|
@@ -614,17 +612,7 @@ returns 403 and also retains it. The chart intentionally enforces one control-pl
 reconnect, and neither durable sessions nor transcripts constitute a live-connection survival
 or HA claim.
 
-### Run deletion retention and release order
-
-The cleanup-capable foundation is published as
-[v0.1.0](https://github.com/Chris-Cullins/swe-platform/releases/tag/v0.1.0).
-Install and verify that release before upgrading to the separately published `0.2.0`
-operator finalizer/client/RBAC wiring. The version bump here prepares that later release; it does
-not publish it. Do not combine both in one rollout. The
-[BYOC upgrade procedure](BYOC.md#cleanup-release-order-and-rollback-boundary) pins the foundation
-and requires a separate target manifest. Rollback across the cleanup boundary is unsupported until
-an API-wide deletion-freeze/drain procedure is separately validated: roll forward only, keeping
-the compatible cleanup path available. Do not strip finalizers or disable transport to bypass it.
+### Run deletion retention
 
 `swe --namespace PROJECT_NAMESPACE delete-run RUN` uses kubeconfig get/delete authority, reads the
 exact Run UID, and submits an asynchronous UID-preconditioned Kubernetes DELETE. A same-name
