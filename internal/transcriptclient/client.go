@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/Chris-Cullins/swe-platform/internal/agent"
 	"github.com/Chris-Cullins/swe-platform/internal/controlplane"
@@ -26,6 +27,44 @@ type Client struct {
 }
 
 var _ agent.AdapterEventSink = Client{}
+
+// Delete acknowledges only the cleanup endpoint's committed/idempotent 204.
+// In particular, an old server's 404 or HTML fallback is never cleanup success.
+func (c Client) Delete(ctx context.Context, namespace, namespaceUID, run, runUID string) error {
+	if namespace == "" || namespaceUID == "" || run == "" || runUID == "" {
+		return fmt.Errorf("transcript cleanup requires complete identity")
+	}
+	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	token, err := os.ReadFile(c.TokenFile)
+	if err != nil || strings.TrimSpace(string(token)) == "" {
+		return fmt.Errorf("transcript cleanup credential unavailable")
+	}
+	endpoint := strings.TrimRight(c.BaseURL, "/") + "/api/v1/namespaces/" + url.PathEscape(namespace) + "/runs/" + url.PathEscape(run) + "/transcript"
+	request, err := http.NewRequestWithContext(ctx, http.MethodDelete, endpoint, nil)
+	if err != nil {
+		return fmt.Errorf("create transcript cleanup request: %w", err)
+	}
+	request.Header.Set("Authorization", "Bearer "+strings.TrimSpace(string(token)))
+	request.Header.Set(controlplane.RunUIDHeader, runUID)
+	request.Header.Set(controlplane.NamespaceUIDHeader, namespaceUID)
+	httpClient := http.DefaultClient
+	if c.HTTP != nil {
+		httpClient = c.HTTP
+	}
+	// Never forward credentials or accept success from a redirected endpoint.
+	isolated := *httpClient
+	isolated.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	response, err := isolated.Do(request)
+	if err != nil {
+		return fmt.Errorf("transcript cleanup transport unavailable")
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusNoContent {
+		return fmt.Errorf("transcript cleanup returned HTTP %d", response.StatusCode)
+	}
+	return nil
+}
 
 func (c Client) Append(ctx context.Context, namespace, run, runUID string, event agent.AdapterEvent) error {
 	token, err := os.ReadFile(c.TokenFile)

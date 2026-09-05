@@ -103,7 +103,7 @@ case "$*" in
   *"get secret swe-platform-session-keyring"*) echo -n present ;;
   *"get deployments -l app.kubernetes.io/instance=swe-platform -o json")
     cat <<'JSON'
-{"items":[{"spec":{"template":{"spec":{"containers":[{"image":"ghcr.io/chris-cullins/swe-platform/operator:0.1.0","args":[]} ]}}}},{"spec":{"template":{"spec":{"containers":[{"image":"ghcr.io/chris-cullins/swe-platform/control-plane:0.1.0","env":[{"name":"SWE_TENANCY_NAMESPACES","value":""},{"name":"SWE_POSTGRES_URL","valueFrom":{"secretKeyRef":{"name":"swe-platform-postgres","key":"url"}}}]}],"volumes":[{"name":"session-keyring","secret":{"secretName":"swe-platform-session-keyring","items":[{"key":"keyring.json"}]}}]}}}}]}
+{"items":[{"spec":{"template":{"spec":{"containers":[{"image":"ghcr.io/chris-cullins/swe-platform/operator:0.2.0","args":[]} ]}}}},{"spec":{"template":{"spec":{"containers":[{"image":"ghcr.io/chris-cullins/swe-platform/control-plane:0.2.0","env":[{"name":"SWE_TENANCY_NAMESPACES","value":""},{"name":"SWE_POSTGRES_URL","valueFrom":{"secretKeyRef":{"name":"swe-platform-postgres","key":"url"}}}]}],"volumes":[{"name":"session-keyring","secret":{"secretName":"swe-platform-session-keyring","items":[{"key":"keyring.json"}]}}]}}}}]}
 JSON
     ;;
   *"rollout status deployment -l app.kubernetes.io/instance=swe-platform --timeout=5m") : ;;

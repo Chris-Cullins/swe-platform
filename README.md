@@ -792,12 +792,16 @@ does not read a Run transcript, and the CLI never infers a Run from a reusable
 Environment. Production transcript durability and replay across control-plane restarts
 require the chart's PostgreSQL configuration. The default, kind, and Argo development
 presets retain bounded process-local storage and cannot promise restart replay. Per-Run event
-and byte limits bound each Run's retained window, but total transcript storage is not bounded
-across Run churn: deleting a Run does not reclaim its UID-fenced transcript rows, and
-retention/garbage-collection policy is tracked in
-[#101](https://github.com/Chris-Cullins/swe-platform/issues/101). See the
-[chart README](charts/swe-platform/README.md#durable-transcript-storage) for operator monitoring
-guidance and the manual retention procedure until automatic cleanup ships.
+and byte limits bound each Run's retained window. Completion, cancellation, pause, and retain-only
+Project offboarding retain it. `swe --namespace PROJECT_NAMESPACE delete-run RUN` reads the Run
+and submits a Kubernetes UID-preconditioned deletion; it does not wait for cleanup. The existing
+Run finalizer fences work, credentials, and claims before requiring exact live-primary transcript
+cleanup. An unavailable configured transport or database leaves the Run terminating and retrying;
+never remove its finalizer to bypass that protection. Only explicitly disabled transport is a no-op.
+There is no TTL, global byte cap, whole-Project purge, or backup/legal-hold guarantee.
+
+Run deletion removes its exact live-primary transcript rows; it is destructive, and rolling back
+the software does not restore them. See the [retention guidance](charts/swe-platform/README.md#run-deletion-retention).
 
 ## Contributing
 

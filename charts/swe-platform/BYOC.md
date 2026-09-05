@@ -21,11 +21,14 @@ runbooks must not be adapted into a Windows-hosted offering by changing node sel
 
 ## Choose and pin an input
 
-The repository does not currently publish a Helm package or GitHub Release. The image workflow
-publishes coordinated `sha-<short SHA>` image tags for each successful main build and stores a
-workflow artifact containing all three image digests. Therefore a latest-main installation must
-use an exact commit checkout and its successful `publish-images` run, never the mutable `latest`
-tag. A tagged release may instead use the chart's `appVersion` defaults.
+The foundation [v0.1.0](https://github.com/Chris-Cullins/swe-platform/releases/tag/v0.1.0)
+is published; the current chart version is `0.2.0`.
+Use the chart from the exact release commit and its release manifest; there is no separately
+published Helm package. The image workflow also publishes coordinated `sha-<short SHA>` image
+tags for each successful main build and stores a workflow artifact containing all three image
+digests. A latest-main installation must use an exact commit checkout and its successful
+`publish-images` run, never mutable `latest`. A tagged release may instead use the chart's
+`appVersion` defaults.
 
 ```sh
 set -euo pipefail
@@ -264,9 +267,8 @@ helm upgrade "$SWE_RELEASE" ./charts/swe-platform \
 
 The operator and singleton control plane use `Recreate`; expect open SSE/WebSocket connections
 to reconnect. PostgreSQL preserves transcripts and browser sessions, but this is not control-
-plane HA. `helm rollback` does not downgrade CRDs or database migrations. Roll forward by
-default. Use Helm rollback only when that specific older release documents compatibility with
-the already-forward CRDs/database and the keyring retains every key it may read.
+plane HA. Downgrading to an operator without transcript cleanup is unsupported. Software rollback
+does not restore deleted transcript rows or reverse CRD/database changes.
 
 ## PostgreSQL backup and restore
 

@@ -127,4 +127,5 @@ rules:
   resources:
   - runs/transcript
   verbs:
+  - delete
   - update

@@ -122,11 +122,17 @@ type RunReconciler struct {
 	Scope                   *tenancy.ReconcileScope
 	Adapters                map[string]agent.AdapterLifecycle
 	EventSink               agent.AdapterEventSink
+	TranscriptsDisabled     bool
 	Connector               sandboxclient.Connector
 	Metrics                 *OperatorMetrics
 	RepositoryCredentials   repositorycredential.Provider
 	RepositoryCanonicalizer repositorycredential.Canonicalizer
 	Now                     func() time.Time
+	// Required unless transcript transport is explicitly disabled. A configured
+	// but unavailable transport must never be treated as disabled.
+	TranscriptCleanup interface {
+		Delete(ctx context.Context, namespace, namespaceUID, run, runUID string) error
+	}
 }
 
 func (r *RunReconciler) now() time.Time {
@@ -138,7 +144,7 @@ func (r *RunReconciler) now() time.Time {
 
 // +kubebuilder:rbac:groups=swe.dev,resources=runs,verbs=get;list;watch;update;patch
 // +kubebuilder:rbac:groups=swe.dev,resources=runs/status,verbs=get;update;patch
-// +kubebuilder:rbac:groups=swe.dev,resources=runs/transcript,verbs=update
+// +kubebuilder:rbac:groups=swe.dev,resources=runs/transcript,verbs=update;delete
 // +kubebuilder:rbac:groups=swe.dev,resources=environments,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=swe.dev,resources=environments/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=swe.dev,resources=projects,verbs=get;list;watch
@@ -1819,6 +1825,21 @@ func (r *RunReconciler) finalize(ctx context.Context, run *platformv1alpha1.Run)
 	if run.Status.EnvironmentRef == nil {
 		if done, result, cleanupErr := r.cleanupRepositoryCredential(ctx, run, nil); !done || cleanupErr != nil {
 			return result, cleanupErr
+		}
+	}
+	if !r.TranscriptsDisabled {
+		if r.TranscriptCleanup == nil {
+			return ctrl.Result{}, errors.New("transcript cleanup transport is not configured")
+		}
+		var namespace corev1.Namespace
+		if err := r.apiReader().Get(ctx, types.NamespacedName{Name: run.Namespace}, &namespace); err != nil {
+			return ctrl.Result{}, fmt.Errorf("resolve transcript cleanup Namespace: %w", err)
+		}
+		if namespace.UID == "" || run.UID == "" {
+			return ctrl.Result{}, errors.New("transcript cleanup identity is incomplete")
+		}
+		if err := r.TranscriptCleanup.Delete(ctx, run.Namespace, string(namespace.UID), run.Name, string(run.UID)); err != nil {
+			return ctrl.Result{}, err
 		}
 	}
 	controllerutil.RemoveFinalizer(run, runFinalizer)
