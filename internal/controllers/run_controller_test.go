@@ -1358,7 +1358,7 @@ func reconciler(t *testing.T, adapter agent.AdapterLifecycle, objects ...client.
 		objects = append(objects, runExecutionPod(env, types.UID("pod-"+env.Name), "10.0.0.1"))
 	}
 	c := fake.NewClientBuilder().WithScheme(s).WithStatusSubresource(&platformv1alpha1.Run{}, &platformv1alpha1.Environment{}).WithObjects(objects...).Build()
-	return &RunReconciler{Client: c, Scheme: s, Adapters: map[string]agent.AdapterLifecycle{"test": adapter}}
+	return &RunReconciler{Client: c, Scheme: s, Adapters: map[string]agent.AdapterLifecycle{"test": adapter}, TranscriptsDisabled: true}
 }
 
 func runExecutionPod(env *platformv1alpha1.Environment, uid types.UID, podIP string) *corev1.Pod {

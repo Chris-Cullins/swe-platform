@@ -12,6 +12,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/validation"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	platformv1alpha1 "github.com/Chris-Cullins/swe-platform/api/v1alpha1"
 )
@@ -174,6 +175,41 @@ func waitForRun(ctx context.Context, clients *kubeClients, namespace, name strin
 		}
 	}
 	return fmt.Errorf("timed out after %s waiting for run %s", timeout, name)
+}
+
+func newDeleteRunCommand() *cobra.Command {
+	return &cobra.Command{
+		Use:   "delete-run RUN",
+		Short: "Delete an exact Run and end its transcript retention (asynchronous)",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			clients, err := newKubeClients()
+			if err != nil {
+				return err
+			}
+			namespace, _ := cmd.Flags().GetString("namespace")
+			if err := deleteRun(cmd.Context(), clients.Client, namespace, args[0]); err != nil {
+				return err
+			}
+			fmt.Fprintf(cmd.OutOrStdout(), "run %s deletion requested; cleanup may remain terminating until transcript storage is available\n", args[0])
+			return nil
+		},
+	}
+}
+
+func deleteRun(ctx context.Context, c client.Client, namespace, name string) error {
+	var run platformv1alpha1.Run
+	if err := c.Get(ctx, types.NamespacedName{Namespace: namespace, Name: name}, &run); err != nil {
+		return fmt.Errorf("get run for deletion: %w", err)
+	}
+	if run.UID == "" {
+		return fmt.Errorf("refuse Run deletion without immutable UID")
+	}
+	// Do not retry a conflict by reading a replacement and deleting its new UID.
+	if err := c.Delete(ctx, &run, client.Preconditions{UID: &run.UID}); err != nil {
+		return fmt.Errorf("delete exact run: %w", err)
+	}
+	return nil
 }
 
 func newCancelCommand() *cobra.Command {

@@ -1354,7 +1354,7 @@ func TestHoldAcceptsSuspendFenceAndAllowsRunCleanupInEitherOrdering(t *testing.T
 			}
 			kubeClient := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(environment, run).WithObjects(environment, run, pod, credentials).Build()
 			environmentReconciler := &EnvironmentReconciler{Client: kubeClient, Scheme: scheme}
-			runReconciler := &RunReconciler{Client: kubeClient, Scheme: scheme, Adapters: map[string]agent.AdapterLifecycle{"test": &scriptedAdapter{}}}
+			runReconciler := &RunReconciler{Client: kubeClient, Scheme: scheme, Adapters: map[string]agent.AdapterLifecycle{"test": &scriptedAdapter{}}, TranscriptsDisabled: true}
 			key := client.ObjectKeyFromObject(environment)
 			reconcileEnvironment := func() {
 				t.Helper()
