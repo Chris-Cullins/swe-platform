@@ -164,6 +164,8 @@ runs both via `make` targets:
   UI with exact Run/Environment identities, and checks one DOM root per connection and zero
   after unmount. The helper closes its isolated browser session on exit; no provider keys or
   browser fixtures are needed in the live acceptance path.
+  Keep failure diagnostics stage-specific and credential-safe: paths, numeric HTTP statuses,
+  bounded terminal state, and DOM counts only, never cookies, response bodies, or page text.
 - **Windows portability:** CI runs focused sandboxd process, launch-material, Exec,
   filesystem, and terminal-backend-selection tests on `windows-latest`; keep OS-specific
   tests behind build tags. Native terminal selection fails closed until ConPTY is implemented.
