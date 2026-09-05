@@ -105,6 +105,13 @@ for mode in scoped trusted-admin; do
 	operator_secret_rule=$(awk -v RS='  - apiGroups:' '
 		/\[""\]/ && /resources: \["secrets"\]/ && /"list"/ && /"watch"/ { print; exit }
 	' <<<"$operator_role")
+	operator_transcript_rule=$(awk -v RS='  - apiGroups:' '
+		/resources: \["runs\/transcript"\]/ { print; exit }
+	' <<<"$operator_role")
+	if ! grep -Fq 'verbs: ["delete", "update"]' <<<"$operator_transcript_rule"; then
+		echo "$mode operator must grant exact transcript cleanup and append verbs" >&2
+		exit 1
+	fi
 	if [[ -z "$operator_role" || -z "$operator_secret_rule" ]]; then
 		echo "$mode render must let the operator watch owned credential Secret teardown" >&2
 		exit 1
@@ -334,6 +341,10 @@ disabled_control_plane_render=$(helm template rbac-test charts/swe-platform \
 	--set controlPlane.metrics.port=0 \
 	--set controlPlane.portal.enabled=true \
 	--set-string controlPlane.portal.suffix=invalid)
+if grep -Fq 'resources: ["runs/transcript"]' <<<"$disabled_control_plane_render"; then
+	echo "disabled transcript transport must not grant transcript RBAC" >&2
+	exit 1
+fi
 if awk -v RS='---' '
 	/kind: (Deployment|Service|ServiceAccount|ClusterRole)\n/ &&
 	/app.kubernetes.io\/component: control-plane/ { found=1 }

@@ -366,8 +366,8 @@ foreign fixed-name children are neither adopted nor deleted.
 The production presets create a `medium` catalog source using the published `env-base` image;
 onboarding creates each runnable Project-local Template copy. Operator, control-plane, and
 env-base tags default to the chart
-`appVersion`, keeping a released chart on one tested version set and making Helm rollback
-restore that set. Override all three tags with a coordinated release or traceable SHA tag when
+`appVersion` (`0.2.0`), keeping a released chart on one tested version set.
+Override all three tags with a coordinated release or traceable SHA tag when
 testing a different set; `latest` and `dev` are development-only choices. Use digests below when
 the registry reference must be immutable.
 
@@ -451,6 +451,9 @@ Actions cache and network/runner variation were not disabled. A local rebuild wa
 because this orb has no Docker-compatible builder; registry manifests provide measured evidence
 for both production architectures, while architecture-specific local build CPU cost remains
 unmeasured.
+
+The three production presets below inherit the coordinated chart `appVersion` (`0.2.0`);
+kind and Argo deliberately retain their development tags.
 
 | Preset | Assumptions |
 |---|---|
@@ -609,11 +612,20 @@ returns 403 and also retains it. The chart intentionally enforces one control-pl
 reconnect, and neither durable sessions nor transcripts constitute a live-connection survival
 or HA claim.
 
-Per-Run event and byte limits do not bound total database size across Run churn. This release
-contains the control-plane/store half of exact deleting-Run transcript cleanup, including cutoff,
-drain, and idempotent deletion, but deliberately has no operator finalizer/client/RBAC or CLI
-wiring. Consequently, deleting a Run or fencing a Project still does not automatically reclaim
-its UID-fenced transcript rows. New and safely associated
+### Run deletion retention
+
+`swe --namespace PROJECT_NAMESPACE delete-run RUN` uses kubeconfig get/delete authority, reads the
+exact Run UID, and submits an asynchronous UID-preconditioned Kubernetes DELETE. A same-name
+replacement is not retried. The Run finalizer fences work, credentials, and claims, then waits for
+the exact authenticated control-plane cleanup commit. Only HTTP 204 acknowledges cleanup;
+unavailable configured transport/PostgreSQL, old-server 404s, redirects, and uncertain responses
+retain the finalizer for retry. The operator's empty `--transcript-url` (chart control plane
+explicitly disabled) is the sole no-op. Memory development storage uses the same endpoint contract.
+
+Per-Run event and byte limits bound the retained window for the lifetime of each exact Run.
+Completion, cancellation, pause, and retain-only Project offboarding never purge it. Explicit Run
+deletion reclaims only its exact live-primary rows. This bounds supported Run-deletion churn,
+not an installation-wide byte budget; there is no TTL. New and safely associated
 rows include the immutable Namespace UID. Legacy rows with no Namespace UID are associated only
 through an authorized exact current Run UID; otherwise they are retained indefinitely. The
 retain-only Project offboarding phase deliberately has no deletion API. Until a future exact
@@ -642,7 +654,10 @@ ORDER BY coalesce(sum(retained_bytes), 0) DESC;
 
 These queries are read-only and report retained history only; they do not advise when or whether
 to delete. There is no supported manual purge recipe: name-only SQL can cross a reused Namespace,
-and direct row deletion is neither Namespace-UID-preconditioned nor resumable. Retain the rows.
+and direct row deletion cannot drain ingress or prevent a racing append from recreating rows.
+Use explicit Run deletion while its exact identity and cleanup authority remain provable;
+otherwise retain the rows. Cleanup covers only the live primary: backup expiry, legal hold, and
+restored orphan rows remain administrator-owned and are not cleaned by an absence-based sweep.
 
 ### Backup and restore
 
@@ -679,8 +694,8 @@ and any chart values overrides), and recreate agent API-key credentials through 
 A coordinated cluster-loss restore order, RPO, and RTO are not tested or provided by this
 release. The monitoring queries above report retained transcript history so you can size
 database backups. Per-Run retention limits bound individual Run transcript windows, but total
-database size is not bounded across Run churn until the garbage-collection policy in
-[#101](https://github.com/Chris-Cullins/swe-platform/issues/101) ships.
+database size has no hard installation-wide cap. Explicit Run deletion reclaims exact live-primary
+rows under the release prerequisites above; restoring older backups may restore inaccessible rows.
 
 ## BYOC operations
 
@@ -781,7 +796,7 @@ exact namespace, resource name, and subresource on every request:
 | Read an Environment | `get` on `environments` with the requested Environment `resourceName` |
 | Read a transcript | `get` on `runs/transcript` with the requested Run `resourceName` |
 | Append a transcript event | `update` on `runs/transcript` with the requested Run `resourceName` |
-| Internal deleting-Run transcript cleanup foundation (not currently invoked) | `delete` on `runs/transcript` with the requested Run `resourceName` |
+| Operator deleting-Run transcript cleanup | `delete` on `runs/transcript` with the requested Run `resourceName` |
 | Open a direct Environment terminal | `get` on `environments/terminal` with the requested Environment `resourceName` |
 | Open a Run terminal | `get` on the requested base `runs` `resourceName`, then `get` on the resolved `environments/terminal` `resourceName` |
 | Discover/use a portal | exact `get` on `environments/portal`, exact `get` on synthetic `environmentservices/portal` name `<environment>.<service>`, then exact current base Run or Project `get` |
@@ -850,9 +865,9 @@ resolution, health checks, or upgrade. The Run DTO exposes `environment.uid` and
 absent otherwise and must retain both identities on remount.
 
 When the control plane is enabled, the chart projects a rotating `swe-platform`-audience
-service-account token into the operator and grants that identity `update` on
-`runs/transcript`. The operator uses it only to forward opaque adapter events to the
-control-plane Service. This platform transport credential is separate from agent provider
+service-account token into the operator and grants that identity `update` and `delete` on
+`runs/transcript`. The operator uses it to forward opaque adapter events and complete exact
+deleting-Run cleanup through the control-plane Service. This platform transport credential is separate from agent provider
 credentials, which the chart never adds to ambient component or Environment state; supported
 API-key adapters deliver them only as write-only process launch material.
 
@@ -1100,8 +1115,8 @@ The memory implementation deliberately changes both on restart, making old curso
 `400 invalid_cursor` instead of silently skipping events. Both stores use retained-window
 idempotency: after an event is evicted, its key may be reused and creates a new event.
 
-The internal `DELETE` on the same exact transcript route is release-sequencing foundation, not a
-current user workflow. It accepts only an explicit bearer credential, requires both the exact
+The operator invokes internal `DELETE` on the same exact transcript route during finalization,
+subject to the mandatory release order above. It accepts only an explicit bearer credential, requires both the exact
 `SWE-Run-UID` and `SWE-Namespace-UID`, and repeats TokenReview, exact `delete` SAR, Namespace
 identity, and exact deleting-Run currentness after draining admitted appends. Tenancy must be
 active except that this exact no-session DELETE may finish during offboarding fencing; onboarding
@@ -1110,7 +1125,7 @@ for both committed and already-absent deletion. Cutoff cancels existing streams 
 reads/appends to return the fixed `410 transcript-retention-cutoff` problem. Failed cleanup
 remains cut off for retry in the current process; after restart, the still-deleting Run
 reestablishes the cutoff before an idempotent store retry. The bounded cleanup metrics above have
-no namespace, name, or UID labels. No supported caller ships in this release.
+no namespace, name, or UID labels. The CLI deletes the Kubernetes Run, not transcript rows directly.
 
 ## Validate
 
