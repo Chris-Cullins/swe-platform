@@ -1752,6 +1752,9 @@ rules:
     resources: ["runs"]
     verbs: ["create", "get", "list", "update", "watch"]
   - apiGroups: ["swe.dev"]
+    resources: ["runs/changes"]
+    verbs: ["get"]
+  - apiGroups: ["swe.dev"]
     resources: ["environments"]
     verbs: ["get"]
   - apiGroups: ["swe.dev"]
@@ -2986,11 +2989,15 @@ fi
 
 echo "==> verifying the rotated key is materialized only for a fresh agent launch"
 RESUME_RUN_NAME=e2e-resume-credential-run
+kubectl exec "$POD_NAME" -- sh -c 'printf pre-existing > /workspace/changes-pre-existing'
 bin/swe --namespace "$PROJECT_NAMESPACE" run "resume credential smoke test" --name "$RESUME_RUN_NAME" --environment "$ENV_NAME" \
 	--credential-profile e2e-claude --wait=false
 kubectl wait --for=jsonpath='{.status.state}'=Running run/"$RESUME_RUN_NAME" --timeout=3m
 RESUME_RUN_UID=$(kubectl get run "$RESUME_RUN_NAME" -o jsonpath='{.metadata.uid}')
 RESUME_ENV_UID=$(kubectl get run "$RESUME_RUN_NAME" -o jsonpath='{.status.environmentRef.uid}')
+SWE_CONTROL_PLANE_URL=http://127.0.0.1:18080 SWE_CONTROL_PLANE_TOKEN="$CONSOLE_TOKEN" \
+bin/swe --namespace "$PROJECT_NAMESPACE" changes "$RESUME_RUN_NAME" --run-uid "$RESUME_RUN_UID" --json | \
+	jq -e '.state != "unavailable" and (.files | all(.path != "changes-pre-existing"))' >/dev/null
 manage_observation_listener service-start "$POD_NAME" "$OBSERVATION_OWNER" console-portal-listener 3999
 wait_service_observation "$ENV_NAME" manual-api 1 Healthy
 CONSOLE_SESSION_REFRESH_STATUS=$(curl --silent --output /dev/null --write-out '%{http_code}' -X POST \
@@ -3074,6 +3081,18 @@ if [[ "${RELEASED_CLAIM_UID:-}" == "$RESUME_RUN_UID" ]]; then
 	echo "FAIL: completed Run retained its Environment claim"
 	exit 1
 fi
+echo "==> verifying retained read-only Run Changes after claim release"
+CHANGES_JSON=$(SWE_CONTROL_PLANE_URL=http://127.0.0.1:18080 SWE_CONTROL_PLANE_TOKEN="$CONSOLE_TOKEN" \
+	bin/swe --namespace "$PROJECT_NAMESPACE" changes "$RESUME_RUN_NAME" --run-uid "$RESUME_RUN_UID" --json)
+jq -e '.final and (.unavailable | not) and (.files | any(.path == "browser-terminal-opened" and .kind == "added")) and (.files | all(.path != "changes-pre-existing"))' <<<"$CHANGES_JSON" >/dev/null
+SWE_CONTROL_PLANE_URL=http://127.0.0.1:18080 SWE_CONTROL_PLANE_TOKEN="$CONSOLE_TOKEN" \
+bin/swe --namespace "$PROJECT_NAMESPACE" changes "$RESUME_RUN_NAME" --run-uid "$RESUME_RUN_UID" \
+	--revision "$(jq -r .revision <<<"$CHANGES_JSON")" --path browser-terminal-opened --json | \
+	jq -e '.files[0].path == "browser-terminal-opened" and .files[0].state == "text"' >/dev/null
+CHANGES_DENIED=$(curl --silent --output /dev/null --write-out '%{http_code}' \
+	-H "SWE-Run-UID: ${RESUME_RUN_UID}" \
+	"http://127.0.0.1:18080/api/v1/namespaces/${PROJECT_NAMESPACE}/runs/${RESUME_RUN_NAME}/changes")
+test "$CHANGES_DENIED" = 401
 RELEASED_RUN_TERMINAL_STATUS=$(curl --silent --output /dev/null --write-out '%{http_code}' \
 	-H "Authorization: Bearer ${CONSOLE_TOKEN}" \
 	"http://127.0.0.1:18080/api/v1/namespaces/${PROJECT_NAMESPACE}/runs/${RESUME_RUN_NAME}/terminal/${RESUME_RUN_UID}/${RESUME_ENV_UID}")
@@ -3138,6 +3157,9 @@ if [[ "$RESUME_RETAINED" != "1" ]]; then
 fi
 bin/swe --namespace "$PROJECT_NAMESPACE" delete-run "$RESUME_RUN_NAME"
 kubectl wait --for=delete run/"$RESUME_RUN_NAME" --timeout=2m
+CHANGES_RETAINED=$(kubectl -n "$SYSTEM_NAMESPACE" exec deployment/postgres -- \
+	psql -U swe -d swe -tAc "SELECT count(*) FROM run_changes WHERE run_uid = '${RESUME_RUN_UID}'" | tr -d '[:space:]')
+test "$CHANGES_RETAINED" = 0
 RESUME_RETAINED=$(kubectl -n "$SYSTEM_NAMESPACE" exec deployment/postgres -- \
 	psql -U swe -d swe -tAc "SELECT count(*) FROM transcript_runs WHERE run_uid = '${RESUME_RUN_UID}'" | tr -d '[:space:]')
 if [[ "$RESUME_RETAINED" != "0" ]]; then

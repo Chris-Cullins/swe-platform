@@ -52,4 +52,22 @@ describe('Run Changes', () => {
     expect(await screen.findByRole('alert')).toHaveTextContent('different Run identity')
     expect(screen.queryByRole('button', { name: /src\/main.go/ })).not.toBeInTheDocument()
   })
+
+  it('rejects a stale file revision and refreshes without retaining its diff', async () => {
+    vi.stubGlobal('fetch', vi.fn(async (input: string) => new URL(input, 'http://test').searchParams.has('path')
+      ? new Response('{}', { status: 409 }) : new Response(JSON.stringify(snapshot))))
+    mount()
+    await userEvent.click(await screen.findByRole('button', { name: /modified src\/main.go/ }))
+    expect(await screen.findByRole('alert')).toHaveTextContent('Refresh the file list')
+    await userEvent.click(screen.getByRole('button', { name: 'Refresh' }))
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument()
+    expect(screen.getByText('Select a file to review its diff.')).toBeInTheDocument()
+  })
+
+  it('shows denied review access without displaying files', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({ detail: 'Run Changes access denied' }), { status: 403 })))
+    mount()
+    expect(await screen.findByRole('alert')).toHaveTextContent('Run Changes access denied')
+    expect(screen.queryByRole('navigation', { name: 'Changed files' })).not.toBeInTheDocument()
+  })
 })

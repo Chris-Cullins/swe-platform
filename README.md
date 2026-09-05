@@ -5,7 +5,8 @@ Open-source platform for running coding agents unattended in ephemeral, isolated
 Give an agent a task — from the CLI, web UI, or an MCP call — and the platform provisions a
 fresh environment (repo clone, toolchain, process-scoped agent credentials, setup hooks), runs
 the agent in it, streams everything back live, and auto-pauses when idle so compute cost drops
-to ~$0. Reviewable diff, branch, and PR publication remain planned work.
+to ~$0. Review bounded Run-start workspace diffs from the CLI or console; automatic branch,
+commit, push, and PR publication remain unimplemented.
 
 > **Status: early.** The P0 scaffold is in — CRDs, operator, `sandboxd`, CLI — with a
 > passing kind end-to-end (`./hack/e2e.sh`). A first control-plane service accepts and
@@ -707,6 +708,34 @@ or render its Run fields or mount child controls until a second, exact GET confi
 
 For a non-interactive authentication/connectivity check (including CI), use `swe tui --check`.
 It validates namespaced Run-list access without starting a terminal UI or printing credentials.
+
+### Reviewing Run Changes
+
+The console's **Changes** tab and CLI compare the workspace with a snapshot taken before the
+Run first starts, including pre-existing dirty tracked and non-ignored untracked files. Reading
+changes never wakes an Environment or commits, pushes, or creates a PR.
+
+```sh
+swe --namespace my-project changes fix-flaky-42 --run-uid "$RUN_UID"
+swe --namespace my-project changes fix-flaky-42 --run-uid "$RUN_UID" \
+  --path src/main.go --revision 4
+```
+
+Use the explicit control-plane URL/token environment variables as for `swe logs`. Access requires
+`get` on the exact `runs/changes` subresource. Lists contain up to 50 files; the CLI prints the next
+`--offset` and `--revision`. Use `--json` for the typed response. Revision-pinned file reads fail
+if a newer observation replaced the list, rather than mixing diffs from different captures.
+
+Binary, oversized, unreadable, and missing-baseline states are explicit. Limits are 4,096 paths,
+256 KiB per file, 16 MiB of snapshot content, and 512 KiB per text diff. Renames appear as
+delete/add. Active or paused Runs show a timestamped **retained observation**, not a promise of
+the exact current workspace. Final cleanup retains its outcome before releasing the Environment;
+if execution disappeared first, the UI labels the latest capture unavailable and preserves any
+previous verified result. No usable baseline means unavailable, never clean.
+
+PostgreSQL retains the baseline and result for the exact Run's lifetime; `swe delete-run` removes
+them with its transcript. The development memory store is bounded and loses review data on
+restart. See [the implemented contract](ARCHITECTURE.md#run-changes-bounded-read-only-review).
 
 ### Local MCP server
 

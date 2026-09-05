@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"reflect"
 	"strconv"
 	"strings"
 	"time"
@@ -40,66 +41,86 @@ type RunChanges struct {
 	Files       []changes.Change `json:"files"`
 }
 
+var changesRequestSlots = make(chan struct{}, 4)
+
 type ChangesCapturer interface {
-	Capture(context.Context, string, string, string, CaptureChangesRequest, []string) (changes.Snapshot, error)
+	Capture(context.Context, string, string, string, CaptureChangesRequest, []string) (CapturedChanges, error)
+}
+
+type CapturedChanges struct {
+	Snapshot changes.Snapshot
+	// Current repeats exact allocation and the private backend/credential proof
+	// immediately before persistence, after potentially slow reauthorization.
+	Current func(context.Context) error
 }
 
 type KubernetesChangesCapturer struct{ Reader client.Reader }
 
-func (c KubernetesChangesCapturer) Capture(ctx context.Context, namespace, name, uid string, request CaptureChangesRequest, baselinePaths []string) (changes.Snapshot, error) {
+func (c KubernetesChangesCapturer) Capture(ctx context.Context, namespace, name, uid string, request CaptureChangesRequest, baselinePaths []string) (CapturedChanges, error) {
+	unavailable := CapturedChanges{Snapshot: changes.Snapshot{State: "unavailable"}}
 	var run platformv1alpha1.Run
 	if err := c.Reader.Get(ctx, types.NamespacedName{Namespace: namespace, Name: name}, &run); err != nil {
-		return changes.Snapshot{}, err
+		return CapturedChanges{}, err
 	}
 	if string(run.UID) != uid || !run.DeletionTimestamp.IsZero() {
-		return changes.Snapshot{}, ErrChangesConflict
+		return CapturedChanges{}, ErrChangesConflict
 	}
 	terminal := run.Status.State == platformv1alpha1.RunStateSucceeded || run.Status.State == platformv1alpha1.RunStateFailed || run.Status.State == platformv1alpha1.RunStateCancelled
 	if request.Final != terminal || request.Baseline && (terminal || apiMeta.IsStatusConditionTrue(run.Status.Conditions, "AdapterAcceptanceAttempted")) {
-		return changes.Snapshot{}, ErrChangesConflict
+		return CapturedChanges{}, ErrChangesConflict
 	}
 	if run.Status.EnvironmentRef == nil {
-		return changes.Snapshot{State: "unavailable"}, nil
+		return unavailable, nil
 	}
 	var env platformv1alpha1.Environment
 	if err := c.Reader.Get(ctx, types.NamespacedName{Namespace: namespace, Name: run.Status.EnvironmentRef.Name}, &env); err != nil {
-		return changes.Snapshot{State: "unavailable"}, nil
+		return unavailable, nil
 	}
 	if !runOwnsOrClaimsEnvironment(&run, &env) || string(env.UID) != request.EnvironmentUID {
 		if request.Final {
-			return changes.Snapshot{State: "unavailable"}, nil
+			return unavailable, nil
 		}
-		return changes.Snapshot{}, ErrChangesConflict
+		return CapturedChanges{}, ErrChangesConflict
 	}
 	if !request.Baseline && (run.Status.AcceptedEnvironmentExecutionGeneration == nil || *run.Status.AcceptedEnvironmentExecutionGeneration != env.Status.ExecutionGeneration) {
-		return changes.Snapshot{State: "unavailable"}, nil
+		return unavailable, nil
 	}
 	fence := lifecycle.CaptureExecutionFence(&env)
 	if fence.ExecutionGeneration() != request.ExecutionGeneration || fence.LifecycleEpoch() != request.LifecycleEpoch || fence.HoldPolicyRevision() != request.HoldPolicyRevision {
-		return changes.Snapshot{}, ErrChangesConflict
+		return CapturedChanges{}, ErrChangesConflict
 	}
 	connector := sandboxclient.Connector{Reader: c.Reader}
 	execution, err := connector.ResolveExecution(ctx, fence)
 	if err != nil {
-		return changes.Snapshot{State: "unavailable"}, nil
+		return unavailable, nil
 	}
-	snapshot, captureErr := connector.SnapshotChanges(ctx, fence, baselinePaths)
-	var currentRun platformv1alpha1.Run
-	if err := c.Reader.Get(ctx, client.ObjectKeyFromObject(&run), &currentRun); err != nil {
-		return changes.Snapshot{}, err
+	observation, captureErr := connector.SnapshotChanges(ctx, fence, baselinePaths)
+	current := func(ctx context.Context) error {
+		var currentRun platformv1alpha1.Run
+		if err := c.Reader.Get(ctx, client.ObjectKeyFromObject(&run), &currentRun); err != nil {
+			return err
+		}
+		currentEnv, err := fence.Revalidate(ctx, c.Reader)
+		if err != nil || currentRun.UID != run.UID || !currentRun.DeletionTimestamp.IsZero() || currentRun.Status.State != run.Status.State || !runOwnsOrClaimsEnvironment(&currentRun, currentEnv) || request.Baseline && apiMeta.IsStatusConditionTrue(currentRun.Status.Conditions, "AdapterAcceptanceAttempted") {
+			return ErrChangesConflict
+		}
+		ok, err := connector.ExecutionCurrent(ctx, fence, execution)
+		if err != nil || !ok {
+			return ErrChangesConflict
+		}
+		if captureErr == nil {
+			return connector.ChangesCurrent(ctx, fence, observation)
+		}
+		return nil
 	}
-	currentEnv, err := fence.Revalidate(ctx, c.Reader)
-	if err != nil || currentRun.UID != run.UID || !currentRun.DeletionTimestamp.IsZero() || currentRun.Status.State != run.Status.State || !runOwnsOrClaimsEnvironment(&currentRun, currentEnv) || request.Baseline && apiMeta.IsStatusConditionTrue(currentRun.Status.Conditions, "AdapterAcceptanceAttempted") {
-		return changes.Snapshot{}, ErrChangesConflict
-	}
-	current, err := connector.ExecutionCurrent(ctx, fence, execution)
-	if err != nil || !current {
-		return changes.Snapshot{}, ErrChangesConflict
+	if err := current(ctx); err != nil {
+		return CapturedChanges{}, err
 	}
 	if captureErr != nil {
-		return changes.Snapshot{State: "unavailable"}, nil
+		unavailable.Current = current
+		return unavailable, nil
 	}
-	return snapshot, nil
+	return CapturedChanges{Snapshot: observation.Snapshot, Current: current}, nil
 }
 
 func (s *Server) handleChanges(w http.ResponseWriter, r *http.Request, namespace, name string) {
@@ -132,6 +153,13 @@ func (s *Server) handleChanges(w http.ResponseWriter, r *http.Request, namespace
 	id := RunIdentity{Namespace: namespace, NamespaceUID: namespaceUIDFromRequest(r), UID: types.UID(uid)}
 	if id.NamespaceUID == "" || s.runs == nil || s.changes == nil {
 		http.Error(w, "changes unavailable", 503)
+		return
+	}
+	select {
+	case changesRequestSlots <- struct{}{}:
+		defer func() { <-changesRequestSlots }()
+	default:
+		http.Error(w, "changes request capacity exceeded", 429)
 		return
 	}
 	ctx, admission, err := s.transcriptGate.admit(r.Context(), id, false)
@@ -183,7 +211,7 @@ func (s *Server) handleChanges(w http.ResponseWriter, r *http.Request, namespace
 	for _, file := range record.Baseline.Files {
 		baselinePaths = append(baselinePaths, file.Path)
 	}
-	snapshot, err := s.changesCapturer.Capture(ctx, namespace, name, uid, request, baselinePaths)
+	captured, err := s.changesCapturer.Capture(ctx, namespace, name, uid, request, baselinePaths)
 	if err != nil {
 		http.Error(w, "changes execution is no longer current", 409)
 		return
@@ -198,7 +226,9 @@ func (s *Server) handleChanges(w http.ResponseWriter, r *http.Request, namespace
 		http.Error(w, "changes identity changed", 409)
 		return
 	}
+	snapshot := captured.Snapshot
 	expected := record.Revision
+	unchanged := expected > 0 && !request.Final && !record.Unavailable && snapshot.State == "available" && reflect.DeepEqual(record.Current, snapshot)
 	if expected == 0 {
 		record.EnvironmentUID = request.EnvironmentUID
 		record.Baseline = changes.Snapshot{State: "unavailable"}
@@ -216,6 +246,21 @@ func (s *Server) handleChanges(w http.ResponseWriter, r *http.Request, namespace
 	if snapshot.State == "available" {
 		record.Current = snapshot
 		record.CapturedAt = time.Now().UTC()
+	}
+	if captured.Current != nil {
+		if err := captured.Current(ctx); err != nil {
+			http.Error(w, "changes execution changed before publication", 409)
+			return
+		}
+	} else if snapshot.State == "available" {
+		http.Error(w, "changes proof unavailable", 503)
+		return
+	}
+	// Identical polling observations keep their revision so a person can select
+	// a file without racing an otherwise meaningless two-second revision bump.
+	if unchanged {
+		w.WriteHeader(204)
+		return
 	}
 	if err := s.changes.Save(ctx, id, expected, record); err != nil {
 		if errors.Is(err, ErrChangesConflict) {

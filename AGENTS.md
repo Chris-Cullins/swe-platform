@@ -24,6 +24,12 @@ browser sessions backed by repeated Kubernetes TokenReview/exact SAR authorizati
 uses one process-owned pgxpool and ordered migrations; production fails closed without its
 database and administrator-owned session keyring. The control plane also provides typed
 Run/Environment resource APIs for the console.
+Run Changes uses a purpose-only sandboxd snapshot capability, pre-acceptance dirty-workspace
+baseline, exact allocation/execution proof at publication, and bounded PostgreSQL/development
+memory review bytes. The CLI `swe changes` and console Changes tab are observation-only.
+Changes shares the transcript cutoff/drain and Run-lifetime deletion path; never infer diffs
+from adapter events or replace a baseline on reacceptance. Limits and retained/unavailable
+semantics are canonical in `ARCHITECTURE.md`.
 The CLI also provides a local stdio `swe mcp` server with bounded `create_run` and
 UID-fenced `read_transcript` tools that act through the caller's existing explicit
 control-plane bearer credential; interactive terminal attach is intentionally not an MCP tool.

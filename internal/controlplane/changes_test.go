@@ -19,10 +19,16 @@ import (
 
 type fakeChangesCapturer struct {
 	capture func(CaptureChangesRequest) (changes.Snapshot, error)
+	current func(context.Context) error
 }
 
-func (c fakeChangesCapturer) Capture(_ context.Context, _, _, _ string, r CaptureChangesRequest, _ []string) (changes.Snapshot, error) {
-	return c.capture(r)
+func (c fakeChangesCapturer) Capture(_ context.Context, _, _, _ string, r CaptureChangesRequest, _ []string) (CapturedChanges, error) {
+	snapshot, err := c.capture(r)
+	current := c.current
+	if current == nil {
+		current = func(context.Context) error { return nil }
+	}
+	return CapturedChanges{Snapshot: snapshot, Current: current}, err
 }
 
 func changesFixture() changes.Snapshot {
@@ -181,6 +187,46 @@ func TestChangesAPIExactIdentityCapturePagesAndDeletion(t *testing.T) {
 	}
 }
 
+func TestChangesBoundedPagesAndStablePollingRevision(t *testing.T) {
+	snapshot := changesFixture()
+	for i := range 60 {
+		snapshot.Files = append(snapshot.Files, changes.File{Path: fmt.Sprintf("z%02d", i), State: "text", Data: []byte("new\n")})
+	}
+	store := NewChangesStore(nil)
+	id := RunIdentity{Namespace: "project-1", NamespaceUID: testNamespaceUID("project-1"), UID: "run-1-uid"}
+	if err := store.Save(context.Background(), id, 0, ChangesRecord{Revision: 1, EnvironmentUID: "env", Baseline: changesFixture(), Current: snapshot}); err != nil {
+		t.Fatal(err)
+	}
+	s := NewServer(nil, ServerOptions{Access: &fakeAccess{}, Runs: &fakeRunResolver{}, ChangesStore: store, ChangesCapturer: fakeChangesCapturer{capture: func(CaptureChangesRequest) (changes.Snapshot, error) { return snapshot, nil }}})
+	for range 3 {
+		r := httptest.NewRequest("POST", "/api/v1/namespaces/project-1/runs/run-1/changes", strings.NewReader(`{"environmentUID":"env"}`))
+		r.Header.Set(RunUIDHeader, "run-1-uid")
+		w := httptest.NewRecorder()
+		s.Handler().ServeHTTP(w, r)
+		if w.Code != 204 {
+			t.Fatal(w.Code, w.Body)
+		}
+	}
+	for _, offset := range []int{0, 50} {
+		r := httptest.NewRequest("GET", fmt.Sprintf("/api/v1/namespaces/project-1/runs/run-1/changes?revision=1&offset=%d", offset), nil)
+		r.Header.Set(RunUIDHeader, "run-1-uid")
+		w := httptest.NewRecorder()
+		s.Handler().ServeHTTP(w, r)
+		var result RunChanges
+		if err := json.Unmarshal(w.Body.Bytes(), &result); err != nil {
+			t.Fatal(err, w.Body)
+		}
+		if w.Code != 200 || result.Revision != 1 || len(result.Files) != min(50, 60-offset) || result.Total != 60 {
+			t.Fatalf("page %+v", result)
+		}
+		for _, f := range result.Files {
+			if f.Diff != "" {
+				t.Fatal("list included unbounded diff")
+			}
+		}
+	}
+}
+
 func TestChangesUnavailableRetainsLastObservation(t *testing.T) {
 	s := NewServer(nil, ServerOptions{Access: &fakeAccess{}, Runs: &fakeRunResolver{}, ChangesStore: NewChangesStore(nil), ChangesCapturer: fakeChangesCapturer{capture: func(CaptureChangesRequest) (changes.Snapshot, error) {
 		return changes.Snapshot{State: "unavailable"}, nil
@@ -200,5 +246,67 @@ func TestChangesUnavailableRetainsLastObservation(t *testing.T) {
 	got, err := s.changes.Load(context.Background(), id)
 	if err != nil || !got.Final || !got.Unavailable || len(got.Current.Files) != 1 || !got.CapturedAt.Equal(r.CapturedAt) {
 		t.Fatalf("lost retained capture %+v %v", got, err)
+	}
+}
+
+func TestChangesCaptureIsAdmittedForEntireDeletionDrain(t *testing.T) {
+	entered, release := make(chan struct{}), make(chan struct{})
+	resolver := &mutableRunResolver{uid: "run-1-uid"}
+	s := NewServer(nil, ServerOptions{Access: &fakeAccess{}, Runs: resolver, ChangesStore: NewChangesStore(nil), ChangesCapturer: fakeChangesCapturer{capture: func(CaptureChangesRequest) (changes.Snapshot, error) {
+		close(entered)
+		<-release
+		return changesFixture(), nil
+	}}})
+	id := RunIdentity{Namespace: "project-1", NamespaceUID: testNamespaceUID("project-1"), UID: "run-1-uid"}
+	request := httptest.NewRequest("POST", "/api/v1/namespaces/project-1/runs/run-1/changes", strings.NewReader(`{"baseline":true}`))
+	request.Header.Set(RunUIDHeader, string(id.UID))
+	done := make(chan int, 1)
+	go func() { w := httptest.NewRecorder(); s.Handler().ServeHTTP(w, request); done <- w.Code }()
+	<-entered
+	cutoff, err := s.transcriptGate.cutoff(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.transcriptGate.mu.Lock()
+	admitted := cutoff.entry.appends
+	s.transcriptGate.mu.Unlock()
+	if admitted != 1 {
+		t.Fatalf("capture admission count=%d", admitted)
+	}
+	resolver.mu.Lock()
+	resolver.deleting = true
+	resolver.mu.Unlock()
+	close(release)
+	if code := <-done; code != 409 {
+		t.Fatalf("late capture returned %d", code)
+	}
+	if _, err := cutoff.beginCleanup(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.changes.Delete(context.Background(), id); err != nil {
+		t.Fatal(err)
+	}
+	cutoff.finish(true)
+	if record, _ := s.changes.Load(context.Background(), id); record.Revision != 0 {
+		t.Fatal("late capture resurrected deleted bytes")
+	}
+}
+
+func TestChangesPublicationRepeatsExecutionProof(t *testing.T) {
+	s := NewServer(nil, ServerOptions{Access: &fakeAccess{}, Runs: &fakeRunResolver{}, ChangesStore: NewChangesStore(nil), ChangesCapturer: fakeChangesCapturer{
+		capture: func(CaptureChangesRequest) (changes.Snapshot, error) { return changesFixture(), nil },
+		current: func(context.Context) error {
+			return errors.New("allocation released or backend replaced during reauthorization")
+		},
+	}})
+	request := httptest.NewRequest("POST", "/api/v1/namespaces/project-1/runs/run-1/changes", strings.NewReader(`{"baseline":true}`))
+	request.Header.Set(RunUIDHeader, "run-1-uid")
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, request)
+	if w.Code != 409 {
+		t.Fatal(w.Code, w.Body)
+	}
+	if record, _ := s.changes.Load(context.Background(), RunIdentity{Namespace: "project-1", NamespaceUID: testNamespaceUID("project-1"), UID: "run-1-uid"}); record.Revision != 0 {
+		t.Fatal("stale bytes published")
 	}
 }

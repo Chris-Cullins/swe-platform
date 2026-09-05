@@ -28,11 +28,29 @@ type ChangesServer struct {
 	gitIdentity  os.FileInfo
 }
 
+var changesCaptureSlots = make(chan struct{}, 2)
+
 func (s *ChangesServer) Snapshot(ctx context.Context, request *sandboxdv1.ChangesSnapshotRequest) (*sandboxdv1.ChangesSnapshotResponse, error) {
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
-	snapshot := s.capture(ctx, request.BaselinePaths)
+	snapshot := changes.Snapshot{State: "unavailable"}
+	select {
+	case changesCaptureSlots <- struct{}{}:
+		result := make(chan changes.Snapshot, 1)
+		go func() { defer func() { <-changesCaptureSlots }(); result <- s.capture(ctx, request.BaselinePaths) }()
+		select {
+		case snapshot = <-result:
+		case <-ctx.Done():
+		}
+	default:
+	}
+	// A raced special-file open may be uninterruptible on some backends. The
+	// worker retains its slot until it exits; RPC deadline and memory/concurrency
+	// remain bounded rather than spawning unbounded abandoned readers.
 	data, err := json.Marshal(snapshot)
+	if len(data) > changes.MaxEncodedBytes {
+		data = []byte(`{"state":"unavailable"}`)
+	}
 	return &sandboxdv1.ChangesSnapshotResponse{SnapshotJson: data}, err
 }
 
@@ -156,7 +174,7 @@ func (s *ChangesServer) capture(ctx context.Context, baselinePaths []string) cha
 		if readErr != nil || statErr != nil || pathErr != nil || !os.SameFile(info, current) || info.Size() != after.Size() || !info.ModTime().Equal(after.ModTime()) {
 			return unavailable
 		}
-		if len(data) > changes.MaxFileBytes {
+		if len(data) > changes.MaxFileBytes || total+len(data) > changes.MaxSnapshotBytes {
 			f.State = "oversized"
 		} else {
 			f.State = changes.ContentState(data)
