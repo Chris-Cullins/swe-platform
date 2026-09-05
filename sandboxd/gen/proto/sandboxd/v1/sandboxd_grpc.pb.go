@@ -1042,3 +1042,113 @@ var HealthService_ServiceDesc = grpc.ServiceDesc{
 	Streams:  []grpc.StreamDesc{},
 	Metadata: "proto/sandboxd/v1/sandboxd.proto",
 }
+
+const (
+	ChangesService_Snapshot_FullMethodName = "/sandboxd.v1.ChangesService/Snapshot"
+)
+
+// ChangesServiceClient is the client API for ChangesService service.
+//
+// For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
+//
+// ChangesService observes the workspace-root repository without Git mutations.
+// No command, ref, or credential input is accepted. JSON uses the bounded
+// sandboxd/changes Snapshot contract, at most 24 MiB encoded.
+type ChangesServiceClient interface {
+	Snapshot(ctx context.Context, in *ChangesSnapshotRequest, opts ...grpc.CallOption) (*ChangesSnapshotResponse, error)
+}
+
+type changesServiceClient struct {
+	cc grpc.ClientConnInterface
+}
+
+func NewChangesServiceClient(cc grpc.ClientConnInterface) ChangesServiceClient {
+	return &changesServiceClient{cc}
+}
+
+func (c *changesServiceClient) Snapshot(ctx context.Context, in *ChangesSnapshotRequest, opts ...grpc.CallOption) (*ChangesSnapshotResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ChangesSnapshotResponse)
+	err := c.cc.Invoke(ctx, ChangesService_Snapshot_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// ChangesServiceServer is the server API for ChangesService service.
+// All implementations must embed UnimplementedChangesServiceServer
+// for forward compatibility.
+//
+// ChangesService observes the workspace-root repository without Git mutations.
+// No command, ref, or credential input is accepted. JSON uses the bounded
+// sandboxd/changes Snapshot contract, at most 24 MiB encoded.
+type ChangesServiceServer interface {
+	Snapshot(context.Context, *ChangesSnapshotRequest) (*ChangesSnapshotResponse, error)
+	mustEmbedUnimplementedChangesServiceServer()
+}
+
+// UnimplementedChangesServiceServer must be embedded to have
+// forward compatible implementations.
+//
+// NOTE: this should be embedded by value instead of pointer to avoid a nil
+// pointer dereference when methods are called.
+type UnimplementedChangesServiceServer struct{}
+
+func (UnimplementedChangesServiceServer) Snapshot(context.Context, *ChangesSnapshotRequest) (*ChangesSnapshotResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method Snapshot not implemented")
+}
+func (UnimplementedChangesServiceServer) mustEmbedUnimplementedChangesServiceServer() {}
+func (UnimplementedChangesServiceServer) testEmbeddedByValue()                        {}
+
+// UnsafeChangesServiceServer may be embedded to opt out of forward compatibility for this service.
+// Use of this interface is not recommended, as added methods to ChangesServiceServer will
+// result in compilation errors.
+type UnsafeChangesServiceServer interface {
+	mustEmbedUnimplementedChangesServiceServer()
+}
+
+func RegisterChangesServiceServer(s grpc.ServiceRegistrar, srv ChangesServiceServer) {
+	// If the following call panics, it indicates UnimplementedChangesServiceServer was
+	// embedded by pointer and is nil.  This will cause panics if an
+	// unimplemented method is ever invoked, so we test this at initialization
+	// time to prevent it from happening at runtime later due to I/O.
+	if t, ok := srv.(interface{ testEmbeddedByValue() }); ok {
+		t.testEmbeddedByValue()
+	}
+	s.RegisterService(&ChangesService_ServiceDesc, srv)
+}
+
+func _ChangesService_Snapshot_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ChangesSnapshotRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ChangesServiceServer).Snapshot(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: ChangesService_Snapshot_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ChangesServiceServer).Snapshot(ctx, req.(*ChangesSnapshotRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+// ChangesService_ServiceDesc is the grpc.ServiceDesc for ChangesService service.
+// It's only intended for direct use with grpc.RegisterService,
+// and not to be introspected or modified (even as a copy)
+var ChangesService_ServiceDesc = grpc.ServiceDesc{
+	ServiceName: "sandboxd.v1.ChangesService",
+	HandlerType: (*ChangesServiceServer)(nil),
+	Methods: []grpc.MethodDesc{
+		{
+			MethodName: "Snapshot",
+			Handler:    _ChangesService_Snapshot_Handler,
+		},
+	},
+	Streams:  []grpc.StreamDesc{},
+	Metadata: "proto/sandboxd/v1/sandboxd.proto",
+}

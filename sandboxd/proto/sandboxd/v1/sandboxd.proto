@@ -412,3 +412,16 @@ message HealthCheckResponse {
   bool ok = 1;
   string version = 2;
 }
+
+// ChangesService observes the workspace-root repository without Git mutations.
+// No command, ref, or credential input is accepted. JSON uses the bounded
+// sandboxd/changes Snapshot contract, at most 24 MiB encoded.
+service ChangesService {
+  rpc Snapshot(ChangesSnapshotRequest) returns (ChangesSnapshotResponse);
+}
+message ChangesSnapshotRequest {
+  // Previously captured paths remain in scope even if Git ignore/index changes.
+  // At most 4096 confined relative paths, 1 MiB in aggregate.
+  repeated string baseline_paths = 1;
+}
+message ChangesSnapshotResponse { bytes snapshot_json = 1; }

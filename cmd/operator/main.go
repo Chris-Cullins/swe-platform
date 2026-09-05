@@ -189,6 +189,7 @@ func main() {
 		}
 	}
 	var eventSink agent.AdapterEventSink
+	var changesSink controllers.RunChangesSink
 	var repositoryCredentials repositorycredential.Provider
 	if (githubAppClientID == "") != (githubAppPrivateKeyFile == "") {
 		setupLog.Error(nil, "github-app-client-id and github-app-private-key-file must be set together")
@@ -216,6 +217,7 @@ func main() {
 			BaseURL: transcriptURL, TokenFile: transcriptTokenFile,
 			HTTP: &http.Client{Timeout: 15 * time.Second},
 		}
+		changesSink = transcriptclient.Client{BaseURL: transcriptURL, TokenFile: transcriptTokenFile, HTTP: &http.Client{Timeout: 30 * time.Second}}
 	}
 	if !(mode == tenancy.ModeScoped && len(tenancyNamespaces) == 0) {
 		if err := (&controllers.RunReconciler{
@@ -225,6 +227,7 @@ func main() {
 			Scope:                   scope,
 			Adapters:                adapters,
 			EventSink:               eventSink,
+			Changes:                 changesSink,
 			Connector:               connector,
 			Metrics:                 operatorMetrics,
 			RepositoryCredentials:   repositoryCredentials,

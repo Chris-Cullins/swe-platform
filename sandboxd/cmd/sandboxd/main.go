@@ -82,6 +82,7 @@ func main() {
 	sandboxdv1.RegisterProcessServiceServer(grpcServer, processServer)
 	sandboxdv1.RegisterFilesystemServiceServer(grpcServer, filesystemServer)
 	sandboxdv1.RegisterTerminalServiceServer(grpcServer, server.NewTerminalServer(*workspace))
+	sandboxdv1.RegisterChangesServiceServer(grpcServer, &server.ChangesServer{Workspace: *workspace})
 	controlAddress, ok := lis.Addr().(*net.TCPAddr)
 	if !ok {
 		log.Fatalf("sandboxd listener has unexpected address type %T", lis.Addr())

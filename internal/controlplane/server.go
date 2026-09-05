@@ -39,6 +39,8 @@ type appendTranscriptRequest struct {
 type Server struct {
 	log                   *slog.Logger
 	store                 TranscriptStore
+	changes               ChangesStore
+	changesCapturer       ChangesCapturer
 	access                AccessController
 	sessions              SessionAuthenticator
 	resources             ResourceService
@@ -90,6 +92,8 @@ type ServerOptions struct {
 	Resources                   ResourceService
 	Runs                        RunResolver
 	TranscriptStore             TranscriptStore
+	ChangesStore                ChangesStore
+	ChangesCapturer             ChangesCapturer
 	TerminalDialer              TerminalDialer
 	PortalResolver              PortalResolver
 	PortalEnvironmentEnumerator PortalEnvironmentEnumerator
@@ -124,6 +128,8 @@ func NewServer(log *slog.Logger, options ServerOptions) *Server {
 	server := &Server{
 		log:                   log,
 		store:                 options.TranscriptStore,
+		changes:               options.ChangesStore,
+		changesCapturer:       options.ChangesCapturer,
 		access:                options.Access,
 		sessions:              options.Sessions,
 		resources:             options.Resources,
@@ -260,6 +266,10 @@ func (s *Server) handleNamespacedAPI(w http.ResponseWriter, r *http.Request) {
 	}
 	if resource == "runs" && subresource == "transcript" {
 		s.handleTranscript(w, r, namespace, name)
+		return
+	}
+	if resource == "runs" && subresource == "changes" {
+		s.handleChanges(w, r, namespace, name)
 		return
 	}
 	if resource == "environments" && subresource == "terminal" && r.Method == http.MethodGet {
@@ -516,6 +526,13 @@ func (s *Server) deleteTranscript(w http.ResponseWriter, r *http.Request, run Ru
 			writeTranscriptProblem(w, http.StatusConflict, "run-not-deleting", "Run is not deleting")
 		}
 		return
+	}
+	if s.changes != nil {
+		if err := s.changes.Delete(r.Context(), run); err != nil {
+			cutoff.finish(false)
+			http.Error(w, "changes cleanup unavailable", http.StatusServiceUnavailable)
+			return
+		}
 	}
 	if s.store == nil {
 		cutoff.finish(true)

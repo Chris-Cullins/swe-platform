@@ -23,7 +23,7 @@ rules:
     verbs: ["get", "list", "patch", "update", "watch"]
   {{- if .Values.controlPlane.enabled }}
   - apiGroups: ["swe.dev"]
-    resources: ["runs/transcript"]
+    resources: ["runs/transcript", "runs/changes"]
     verbs: ["update"]
   {{- end }}
   - apiGroups: ["swe.dev"]

@@ -114,3 +114,22 @@ export interface PortalService {
 export interface PortalServiceList {
   items: PortalService[]
 }
+
+export interface ChangedFile {
+  path: string
+  kind: 'added' | 'modified' | 'deleted'
+  state: 'text' | 'binary' | 'oversized' | 'unavailable'
+  diff?: string
+}
+
+export interface RunChanges {
+  runUID: string
+  revision: number
+  state: 'clean' | 'changed' | 'unavailable'
+  capturedAt: string
+  final: boolean
+  unavailable: boolean
+  total: number
+  next?: number
+  files: ChangedFile[]
+}

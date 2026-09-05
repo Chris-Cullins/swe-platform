@@ -122,6 +122,7 @@ type RunReconciler struct {
 	Scope                   *tenancy.ReconcileScope
 	Adapters                map[string]agent.AdapterLifecycle
 	EventSink               agent.AdapterEventSink
+	Changes                 RunChangesSink
 	Connector               sandboxclient.Connector
 	Metrics                 *OperatorMetrics
 	RepositoryCredentials   repositorycredential.Provider
@@ -139,6 +140,7 @@ func (r *RunReconciler) now() time.Time {
 // +kubebuilder:rbac:groups=swe.dev,resources=runs,verbs=get;list;watch;update;patch
 // +kubebuilder:rbac:groups=swe.dev,resources=runs/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=swe.dev,resources=runs/transcript,verbs=update
+// +kubebuilder:rbac:groups=swe.dev,resources=runs/changes,verbs=update
 // +kubebuilder:rbac:groups=swe.dev,resources=environments,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=swe.dev,resources=environments/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=swe.dev,resources=projects,verbs=get;list;watch
@@ -379,6 +381,9 @@ func (r *RunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.R
 	}
 	if run.Status.State == platformv1alpha1.RunStateEnvironmentReady {
 		if !acceptanceAttempted(&run) {
+			if err := r.captureChanges(ctx, &run, env, true, false); err != nil {
+				return ctrl.Result{}, err
+			}
 			return ctrl.Result{Requeue: true}, r.markAcceptanceAttempted(ctx, &run)
 		}
 		credential, reason, err := r.resolveCredential(ctx, &run)
@@ -482,6 +487,15 @@ func (r *RunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.R
 		state = platformv1alpha1.RunStateFailed
 	default:
 		return ctrl.Result{}, metricErr
+	}
+	if r.Changes != nil && !terminalRunState(state) {
+		if err := r.captureChanges(ctx, &run, env, false, false); err != nil {
+			return ctrl.Result{}, err
+		}
+		current, err = r.allocatedExecutionCurrent(ctx, &run, env, execution, fenceRejections)
+		if err != nil || !current {
+			return ctrl.Result{Requeue: true}, err
+		}
 	}
 	err = r.setRunState(ctx, &run, state, string(observation), observation.StatusMessage(), true)
 	if err != nil || terminalRunState(state) {
@@ -1649,6 +1663,9 @@ func (r *RunReconciler) requestEnvironmentFence(ctx context.Context, env *platfo
 
 func (r *RunReconciler) cleanupTerminal(ctx context.Context, run *platformv1alpha1.Run) (ctrl.Result, error) {
 	if run.Status.EnvironmentRef == nil {
+		if err := r.captureChanges(ctx, run, nil, false, true); err != nil {
+			return ctrl.Result{}, err
+		}
 		if done, result, err := r.cleanupRepositoryCredential(ctx, run, nil); !done || err != nil {
 			return result, err
 		}
@@ -1662,6 +1679,9 @@ func (r *RunReconciler) cleanupTerminal(ctx context.Context, run *platformv1alph
 	}
 	env, err := r.getAllocatedEnvironment(ctx, run)
 	if apierrors.IsNotFound(err) || errors.Is(err, errAllocatedEnvironmentGone) {
+		if captureErr := r.captureChanges(ctx, run, nil, false, true); captureErr != nil {
+			return ctrl.Result{}, captureErr
+		}
 		if done, result, cleanupErr := r.cleanupRepositoryCredential(ctx, run, nil); !done || cleanupErr != nil {
 			return result, cleanupErr
 		}
@@ -1678,6 +1698,9 @@ func (r *RunReconciler) cleanupTerminal(ctx context.Context, run *platformv1alph
 	if runMayHaveAccepted(run) && !environmentFenced(env) {
 		adapter := r.Adapters[run.Spec.Agent]
 		if !environmentReachable(env) || adapter == nil {
+			if err := r.captureChanges(ctx, run, env, false, true); err != nil {
+				return ctrl.Result{}, err
+			}
 			return r.requestEnvironmentFence(ctx, env)
 		}
 		fenceRejections := &fenceRejectionRecorder{metrics: r.Metrics, callSite: fenceCallSiteTerminalCleanup}
@@ -1705,6 +1728,9 @@ func (r *RunReconciler) cleanupTerminal(ctx context.Context, run *platformv1alph
 		if !current {
 			return ctrl.Result{Requeue: true}, nil
 		}
+	}
+	if err := r.captureChanges(ctx, run, env, false, true); err != nil {
+		return ctrl.Result{}, err
 	}
 	if run.Spec.RepositoryCredential != "" && !environmentFenced(env) {
 		return r.requestEnvironmentFence(ctx, env)

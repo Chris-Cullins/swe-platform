@@ -525,7 +525,7 @@ func TestEnsurePodCreatesAndRotatesEphemeralSandboxdCredentials(t *testing.T) {
 		t.Fatalf("credential mode = %v, want readable by non-root sandboxd", pod.Spec.Volumes[1].Secret.DefaultMode)
 	}
 	for _, item := range pod.Spec.Volumes[1].Secret.Items {
-		if item.Key == sandboxdauth.ProcessTokenKey || item.Key == sandboxdauth.ServiceObservationTokenKey || item.Key == sandboxdauth.PortalTokenKey {
+		if item.Key == sandboxdauth.ProcessTokenKey || item.Key == sandboxdauth.ServiceObservationTokenKey || item.Key == sandboxdauth.PortalTokenKey || item.Key == sandboxdauth.ChangesTokenKey {
 			t.Fatal("private operator capability token was mounted into the environment pod")
 		}
 	}
@@ -541,12 +541,13 @@ func TestEnsurePodCreatesAndRotatesEphemeralSandboxdCredentials(t *testing.T) {
 	if err := json.Unmarshal(first.Data[sandboxdauth.CapabilitiesKey], &capabilityConfig); err != nil {
 		t.Fatal(err)
 	}
-	if len(capabilityConfig.Grants) != 6 || len(capabilityConfig.Grants[0].Capabilities) != 2 ||
+	if len(capabilityConfig.Grants) != 7 || len(capabilityConfig.Grants[0].Capabilities) != 2 ||
 		len(capabilityConfig.Grants[1].Capabilities) != 1 || capabilityConfig.Grants[1].Capabilities[0] != sandboxdauth.CapabilityHealth ||
 		len(capabilityConfig.Grants[2].Capabilities) != 1 || capabilityConfig.Grants[2].Capabilities[0] != sandboxdauth.CapabilityProcess ||
 		len(capabilityConfig.Grants[3].Capabilities) != 1 || capabilityConfig.Grants[3].Capabilities[0] != sandboxdauth.CapabilityFilesystem ||
 		len(capabilityConfig.Grants[4].Capabilities) != 1 || capabilityConfig.Grants[4].Capabilities[0] != sandboxdauth.CapabilityServiceObservation ||
-		len(capabilityConfig.Grants[5].Capabilities) != 1 || capabilityConfig.Grants[5].Capabilities[0] != sandboxdauth.CapabilityPortal {
+		len(capabilityConfig.Grants[5].Capabilities) != 1 || capabilityConfig.Grants[5].Capabilities[0] != sandboxdauth.CapabilityPortal ||
+		len(capabilityConfig.Grants[6].Capabilities) != 1 || capabilityConfig.Grants[6].Capabilities[0] != sandboxdauth.CapabilityChanges {
 		t.Fatalf("capability grants = %#v, want terminal, probe health, process, and distinct observation grants", capabilityConfig.Grants)
 	}
 	if _, published := pod.Annotations[sandboxdauth.ProcessTokenKey]; published {
@@ -554,6 +555,9 @@ func TestEnsurePodCreatesAndRotatesEphemeralSandboxdCredentials(t *testing.T) {
 	}
 	if _, published := pod.Annotations[sandboxdauth.FilesystemTokenKey]; published {
 		t.Fatal("filesystem token was published on pod")
+	}
+	if _, published := pod.Annotations[sandboxdauth.ChangesTokenKey]; published || len(first.Data[sandboxdauth.ChangesTokenKey]) == 0 {
+		t.Fatal("changes token must be private and present in the credential Secret")
 	}
 	if _, published := pod.Annotations[sandboxdauth.ServiceObservationTokenKey]; published {
 		t.Fatal("service observation token was published on pod")
