@@ -45,8 +45,13 @@ browser wait --text 'Task ·' >/dev/null
 # host reference so unmount checks detect leaked children even in detached DOM.
 browser eval --stdin >/dev/null <<'JS'
 window.terminalSockets = [];
+window.terminalInput = '';
 window.WebSocket = class extends WebSocket {
   constructor(...args) { super(...args); window.terminalSockets.push(this); }
+  send(data) {
+    if (ArrayBuffer.isView(data)) window.terminalInput += new TextDecoder().decode(data);
+    super.send(data);
+  }
 };
 JS
 stage terminal-open
@@ -58,13 +63,22 @@ for attempt in 1 2 3; do
   stage "shell-exit-$attempt"
   # Input goes through xterm, not a direct socket send. Split the marker so shell
   # echo cannot satisfy the output assertion before the command actually runs.
-  browser find role textbox click --name 'Terminal input' --exact >/dev/null
-  browser keyboard type "printf 'browser-reconnect-%s\\n' $attempt; exit" >/dev/null
+  command="printf 'browser-reconnect-%s\\n' $attempt; exit"
+  expected=$(printf '%s\r' "$command" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))')
+  browser eval "window.terminalInput=''; window.expectedTerminalInput=$expected;" >/dev/null
+  # xterm's helper textarea is an offscreen input sink, not a mouse hit target.
+  # Click the visible terminal as a user would and prove keyboard focus first.
+  browser scrollintoview '.terminal .xterm-screen' >/dev/null
+  browser click '.terminal .xterm-screen' >/dev/null
+  browser wait --fn 'document.activeElement === document.querySelector(".xterm-helper-textarea")' >/dev/null
+  browser keyboard type "$command" >/dev/null
   browser press Enter >/dev/null
-  stage "server-disconnect-$attempt"
-  browser wait --text 'Terminal: Disconnected' >/dev/null
+  stage "outbound-input-$attempt"
+  browser eval 'if (terminalInput !== expectedTerminalInput) throw new Error(`Fixture input mismatch: actual ${terminalInput.length} expected ${expectedTerminalInput.length} characters`); ({fixtureInputMatches:true,bytes:terminalInput.length})'
   stage "shell-output-$attempt"
   browser wait --text "browser-reconnect-$attempt" >/dev/null
+  stage "server-disconnect-$attempt"
+  browser wait --text 'Terminal: Disconnected' >/dev/null
   stage "reconnect-$attempt"
   browser find role button click --name 'Reconnect terminal' --exact >/dev/null
   browser wait --text 'Terminal: Connected' >/dev/null

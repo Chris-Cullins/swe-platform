@@ -164,6 +164,8 @@ runs both via `make` targets:
   UI with exact Run/Environment identities, and checks one DOM root per connection and zero
   after unmount. The helper closes its isolated browser session on exit; no provider keys or
   browser fixtures are needed in the live acceptance path.
+  Scroll the actual xterm screen into view and verify keyboard focus before typing; assert
+  outbound fixture bytes, expanded shell output, and server disconnect as separate stages.
   Keep failure diagnostics stage-specific and credential-safe: paths, numeric HTTP statuses,
   bounded terminal state, and DOM counts only, never cookies, response bodies, or page text.
 - **Windows portability:** CI runs focused sandboxd process, launch-material, Exec,
