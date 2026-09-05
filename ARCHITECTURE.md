@@ -80,7 +80,7 @@ All current CRDs are namespaced:
 | `Project` | One repository URL (represented as a one-item list), a same-namespace default Template reference, changes-workflow metadata, and up to 64 exact lowercase-ASCII FQDN egress selections. The selection contract is admitted, but a non-empty selection remains rejected when an Environment uses the Project because runtime egress enforcement is not enabled. |
 | `EnvironmentTemplate` | Pod image, size/resources, disk, runtime class, idle timeout, warm-pool minimum, and backend. Admission currently permits only the `pod` backend. Chart-owned system-namespace objects are inert catalog sources; execution accepts only installation-managed same-namespace copies bound to exact Installation, source, and Project identities. |
 | `Environment` | Immutable Template selection, an immutable optional backend override, one-way empty-to-nonempty Project binding, explicit hold policy, bounded wake/suspend/activity intents, and up to 32 API- or Repository-owned service declarations. New declarations have an immutable-per-incarnation random `instanceID`; upgrade-retained legacy declarations may omit it, receive no portal route, and can add it only with a higher revision. Omitted legacy service ownership defaults only to `API` and is immutable thereafter. Controller-owned status includes the immutable resolved `provisioning` snapshot, readiness, lifecycle/execution, claim, observations, activity, and nested backend-neutral recovery state; recovery records attempts, exhaustion, the exact failed execution generation being accounted, and the next allowed attempt time, while generation zero means no recovery identity. The gateway owns bounded `portalRoutes` and monotonic `nextPortalRouteGeneration`; inactive routes are denial tombstones preserved by other status writers. |
-| `Run` | Immutable agent task and Environment/Project/Template/agent-credential/repository-credential selection plus monotonic cancellation; status records normalized lifecycle, exact Environment name/UID and ownership, exact credential profile identity, repository credential readiness, accepted lifecycle epoch, and accepted execution generation. `notify` and `parentRef` are schema placeholders without an implemented inbox. |
+| `Run` | Immutable agent task and Environment/Project/Template/agent-credential/repository-credential selection plus monotonic cancellation; status records normalized lifecycle, exact Environment name/UID and ownership, exact credential profile identity, repository credential readiness, accepted lifecycle epoch, and accepted execution generation. The cleanup finalizer retains deletion authority until work/credentials/claims are fenced and exact live-primary transcript cleanup commits (next-release sequencing blocker below). `notify` and `parentRef` are schema placeholders without an implemented inbox. |
 | `AgentCredentialProfile` | Immutable adapter and `APIKey` type metadata. Key bytes live in an owner-linked Secret whose name is derived from the profile UID. |
 
 The current ownership/reference shape is:
@@ -557,9 +557,24 @@ be active except that this exact no-session DELETE alone may continue during
 `LifecycleFencing` + `OperationOffboarding`; onboarding fencing, fenced claims, GET/POST/SSE,
 and every other namespaced operation remain denied. PostgreSQL uses the existing Namespace-UID
 association and one transaction; the memory development store reclaims its accounting and
-subscribers. No operator, finalizer, client, CLI, or RBAC wiring invokes this capability yet, so
-transcript rows are not currently garbage-collected when a Run or Project is deleted and the
-existing operational limitation remains.
+subscribers. The operator's existing `swe.dev/run-cleanup` finalizer now invokes this endpoint
+through its rotating projected bearer credential only after work, repository credentials, and
+claims are fenced. It uncached-resolves Namespace UID and supplies that plus Run UID. Only the
+endpoint's committed/already-absent 204 permits finalizer removal; errors, old-server responses,
+redirects, unavailable configured transport, and uncertain commits leave deletion retrying.
+The empty operator `--transcript-url` explicitly disables both ingestion and cleanup; this is
+the sole cleanup no-op. Terminal states and retain-only offboarding do not invoke deletion.
+`swe delete-run RUN --namespace NS` captures the current Run UID before Kubernetes DELETE and
+never retries a conflict against a replacement UID. Callers need Kubernetes get/delete on Runs.
+The control plane remains sole store/ingress owner; operator RBAC adds only transcript delete
+alongside its existing append authority. Existing cleanup metrics remain bounded and identity-free.
+
+**Mandatory next-release blocker:** the cleanup-capable control-plane foundation must first have
+a versioned release; only a later release whose predecessor supports it may ship this operator
+wiring. No such predecessor exists yet. This implementation is prepared for draft review, not a
+combined foundation/operator rollout. Rollback across the operator-owning release requires a
+Run-deletion freeze. Retention lasts for the exact Run's lifetime; there is no TTL, hard global
+byte budget, whole-Project purge, legal hold, or backup/restore cleanup guarantee.
 
 ### Authentication and exact identity fences
 
@@ -960,7 +975,7 @@ non-empty allowlist rejection behavior.
 
 Repository service ingestion, process URL injection from authenticated discovery, and the
 authorization-filtered per-Run console Portal tab are implemented. Other unimplemented areas include inbox and child-run semantics, changes
-publication, transcript garbage collection, additional credential forms, ConPTY, Windows
+publication, whole-Project transcript purge, additional credential forms, ConPTY, Windows
 setup/resume hook semantics and node-pool/provider requirements, non-Pod
 backends, and control-plane HA. Their detailed contracts remain issue work unless and until a
 maintainer decision is recorded. In particular, schema placeholders or portable interfaces do

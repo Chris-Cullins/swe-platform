@@ -3111,7 +3111,22 @@ if [[ "$REASSIGNED_RUN_TERMINAL_STATUS" != "409" ]]; then
 	echo "FAIL: reassigned browser Run terminal status was ${REASSIGNED_RUN_TERMINAL_STATUS}, expected 409"
 	exit 1
 fi
-kubectl delete run "$RESUME_RUN_NAME" --wait=true >/dev/null
+# Pause/resume and completion retained the original transcript. Explicit CLI
+# deletion alone ends retention, and finalizer completion proves cleanup committed.
+RESUME_RETAINED=$(kubectl -n "$SYSTEM_NAMESPACE" exec deployment/postgres -- \
+	psql -U swe -d swe -tAc "SELECT count(*) FROM transcript_runs WHERE run_uid = '${RESUME_RUN_UID}'" | tr -d '[:space:]')
+if [[ "$RESUME_RETAINED" != "1" ]]; then
+	echo "FAIL: original transcript was not retained for the Run lifetime"
+	exit 1
+fi
+bin/swe --namespace "$PROJECT_NAMESPACE" delete-run "$RESUME_RUN_NAME"
+kubectl wait --for=delete run/"$RESUME_RUN_NAME" --timeout=2m
+RESUME_RETAINED=$(kubectl -n "$SYSTEM_NAMESPACE" exec deployment/postgres -- \
+	psql -U swe -d swe -tAc "SELECT count(*) FROM transcript_runs WHERE run_uid = '${RESUME_RUN_UID}'" | tr -d '[:space:]')
+if [[ "$RESUME_RETAINED" != "0" ]]; then
+	echo "FAIL: finalizer completed without deleting the exact transcript"
+	exit 1
+fi
 kubectl wait --for=jsonpath='{.status.state}'=Succeeded run/"$AMP_RUN_NAME" --timeout=3m
 AMP_RUN_UID=$(kubectl get run "$AMP_RUN_NAME" -o jsonpath='{.metadata.uid}')
 AMP_POD_NAME=$(kubectl get environment "$ENV_NAME" -o jsonpath='{.status.podName}')
