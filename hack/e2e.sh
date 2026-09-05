@@ -2616,9 +2616,32 @@ echo "==> verifying malformed and API-colliding repository config fail closed"
 printf '%s' $'version: 1\nservices:\n  repository-web:\n    command: invalid\n' |
 	kubectl exec -i "$POD_NAME" -- sh -c 'cat > /workspace/.swe/services.yaml'
 sleep 25
-if [[ "$(kubectl get environment "$ENV_NAME" -o jsonpath='{.spec.services[?(@.name=="repository-web")].revision}')" != "1" ]] ||
-	! curl --silent --fail -H "Host: $REPOSITORY_PORTAL_HOST" -H "Authorization: Bearer $CONSOLE_TOKEN" http://127.0.0.1:18080/ >/dev/null; then
-	echo "FAIL: malformed repository service config replaced the last admitted intent"
+REPOSITORY_REVISION_STATUS=0
+REPOSITORY_REVISION=$(kubectl --request-timeout=10s get environment "$ENV_NAME" \
+	-o jsonpath='{.spec.services[?(@.name=="repository-web")].revision}' 2>/dev/null) || REPOSITORY_REVISION_STATUS=$?
+REPOSITORY_HTTP_STATUS=0
+REPOSITORY_HTTP_CODE=$(curl --silent --fail --max-time 10 --output /dev/null --write-out '%{http_code}' \
+	-H "Host: $REPOSITORY_PORTAL_HOST" -H "Authorization: Bearer $CONSOLE_TOKEN" \
+	http://127.0.0.1:18080/) || REPOSITORY_HTTP_STATUS=$?
+echo "malformed-config check: revision=${REPOSITORY_REVISION:-absent} expected=1 kubectl_exit=$REPOSITORY_REVISION_STATUS http_code=$REPOSITORY_HTTP_CODE curl_exit=$REPOSITORY_HTTP_STATUS"
+if [[ "$REPOSITORY_REVISION_STATUS" != "0" || "$REPOSITORY_REVISION" != "1" || "$REPOSITORY_HTTP_STATUS" != "0" ]]; then
+	echo "FAIL: malformed config did not preserve both declaration revision and portal availability"
+	# Bounded, allowlisted evidence only: never print bearer credentials, portal
+	# locators, process argv/env, HTTP bodies, Secret data, or arbitrary log messages.
+	kubectl --request-timeout=10s get environment "$ENV_NAME" -o json 2>/dev/null | jq -c '{
+		identity: (.metadata | {uid, generation, resourceVersion}),
+		declaration: [.spec.services[]? | select(.name == "repository-web") | {name, source, revision, targetPort, instanceID}],
+		phase: .status.phase, executionGeneration: .status.executionGeneration,
+		podName: .status.podName,
+		lifecycle: (.status.lifecycle | {epoch, suspended, suspensionReason}),
+		observations: (.status.serviceObservations | {observedGeneration, executionGeneration, lifecycleEpoch, holdRevision, observedAt,
+			records: [.records[]? | select(.name == "repository-web") | {declarationRevision, state, reason}]}),
+		routes: [.status.portalRoutes[]? | select(.name == "repository-web") | {declarationInstanceID, declarationRevision, generation, active}]
+	}' || echo "Environment failure evidence unavailable"
+	kubectl --request-timeout=10s get pod "$POD_NAME" -o json 2>/dev/null | jq -c '{
+		podUID: .metadata.uid, deleting: .metadata.deletionTimestamp, phase: .status.phase,
+		containers: [.status.containerStatuses[]? | {name, ready, restartCount, state: (.state | keys)}]
+	}' || echo "Pod failure evidence unavailable"
 	exit 1
 fi
 printf '%s' $'version: 1\nservices:\n  repository-web:\n    command: ["node", ".swe/service.js", "v1"]\n  manual-api:\n    command: ["node", ".swe/service.js", "collision"]\n' |
