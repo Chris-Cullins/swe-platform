@@ -1,4 +1,5 @@
 import { act, render, screen } from '@testing-library/react'
+import userEvent from '@testing-library/user-event'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import Terminal from './Terminal'
 
@@ -52,6 +53,30 @@ describe('Terminal', () => {
     expect(mocks.disposeInput).toHaveBeenCalledOnce()
     expect(mocks.disposeFit).toHaveBeenCalledOnce()
     expect(mocks.disposeTerminal).toHaveBeenCalledOnce()
+  })
+
+  it.each(['onclose', 'onerror'] as const)('reconnects after %s with the same exact identities and cleans up the old connection', async event => {
+    vi.stubGlobal('WebSocket', Socket)
+    vi.stubGlobal('ResizeObserver', Observer)
+    const view = render(<Terminal namespace="team" run="run" runUID="run-uid" environment="env" environmentUID="env-uid" />)
+    const oldSocket = Socket.current
+    const oldObserver = Observer.current
+    act(() => oldSocket[event]?.())
+    await userEvent.click(screen.getByRole('button', { name: 'Reconnect terminal' }))
+    expect(oldSocket.close).toHaveBeenCalledOnce()
+    expect(oldObserver.disconnect).toHaveBeenCalledOnce()
+    expect(oldSocket.onmessage).toBeNull()
+    expect(mocks.disposeTerminal).toHaveBeenCalledOnce()
+    expect(mocks.disposeInput).toHaveBeenCalledOnce()
+    expect(mocks.disposeFit).toHaveBeenCalledOnce()
+    expect(Socket.current).not.toBe(oldSocket)
+    expect(Socket.current.url).toBe(oldSocket.url)
+    expect(screen.getByRole('status')).toHaveTextContent('Terminal: Connecting')
+    expect(screen.queryByRole('button', { name: 'Reconnect terminal' })).not.toBeInTheDocument()
+    act(() => Socket.current.onopen?.())
+    expect(screen.getByRole('status')).toHaveTextContent('Terminal: Connected')
+    expect(JSON.parse(Socket.current.send.mock.calls[0][0])).toEqual({ type: 'open', cols: 80, rows: 24 })
+    view.unmount()
   })
 
   it('remounts on exact identity replacement without retaining the old socket', () => {

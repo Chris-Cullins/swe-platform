@@ -158,6 +158,16 @@ runs both via `make` targets:
   image performs both stages in one multi-stage build. The ESLint flat config deliberately
   enables only `rules-of-hooks` and `exhaustive-deps` from the React Hooks plugin; treat
   enabling that plugin's expanding recommended preset as a lint-policy change.
+  Live kind acceptance also runs `hack/console-terminal-reconnect_test.sh` against the
+  embedded console using pinned `agent-browser@0.33.2` and Chromium (`agent-browser install
+  --with-deps`). It types shell exits through real xterm, reconnects three times through the
+  UI with exact Run/Environment identities, and checks one DOM root per connection and zero
+  after unmount. The helper closes its isolated browser session on exit; no provider keys or
+  browser fixtures are needed in the live acceptance path.
+  Scroll the actual xterm screen into view and verify keyboard focus before typing; assert
+  outbound fixture bytes, expanded shell output, and server disconnect as separate stages.
+  Keep failure diagnostics stage-specific and credential-safe: paths, numeric HTTP statuses,
+  bounded terminal state, and DOM counts only, never cookies, response bodies, or page text.
 - **Windows portability:** CI runs focused sandboxd process, launch-material, Exec,
   filesystem, and terminal-backend-selection tests on `windows-latest`; keep OS-specific
   tests behind build tags. Native terminal selection fails closed until ConPTY is implemented.

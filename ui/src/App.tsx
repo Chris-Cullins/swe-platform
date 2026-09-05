@@ -241,11 +241,13 @@ function Detail() {
   const { namespace = '', run = '' } = useParams()
   const query = useRun()
   if (query.isPending) return <main><Busy label="Loading run" /></main>
-  if (query.error) return <main><Failure error={query.error} /></main>
+  if (query.error) return <main><Link to={`/namespaces/${encodeURIComponent(namespace)}/runs`}>← Runs</Link><Failure error={query.error} /><p>Select a run from the list to try again.</p></main>
   if (!query.data) return <main><Busy label="Confirming run identity" /></main>
   return <main><div className="title"><div><Link to={`/namespaces/${encodeURIComponent(namespace)}/runs`}>← Runs</Link><h1>{run}</h1></div><span className="pill">{query.data.state}</span></div>
+    <details className="card" key={`task:${query.data.uid}`}><summary>Task · {query.data.intent.agent}</summary><pre>{query.data.intent.prompt}</pre></details>
+    {query.data.cancelRequested && !isTerminal(query.data.state) && <p role="status">Cancellation requested. Waiting for the agent to stop.</p>}
     <nav aria-label="Run sections"><NavLink to="overview">Overview</NavLink><NavLink to="transcript">Transcript</NavLink>{query.data.environment?.uid && <NavLink to="portals">Portals</NavLink>}{query.data.terminalAvailable && query.data.environment?.uid && <NavLink to="terminal">Terminal</NavLink>}</nav>
-    <Outlet context={query.data} />
+    <Outlet key={query.data.uid} context={query.data} />
   </main>
 }
 
@@ -255,6 +257,9 @@ function Overview() {
   const run = useOutletRun()
   const { namespace = '' } = useParams()
   const queryClient = useQueryClient()
+  const [confirmCancel, setConfirmCancel] = React.useState(false)
+  const keepRunning = React.useRef<HTMLButtonElement>(null)
+  React.useEffect(() => { if (confirmCancel) keepRunning.current?.focus() }, [confirmCancel])
   const environmentUID = run.environment?.uid || ''
   const environment = useQuery<Environment, Error>({
     queryKey: queryKeys.environment(namespace, run.environment?.name || '', environmentUID),
@@ -283,7 +288,11 @@ function Overview() {
       {environmentUID && <><tr><td>Environment ready</td><td>{environment.isPending ? 'Loading…' : env?.ready ? 'Yes' : 'No'}</td></tr><tr><td>Environment paused</td><td>{environment.isPending ? 'Loading…' : env?.paused ? 'Yes' : 'No'}</td></tr></>}
     </tbody></table>
     <h2>Environment</h2>{!run.environment ? <p>Not allocated.</p> : !environmentUID ? <p role="status">Exact Environment identity unavailable.</p> : environment.error ? <Failure error={environment.error} /> : <dl className="facts"><dt>Name</dt><dd>{run.environment.name}</dd><dt>Ownership</dt><dd>{run.environment.ownership}</dd><dt>Phase</dt><dd>{env?.phase || 'Loading…'}</dd><dt>Backend</dt><dd>{env?.backend || 'Loading…'}</dd><dt>Template</dt><dd>{env?.template || 'Loading…'}</dd><dt>Status</dt><dd>{env ? `${env.ready ? 'Ready' : 'Not ready'}, ${env.paused ? 'paused' : 'active'}` : 'Loading…'}</dd></dl>}
-    {!isTerminal(run.state) && <button className="danger" disabled={cancel.isPending} onClick={() => cancel.mutate()}>Cancel run</button>}{cancel.isError && <Failure error={cancel.error} />}
+    {!isTerminal(run.state) && !run.cancelRequested && (confirmCancel ? <section className="card" aria-label="Confirm cancellation">
+      <h2>Cancel {run.name}?</h2>
+      <p>This requests that the agent stop its current task. It cannot be undone.</p>
+      <div className="title"><button ref={keepRunning} disabled={cancel.isPending} onClick={() => { setConfirmCancel(false); cancel.reset() }}>Keep running</button><button className="danger" disabled={cancel.isPending} onClick={() => cancel.mutate()}>{cancel.isPending ? 'Requesting cancellation…' : 'Confirm cancellation'}</button></div>
+    </section> : <button className="danger" onClick={() => setConfirmCancel(true)}>Cancel run</button>)}{cancel.isError && <Failure error={cancel.error} />}
   </section>
 }
 
@@ -314,7 +323,7 @@ function Portals() {
   if (!environmentUID) return <p role="status">Portals unavailable for this Run identity.</p>
   if (query.isPending) return <Busy label="Loading portals" />
   if (query.error) return <Failure error={query.error} />
-  if (!query.data.items.length) return <p role="status">No authorized declared services.</p>
+  if (!query.data.items.length) return <section><p role="status">No authorized declared services.</p><p>Only declared HTTP services you can access appear here. If your task needs a preview, declare it in <code>.swe/services.yaml</code> in the repository or use <code>swe environment services</code> from the CLI.</p><Link to="../transcript">View task progress</Link></section>
   return <section>
     <p className="hint">Links are stable gateway locators, not credentials. Opening an idle portal wakes its Environment. Portal sessions are host-local.</p>
     <table><thead><tr><th>Service</th><th>Port</th><th>Status</th><th>Portal</th></tr></thead><tbody>{query.data.items.map(service => {
