@@ -374,7 +374,31 @@ describe('App frozen API integration', () => {
     expect(screen.getByText('202')).toBeInTheDocument()
     expect(screen.getByText('2026-07-19T12:01:00Z')).toBeInTheDocument()
     expect(screen.getByText('Owned')).toBeInTheDocument()
-    expect(screen.queryByRole('link', { name: /changes/i })).not.toBeInTheDocument()
+    expect(screen.getByRole('link', { name: 'Changes' })).toHaveAttribute('href', '/namespaces/default/runs/repair-ui/changes')
+  })
+
+  it.each(['Running', 'Paused', 'Succeeded'] as const)('routes %s Changes through exact Run context while retaining task and cancellation state', async state => {
+    let exactConfirmed = false
+    const current = { ...run, state, cancelRequested: state === 'Running', terminalAvailable: state === 'Running' }
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (input, init) => {
+      const path = String(input)
+      if (path === '/api/v1/session') return response({ authenticated: true, username: 'alex' })
+      if (path === '/api/v1/namespaces/default/runs?limit=200&view=summary') return response({ items: [] })
+      if (path.includes('/changes?')) {
+        expect(exactConfirmed).toBe(true)
+        expect(new Headers(init?.headers).get('SWE-Run-UID')).toBe(run.uid)
+        return response({ runUID: run.uid, revision: 1, state: 'clean', final: state === 'Succeeded', unavailable: false, total: 0, files: [] })
+      }
+      if (new Headers(init?.headers).get('SWE-Run-UID') === run.uid) exactConfirmed = true
+      return response(current)
+    })
+    show('/namespaces/default/runs/repair-ui/changes')
+    expect(await screen.findByText('No changes in this captured observation.')).toBeInTheDocument()
+    expect(screen.getByRole('link', { name: 'Changes' })).toHaveAttribute('aria-current', 'page')
+    expect(screen.getByText(/Pre-existing edits are part of the baseline, not attributed to this Run/)).toBeInTheDocument()
+    await userEvent.click(screen.getByText('Task · amp'))
+    expect(screen.getByText('Repair UI')).toBeVisible()
+    if (state === 'Running') expect(screen.getByText(/Cancellation requested. Waiting for the agent to stop/)).toBeInTheDocument()
   })
 
   it('recovers Environment detail from 503 but stops on identity mismatch', async () => {

@@ -47,7 +47,7 @@ export function RunChangesView({ namespace, run }: { namespace: string; run: Run
   const snapshot = list.data
   const file = detail.data?.files[0]
   return <section className="changes-review" aria-label="Run changes">
-    <div className="changes-heading"><div><h2>Workspace changes</h2><p className="hint">Compared with the workspace before this Run started, including pre-existing edits. Read-only review; nothing is committed or published.</p></div><button onClick={refresh} disabled={list.isFetching}>Refresh</button></div>
+    <div className="changes-heading"><div><h2>Workspace changes</h2><p className="hint">Compared with the workspace captured before this Run started. Pre-existing edits are part of the baseline, not attributed to this Run. Read-only review; nothing is committed or published.</p></div><button onClick={refresh} disabled={list.isFetching}>Refresh</button></div>
     {list.isPending && <p role="status">Loading changed files…</p>}
     {!!list.error && <p role="alert">{failure(list.error)}</p>}
     {snapshot && !list.error && <>
