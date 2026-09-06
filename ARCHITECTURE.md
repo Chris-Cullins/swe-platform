@@ -244,7 +244,8 @@ mount-group handling, root-squashed storage that cannot grant the group, and non
 without an equivalent access mechanism are unsupported. This is a required storage contract, not
 runtime or CSI capability attestation. Other backends, including a future Windows backend, must
 provide equivalent ACL or workspace preparation semantics rather than reproducing a numeric GID.
-Security revision 5 replaces older Environment Pods to apply this contract while retaining the
+Security revision 6 also requires the purpose-scoped Changes token and replaces older Environment
+Pods to apply the workspace and Changes contracts while retaining the
 exact workspace PVC and frozen provisioning inputs.
 
 ### Tenancy and Project namespace lifecycle
@@ -618,7 +619,21 @@ reviewable and is labeled retained, never asserted to be the exact pause-time wo
 latest capture preserves the last verified bytes with an explicit unavailable flag. Baseline loss
 (including development-store restart) is unrecoverable for that Run and never becomes an empty base.
 Configured storage/transport failures gate baseline acceptance and terminal cleanup; disabling the
-control-plane transport disables capture. Explicit Run deletion uses the existing exact transcript
+control-plane transport disables capture. Transient Environment/execution reads and snapshot RPC
+errors never establish a baseline: they retry before acceptance. Snapshot deadline/capacity errors
+are retryable, not successful unavailable captures.
+
+Offboarding withdraws Changes authorization without blocking terminal safety cleanup. Only a
+terminal final capture may skip transport under a revalidated exact reconcile claim in
+`Fencing`/`offboarding`, or `Fenced` (whose operation must be empty). It records
+`ChangesFinalCaptured=True` with reason `OffboardingUnavailable`; stored bytes stay honestly
+retained and non-final. The Run controller admits `Fenced` only for non-deleting terminal cleanup,
+never execution or baseline capture. Claim transitions abort the old lease; a new reconcile
+must prove the complete current Namespace/Project/Installation identity. This lets cleanup
+finish even if the offboarding CLI reaches `Fenced` before the capture condition, without adding
+any control-plane read/capture authorization exception.
+
+Explicit Run deletion uses the existing exact transcript
 DELETE finalizer path: its shared cutoff/drain includes the entire Changes read/capture request and
 removes both stores before acknowledging cleanup. No new deletion endpoint or retention timer exists.
 

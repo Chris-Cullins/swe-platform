@@ -777,6 +777,37 @@ func TestCurrentSandboxdPodRejectsRestartableLegacyPod(t *testing.T) {
 	}
 }
 
+func TestCurrentSandboxdPodRequiresChangesExecution(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = platformv1alpha1.AddToScheme(scheme)
+	env := &platformv1alpha1.Environment{ObjectMeta: metav1.ObjectMeta{Name: "env", Namespace: "ns", UID: "e"}, Status: platformv1alpha1.EnvironmentStatus{ExecutionGeneration: 1}}
+	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "pod", Namespace: "ns", UID: "pod", Annotations: map[string]string{executionGenerationAnnotation: "1", sandboxdRevisionAnnotation: sandboxdSecurityRevision, sandboxdauth.IdentityAnnotation: "identity", sandboxdauth.TrustAnnotation: "trust", sandboxdauth.TokenAnnotation: "terminal", sandboxdauth.SecretNameAnnotation: envCredentialName(env), sandboxdauth.SecretUIDAnnotation: "secret"}}, Spec: corev1.PodSpec{RestartPolicy: corev1.RestartPolicyNever}}
+	secret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: envCredentialName(env), Namespace: "ns", UID: "secret", Annotations: map[string]string{sandboxdauth.IdentityAnnotation: "identity", sandboxdauth.PodUIDAnnotation: "pod"}}, Data: map[string][]byte{}}
+	for _, key := range []string{sandboxdauth.TLSCertKey, sandboxdauth.TLSKeyKey, sandboxdauth.CapabilitiesKey, sandboxdauth.HealthTokenKey, sandboxdauth.ProcessTokenKey, sandboxdauth.FilesystemTokenKey, sandboxdauth.ServiceObservationTokenKey, sandboxdauth.PortalTokenKey, sandboxdauth.ChangesTokenKey} {
+		secret.Data[key] = []byte("fixture")
+	}
+	_ = controllerutil.SetControllerReference(env, pod, scheme)
+	_ = controllerutil.SetControllerReference(env, secret, scheme)
+	kube := fake.NewClientBuilder().WithScheme(scheme).WithObjects(secret).Build()
+	r := &EnvironmentReconciler{Client: kube}
+	if ok, err := r.currentSandboxdPod(context.Background(), env, pod); err != nil || !ok {
+		t.Fatalf("current: %t %v", ok, err)
+	}
+	pod.Annotations[sandboxdRevisionAnnotation] = "5"
+	if ok, err := r.currentSandboxdPod(context.Background(), env, pod); err != nil || ok {
+		t.Fatalf("old revision accepted: %t %v", ok, err)
+	}
+	pod.Annotations[sandboxdRevisionAnnotation] = sandboxdSecurityRevision
+	delete(secret.Data, sandboxdauth.ChangesTokenKey)
+	if err := kube.Update(context.Background(), secret); err != nil {
+		t.Fatal(err)
+	}
+	if ok, err := r.currentSandboxdPod(context.Background(), env, pod); err != nil || ok {
+		t.Fatalf("missing Changes token accepted: %t %v", ok, err)
+	}
+}
+
 func TestEnsurePodReplacesRevision4AndRetainsWorkspace(t *testing.T) {
 	scheme := runtime.NewScheme()
 	if err := corev1.AddToScheme(scheme); err != nil {
@@ -1363,7 +1394,8 @@ func TestTerminatingFailedPodPersistsRecoveryBeforeReplacement(t *testing.T) {
 		Name: envCredentialName(env), Namespace: env.Namespace, UID: "secret-uid",
 		Annotations: map[string]string{sandboxdauth.IdentityAnnotation: "sandboxd.test", sandboxdauth.PodUIDAnnotation: string(pod.UID)},
 	}, Data: map[string][]byte{
-		sandboxdauth.TLSCertKey: []byte("cert"), sandboxdauth.TLSKeyKey: []byte("key"),
+		sandboxdauth.ChangesTokenKey: []byte("changes"),
+		sandboxdauth.TLSCertKey:      []byte("cert"), sandboxdauth.TLSKeyKey: []byte("key"),
 		sandboxdauth.CapabilitiesKey: []byte("capabilities"), sandboxdauth.HealthTokenKey: []byte("health"), sandboxdauth.ProcessTokenKey: []byte("process"), sandboxdauth.FilesystemTokenKey: []byte("filesystem"), sandboxdauth.ServiceObservationTokenKey: []byte("observe"), sandboxdauth.PortalTokenKey: []byte("portal"),
 	}}
 	for _, object := range []client.Object{pvc, pod, secret} {
@@ -2060,7 +2092,8 @@ func TestReconcileDropsStaleEnvironmentIncarnationStatusWrites(t *testing.T) {
 				Name: envCredentialName(stale), Namespace: stale.Namespace, UID: "u1-secret",
 				Annotations: map[string]string{sandboxdauth.IdentityAnnotation: "sandboxd.u1", sandboxdauth.PodUIDAnnotation: string(pod.UID)},
 			}, Data: map[string][]byte{
-				sandboxdauth.TLSCertKey: []byte("cert"), sandboxdauth.TLSKeyKey: []byte("key"),
+				sandboxdauth.ChangesTokenKey: []byte("changes"),
+				sandboxdauth.TLSCertKey:      []byte("cert"), sandboxdauth.TLSKeyKey: []byte("key"),
 				sandboxdauth.CapabilitiesKey: []byte("capabilities"), sandboxdauth.HealthTokenKey: []byte("health"), sandboxdauth.ProcessTokenKey: []byte("process"), sandboxdauth.FilesystemTokenKey: []byte("filesystem"), sandboxdauth.ServiceObservationTokenKey: []byte("observe"), sandboxdauth.PortalTokenKey: []byte("portal"),
 			}}
 			for _, object := range []client.Object{pvc, pod, secret} {
@@ -2175,7 +2208,8 @@ func TestReconcileUsesUncachedEnvironmentWithLiveExecution(t *testing.T) {
 				Name: envCredentialName(current), Namespace: current.Namespace, UID: "secret-uid",
 				Annotations: map[string]string{sandboxdauth.IdentityAnnotation: "current.sandboxd.swe.dev", sandboxdauth.PodUIDAnnotation: string(pod.UID)},
 			}, Data: map[string][]byte{
-				sandboxdauth.TLSCertKey: []byte("cert"), sandboxdauth.TLSKeyKey: []byte("key"), sandboxdauth.CapabilitiesKey: []byte("capabilities"),
+				sandboxdauth.ChangesTokenKey: []byte("changes"),
+				sandboxdauth.TLSCertKey:      []byte("cert"), sandboxdauth.TLSKeyKey: []byte("key"), sandboxdauth.CapabilitiesKey: []byte("capabilities"),
 				sandboxdauth.HealthTokenKey: []byte("health"), sandboxdauth.ProcessTokenKey: []byte("process"), sandboxdauth.FilesystemTokenKey: []byte("filesystem"), sandboxdauth.ServiceObservationTokenKey: []byte("observe"), sandboxdauth.PortalTokenKey: []byte("portal"),
 			}}
 			for _, object := range []client.Object{pod, secret} {

@@ -125,7 +125,7 @@ func terminalEnvironment(err error) error {
 
 const (
 	sandboxdCredentialMount    = "/var/run/swe-platform/sandboxd"
-	sandboxdSecurityRevision   = "5"
+	sandboxdSecurityRevision   = "6"
 	sandboxdRevisionAnnotation = "swe.dev/sandboxd-security-revision"
 	environmentFinalizer       = "swe.dev/environment-security"
 	workspaceAccessGroup       = int64(10001)
@@ -1446,7 +1446,8 @@ func (r *EnvironmentReconciler) currentSandboxdPod(ctx context.Context, env *pla
 		len(secret.Data[sandboxdauth.TLSCertKey]) > 0 && len(secret.Data[sandboxdauth.TLSKeyKey]) > 0 &&
 		len(secret.Data[sandboxdauth.CapabilitiesKey]) > 0 && len(secret.Data[sandboxdauth.HealthTokenKey]) > 0 &&
 		len(secret.Data[sandboxdauth.ProcessTokenKey]) > 0 && len(secret.Data[sandboxdauth.FilesystemTokenKey]) > 0 &&
-		len(secret.Data[sandboxdauth.ServiceObservationTokenKey]) > 0 && len(secret.Data[sandboxdauth.PortalTokenKey]) > 0, nil
+		len(secret.Data[sandboxdauth.ServiceObservationTokenKey]) > 0 && len(secret.Data[sandboxdauth.PortalTokenKey]) > 0 &&
+		len(secret.Data[sandboxdauth.ChangesTokenKey]) > 0, nil
 }
 
 func (r *EnvironmentReconciler) rotateSandboxdCredentials(ctx context.Context, env *platformv1alpha1.Environment) (string, []byte, string, error) {

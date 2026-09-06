@@ -158,12 +158,20 @@ func (r *RunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.R
 	if err := r.Get(ctx, req.NamespacedName, &run); err != nil {
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
-	ctx, namespaceClaim, err := r.Scope.Begin(ctx, run.Namespace, tenancy.LifecycleActive, tenancy.LifecycleFencing)
+	ctx, namespaceClaim, err := r.Scope.Begin(ctx, run.Namespace, tenancy.LifecycleActive, tenancy.LifecycleFencing, tenancy.LifecycleFenced)
 	if err != nil {
 		if errors.Is(err, tenancy.ErrOutOfScope) {
 			return ctrl.Result{}, nil
 		}
 		return ctrl.Result{}, err
+	}
+	if namespaceClaim.Lifecycle == tenancy.LifecycleFenced {
+		// Offboarding may finish before the terminal cleanup reconcile. Admit
+		// only retained terminal safety cleanup, never acceptance or execution.
+		if terminalRunState(run.Status.State) && run.DeletionTimestamp.IsZero() {
+			return r.cleanupTerminal(ctx, &run)
+		}
+		return ctrl.Result{}, nil
 	}
 	if namespaceClaim.Lifecycle == tenancy.LifecycleFencing {
 		if namespaceClaim.Operation != tenancy.OperationOffboarding {

@@ -18,6 +18,8 @@ import (
 
 	"github.com/Chris-Cullins/swe-platform/sandboxd/changes"
 	sandboxdv1 "github.com/Chris-Cullins/swe-platform/sandboxd/gen/proto/sandboxd/v1"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 type ChangesServer struct {
@@ -41,8 +43,13 @@ func (s *ChangesServer) Snapshot(ctx context.Context, request *sandboxdv1.Change
 		select {
 		case snapshot = <-result:
 		case <-ctx.Done():
+			return nil, status.FromContextError(ctx.Err()).Err()
 		}
 	default:
+		return nil, status.Error(codes.ResourceExhausted, "changes capture capacity exceeded")
+	}
+	if ctx.Err() != nil {
+		return nil, status.FromContextError(ctx.Err()).Err()
 	}
 	// A raced special-file open may be uninterruptible on some backends. The
 	// worker retains its slot until it exits; RPC deadline and memory/concurrency

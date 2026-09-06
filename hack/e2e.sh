@@ -1281,10 +1281,10 @@ if ! kubectl get pod "env-${WARM_ENV_NAME}" -o json | jq -e '
 	.spec.securityContext.fsGroupChangePolicy == "OnRootMismatch" and
 	.spec.securityContext.runAsUser == null and .spec.securityContext.runAsGroup == null and
 	.spec.securityContext.seccompProfile.type == "RuntimeDefault" and
-	.metadata.annotations["swe.dev/sandboxd-security-revision"] == "5" and
+	.metadata.annotations["swe.dev/sandboxd-security-revision"] == "6" and
 	(.spec.containers[] | select(.name == "environment") |
 		.securityContext.allowPrivilegeEscalation == false and .securityContext.capabilities.drop == ["ALL"])' >/dev/null; then
-	echo "FAIL: Environment pod did not apply revision 5 supplementary workspace access without forcing image identity" >&2
+	echo "FAIL: Environment pod did not apply revision 6 Changes/workspace contract without forcing image identity" >&2
 	exit 1
 fi
 if [[ -n "${E2E_RUNTIME_CLASS:-}" ]]; then

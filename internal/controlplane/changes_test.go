@@ -13,13 +13,82 @@ import (
 	"testing"
 	"time"
 
+	platformv1alpha1 "github.com/Chris-Cullins/swe-platform/api/v1alpha1"
 	"github.com/Chris-Cullins/swe-platform/sandboxd/changes"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 )
 
 type fakeChangesCapturer struct {
 	capture func(CaptureChangesRequest) (changes.Snapshot, error)
 	current func(context.Context) error
+}
+
+type changesReadFailure struct {
+	client.Reader
+	remaining int
+	err       error
+}
+
+func (r *changesReadFailure) Get(ctx context.Context, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+	if _, ok := obj.(*platformv1alpha1.Environment); ok {
+		r.remaining--
+		if r.remaining == 0 {
+			return r.err
+		}
+	}
+	return r.Reader.Get(ctx, key, obj, opts...)
+}
+
+func TestChangesBaselinePropagatesEnvironmentAndExecutionReadFailures(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = platformv1alpha1.AddToScheme(scheme)
+	run := &platformv1alpha1.Run{ObjectMeta: metav1.ObjectMeta{Name: "r", Namespace: "ns", UID: "r"}, Status: platformv1alpha1.RunStatus{State: platformv1alpha1.RunStateEnvironmentReady, EnvironmentRef: &platformv1alpha1.RunEnvironmentReference{Name: "e", UID: "e", Ownership: platformv1alpha1.EnvironmentOwnershipClaimed}}}
+	env := &platformv1alpha1.Environment{ObjectMeta: metav1.ObjectMeta{Name: "e", Namespace: "ns", UID: "e"}, Status: platformv1alpha1.EnvironmentStatus{ExecutionGeneration: 1, ClaimedBy: &platformv1alpha1.RunReference{Name: "r", UID: "r"}}}
+	for _, read := range []int{1, 2} {
+		t.Run(fmt.Sprint(read), func(t *testing.T) {
+			uncertain := errors.New("temporary API read failure")
+			reader := &changesReadFailure{Reader: fake.NewClientBuilder().WithScheme(scheme).WithObjects(run, env).Build(), remaining: read, err: uncertain}
+			got, err := (KubernetesChangesCapturer{Reader: reader}).Capture(context.Background(), "ns", "r", "r", CaptureChangesRequest{Baseline: true, EnvironmentUID: "e", ExecutionGeneration: 1}, nil)
+			if !errors.Is(err, uncertain) || got.Snapshot.State != "" {
+				t.Fatalf("uncertainty became baseline: %+v %v", got, err)
+			}
+		})
+	}
+}
+
+func TestChangesTransientBaselineCannotPersistAndRetrySucceeds(t *testing.T) {
+	fail := true
+	s := NewServer(nil, ServerOptions{Access: &fakeAccess{}, Runs: &fakeRunResolver{}, ChangesStore: NewChangesStore(nil), ChangesCapturer: fakeChangesCapturer{capture: func(CaptureChangesRequest) (changes.Snapshot, error) {
+		if fail {
+			return changes.Snapshot{}, context.DeadlineExceeded
+		}
+		return changesFixture(), nil
+	}}})
+	id := RunIdentity{Namespace: "project-1", NamespaceUID: testNamespaceUID("project-1"), UID: "run-1-uid"}
+	for _, want := range []int{503, 204} {
+		r := httptest.NewRequest("POST", "/api/v1/namespaces/project-1/runs/run-1/changes", strings.NewReader(`{"baseline":true,"environmentUID":"env"}`))
+		r.Header.Set(RunUIDHeader, "run-1-uid")
+		w := httptest.NewRecorder()
+		s.Handler().ServeHTTP(w, r)
+		if w.Code != want {
+			t.Fatal(w.Code, w.Body)
+		}
+		got, err := s.changes.Load(context.Background(), id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if fail && got.Revision != 0 {
+			t.Fatal("transient baseline persisted")
+		}
+		if !fail && (got.Revision != 1 || got.Baseline.State != "available") {
+			t.Fatalf("retry failed: %+v", got)
+		}
+		fail = false
+	}
 }
 
 func (c fakeChangesCapturer) Capture(_ context.Context, _, _, _ string, r CaptureChangesRequest, _ []string) (CapturedChanges, error) {

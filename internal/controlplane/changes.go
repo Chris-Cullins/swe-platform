@@ -14,6 +14,7 @@ import (
 	"github.com/Chris-Cullins/swe-platform/internal/lifecycle"
 	"github.com/Chris-Cullins/swe-platform/internal/sandboxclient"
 	"github.com/Chris-Cullins/swe-platform/sandboxd/changes"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	apiMeta "k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -74,6 +75,9 @@ func (c KubernetesChangesCapturer) Capture(ctx context.Context, namespace, name,
 	}
 	var env platformv1alpha1.Environment
 	if err := c.Reader.Get(ctx, types.NamespacedName{Namespace: namespace, Name: run.Status.EnvironmentRef.Name}, &env); err != nil {
+		if !apierrors.IsNotFound(err) {
+			return CapturedChanges{}, err
+		}
 		return unavailable, nil
 	}
 	if !runOwnsOrClaimsEnvironment(&run, &env) || string(env.UID) != request.EnvironmentUID {
@@ -92,9 +96,15 @@ func (c KubernetesChangesCapturer) Capture(ctx context.Context, namespace, name,
 	connector := sandboxclient.Connector{Reader: c.Reader}
 	execution, err := connector.ResolveExecution(ctx, fence)
 	if err != nil {
+		if request.Baseline {
+			return CapturedChanges{}, err
+		}
 		return unavailable, nil
 	}
 	observation, captureErr := connector.SnapshotChanges(ctx, fence, baselinePaths)
+	if request.Baseline && captureErr != nil {
+		return CapturedChanges{}, captureErr
+	}
 	current := func(ctx context.Context) error {
 		var currentRun platformv1alpha1.Run
 		if err := c.Reader.Get(ctx, client.ObjectKeyFromObject(&run), &currentRun); err != nil {
@@ -213,7 +223,11 @@ func (s *Server) handleChanges(w http.ResponseWriter, r *http.Request, namespace
 	}
 	captured, err := s.changesCapturer.Capture(ctx, namespace, name, uid, request, baselinePaths)
 	if err != nil {
-		http.Error(w, "changes execution is no longer current", 409)
+		if errors.Is(err, ErrChangesConflict) || errors.Is(err, lifecycle.ErrExecutionFenceChanged) {
+			http.Error(w, "changes execution is no longer current", 409)
+		} else {
+			http.Error(w, "changes capture temporarily unavailable", 503)
+		}
 		return
 	}
 	// Repeat authorization and exact identity after potentially slow capture.

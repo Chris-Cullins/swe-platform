@@ -732,6 +732,8 @@ delete/add. Active or paused Runs show a timestamped **retained observation**, n
 the exact current workspace. Final cleanup retains its outcome before releasing the Environment;
 if execution disappeared first, the UI labels the latest capture unavailable and preserves any
 previous verified result. No usable baseline means unavailable, never clean.
+Project offboarding withdraws capture access: terminal safety cleanup preserves the last
+retained observation rather than claiming a final capture or blocking credential/claim cleanup.
 
 PostgreSQL retains the baseline and result for the exact Run's lifetime; `swe delete-run` removes
 them with its transcript. The development memory store is bounded and loses review data on

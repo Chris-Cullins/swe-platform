@@ -9,7 +9,28 @@ import (
 	"testing"
 
 	"github.com/Chris-Cullins/swe-platform/sandboxd/changes"
+	sandboxdv1 "github.com/Chris-Cullins/swe-platform/sandboxd/gen/proto/sandboxd/v1"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
+
+func TestChangesSnapshotCapacityAndCancellationRemainRetryable(t *testing.T) {
+	s := &ChangesServer{Workspace: t.TempDir()}
+	changesCaptureSlots <- struct{}{}
+	changesCaptureSlots <- struct{}{}
+	response, err := s.Snapshot(context.Background(), &sandboxdv1.ChangesSnapshotRequest{})
+	<-changesCaptureSlots
+	<-changesCaptureSlots
+	if response != nil || status.Code(err) != codes.ResourceExhausted {
+		t.Fatalf("capacity became unavailable snapshot: %v %v", response, err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	response, err = s.Snapshot(ctx, &sandboxdv1.ChangesSnapshotRequest{})
+	if response != nil || status.Code(err) != codes.Canceled {
+		t.Fatalf("cancellation became unavailable snapshot: %v %v", response, err)
+	}
+}
 
 func TestChangesDirtyBaselineAndReadOnlyGit(t *testing.T) {
 	dir := t.TempDir()
