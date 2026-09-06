@@ -24,6 +24,12 @@ browser sessions backed by repeated Kubernetes TokenReview/exact SAR authorizati
 uses one process-owned pgxpool and ordered migrations; production fails closed without its
 database and administrator-owned session keyring. The control plane also provides typed
 Run/Environment resource APIs for the console.
+Run Changes uses a purpose-only sandboxd snapshot capability, pre-acceptance dirty-workspace
+baseline, exact allocation/execution proof at publication, and bounded PostgreSQL/development
+memory review bytes. The CLI `swe changes` and console Changes tab are observation-only.
+Changes shares the transcript cutoff/drain and Run-lifetime deletion path; never infer diffs
+from adapter events or replace a baseline on reacceptance. Limits and retained/unavailable
+semantics are canonical in `ARCHITECTURE.md`.
 The CLI also provides a local stdio `swe mcp` server with bounded `create_run` and
 UID-fenced `read_transcript` tools that act through the caller's existing explicit
 control-plane bearer credential; interactive terminal attach is intentionally not an MCP tool.
@@ -162,7 +168,8 @@ runs both via `make` targets:
   embedded console using pinned `agent-browser@0.33.2` and Chromium (`agent-browser install
   --with-deps`). It types shell exits through real xterm, reconnects three times through the
   UI with exact Run/Environment identities, and checks one DOM root per connection and zero
-  after unmount. The helper closes its isolated browser session on exit; no provider keys or
+  after unmount. It then verifies the Changes tab renders authenticated retained review and
+  baseline attribution. The helper closes its isolated browser session on exit; no provider keys or
   browser fixtures are needed in the live acceptance path.
   Scroll the actual xterm screen into view and verify keyboard focus before typing; assert
   outbound fixture bytes, expanded shell output, and server disconnect as separate stages.
@@ -228,8 +235,10 @@ runs both via `make` targets:
   Runs in CI as the `e2e` workflow on relevant PRs and via `workflow_dispatch`.
 - **CRD installation/upgrades:** `make install-crds` uses server-side apply with force-conflicts;
   plain Helm upgrades must apply the chart's `crds/` directory before `helm upgrade`.
-- **Images:** `make docker-build` (operator + env-base). The env-base image builds
-  its pinned tmux with `images/env-base/tmux-control-output-drain.patch`; keep the
+- **Images:** `make docker-build` (operator + env-base).
+  The operator and control-plane Dockerfiles selectively copy shared sandboxd packages;
+  keep those COPY lists synchronized with imports (including `sandboxd/changes`).
+  The env-base image builds its pinned tmux with `images/env-base/tmux-control-output-drain.patch`; keep the
   source checksum and patch synchronized when upgrading tmux. Its `terminal-test`
   target runs the patched-runtime terminal regression during `hack/e2e.sh`. The image
   also includes version-pinned Claude Code (the default adapter), Amp, Codex, and Pi CLIs. Amp

@@ -90,3 +90,8 @@ browser find role link click --name Overview --exact >/dev/null
 browser wait --fn '!document.querySelector(".terminal")' >/dev/null
 browser eval 'if (terminalHost.querySelectorAll(".xterm").length !== 0 || document.querySelectorAll(".xterm").length !== 0) throw new Error("Unmount leaked xterm DOM");' >/dev/null
 echo 'PASS: real xterm unmount removes root from retained host and document'
+stage changes-review
+browser find role link click --name Changes --exact >/dev/null
+browser wait --text 'Review limits:' >/dev/null
+browser eval 'const review=document.querySelector("[aria-label=\"Run changes\"]"); if (!review || document.querySelector("[role=alert]") || review.textContent.includes("Comparison unavailable:")) throw new Error("Run Changes review unavailable"); if (!review.textContent.includes("Pre-existing edits are part of the baseline, not attributed to this Run.")) throw new Error("Missing baseline attribution explanation"); if (document.querySelector("nav[aria-label=\"Run sections\"] a[aria-current=page]")?.textContent !== "Changes") throw new Error("Changes tab not active");' >/dev/null
+echo 'PASS: real console Changes tab renders authenticated retained review and baseline attribution'

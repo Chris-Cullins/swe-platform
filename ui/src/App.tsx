@@ -11,6 +11,7 @@ import {
 import type { CreateRun, Environment, PortalServiceList, Run, Selector } from './contracts'
 import { useRunFeed } from './runFeed'
 import { Transcript } from './Transcript'
+import Changes from './Changes'
 
 const Terminal = lazy(() => import('./Terminal'))
 const DNS_SUBDOMAIN = /^[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?$/
@@ -246,7 +247,7 @@ function Detail() {
   return <main><div className="title"><div><Link to={`/namespaces/${encodeURIComponent(namespace)}/runs`}>← Runs</Link><h1>{run}</h1></div><span className="pill">{query.data.state}</span></div>
     <details className="card" key={`task:${query.data.uid}`}><summary>Task · {query.data.intent.agent}</summary><pre>{query.data.intent.prompt}</pre></details>
     {query.data.cancelRequested && !isTerminal(query.data.state) && <p role="status">Cancellation requested. Waiting for the agent to stop.</p>}
-    <nav aria-label="Run sections"><NavLink to="overview">Overview</NavLink><NavLink to="transcript">Transcript</NavLink>{query.data.environment?.uid && <NavLink to="portals">Portals</NavLink>}{query.data.terminalAvailable && query.data.environment?.uid && <NavLink to="terminal">Terminal</NavLink>}</nav>
+    <nav aria-label="Run sections"><NavLink to="overview">Overview</NavLink><NavLink to="transcript">Transcript</NavLink><NavLink to="changes">Changes</NavLink>{query.data.environment?.uid && <NavLink to="portals">Portals</NavLink>}{query.data.terminalAvailable && query.data.environment?.uid && <NavLink to="terminal">Terminal</NavLink>}</nav>
     <Outlet key={query.data.uid} context={query.data} />
   </main>
 }
@@ -344,7 +345,7 @@ export function App() {
         <Route path="runs/:run" element={<Detail />}>
           <Route index element={<Navigate to="overview" replace />} /><Route path="overview" element={<Overview />} />
           <Route path="transcript" element={<TranscriptRoute />} /><Route path="portals" element={<Portals />} /><Route path="terminal" element={<TerminalRoute />} />
-          <Route path="changes/*" element={<Navigate to="../overview" replace />} />
+          <Route path="changes" element={<Changes />} />
         </Route>
       </Route>
     </Route>

@@ -125,6 +125,12 @@ rules:
 - apiGroups:
   - swe.dev
   resources:
+  - runs/changes
+  verbs:
+  - update
+- apiGroups:
+  - swe.dev
+  resources:
   - runs/transcript
   verbs:
   - delete

@@ -1,4 +1,4 @@
-import type { CreateRun, Environment, PortalServiceList, Problem, Run, RunList, RunSummaryList, Session } from './contracts'
+import type { CreateRun, Environment, PortalServiceList, Problem, Run, RunChanges, RunList, RunSummaryList, Session } from './contracts'
 
 export class ApiProblem extends Error {
   constructor(public readonly problem: Problem, public readonly status: number) {
@@ -88,6 +88,17 @@ async function request<T>(path: string, init: RequestInit = {}, options?: { toke
 }
 
 const base = (namespace: string) => `/api/v1/namespaces/${encodeURIComponent(namespace)}`
+
+export async function getRunChanges(namespace: string, name: string, uid: string, options: { offset?: number; revision?: number; path?: string; signal?: AbortSignal } = {}) {
+  const query = new URLSearchParams()
+  if (options.offset) query.set('offset', String(options.offset))
+  if (options.revision) query.set('revision', String(options.revision))
+  if (options.path) query.set('path', options.path)
+  const result = await request<RunChanges>(`${base(namespace)}/runs/${encodeURIComponent(name)}/changes?${query}`, { headers: { 'SWE-Run-UID': uid }, signal: options.signal })
+  if (result.runUID !== uid) throw new ResourceIdentityMismatch('Run')
+  if (options.revision && result.revision !== options.revision) throw new Error('Changes revision changed. Refresh the file list.')
+  return result
+}
 
 export interface RunListOptions { limit?: number; continue?: string; signal?: AbortSignal }
 const MAX_RUN_LIST_PAGES = 100

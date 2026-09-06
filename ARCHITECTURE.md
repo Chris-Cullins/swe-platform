@@ -68,9 +68,9 @@ Environment backends are not implemented.
 ### Current CRDs and sources of truth
 
 CRDs are the source of truth for desired and observed infrastructure state. PostgreSQL is
-used for durable transcript events and encrypted browser sessions, not as a second
+used for durable transcript events, bounded Run Changes review bytes, and encrypted browser sessions, not as a second
 infrastructure-state store. The control plane owns one shared `pgxpool` and ordered,
-versioned migrations; migration 003 adds browser sessions.
+versioned migrations; migration 003 adds browser sessions and 004 adds Run Changes.
 
 All current CRDs are namespaced:
 
@@ -80,7 +80,7 @@ All current CRDs are namespaced:
 | `Project` | One repository URL (represented as a one-item list), a same-namespace default Template reference, changes-workflow metadata, and up to 64 exact lowercase-ASCII FQDN egress selections. The selection contract is admitted, but a non-empty selection remains rejected when an Environment uses the Project because runtime egress enforcement is not enabled. |
 | `EnvironmentTemplate` | Pod image, size/resources, disk, runtime class, idle timeout, warm-pool minimum, and backend. Admission currently permits only the `pod` backend. Chart-owned system-namespace objects are inert catalog sources; execution accepts only installation-managed same-namespace copies bound to exact Installation, source, and Project identities. |
 | `Environment` | Immutable Template selection, an immutable optional backend override, one-way empty-to-nonempty Project binding, explicit hold policy, bounded wake/suspend/activity intents, and up to 32 API- or Repository-owned service declarations. New declarations have an immutable-per-incarnation random `instanceID`; upgrade-retained legacy declarations may omit it, receive no portal route, and can add it only with a higher revision. Omitted legacy service ownership defaults only to `API` and is immutable thereafter. Controller-owned status includes the immutable resolved `provisioning` snapshot, readiness, lifecycle/execution, claim, observations, activity, and nested backend-neutral recovery state; recovery records attempts, exhaustion, the exact failed execution generation being accounted, and the next allowed attempt time, while generation zero means no recovery identity. The gateway owns bounded `portalRoutes` and monotonic `nextPortalRouteGeneration`; inactive routes are denial tombstones preserved by other status writers. |
-| `Run` | Immutable agent task and Environment/Project/Template/agent-credential/repository-credential selection plus monotonic cancellation; status records normalized lifecycle, exact Environment name/UID and ownership, exact credential profile identity, repository credential readiness, accepted lifecycle epoch, and accepted execution generation. The cleanup finalizer retains deletion authority until work/credentials/claims are fenced and exact live-primary transcript cleanup commits (next-release sequencing blocker below). `notify` and `parentRef` are schema placeholders without an implemented inbox. |
+| `Run` | Immutable agent task and Environment/Project/Template/agent-credential/repository-credential selection plus monotonic cancellation; status records normalized lifecycle, exact Environment name/UID and ownership, exact credential profile identity, repository credential readiness, accepted lifecycle epoch, and accepted execution generation. Controller-owned `ChangesBaselineCaptured` and `ChangesFinalCaptured` conditions record durable capture outcomes, never diff bytes. The cleanup finalizer retains deletion authority until work/credentials/claims are fenced and exact live-primary transcript and Changes cleanup commits. `notify` and `parentRef` are schema placeholders without an implemented inbox. |
 | `AgentCredentialProfile` | Immutable adapter and `APIKey` type metadata. Key bytes live in an owner-linked Secret whose name is derived from the profile UID. |
 
 The current ownership/reference shape is:
@@ -244,7 +244,8 @@ mount-group handling, root-squashed storage that cannot grant the group, and non
 without an equivalent access mechanism are unsupported. This is a required storage contract, not
 runtime or CSI capability attestation. Other backends, including a future Windows backend, must
 provide equivalent ACL or workspace preparation semantics rather than reproducing a numeric GID.
-Security revision 5 replaces older Environment Pods to apply this contract while retaining the
+Security revision 6 also requires the purpose-scoped Changes token and replaces older Environment
+Pods to apply the workspace and Changes contracts while retaining the
 exact workspace PVC and frozen provisioning inputs.
 
 ### Tenancy and Project namespace lifecycle
@@ -575,6 +576,83 @@ cleanup implementation is not gated on a foundation-first deployment. This chang
 planning, not the exact-identity/authentication fences or fail-closed cleanup contract above.
 Retention lasts for the exact Run's lifetime; there is no TTL, hard global
 byte budget, whole-Project purge, legal hold, or backup/restore cleanup guarantee.
+
+### Run Changes: bounded read-only review
+
+The approved MVP in #94 compares the workspace-root Git repository with its state captured
+**before the first adapter acceptance attempt**. The Run controller requests baseline capture
+before writing `AdapterAcceptanceAttempted`; a retained outcome is acknowledged before execution.
+The immutable baseline includes dirty tracked and non-ignored untracked contents, not merely HEAD.
+Reacceptance, controller restart, and pause/resume never replace that baseline. Paths already in
+the baseline remain in scope even if subsequent index or ignore rules change. New ignored files,
+external Git worktrees, nested repository contents, symlinks and special files are not followed.
+No Git objects, index, configuration, branches, commits, push, or PRs are created or modified.
+`Run.status.branch` and `Project.changesWorkflow` do not provide attribution or publication authority.
+This is a workspace observation, not proof that the agent alone authored each change: attached
+users and repository services can also change that workspace.
+
+The operator's explicit rotating bearer calls `POST runs/{name}/changes` with the exact Run UID,
+capture intent, and complete Environment execution-generation/epoch/hold-revision preconditions.
+Only `update runs/changes` permits capture; cookie sessions cannot invoke it. The control plane
+uncached-proves the exact owned/claimed allocation and uses the connector's dedicated private
+`changes` capability to invoke sandboxd `ChangesService.Snapshot`. This is neither generic Exec
+nor adapter transcript parsing. sandboxd's bounded Git listing disables fsmonitor/optional locks
+and ambient Git configuration. Command-scoped `safe.directory` names only the configured workspace
+root, supporting CSI group-writable ownership without writing configuration or trusting other
+repositories. Portable `os.Root` handles confine file reads. Root/repository
+replacement within a daemon, path-list drift and observed file identity/size/mtime drift fail
+unavailable. Captures are bounded observations, not filesystem-atomic checkpoints; concurrent
+writers that restore metadata cannot be exhaustively detected.
+
+The connector retains opaque full backend, Pod, endpoint, Template, Secret, TLS and capability
+proof. After capture and repeated authorization, publication repeats that proof and exact Run
+allocation immediately before a compare-and-swap store update. Delayed older revisions cannot
+overwrite newer or final results. CRDs retain lifecycle authority; baseline and latest observation
+bytes live in the process-owned PostgreSQL pool or bounded development memory, keyed by exact
+`(namespace name, Namespace UID, Run UID)` and bound to the Environment UID.
+
+Active adapter observation requests refresh retained results. Terminal cleanup first stops the
+Run process when reachable, then retains a final capture outcome before pausing/releasing the
+Environment. A missing/replaced/unreachable execution records unavailable, not clean. Explicit
+pause can withdraw execution before a last capture; the previous timestamped observation remains
+reviewable and is labeled retained, never asserted to be the exact pause-time workspace. A failed
+latest capture preserves the last verified bytes with an explicit unavailable flag. Baseline loss
+(including development-store restart) is unrecoverable for that Run and never becomes an empty base.
+Configured storage/transport failures gate baseline acceptance and terminal cleanup; disabling the
+control-plane transport disables capture. Transient Environment/execution reads and snapshot RPC
+errors never establish a baseline: they retry before acceptance. Snapshot deadline/capacity errors
+are retryable, not successful unavailable captures.
+
+Offboarding withdraws Changes authorization without blocking terminal safety cleanup. Only a
+terminal final capture may skip transport under a revalidated exact reconcile claim in
+`Fencing`/`offboarding`, or `Fenced` (whose operation must be empty). It records
+`ChangesFinalCaptured=True` with reason `OffboardingUnavailable`; stored bytes stay honestly
+retained and non-final. The Run controller admits `Fenced` only for non-deleting terminal cleanup,
+never execution or baseline capture. Claim transitions abort the old lease; a new reconcile
+must prove the complete current Namespace/Project/Installation identity. This lets cleanup
+finish even if the offboarding CLI reaches `Fenced` before the capture condition, without adding
+any control-plane read/capture authorization exception.
+
+Explicit Run deletion uses the existing exact transcript
+DELETE finalizer path: its shared cutoff/drain includes the entire Changes read/capture request and
+removes both stores before acknowledging cleanup. No new deletion endpoint or retention timer exists.
+
+Limits are fixed: 4,096 paths, 4,096 UTF-8 bytes per path, 1 MiB Git path-list output, 256 KiB
+per file, 16 MiB retained content per snapshot, 24 MiB encoded per snapshot, and two snapshots
+per Run. Excess individual content is `oversized`; excessive listing or missing repository is
+`unavailable`, never partially clean. File states are `text`, `binary`, `oversized`, `unavailable`;
+rename detection is deliberately delete/add. A linear, single-hunk unified text diff has a
+512 KiB cap. sandboxd permits two simultaneous captures with a 10-second RPC deadline; the
+control plane permits four concurrent Changes requests. Development storage rejects capacity
+above 1,024 Runs or 128 MiB without evicting another Run's baseline. PostgreSQL is bounded per
+Run and retained for the Run lifetime, not globally bounded across retained Run count.
+
+`swe changes RUN --run-uid UID` and the console Changes tab use `GET runs/{name}/changes`,
+requiring exact `get runs/changes` and `SWE-Run-UID`. No hidden base-Run GET or Environment wake
+occurs. Lists return at most 50 file summaries; `path` selects one diff. `revision` pins subsequent
+file/page reads, rejecting mixed observations with HTTP 409. Responses are no-store and at most
+4 MiB encoded. Review metadata includes final/retained status, last successful capture time and
+latest-unavailable status. Observation grants no publication authority.
 
 ### Authentication and exact identity fences
 

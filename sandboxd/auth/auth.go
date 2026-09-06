@@ -30,6 +30,7 @@ const (
 	CapabilityTerminal           Capability = "terminal"
 	CapabilityServiceObservation Capability = "service-observation"
 	CapabilityPortal             Capability = "portal"
+	CapabilityChanges            Capability = "changes"
 )
 
 // Credential bundle keys and identity annotation shared by provisioners and clients.
@@ -42,6 +43,7 @@ const (
 	FilesystemTokenKey         = "filesystem-token"
 	ServiceObservationTokenKey = "service-observation-token"
 	PortalTokenKey             = "portal-token"
+	ChangesTokenKey            = "changes-token"
 	IdentityAnnotation         = "swe.dev/sandboxd-identity"
 	TrustAnnotation            = "swe.dev/sandboxd-trust"
 	TokenAnnotation            = "swe.dev/sandboxd-terminal-token"
@@ -167,6 +169,8 @@ func methodCapability(method string) (Capability, bool) {
 		return CapabilityServiceObservation, true
 	case "sandboxd.v1.PortalService":
 		return CapabilityPortal, true
+	case "sandboxd.v1.ChangesService":
+		return CapabilityChanges, true
 	default:
 		return "", false
 	}
@@ -174,7 +178,7 @@ func methodCapability(method string) (Capability, bool) {
 
 func validCapability(capability Capability) bool {
 	switch capability {
-	case CapabilityHealth, CapabilityExec, CapabilityProcess, CapabilityFilesystem, CapabilityTerminal, CapabilityServiceObservation, CapabilityPortal:
+	case CapabilityHealth, CapabilityExec, CapabilityProcess, CapabilityFilesystem, CapabilityTerminal, CapabilityServiceObservation, CapabilityPortal, CapabilityChanges:
 		return true
 	default:
 		return false

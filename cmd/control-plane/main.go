@@ -129,6 +129,8 @@ func main() {
 			Resources:                   resources,
 			Runs:                        controlplane.KubernetesRunResolver{Client: kubeClient},
 			TranscriptStore:             transcripts,
+			ChangesStore:                controlplane.NewChangesStore(transcripts),
+			ChangesCapturer:             controlplane.KubernetesChangesCapturer{Reader: kubeClient},
 			TerminalDialer:              controlplane.KubernetesTerminalDialer{Client: kubeClient, Metrics: metrics},
 			PortalResolver:              kubeClient,
 			PortalEnvironmentEnumerator: controlplane.KubernetesPortalEnvironmentEnumerator{Client: kubeClient, Verifier: verifier, Namespaces: configuredNamespaces},

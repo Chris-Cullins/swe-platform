@@ -795,6 +795,8 @@ exact namespace, resource name, and subresource on every request:
 | Cancel a Run | `update` on base `runs` with the requested Run `resourceName` |
 | Read an Environment | `get` on `environments` with the requested Environment `resourceName` |
 | Read a transcript | `get` on `runs/transcript` with the requested Run `resourceName` |
+| Review Run Changes | `get` on `runs/changes` with the requested Run `resourceName` and exact Run UID |
+| Operator capture of Run Changes | `update` on `runs/changes` with the requested Run `resourceName`; explicit bearer only |
 | Append a transcript event | `update` on `runs/transcript` with the requested Run `resourceName` |
 | Operator deleting-Run transcript cleanup | `delete` on `runs/transcript` with the requested Run `resourceName` |
 | Open a direct Environment terminal | `get` on `environments/terminal` with the requested Environment `resourceName` |
@@ -866,8 +868,11 @@ absent otherwise and must retain both identities on remount.
 
 When the control plane is enabled, the chart projects a rotating `swe-platform`-audience
 service-account token into the operator and grants that identity `update` and `delete` on
-`runs/transcript`. The operator uses it to forward opaque adapter events and complete exact
-deleting-Run cleanup through the control-plane Service. This platform transport credential is separate from agent provider
+`runs/transcript`, plus `update` on `runs/changes`. The operator uses it to forward opaque
+adapter events, request bounded workspace capture, and complete exact deleting-Run cleanup
+of both transcripts and Changes through the control-plane Service. All presets use the same
+capture contract; production retains bytes in the existing PostgreSQL database, while kind/Argo
+use bounded process-local development storage. This platform transport credential is separate from agent provider
 credentials, which the chart never adds to ambient component or Environment state; supported
 API-key adapters deliver them only as write-only process launch material.
 

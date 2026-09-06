@@ -189,6 +189,7 @@ func main() {
 		}
 	}
 	var eventSink agent.AdapterEventSink
+	var changesSink controllers.RunChangesSink
 	var transcriptCleanup *transcriptclient.Client
 	var repositoryCredentials repositorycredential.Provider
 	if (githubAppClientID == "") != (githubAppPrivateKeyFile == "") {
@@ -217,6 +218,7 @@ func main() {
 			BaseURL: transcriptURL, TokenFile: transcriptTokenFile,
 			HTTP: &http.Client{Timeout: 15 * time.Second},
 		}
+		changesSink = transcriptclient.Client{BaseURL: transcriptURL, TokenFile: transcriptTokenFile, HTTP: &http.Client{Timeout: 30 * time.Second}}
 		eventSink = transcriptCleanup
 	}
 	if !(mode == tenancy.ModeScoped && len(tenancyNamespaces) == 0) {
@@ -227,6 +229,7 @@ func main() {
 			Scope:                   scope,
 			Adapters:                adapters,
 			EventSink:               eventSink,
+			Changes:                 changesSink,
 			TranscriptCleanup:       transcriptCleanup,
 			TranscriptsDisabled:     transcriptURL == "",
 			Connector:               connector,
