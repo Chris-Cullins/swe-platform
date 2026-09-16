@@ -348,6 +348,25 @@ other agent-controlled bytes remain only in adapter-owned opaque transcript even
 adapter rejection and cancellation conditions likewise use fixed platform messages. Reconcile
 also normalizes legacy adapter observation/rejection messages before terminal or deletion cleanup.
 
+The typed Run HTTP representation adds optional `diagnostic: {code, message, nextAction}` for
+the CLI `swe tui` detail and browser Run detail. All three fields are fixed platform strings,
+derived only from recognized `AdapterAccepted` reason/Run-state combinations, never condition
+messages. Both status and condition must observe the Run's current positive generation, and
+the condition must have a definite boolean status; adapter-observed failure/input-needed also
+require accepted status. `EnvironmentReady` is not used as the failure source because terminal
+cleanup rewrites it. Unknown, stale, inconsistent, and ordinary progressing/completed states
+omit the diagnostic; absence is not proof of health or a task-specific cause. Clients show an
+explicit unavailable explanation for attention states with no diagnostic. Summary feeds do not
+include diagnostics, and Run/Environment identity fencing and authorization are unchanged.
+
+The bounded diagnostic codes are `EnvironmentUnavailable`, `EnvironmentLost`,
+`EnvironmentFailed`, `AdapterUnavailable`, `AdapterRejected`, and `AdapterFailed` for `Failed`;
+`EnvironmentPreparing`, `EnvironmentStatusPending`, and `EnvironmentNotReachable` for
+`Allocating`; `EnvironmentPaused` for `Paused`; and `AgentNeedsInput` for `NeedsInput`.
+`EnvironmentPreparing` covers allocated, recovered, and not-ready reasons. Credential-specific
+failure diagnostics and raw operator errors are not projected by this contract. Next actions
+are read-only guidance, not retry/resume/input capabilities; agent detail remains in transcripts.
+
 `Run.status.usage` is currently an unwritten compatibility placeholder. Lifecycle wall duration
 is derivable as `FinishedAt - StartedAt`; it includes `Paused` and `NeedsInput` intervals and is
 unavailable for Runs that were never accepted because `StartedAt` remains absent. Usage-, token-,

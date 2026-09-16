@@ -54,6 +54,33 @@ func TestTUIModelListDetailCancelAndFreeFormCreate(t *testing.T) {
 	}
 }
 
+func TestTUIDetailDiagnosticAndRefresh(t *testing.T) {
+	client, _ := controlplaneclient.New("http://control.test", "token", &http.Client{})
+	model := newTUIModel(context.Background(), client, "team-a")
+	model.mode, model.width, model.height = tuiDetail, 60, 30
+	model.run = &controlplane.Run{Name: "failed-run", UID: "uid", State: "Failed", Diagnostic: &controlplane.RunDiagnostic{
+		Code: "AdapterFailed", Message: "The agent reported a failure.",
+		NextAction: "Review the transcript for agent-reported details before starting another run.",
+	}}
+	view := model.View()
+	if !strings.Contains(view, "Status: The agent reported a failure.") || !strings.Contains(strings.Join(strings.Fields(view), " "), "Next: Review the transcript for agent-reported details before starting another run.") {
+		t.Fatalf("diagnostic or complete action missing: %s", view)
+	}
+	for _, line := range strings.Split(view, "\n") {
+		if len(line) > 60 && (strings.HasPrefix(line, "Status:") || strings.HasPrefix(line, "Next:")) {
+			t.Fatalf("diagnostic was not wrapped: %q", line)
+		}
+	}
+	model.run.Diagnostic = nil
+	if view := model.View(); !strings.Contains(view, "No current diagnostic is available.") || strings.Contains(view, "agent reported a failure") {
+		t.Fatalf("missing diagnostic guessed a cause: %s", view)
+	}
+	model.run.State = "Running"
+	if view := model.View(); strings.Contains(view, "diagnostic") || strings.Contains(view, "Next:") {
+		t.Fatalf("normal state retained a diagnostic: %s", view)
+	}
+}
+
 func TestTUIAllowsOnlyOneCreateMutationAtATime(t *testing.T) {
 	client, _ := controlplaneclient.New("http://control.test", "token", &http.Client{})
 	model := newTUIModel(context.Background(), client, "team-a")
