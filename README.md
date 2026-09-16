@@ -696,7 +696,11 @@ attached terminal and restores the dashboard. Run details show normalized status
 wall-time timestamps (started/finished), and usage, Environment readiness/pause state, and a
 bounded raw transcript view. Transcript source, type,
 payload, and retention gaps are displayed generically; adapter-owned payloads are not parsed as
-a common event schema. Both native and browser consoles show terminal navigation only when the
+a common event schema. Both consoles show a fixed, safe status explanation and next action for
+recognized provisioning, adapter-failure, paused, and input-needed conditions. Unknown or stale
+conditions show no inferred cause; inspect the transcript or contact an administrator. These
+diagnostics do not expose raw controller/provider messages or add retry/resume capabilities.
+Both native and browser consoles show terminal navigation only when the
 Run API returns `terminalAvailable` with an exact `environment.uid`; reconnects and component
 remounts retain that same Run and Environment identity and never follow same-name replacements.
 Ordinary Run detail GET remains a current-name read for compatibility. Clients that selected a

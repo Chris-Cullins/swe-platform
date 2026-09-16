@@ -60,6 +60,14 @@ type RunUsage struct {
 	TokensOut  int64 `json:"tokensOut"`
 }
 
+// RunDiagnostic is fixed platform vocabulary, not an adapter or Kubernetes
+// message. It is omitted when no current, recognized state/condition pair exists.
+type RunDiagnostic struct {
+	Code       string `json:"code"`
+	Message    string `json:"message"`
+	NextAction string `json:"nextAction"`
+}
+
 // Run is the stable HTTP representation of a Run CRD.
 type Run struct {
 	Name                       string          `json:"name"`
@@ -69,6 +77,7 @@ type Run struct {
 	Intent                     RunIntent       `json:"intent"`
 	CancelRequested            bool            `json:"cancelRequested"`
 	State                      string          `json:"state"`
+	Diagnostic                 *RunDiagnostic  `json:"diagnostic,omitempty"`
 	RepositoryCredentialReason string          `json:"repositoryCredentialReason,omitempty"`
 	StartedAt                  *time.Time      `json:"startedAt,omitempty"`
 	FinishedAt                 *time.Time      `json:"finishedAt,omitempty"`

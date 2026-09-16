@@ -377,6 +377,52 @@ describe('App frozen API integration', () => {
     expect(screen.getByRole('link', { name: 'Changes' })).toHaveAttribute('href', '/namespaces/default/runs/repair-ui/changes')
   })
 
+  it.each([
+    { state: 'Failed', code: 'AdapterFailed', message: 'The agent reported a failure.', nextAction: 'Review the transcript for agent-reported details before starting another run.' },
+    { state: 'Allocating', code: 'EnvironmentPreparing', message: 'Waiting for the environment to become ready.', nextAction: 'Wait for provisioning to finish. If this persists, ask an administrator to check the environment.' },
+    { state: 'Paused', code: 'EnvironmentPaused', message: 'The environment is paused; workspace and transcript are retained.', nextAction: 'Check the environment hold with an administrator before resuming.' },
+    { state: 'NeedsInput', code: 'AgentNeedsInput', message: 'The agent reported that it needs input.', nextAction: "Review the transcript for the agent's request. Input support depends on the adapter." },
+  ])('shows $state diagnosis and next action through exact Run context', async ({ state, ...diagnostic }) => {
+    const current = { ...run, state, diagnostic, cancelRequested: state === 'Allocating' }
+    let exactConfirmed = false
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (path, init) => {
+      if (path === '/api/v1/session') return response({ authenticated: true, username: 'alex' })
+      if (String(path).includes('/environments/')) return response(environment)
+      if (String(path).includes('/transcript')) return new Response('', { headers: { 'Content-Type': 'text/event-stream' } })
+      if (new Headers(init?.headers).get('SWE-Run-UID') === run.uid) exactConfirmed = true
+      return response(current)
+    })
+    show('/namespaces/default/runs/repair-ui/overview')
+    expect(await screen.findByText(diagnostic.message)).toBeInTheDocument()
+    expect(exactConfirmed).toBe(true)
+    expect(screen.getByText(diagnostic.nextAction)).toBeInTheDocument()
+    if (current.cancelRequested) expect(screen.getByText(/Cancellation requested. Waiting/)).toBeInTheDocument()
+    await userEvent.click(screen.getByRole('link', { name: 'Review transcript' }))
+    expect(await screen.findByText('No transcript events yet.')).toBeInTheDocument()
+    expect(screen.getByTestId('location')).toHaveTextContent('/namespaces/default/runs/repair-ui/transcript')
+    expect(screen.getByText(diagnostic.message)).toBeInTheDocument()
+    await userEvent.click(screen.getByText('Task · amp'))
+    expect(screen.getByText('Repair UI')).toBeVisible()
+    expect(screen.getByRole('link', { name: 'Changes' })).toBeInTheDocument()
+  })
+
+  it('does not invent a missing diagnosis and removes the notice after a normal transition', async () => {
+    let current: Run = { ...run, state: 'Failed', diagnostic: undefined }
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async path => {
+      if (path === '/api/v1/session') return response({ authenticated: true, username: 'alex' })
+      if (String(path).includes('/environments/')) return response(environment)
+      return response(current)
+    })
+    const { client } = show('/namespaces/default/runs/repair-ui/overview')
+    expect(await screen.findByText('No current diagnostic is available.')).toBeInTheDocument()
+    expect(screen.queryByText('The agent reported a failure.')).not.toBeInTheDocument()
+    current = { ...run, state: 'Running' }
+    act(() => { void client.invalidateQueries({ queryKey: queryKeys.run('default', run.name, run.uid) }) })
+    await waitFor(() => expect(screen.queryByRole('region', { name: 'Run status' })).not.toBeInTheDocument())
+    expect(screen.getByRole('button', { name: 'Cancel run' })).toBeInTheDocument()
+    expect(screen.getByRole('link', { name: 'Terminal' })).toBeInTheDocument()
+  })
+
   it.each(['Running', 'Paused', 'Succeeded'] as const)('routes %s Changes through exact Run context while retaining task and cancellation state', async state => {
     let exactConfirmed = false
     const current = { ...run, state, cancelRequested: state === 'Running', terminalAvailable: state === 'Running' }

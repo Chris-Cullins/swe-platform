@@ -21,6 +21,7 @@ import (
 	"github.com/charmbracelet/bubbles/textarea"
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/x/ansi"
 	"github.com/spf13/cobra"
 )
 
@@ -667,6 +668,16 @@ func (m *tuiModel) renderDetail(body *strings.Builder, width int) {
 	if run.CancelRequested {
 		body.WriteString(" (cancellation requested)")
 	}
+	diagnosticLines := 0
+	if run.Diagnostic != nil {
+		diagnostic := ansi.Wrap("Status: "+safeText(run.Diagnostic.Message)+"\nNext: "+safeText(run.Diagnostic.NextAction), width, "")
+		body.WriteString("\n" + diagnostic)
+		diagnosticLines = strings.Count(diagnostic, "\n") + 1
+	} else if run.State == "Failed" || run.State == "Allocating" || run.State == "Paused" || run.State == "NeedsInput" {
+		diagnostic := ansi.Wrap("No current diagnostic is available. Review the transcript or ask an administrator to check this run.", width, "")
+		body.WriteString("\n" + diagnostic)
+		diagnosticLines = strings.Count(diagnostic, "\n") + 1
+	}
 	fmt.Fprintf(body, "\nAgent: %s\nPrompt: %s\n", safeText(run.Intent.Agent), truncate(safeText(run.Intent.Prompt), width-8))
 	selector, selectorValue := selectedSelector(run.Intent.Selector)
 	fmt.Fprintf(body, "Selector: %s=%s\n", selector, safeText(selectorValue))
@@ -689,7 +700,7 @@ func (m *tuiModel) renderDetail(body *strings.Builder, width int) {
 		fmt.Fprintf(body, "Environment: %s • phase %s • ready %t • paused %t\n", safeText(m.env.Name), safeText(m.env.Phase), m.env.Ready, m.env.Paused)
 	}
 	body.WriteString("Transcript (opaque adapter events):\n")
-	available := m.height - 15
+	available := m.height - 15 - diagnosticLines
 	if available < 3 {
 		available = 3
 	}

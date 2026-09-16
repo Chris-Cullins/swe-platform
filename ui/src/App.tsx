@@ -248,6 +248,12 @@ function Detail() {
     <details className="card" key={`task:${query.data.uid}`}><summary>Task · {query.data.intent.agent}</summary><pre>{query.data.intent.prompt}</pre></details>
     {query.data.cancelRequested && !isTerminal(query.data.state) && <p role="status">Cancellation requested. Waiting for the agent to stop.</p>}
     <nav aria-label="Run sections"><NavLink to="overview">Overview</NavLink><NavLink to="transcript">Transcript</NavLink><NavLink to="changes">Changes</NavLink>{query.data.environment?.uid && <NavLink to="portals">Portals</NavLink>}{query.data.terminalAvailable && query.data.environment?.uid && <NavLink to="terminal">Terminal</NavLink>}</nav>
+    {(query.data.diagnostic || ['Failed', 'Allocating', 'Paused', 'NeedsInput'].includes(query.data.state)) && <section className="card" aria-label="Run status">
+      <h2>Run status</h2>
+      <p>{query.data.diagnostic?.message || 'No current diagnostic is available.'}</p>
+      <p><strong>Next:</strong> {query.data.diagnostic?.nextAction || 'Review the transcript or ask an administrator to check this run.'}</p>
+      <Link to="transcript">Review transcript</Link>
+    </section>}
     <Outlet key={query.data.uid} context={query.data} />
   </main>
 }

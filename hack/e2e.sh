@@ -3359,6 +3359,11 @@ echo "==> verifying fake Codex terminal failure through the real controller"
 CODEX_FAILED_RUN_NAME=e2e-fake-codex-failed-run
 bin/swe --namespace "$PROJECT_NAMESPACE" run "fake Codex failure smoke test" --name "$CODEX_FAILED_RUN_NAME" --environment "$ENV_NAME" --agent codex --wait=false
 kubectl wait --for=jsonpath='{.status.state}'=Failed run/"$CODEX_FAILED_RUN_NAME" --timeout=3m
+CODEX_FAILED_RUN_UID=$(kubectl get run "$CODEX_FAILED_RUN_NAME" -o jsonpath='{.metadata.uid}')
+echo "==> verifying safe Run diagnostic and console transcript action"
+SWE_BROWSER_TOKEN="$CONSOLE_TOKEN" ./hack/console-run-diagnostic_test.sh \
+	"http://127.0.0.1:18080" "$PROJECT_NAMESPACE" "$CODEX_FAILED_RUN_NAME" "$CODEX_FAILED_RUN_UID" \
+	/tmp/swe-platform-run-diagnostic.png
 kubectl delete run "$CODEX_FAILED_RUN_NAME" --wait=true >/dev/null
 
 echo "==> verifying fake Pi success, opaque output, and terminal error"

@@ -321,6 +321,121 @@ func TestResourceServiceRunDTOMapsRepositoryCredentialReason(t *testing.T) {
 	}
 }
 
+func TestRunDiagnosticKnownConditions(t *testing.T) {
+	for _, tc := range []struct {
+		state  platformv1alpha1.RunState
+		reason string
+		code   string
+	}{
+		{platformv1alpha1.RunStateFailed, "EnvironmentUnavailable", "EnvironmentUnavailable"},
+		{platformv1alpha1.RunStateFailed, "EnvironmentLost", "EnvironmentLost"},
+		{platformv1alpha1.RunStateFailed, "EnvironmentFailed", "EnvironmentFailed"},
+		{platformv1alpha1.RunStateFailed, "AdapterUnavailable", "AdapterUnavailable"},
+		{platformv1alpha1.RunStateFailed, "AdapterRejected", "AdapterRejected"},
+		{platformv1alpha1.RunStateFailed, "Failed", "AdapterFailed"},
+		{platformv1alpha1.RunStateAllocating, "EnvironmentAllocated", "EnvironmentPreparing"},
+		{platformv1alpha1.RunStateAllocating, "EnvironmentRecovered", "EnvironmentPreparing"},
+		{platformv1alpha1.RunStateAllocating, "EnvironmentNotReady", "EnvironmentPreparing"},
+		{platformv1alpha1.RunStateAllocating, "EnvironmentStatusStale", "EnvironmentStatusPending"},
+		{platformv1alpha1.RunStateAllocating, "EnvironmentNotReachable", "EnvironmentNotReachable"},
+		{platformv1alpha1.RunStatePaused, "EnvironmentPaused", "EnvironmentPaused"},
+		{platformv1alpha1.RunStateNeedsInput, "NeedsInput", "AgentNeedsInput"},
+	} {
+		t.Run(tc.reason, func(t *testing.T) {
+			run := diagnosticRun(tc.state, tc.reason)
+			// Cleanup overwrites EnvironmentReady, not the original Run reason.
+			run.Status.Conditions = append(run.Status.Conditions, metav1.Condition{Type: "EnvironmentReady", Status: metav1.ConditionFalse, Reason: "EnvironmentReleased", ObservedGeneration: 7})
+			got := runDTO(run)
+			if got.Diagnostic == nil || got.Diagnostic.Code != tc.code || got.Diagnostic.Message == "" || got.Diagnostic.NextAction == "" {
+				t.Fatalf("diagnostic = %#v", got.Diagnostic)
+			}
+			assertJSONRedacted(t, got, "malicious", "secret-token", "conditions")
+		})
+	}
+}
+
+func diagnosticRun(state platformv1alpha1.RunState, reason string) *platformv1alpha1.Run {
+	return &platformv1alpha1.Run{
+		ObjectMeta: metav1.ObjectMeta{Name: "run", Namespace: "ns", UID: "uid", Generation: 7},
+		Status: platformv1alpha1.RunStatus{State: state, ObservedGeneration: 7, Conditions: []metav1.Condition{{
+			Type: "AdapterAccepted", Status: metav1.ConditionTrue, ObservedGeneration: 7,
+			Reason: reason, Message: "malicious <script>alert('secret-token')</script>\x1b[31m provider detail",
+		}}},
+	}
+}
+
+func TestRunDiagnosticRejectsStaleUnknownAndInconsistentConditions(t *testing.T) {
+	for name, mutate := range map[string]func(*platformv1alpha1.Run){
+		"no generation": func(r *platformv1alpha1.Run) {
+			r.Generation = 0
+			r.Status.ObservedGeneration = 0
+			r.Status.Conditions[0].ObservedGeneration = 0
+		},
+		"stale run":                func(r *platformv1alpha1.Run) { r.Status.ObservedGeneration = 6 },
+		"future run":               func(r *platformv1alpha1.Run) { r.Status.ObservedGeneration = 8 },
+		"stale condition":          func(r *platformv1alpha1.Run) { r.Status.Conditions[0].ObservedGeneration = 6 },
+		"future condition":         func(r *platformv1alpha1.Run) { r.Status.Conditions[0].ObservedGeneration = 8 },
+		"no condition":             func(r *platformv1alpha1.Run) { r.Status.Conditions = nil },
+		"wrong condition":          func(r *platformv1alpha1.Run) { r.Status.Conditions[0].Type = "EnvironmentReady" },
+		"unknown status":           func(r *platformv1alpha1.Run) { r.Status.Conditions[0].Status = metav1.ConditionUnknown },
+		"failed before acceptance": func(r *platformv1alpha1.Run) { r.Status.Conditions[0].Status = metav1.ConditionFalse },
+		"unknown reason":           func(r *platformv1alpha1.Run) { r.Status.Conditions[0].Reason = "malicious-secret-token" },
+		"known reason wrong state": func(r *platformv1alpha1.Run) { r.Status.Conditions[0].Reason = "EnvironmentNotReady" },
+		"unknown state":            func(r *platformv1alpha1.Run) { r.Status.State = "FutureState" },
+		"allocating with failure":  func(r *platformv1alpha1.Run) { r.Status.State = platformv1alpha1.RunStateAllocating },
+		"paused with failure":      func(r *platformv1alpha1.Run) { r.Status.State = platformv1alpha1.RunStatePaused },
+		"needs input with failure": func(r *platformv1alpha1.Run) { r.Status.State = platformv1alpha1.RunStateNeedsInput },
+		"input without acceptance": func(r *platformv1alpha1.Run) {
+			r.Status.State = platformv1alpha1.RunStateNeedsInput
+			r.Status.Conditions[0].Reason = "NeedsInput"
+			r.Status.Conditions[0].Status = metav1.ConditionFalse
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			run := diagnosticRun(platformv1alpha1.RunStateFailed, "Failed")
+			mutate(run)
+			got := runDTO(run)
+			if got.Diagnostic != nil {
+				t.Fatalf("unexpected diagnostic: %#v", got.Diagnostic)
+			}
+			assertJSONRedacted(t, got, "diagnostic", "malicious", "secret-token")
+		})
+	}
+}
+
+func TestRunDiagnosticTransitionsAndExactRead(t *testing.T) {
+	run := diagnosticRun(platformv1alpha1.RunStateFailed, "EnvironmentFailed")
+	run.Status.Conditions[0].Status = metav1.ConditionFalse
+	service := &KubernetesResourceService{Client: fake.NewClientBuilder().WithScheme(resourceScheme(t)).WithObjects(run).Build()}
+	got, err := service.GetRunExact(context.Background(), "ns", "run", "uid")
+	if err != nil || got.Diagnostic == nil || *got.Diagnostic != (RunDiagnostic{
+		Code: "EnvironmentFailed", Message: "The environment reported a failure.",
+		NextAction: "Ask an administrator to check environment provisioning and health before starting another run.",
+	}) {
+		t.Fatalf("exact diagnostic: %#v, %v", got.Diagnostic, err)
+	}
+	run.Status.Conditions[0].Status = metav1.ConditionTrue
+	for _, step := range []struct {
+		state  platformv1alpha1.RunState
+		reason string
+		want   bool
+	}{
+		{platformv1alpha1.RunStateAllocating, "EnvironmentNotReady", true},
+		{platformv1alpha1.RunStateEnvironmentReady, "EnvironmentReady", false},
+		{platformv1alpha1.RunStateAdapterAccepted, "AdapterAccepted", false},
+		{platformv1alpha1.RunStateRunning, "Running", false},
+		{platformv1alpha1.RunStateNeedsInput, "NeedsInput", true},
+		{platformv1alpha1.RunStateRunning, "Running", false},
+		{platformv1alpha1.RunStateSucceeded, "Succeeded", false},
+		{platformv1alpha1.RunStateCancelled, "Cancelled", false},
+	} {
+		run.Status.State, run.Status.Conditions[0].Reason = step.state, step.reason
+		if got := runDTO(run).Diagnostic; (got != nil) != step.want {
+			t.Fatalf("%s: diagnostic = %#v", step.state, got)
+		}
+	}
+}
+
 func TestResourceServiceRunDTONilTimestampsOmitted(t *testing.T) {
 	run := &platformv1alpha1.Run{
 		ObjectMeta: metav1.ObjectMeta{Name: "run", Namespace: "ns", UID: "run-uid"},

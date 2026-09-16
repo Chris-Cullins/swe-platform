@@ -291,6 +291,7 @@ func runDTO(run *platformv1alpha1.Run) Run {
 		},
 		CancelRequested: run.Spec.Cancel,
 		State:           string(run.Status.State),
+		Diagnostic:      runDiagnostic(run),
 		Branch:          run.Status.Branch,
 		Usage: RunUsage{
 			CPUSeconds: run.Status.Usage.CPUSeconds,
@@ -314,6 +315,57 @@ func runDTO(run *platformv1alpha1.Run) Run {
 		}
 	}
 	return result
+}
+
+func runDiagnostic(run *platformv1alpha1.Run) *RunDiagnostic {
+	// setRunState writes the reason to AdapterAccepted even before acceptance.
+	// EnvironmentReady is not a failure source: terminal cleanup overwrites it.
+	condition := apiMeta.FindStatusCondition(run.Status.Conditions, "AdapterAccepted")
+	if run.Generation <= 0 || run.Status.ObservedGeneration != run.Generation || condition == nil || condition.ObservedGeneration != run.Generation {
+		return nil
+	}
+	if condition.Status != metav1.ConditionTrue && condition.Status != metav1.ConditionFalse {
+		return nil
+	}
+	// Never copy Message (including legacy/provider detail) or an unknown Reason.
+	// Infrastructure reasons can occur both before and after adapter acceptance.
+	switch run.Status.State {
+	case platformv1alpha1.RunStateFailed:
+		switch condition.Reason {
+		case "EnvironmentUnavailable":
+			return &RunDiagnostic{"EnvironmentUnavailable", "The environment could not be allocated.", "Ask an administrator to check environment availability before starting another run."}
+		case "EnvironmentLost":
+			return &RunDiagnostic{"EnvironmentLost", "The allocated environment is no longer available to this run.", "Ask an administrator to check the environment identity before starting another run."}
+		case "EnvironmentFailed":
+			return &RunDiagnostic{"EnvironmentFailed", "The environment reported a failure.", "Ask an administrator to check environment provisioning and health before starting another run."}
+		case "AdapterUnavailable":
+			return &RunDiagnostic{"AdapterUnavailable", "The selected agent adapter is not available.", "Check the agent name and ask an administrator which adapters are enabled."}
+		case "AdapterRejected":
+			return &RunDiagnostic{"AdapterRejected", "The agent adapter rejected the task.", "Review the task and adapter configuration before starting another run."}
+		case "Failed":
+			if condition.Status == metav1.ConditionTrue {
+				return &RunDiagnostic{"AdapterFailed", "The agent reported a failure.", "Review the transcript for agent-reported details before starting another run."}
+			}
+		}
+	case platformv1alpha1.RunStateAllocating:
+		switch condition.Reason {
+		case "EnvironmentAllocated", "EnvironmentRecovered", "EnvironmentNotReady":
+			return &RunDiagnostic{"EnvironmentPreparing", "Waiting for the environment to become ready.", "Wait for provisioning to finish. If this persists, ask an administrator to check the environment."}
+		case "EnvironmentStatusStale":
+			return &RunDiagnostic{"EnvironmentStatusPending", "Waiting for a current environment status.", "Wait for the environment controller to reconcile. If this persists, contact an administrator."}
+		case "EnvironmentNotReachable":
+			return &RunDiagnostic{"EnvironmentNotReachable", "The environment is not currently reachable.", "Wait for the connection to recover. If this persists, ask an administrator to check environment health."}
+		}
+	case platformv1alpha1.RunStatePaused:
+		if condition.Reason == "EnvironmentPaused" {
+			return &RunDiagnostic{"EnvironmentPaused", "The environment is paused; workspace and transcript are retained.", "Check the environment hold with an administrator before resuming."}
+		}
+	case platformv1alpha1.RunStateNeedsInput:
+		if condition.Reason == "NeedsInput" && condition.Status == metav1.ConditionTrue {
+			return &RunDiagnostic{"AgentNeedsInput", "The agent reported that it needs input.", "Review the transcript for the agent's request. Input support depends on the adapter."}
+		}
+	}
+	return nil
 }
 
 func runSummaryDTO(run *platformv1alpha1.Run) RunSummary {
