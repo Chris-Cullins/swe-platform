@@ -813,6 +813,13 @@ or render its Run fields or mount child controls until a second, exact GET confi
 For a non-interactive authentication/connectivity check (including CI), use `swe tui --check`.
 It validates namespaced Run-list access without starting a terminal UI or printing credentials.
 
+The browser **New run** form starts with an editable, randomly generated technical name.
+That name is the stable create key: after an uncertain response, retry with the same name
+and all the same fields to recover the same task. Validation and request errors retain the
+form; leaving it or switching namespace starts a fresh form and name. The form is not saved
+across reloads. Project references remain name-based; this does not implement exact Project
+selection or resolve the identity contract proposed in #207.
+
 ### Reviewing Run Changes
 
 The console's **Changes** tab and CLI compare the workspace with a snapshot taken before the

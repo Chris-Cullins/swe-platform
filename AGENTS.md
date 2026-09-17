@@ -180,7 +180,8 @@ runs both via `make` targets:
   --with-deps`). It types shell exits through real xterm, reconnects three times through the
   UI with exact Run/Environment identities, and checks one DOM root per connection and zero
   after unmount. It then verifies the Changes tab renders authenticated retained review and
-  baseline attribution. The helper closes its isolated browser session on exit; no provider keys or
+  baseline attribution, plus a valid generated New run name retained through validation without
+  creating an extra task. The helper closes its isolated browser session on exit; no provider keys or
   browser fixtures are needed in the live acceptance path.
   Scroll the actual xterm screen into view and verify keyboard focus before typing; assert
   outbound fixture bytes, expanded shell output, and server disconnect as separate stages.
