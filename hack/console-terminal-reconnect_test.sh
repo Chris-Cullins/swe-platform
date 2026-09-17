@@ -91,7 +91,11 @@ browser wait --fn '!document.querySelector(".terminal")' >/dev/null
 browser eval 'if (terminalHost.querySelectorAll(".xterm").length !== 0 || document.querySelectorAll(".xterm").length !== 0) throw new Error("Unmount leaked xterm DOM");' >/dev/null
 echo 'PASS: real xterm unmount removes root from retained host and document'
 stage changes-review
+# Observe the same native response the component renders, rather than racing a
+# second request against a newer capture. Do not print review bytes or headers.
+browser eval 'window.changesRevision = undefined; const changesFetch = window.fetch; window.fetch = async (...args) => { const response = await changesFetch(...args); if (new URL(response.url).pathname.endsWith("/changes") && response.ok) window.changesRevision = (await response.clone().json()).revision; return response; };' >/dev/null
 browser find role link click --name Changes --exact >/dev/null
 browser wait --text 'Review limits:' >/dev/null
 browser eval 'const review=document.querySelector("[aria-label=\"Run changes\"]"); if (!review || document.querySelector("[role=alert]") || review.textContent.includes("Comparison unavailable:")) throw new Error("Run Changes review unavailable"); if (!review.textContent.includes("Pre-existing edits are part of the baseline, not attributed to this Run.")) throw new Error("Missing baseline attribution explanation"); if (document.querySelector("nav[aria-label=\"Run sections\"] a[aria-current=page]")?.textContent !== "Changes") throw new Error("Changes tab not active");' >/dev/null
-echo 'PASS: real console Changes tab renders authenticated retained review and baseline attribution'
+browser eval 'if (!(window.changesRevision > 0) || document.querySelector("[aria-label=\"Observation revision\"]")?.textContent !== `Revision ${window.changesRevision}`) throw new Error("Missing returned observation revision");' >/dev/null
+echo 'PASS: real console Changes tab renders authenticated retained review, returned revision, and baseline attribution'
