@@ -103,8 +103,8 @@ stage generated-run-name
 # Inspect a fresh form without submitting or starting another live task.
 browser open "$BASE_URL/namespaces/$NAMESPACE/runs/new" >/dev/null
 browser wait --text 'stable create key' >/dev/null
-browser eval 'const input=[...document.querySelectorAll(".runform label")].find(label => label.firstChild.textContent === "Name")?.querySelector("input"); if (!input || !/^run-[a-f0-9]{32}$/.test(input.value)) throw new Error("Missing valid generated Run name"); window.generatedRunName=input.value;' >/dev/null
+browser eval '(() => { const input=[...document.querySelectorAll(".runform label")].find(label => label.firstChild.textContent === "Name")?.querySelector("input"); if (!input || !/^run-[a-f0-9]{32}$/.test(input.value)) throw new Error("Missing valid generated Run name"); window.generatedRunName=input.value; })()' >/dev/null
 browser find role button click --name 'Create run' --exact >/dev/null
 browser wait --fn '!!document.querySelector(".runform [role=alert]")' >/dev/null
-browser eval 'const input=document.querySelector(".runform input"); if (input?.value !== window.generatedRunName) throw new Error("Validation changed generated name");' >/dev/null
+browser eval '(() => { const input=document.querySelector(".runform input"); if (input?.value !== window.generatedRunName) throw new Error("Validation changed generated name"); })()' >/dev/null
 echo 'PASS: New run displays a valid generated editable name and retains it after validation without creating a task'
