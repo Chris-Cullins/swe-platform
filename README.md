@@ -884,6 +884,13 @@ for terminal access until an explicit noninteractive, capability-safe session co
 
 ### Run resource watches
 
+The browser Runs list offers **State** and **Agent** filters over this same authorized feed.
+Exact, case-sensitive matches combine with AND; **Clear filters** restores all Runs, including
+unknown future states and agents. Live updates change the matching cards. A selected agent
+remains selected even if its last Run disappears; changing namespace resets both filters.
+An empty namespace and a feed with no filter matches have distinct messages. Filters are local,
+unsaved observations, not attention categories, readiness checks, or review-state changes.
+
 Authenticated consoles obtain a fully paginated Run summary snapshot from
 `GET /api/v1/namespaces/{namespace}/runs?view=summary`, then watch that same collection with
 `watch=true&view=summary&resourceVersion=<opaque>` and `Accept: text/event-stream`. The snapshot

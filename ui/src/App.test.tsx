@@ -5,7 +5,7 @@ import { MemoryRouter, useLocation } from 'react-router'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { App } from './App'
 import { queryKeys } from './api'
-import type { Environment, Run } from './contracts'
+import type { Environment, Run, RunSummary, RunWatchEvent } from './contracts'
 
 const run: Run = {
   name: 'repair-ui', uid: 'run-uid', generation: 1, createdAt: '2026-07-19T12:00:00Z',
@@ -43,7 +43,66 @@ describe('App frozen API integration', () => {
     expect(await screen.findByRole('heading', { name: 'SWE Operations' })).toBeInTheDocument()
   })
 
-  it('switches to a valid namespace without leaking the previous namespace cache', async () => {
+  it('filters the complete live feed with exact AND matches and preserves replacement UID navigation', async () => {
+    const items: RunSummary[] = [
+      { ...run, name: 'running-amp', uid: 'a', agent: 'amp', promptPreview: 'Running task' },
+      { ...run, name: 'failed-codex', uid: 'b', state: 'Failed', agent: 'codex', promptPreview: 'Codex task' },
+      { ...run, name: 'failed-amp', uid: 'c', state: 'Failed', agent: 'amp', promptPreview: 'Amp task' },
+      { ...run, name: 'future', uid: 'd', state: 'FutureState', agent: 'future-agent', promptPreview: 'Future task' },
+      { ...run, name: 'upper-amp', uid: 'e', state: 'Failed', agent: 'AMP', promptPreview: 'Case-sensitive agent' },
+    ]
+    let stream!: ReadableStreamDefaultController<Uint8Array>
+    const fetch = vi.spyOn(globalThis, 'fetch').mockImplementation(async (path, init) => {
+      if (path === '/api/v1/session') return response({ authenticated: true, username: 'alex' })
+      if (String(path).includes('watch=true')) return new Response(new ReadableStream({ start(controller) { stream = controller } }))
+      if (path === '/api/v1/namespaces/default/runs?limit=200&view=summary') return response({ items: items.slice(0, 2), continue: 'next', resourceVersion: '1' })
+      if (String(path).includes('continue=next')) return response({ items: items.slice(2), resourceVersion: '1' })
+      if (path === '/api/v1/namespaces/default/runs/failed-amp') {
+        expect(new Headers(init?.headers).get('SWE-Run-UID')).toBe('replacement-uid')
+        return response({ ...run, name: 'failed-amp', uid: 'replacement-uid', state: 'Failed', environment: undefined })
+      }
+      throw new Error(`Unexpected request: ${path}`)
+    })
+    show('/namespaces/default/runs')
+    await screen.findByText('future')
+    expect(screen.getByText('FutureState')).toBeInTheDocument()
+    await userEvent.selectOptions(screen.getByLabelText('State'), 'Failed')
+    expect(screen.getByText('failed-codex')).toBeInTheDocument()
+    expect(screen.queryByText('running-amp')).not.toBeInTheDocument()
+    await userEvent.selectOptions(screen.getByLabelText('Agent'), 'amp')
+    expect(screen.getByText('failed-amp')).toBeInTheDocument()
+    expect(screen.queryByText('failed-codex')).not.toBeInTheDocument()
+    expect(screen.queryByText('upper-amp')).not.toBeInTheDocument()
+    let revision = 1
+    const publish = async (type: RunWatchEvent['type'], summary: RunSummary) => {
+      const resourceVersion = String(++revision)
+      await act(async () => { stream.enqueue(new TextEncoder().encode(`event: run\nid: ${resourceVersion}\ndata: ${JSON.stringify({ type, resourceVersion, run: summary })}\n\n`)) })
+    }
+    await publish('MODIFIED', { ...items[2], state: 'Running' })
+    expect(await screen.findByText('No runs match the filters.')).toBeInTheDocument()
+    await publish('DELETED', items[2])
+    await publish('DELETED', items[0])
+    expect(screen.getByLabelText('Agent')).toHaveValue('amp')
+    expect(screen.getByRole('option', { name: 'amp' })).toBeInTheDocument()
+    expect(screen.queryByText('failed-codex')).not.toBeInTheDocument()
+    for (const item of [items[1], items[3], items[4]]) await publish('DELETED', item)
+    expect(await screen.findByText('No runs found.')).toBeInTheDocument()
+    expect(screen.getByLabelText('Agent')).toHaveValue('amp')
+    for (const item of [items[1], items[3]]) await publish('ADDED', item)
+    expect(await screen.findByText('No runs match the filters.')).toBeInTheDocument()
+    await userEvent.click(screen.getByRole('button', { name: 'Clear filters' }))
+    expect(screen.getByText('failed-codex')).toBeInTheDocument()
+    expect(screen.getByText('future')).toBeInTheDocument()
+    expect(screen.queryByRole('option', { name: 'amp' })).not.toBeInTheDocument()
+    await publish('ADDED', { ...items[2], uid: 'replacement-uid' })
+    await userEvent.selectOptions(screen.getByLabelText('State'), 'Failed')
+    await userEvent.selectOptions(screen.getByLabelText('Agent'), 'amp')
+    await userEvent.click(screen.getByRole('link', { name: /failed-amp/ }))
+    expect(await screen.findByText('replacement-uid')).toBeInTheDocument()
+    expect(fetch.mock.calls.filter(([path]) => String(path).includes('watch=true'))).toHaveLength(1)
+  })
+
+  it('switches to a valid namespace without leaking the previous namespace cache or filters', async () => {
     const otherRun = { ...run, name: 'argo-run', uid: 'argo-uid', intent: { ...run.intent, prompt: 'Argo namespace task' } }
     const lateRun = { ...run, name: 'late-default-run', uid: 'late-default-uid' }
     let defaultRequests = 0
@@ -61,12 +120,18 @@ describe('App frozen API integration', () => {
     })
     const { client } = show('/namespaces/default/runs')
     expect(await screen.findByText('repair-ui')).toBeInTheDocument()
+    await userEvent.selectOptions(screen.getByLabelText('State'), 'Failed')
+    await userEvent.selectOptions(screen.getByLabelText('Agent'), 'amp')
+    expect(screen.getByText('No runs match the filters.')).toBeInTheDocument()
     act(() => { void client.invalidateQueries({ queryKey: queryKeys.runs('default') }) })
     await waitFor(() => expect(defaultRequests).toBe(2))
     await userEvent.clear(screen.getByLabelText('Namespace'))
     await userEvent.type(screen.getByLabelText('Namespace'), 'swe-platform-system')
     await userEvent.click(screen.getByRole('button', { name: 'Switch' }))
     expect(await screen.findByText('Loading runs…')).toBeInTheDocument()
+    expect(screen.getByLabelText('State')).toHaveValue('')
+    expect(screen.getByLabelText('Agent')).toHaveValue('')
+    expect(screen.queryByRole('option', { name: 'amp' })).not.toBeInTheDocument()
     expect(screen.queryByText('repair-ui')).not.toBeInTheDocument()
     resolveOther(response({ items: [otherRun] }))
     expect(await screen.findByText('argo-run')).toBeInTheDocument()

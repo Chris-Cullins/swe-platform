@@ -29,8 +29,24 @@ PY
 unset SWE_BROWSER_TOKEN
 stage exact-diagnostic-read
 browser eval "(async () => { const r = await fetch('/api/v1/namespaces/$NAMESPACE/runs/$RUN_NAME', {headers:{'SWE-Run-UID':'$RUN_UID'}}); if (r.status !== 200) throw new Error('Exact Run HTTP '+r.status); const run = await r.json(); if (run.uid !== '$RUN_UID' || run.state !== 'Failed' || run.diagnostic?.code !== 'AdapterFailed' || run.diagnostic.message !== 'The agent reported a failure.' || run.diagnostic.nextAction !== 'Review the transcript for agent-reported details before starting another run.') throw new Error('Unexpected failure diagnostic'); return {exactDiagnostic:true}; })()"
+stage run-filters
+browser open "$BASE_URL/namespaces/$NAMESPACE/runs" >/dev/null
+browser wait --fn "!!document.querySelector('a.card[href$=\"/$RUN_NAME/overview\"]')" >/dev/null
+browser select '#run-state-filter' Failed >/dev/null
+browser select '#run-agent-filter' codex >/dev/null
+browser wait --fn "!!document.querySelector('a.card[href$=\"/$RUN_NAME/overview\"]') && [...document.querySelectorAll('a.card')].every(card => card.querySelector('.pill')?.textContent === 'Failed' && [...card.querySelectorAll('dt')].find(dt => dt.textContent === 'Agent')?.nextElementSibling?.textContent === 'codex')" >/dev/null
+stage run-filters-no-match
+browser select '#run-state-filter' NeedsInput >/dev/null
+browser wait --text 'No runs match the filters.' >/dev/null
+browser eval "(() => { if (document.querySelector('a.card')) throw new Error('Unexpected filtered card'); })()" >/dev/null
+stage run-filters-clear
+browser find role button click --name 'Clear filters' --exact >/dev/null
+browser wait --fn "!!document.querySelector('a.card[href$=\"/$RUN_NAME/overview\"]') && [...document.querySelectorAll('.run-filters select')].every(select => select.value === '')" >/dev/null
+browser select '#run-state-filter' Failed >/dev/null
+browser select '#run-agent-filter' codex >/dev/null
 stage failure-detail
-browser open "$BASE_URL/namespaces/$NAMESPACE/runs/$RUN_NAME/overview" >/dev/null
+browser click "a.card[href$='/$RUN_NAME/overview']" >/dev/null
+browser wait --fn "location.pathname.endsWith('/runs/$RUN_NAME/overview') && history.state?.usr?.runUID === '$RUN_UID'" >/dev/null
 browser set viewport 1280 900 2 >/dev/null
 browser wait --text 'The agent reported a failure.' >/dev/null
 browser wait --text 'Review the transcript for agent-reported details before starting another run.' >/dev/null
@@ -39,4 +55,4 @@ stage review-transcript
 browser find role link click --name 'Review transcript' --exact >/dev/null
 browser wait --fn "location.pathname.endsWith('/runs/$RUN_NAME/transcript') && !!document.querySelector('[aria-label=\"Run status\"]')" >/dev/null
 browser wait --text 'Task ·' >/dev/null
-echo 'PASS: exact safe failure diagnostic, next action, transcript navigation, and task context'
+echo 'PASS: Run filters, clear/no-match, exact UID navigation, safe failure diagnostic, next action, transcript navigation, and task context'

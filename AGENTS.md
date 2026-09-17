@@ -189,6 +189,7 @@ runs both via `make` targets:
   bounded terminal state, and DOM counts only, never cookies, response bodies, or page text.
   `hack/console-run-diagnostic_test.sh` exercises the existing fake Codex failure through the
   exact Run API and embedded console, checking fixed diagnostic text and transcript navigation.
+  It also checks Run-list State/Agent AND filters, clear/no-match, and exact UID card navigation.
   Safe Run diagnostics belong in the resource DTO mapper, not controller lifecycle changes:
   allowlist current state/reason pairs, never project raw condition messages.
 - **Windows portability:** CI runs focused sandboxd process, launch-material, Exec,
