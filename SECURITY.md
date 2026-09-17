@@ -354,7 +354,11 @@ generation that tombstones routes and stops the complete managed set; unavailabl
 preserves declarations but prevents launch. Process reconciliation is fenced by Environment UID and the monotonic
 Environment-intent/gateway-route revision pair;
 pause/resume creates a new daemon epoch, and pause, removal, or replacement revokes the old
-process and URL. Portal UI work (#95) remains out of scope.
+process and URL. The console's per-Run Portals tab is implemented: exact Run/Environment
+identities and per-service authorization filter its list. Opening uses a bounded 30-second,
+one-time, locator-bound form handoff to establish a host-only browser session before loading
+the stable URL. No bearer credential or reusable secret is placed in the URL or UI data;
+this is not an anonymous sharing link and does not bypass the gateway checks above.
 
 ## Browser sessions
 
@@ -412,7 +416,8 @@ buffers after the call. At the acceptance process-dial boundary it also uncached
 complete active Installation/Namespace/Project claim, so offboarding prevents an already-running
 reconcile from starting new work with launch-only credentials. The Claude Code adapter sends the
 key only through sandboxd's distinct
-`StartWithLaunchMaterial` RPC as `ANTHROPIC_API_KEY`. It never falls back to the ordinary Start
+`StartWithLaunchMaterial` RPC as `ANTHROPIC_API_KEY`; Amp and Codex use the same boundary as
+`AMP_API_KEY` and `CODEX_API_KEY`. It never falls back to the ordinary Start
 RPC if an old sandboxd server reports `Unimplemented`. sandboxd validates launch material before
 publishing a process, applies it only to the child environment, and stores and returns only the
 public process specification plus a private launch-mode bit used for idempotency fencing.
@@ -423,7 +428,9 @@ repository wrappers left by setup, same-UID peers, or explicit output can disclo
 transcript redaction is not guaranteed. Anyone allowed to create a Run in a namespace can
 initially select any profile in that namespace; profile management requires separate Secret and
 CRD administration. OAuth/subscription files, refresh and writeback, leases, per-user ownership,
-Git/setup/service credentials, Amp login persistence, and stronger confinement remain deferred.
+setup/service credentials, Amp login persistence, and stronger confinement remain deferred.
+GitHub App repository credentials are the separate shipped exact-repository contract above;
+this does not add arbitrary Git credentials or PR-publication permissions.
 
 The Pi adapter never accepts a credential profile or injects provider credentials. The
 controller rejects such Runs before Environment allocation and before reading the selected

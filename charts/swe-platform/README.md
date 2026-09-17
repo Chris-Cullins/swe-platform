@@ -624,14 +624,16 @@ explicitly disabled) is the sole no-op. Memory development storage uses the same
 
 Per-Run event and byte limits bound the retained window for the lifetime of each exact Run.
 Completion, cancellation, pause, and retain-only Project offboarding never purge it. Explicit Run
-deletion reclaims only its exact live-primary rows. This bounds supported Run-deletion churn,
-not an installation-wide byte budget; there is no TTL. New and safely associated
+deletion reclaims only its exact live-primary transcript and Changes data through the shared
+cutoff/drain path. Changes also has fixed per-Run snapshot/diff bounds, not a global storage cap.
+This bounds supported Run-deletion churn, not an installation-wide byte budget; there is no TTL.
+New and safely associated
 rows include the immutable Namespace UID. Legacy rows with no Namespace UID are associated only
 through an authorized exact current Run UID; otherwise they are retained indefinitely. The
 retain-only Project offboarding phase deliberately has no deletion API. Until a future exact
 Namespace-UID-preconditioned durable purge operation ships, operators must monitor and provision
-the dedicated transcript database for accumulated history.
-Total retained storage across all Runs can be checked directly against the per-Run accounting
+the shared database for accumulated history.
+Retained transcript bytes across all Runs can be checked against the per-Run accounting
 columns the append path maintains:
 
 ```sql
@@ -652,7 +654,8 @@ GROUP BY namespace, namespace_uid
 ORDER BY coalesce(sum(retained_bytes), 0) DESC;
 ```
 
-These queries are read-only and report retained history only; they do not advise when or whether
+These queries are read-only and report transcript accounting only, not Changes bytes, sessions,
+indexes, or total PostgreSQL disk usage; they do not advise when or whether
 to delete. There is no supported manual purge recipe: name-only SQL can cross a reused Namespace,
 and direct row deletion cannot drain ingress or prevent a racing append from recreating rows.
 Use explicit Run deletion while its exact identity and cleanup authority remain provable;
@@ -666,18 +669,19 @@ is not exhaustive:
 
 | State | Location | Helm reconstructs it? |
 |---|---|---|
-| Transcript events | PostgreSQL database | No |
+| Transcript events, retained Changes, encrypted browser sessions | Shared PostgreSQL database | No; session recovery also requires the matching keyring |
 | Infrastructure state (Installation, Namespace claims, Project, Run, Environment, AgentCredentialProfile, managed Project-local EnvironmentTemplate copies) | Kubernetes API / etcd | No — Helm reapplies the system Installation and catalog sources, not Project namespace resources |
 | Workspace contents (cloned repos, agent work, uncommitted changes) | Environment PVCs | No |
 | Installation and credential material (out-of-band PostgreSQL URL, session keyring, bootstrap token Secrets, chart values overrides) | Kubernetes Secrets and local configuration | No |
 
-Back up the PostgreSQL transcript database before every upgrade using your provider's backup
-mechanism (`pg_dump`, managed-service snapshots, or equivalent). To restore transcripts only,
-point the same connection URL at the recovered database and restart the control-plane pod.
+Back up the complete shared PostgreSQL database before every upgrade using your provider's backup
+mechanism (`pg_dump`, managed-service snapshots, or equivalent), and preserve its matching session
+keyring separately. For database-only recovery, point the connection URL at the recovered
+database and restart the control-plane pod.
 The control plane applies ordered embedded migrations under a PostgreSQL advisory lock on
 startup, so a restored database at an older migration version is brought forward automatically.
-This database-only recovery path restores transcript events; it does not reconstruct
-infrastructure state, workspace contents, or installation material.
+This database-only recovery path restores stored events, review bytes, and session rows; it does
+not reconstruct infrastructure state, workspace contents, or installation material.
 
 Separately, export or back up the Namespace claims and custom-resource instances (Project, Run,
 Environment, AgentCredentialProfile, and managed Project-local EnvironmentTemplate copies) and snapshot or back
@@ -692,10 +696,10 @@ and any chart values overrides), and recreate agent API-key credentials through 
 `swe credentials create` / `--api-key-stdin` flow, then rotate if necessary.
 
 A coordinated cluster-loss restore order, RPO, and RTO are not tested or provided by this
-release. The monitoring queries above report retained transcript history so you can size
-database backups. Per-Run retention limits bound individual Run transcript windows, but total
-database size has no hard installation-wide cap. Explicit Run deletion reclaims exact live-primary
-rows under the release prerequisites above; restoring older backups may restore inaccessible rows.
+release. The monitoring queries above report only retained transcript history; measure complete
+database size separately when sizing backups. Per-Run retention limits bound individual Run
+transcript windows, but total database size has no hard installation-wide cap. Explicit Run deletion reclaims exact live-primary
+rows through the cleanup contract above; restoring older backups may restore inaccessible rows.
 
 ## BYOC operations
 
@@ -710,6 +714,17 @@ The executable, provider-specific procedures are in the
 [`BYOC operator runbooks`](BYOC.md). They pin latest-main images to an exact successful publish,
 run the checked-in validator, preserve scoped-tenancy ordering, and cover PostgreSQL backup,
 restore, and incident response without claiming production isolation.
+
+“Production preset” names describe deployment/storage choices, not restricted-execution
+eligibility. Current k3s/GKE/EKS selections are legacy-unclassified; explicit unrestricted
+development is non-production, and restricted selection fences execution and stays `Blocked`.
+Durable PostgreSQL does not enable control-plane HA. See the
+[security model](../../SECURITY.md) and [roadmap index](https://github.com/Chris-Cullins/swe-platform/issues/197).
+
+Pause removes the Environment pod, not its retained PVC, database history, warm-pool capacity,
+shared services, or cluster nodes. It removes that pod's resource consumption, not necessarily
+cloud compute charges or total cost. Hibernation/PVC reclamation and normalized usage/cost
+accounting remain separate work; lifecycle duration is not active CPU time.
 
 ### Active Run capacity
 
@@ -1004,7 +1019,10 @@ repository process port collisions fail closed, while API port aliases remain su
 refuses to mutate repository-owned entries. Services receive only `PORT` and discovered
 `PUBLIC_URL`, not a portal credential or projected token. If portals are disabled, the gateway
 tombstones active routes and the operator stops the complete managed service set; if discovery is
-unavailable, declarations remain durable but launch fails closed. Portal UI (#95) is not implemented.
+unavailable, declarations remain durable but launch fails closed. The console's per-Run Portals
+tab lists authorized declared services and opens them through a bounded one-time form handoff;
+stable locators are not credentials or public sharing links. `swe portal ENV SERVICE` remains
+the CLI discovery path. Both require the configured gateway; checked-in presets disable portals.
 
 ## Operations console
 
@@ -1048,7 +1066,8 @@ Kubernetes DNS-subdomain `name` as the retry key. An existing same-name Run is r
 when the caller is separately authorized to get that exact Run and its immutable intent
 matches; otherwise the API returns a conflict without exposing it. Clients select either an
 existing Environment or a Project/Template allocation intent. Only the Run is created—the
-Run controller exclusively allocates or claims Environments. Cancellation monotonically sets
+Run controller exclusively allocates or claims Environments. This recovery is idempotent API
+creation, not task retry, prompt revision, or agent continuation. Cancellation monotonically sets
 `spec.cancel` and retries bounded Kubernetes update conflicts. Every cancellation body must
 include the expected immutable Run UID, for example `{"runUID":"<uid from the Run response>"}`.
 Missing or empty UIDs fail before resource resolution, and a UID that no longer matches a

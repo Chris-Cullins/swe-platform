@@ -13,11 +13,17 @@ before architectural work and keep implemented behavior, approved future contrac
 open work clearly separated. Do not guess at design intent that is not recorded there or in
 an approved maintainer decision.
 
+The [product roadmap index (#197)](https://github.com/Chris-Cullins/swe-platform/issues/197)
+owns sequencing; existing technical issues retain their contracts and history. Use shipped,
+implementing (with active-work evidence), approved-not-started, and proposed/decision-needed
+explicitly. Product direction does not approve unresolved CRD, identity, publication, or
+persistence designs. Verify capability claims against code, not issue state or schema fields.
+
 ## Current state
 
-P0 scaffold is in place: CRD types, environment controller, `sandboxd` (exec/fs/ports/
-health and a shared tmux terminal), CLI (`run`/`logs`/`attach`), kind acceptance, CI,
-and a Helm chart for the operator, control plane, and CRDs. The control plane currently
+Pre-1.0 developer workflows are implemented: CRDs, lifecycle/warm-pool controllers, `sandboxd`,
+CLI/TUI/browser/MCP entry points, kind acceptance, CI, and a Helm chart for the operator,
+control plane, and CRDs. This is not restricted-production readiness. The control plane
 provides PostgreSQL-backed durable transcript ingestion and database-polled SSE streaming with
 a development-only bounded memory fallback, plus explicit memory or encrypted PostgreSQL
 browser sessions backed by repeated Kubernetes TokenReview/exact SAR authorization. PostgreSQL
@@ -40,7 +46,8 @@ pre-live: the approved focus is feature completeness and UX, not staged rollout 
 Chart version/appVersion, MCP server identity, and private UI package metadata advance together;
 production presets inherit appVersion, while kind/Argo retain dev/latest respectively.
 The control plane also provides the authenticated declared-service portal gateway, with fenced
-wake/currentness checks and a purpose-scoped sandboxd tunnel. Remaining gaps are tracked in
+wake/currentness checks, a purpose-scoped sandboxd tunnel, and the authorization-filtered console
+Portals tab with a bounded one-time browser handoff. Remaining gaps are tracked in
 `ARCHITECTURE.md`, code comments, and linked issues — most notably additional credential forms,
 additional agent adapters, and egress networking. Repository
 `.swe/services.yaml` ingestion and supervised service launch with
@@ -59,6 +66,10 @@ Environment through the existing ordered teardown and blocks warm replenishment,
 non-legacy lifecycle may reopen development execution only from current exact `Active` status after
 fence proof. Trusted-admin fence proof ignores only exact foreign Installation namespace claims.
 This does not activate or claim restricted runtime or egress enforcement.
+Run create recovery is API idempotency, not task retry/continuation. Usage/branch/notify/parent
+fields do not implement accounting/publication/messaging; `NeedsInput` is not a live input
+channel. Pause retains disk, not processes, and is not zero total cost. Onboarding and retained
+offboarding ship; destructive Project purge remains open. Preserve these boundaries in docs.
 
 ## Architecture invariants — do not violate these
 
@@ -226,7 +237,7 @@ runs both via `make` targets:
   control-plane TokenReview/SAR scoping, memory and durable encrypted PostgreSQL browser session
   exchange/logout/revocation, capacity and CSRF,
   the embedded console entry point/SPA fallback/static assets, typed Run
-  list/get/create/retry/cancel, Environment get, transcript SSE, terminal attach, and
+  list/get/create/idempotent-create-recovery/cancel, Environment get, transcript SSE, terminal attach, and
   the local stdio MCP tool list plus UID-fenced bounded transcript read,
   actual-listener service observation through healthy/unhealthy/restart/pause/resume/removal
   transitions with declaration and fresh-execution correlation and no URL,

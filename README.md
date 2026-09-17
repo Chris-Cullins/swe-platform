@@ -3,29 +3,32 @@
 Open-source platform for running coding agents unattended in ephemeral, isolated Kubernetes environments.
 
 Give an agent a task — from the CLI, web UI, or an MCP call — and the platform provisions a
-fresh environment (repo clone, toolchain, process-scoped agent credentials, setup hooks), runs
-the agent in it, streams everything back live, and auto-pauses when idle so compute cost drops
-to ~$0. Review bounded Run-start workspace diffs from the CLI or console; automatic branch,
-commit, push, and PR publication remain unimplemented.
+new environment or claims warm capacity, prepares the repository, runs the selected agent,
+and streams its output. Review retained workspace changes and authenticated service previews
+from the console. Pause deletes the Environment pod and retains its workspace disk; resume
+starts fresh processes, not a process-memory checkpoint.
 
-> **Status: early.** The P0 scaffold is in — CRDs, operator, `sandboxd`, CLI — with a
-> passing kind end-to-end (`./hack/e2e.sh`). A first control-plane service accepts and
-> streams adapter-owned transcript events through a bounded, tenant-aware transcript-store
-> contract over SSE, while `swe attach` and the control
-> plane's WebSocket terminal endpoint connect to a shared tmux session through `sandboxd`;
-> pause/resume preserves workspace disks and runs repository resume hooks, and idle
-> environments pause automatically before terminal requests wake them. Template warm
-> pools keep unclaimed environments ready for `swe run` to claim. The `claude-code` (default),
-> `amp`, `codex`, and `pi` adapters run through sandboxd's managed-process API. Environments
-> accept bounded durable desired service declarations from the API or strict repository-owned
-> `.swe/services.yaml`, supervise repository services, publish fenced advisory TCP-connect
-> observations, and expose declared HTTP services through authenticated, fenced portal URLs.
-> The Helm chart installs the
-> operator, control plane, CRDs, a stable Installation identity, and inert Template catalog
-> sources in a system namespace. `swe project onboard` creates a dedicated claimed namespace,
-> managed local Template copies, quota, RBAC, and baseline policy before Runs are enabled there.
-> Values presets
-> cover kind, k3s, GKE with GKE Sandbox, and EKS.
+> **Status: pre-1.0, self-hosted developer workflows implemented; restricted-production
+> execution is not available.** Selecting restricted isolation fences execution and remains
+> `Blocked`. Provider presets and durable storage do not establish production isolation.
+
+**Shipped capabilities:**
+
+- Claude Code (default), Amp, Codex, and Pi adapters; CLI, terminal TUI, browser console, and
+  local MCP (`create_run` / `read_transcript`) entry points. Adapter capabilities differ;
+  Pi rejects credential profiles, and a successful process is not proof of a verified result.
+- Live transcripts, shared terminal, safe Run diagnostics, bounded observation-only Changes,
+  and an authorization-filtered console Portals tab. Changes are timestamped retained
+  observations, not live workspace truth; platform branch/commit/push/PR publication is absent.
+- Repository hooks, supervised declared services, idle pause/resume, and warm pools.
+- Namespace-per-Project onboarding, managed local Templates, quotas/RBAC, scoped tenancy,
+  and retain-only offboarding. Destructive whole-Project purge is not implemented.
+- Process-scoped agent API keys and exact-repository, short-lived GitHub App clone/Git tokens.
+  Selected agents can disclose credentials; same-UID isolation and transcript redaction are
+  not guaranteed.
+- PostgreSQL transcripts, Changes, and encrypted browser sessions; exact Run-lifetime deletion.
+  Development memory stores lose data on restart. Helm/BYOC instructions cover kind, k3s,
+  GKE, and EKS; the control plane remains singleton, not HA.
 
 ## Why
 
@@ -36,7 +39,8 @@ commit, push, and PR publication remain unimplemented.
   is explicitly non-production. Selecting restricted fences existing Environment execution and
   stays blocked because default-deny egress and restricted runtime activation are not implemented.
 - **Pause economics** — idle environments are paused (pod deleted, disk retained) and
-  woken on demand. A suspended Environment costs ~$0 in compute.
+  woken on demand. Their pods consume no compute while paused, but retained disks, database,
+  warm pools, shared services, and provisioned cluster nodes can still incur costs.
 - **Agent-agnostic** — existing agents plug in via adapters; the platform never depends
   on one agent's internals.
 - **Self-hosted** — your cluster, your credentials, your data. Runs on anything from a
@@ -265,13 +269,39 @@ allowed to overlap the new one.
 
 ## Roadmap
 
-- **P0 — skeleton:** `sandboxd`, CRDs, operator, CLI, kind quickstart
-- **P1 — secure & streamable:** Helm chart, transcript streaming, web terminal, scoped
-  git tokens, egress proxy
-- **P2 — economics & portals:** pause/resume, warm pools, portals, repo setup hooks
-- **P3 — multiplayer agents:** inboxes/spawning, web UI, metering, MCP server
-- **P4 — enterprise:** SSO/RBAC/audit, Windows environments (.NET Framework workloads),
-  hibernation tier, hosted offering
+The [product roadmap index (#197)](https://github.com/Chris-Cullins/swe-platform/issues/197)
+supersedes the old P0–P4 phase list. Architecture owns technical contracts; issues own execution
+tracking. Product direction approval does not approve unresolved identity, CRD, publication,
+or persistence designs. No delivery dates are committed.
+
+Use four states: **shipped** (verified on main), **implementing** (linked active work),
+**approved, not started** (approved scope without active work), and **proposed/decision needed**
+(unsettled detailed contracts). An epic can contain slices in different states; its creation
+does not mean implementation has started. The capabilities above are shipped. Active slices
+are recorded on the index and owning issues, not inferred from an open checkbox.
+
+| Outcome | Owner and remaining scope |
+|---|---|
+| First useful task | [#189](https://github.com/Chris-Cullins/swe-platform/issues/189): Project discovery, compatible selection, defaults, readiness, and guided launch |
+| Review and refine | [#190](https://github.com/Chris-Cullins/swe-platform/issues/190): results/evidence, readable output, linked follow-ups, bounded artifacts |
+| Work unattended | [#192](https://github.com/Chris-Cullins/swe-platform/issues/192): attention queue and user notifications |
+| Review to PR | [#191](https://github.com/Chris-Cullins/swe-platform/issues/191): explicit publication of exactly reviewed changes, separate from read-only Changes |
+| Controlled team operation | [#193](https://github.com/Chris-Cullins/swe-platform/issues/193): integrate existing security, credentials, identity/audit, accounting, and retention owners |
+| Bounded automation | [#194](https://github.com/Chris-Cullins/swe-platform/issues/194): issue-to-task/templates/MCP expansion first; coordination later |
+| Advanced review and deployment discovery | [#195](https://github.com/Chris-Cullins/swe-platform/issues/195): proposed comparisons, collaboration, forks, multi-repo, and customer-driven backend/hosted expansion |
+
+These are approved product directions; detailed contracts remain proposed/decision needed
+where their owning issues say so. Restricted runtime/egress activation remains with
+[#10](https://github.com/Chris-Cullins/swe-platform/issues/10) and
+[#68](https://github.com/Chris-Cullins/swe-platform/issues/68), in parallel with developer UX.
+The [documentation reconciliation (#196)](https://github.com/Chris-Cullins/swe-platform/issues/196)
+preserves historical decisions rather than resetting the technical backlog.
+
+API idempotent create recovery returns the same Run after an uncertain request; it is not a
+task retry or continuation channel. `NeedsInput` does not establish supported live input.
+Declared usage, branch, `changesWorkflow`, `notify`, and parent fields do not implement
+accounting, publication, notifications, or messaging. Unknown usage is not zero; lifecycle
+wall time includes pauses and is not active compute time.
 
 ## Local development
 
