@@ -753,6 +753,25 @@ The table explicitly reports an empty or unmatched result. This is a read-only o
 not a watch, wake, readiness probe, review queue, notification subscription, or input channel.
 `Succeeded` describes an agent outcome, not verified software.
 
+### Describing an exact Run
+
+Use the UID returned by `swe list-runs` to inspect one Run without following a same-name replacement:
+
+```sh
+swe describe-run fix-flaky-42 --namespace my-project --run-uid "$RUN_UID"
+swe describe-run fix-flaky-42 --namespace my-project --run-uid "$RUN_UID" --json
+```
+
+Set `SWE_CONTROL_PLANE_URL` and `SWE_CONTROL_PLANE_TOKEN`, or pass `--control-plane` and `--token`.
+The command requires an explicit namespace, name and UID, and exact `get runs` permission. It makes
+one UID-fenced detail request; denial, deletion or identity conflict fails without partial output,
+name lookup, Kubernetes fallback or retry against a replacement. Human output includes identity,
+lifecycle state, agent, known timestamps and the existing fixed diagnostic/next action. It omits
+prompts, transcripts and raw condition messages; absent diagnostics mean unknown, not healthy.
+**JSON includes the authorized task prompt and other existing typed Run detail**; handle it as
+potentially sensitive. Neither format fetches transcripts, Changes or credentials. This command
+does not wake, cancel, continue or publish a Run, and an agent outcome is not verification evidence.
+
 ### Terminal operations console
 
 `swe tui` is a keyboard-first, agent-neutral operations console for one namespace. It uses

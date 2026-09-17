@@ -3435,6 +3435,31 @@ CODEX_FAILED_RUN_NAME=e2e-fake-codex-failed-run
 bin/swe --namespace "$PROJECT_NAMESPACE" run "fake Codex failure smoke test" --name "$CODEX_FAILED_RUN_NAME" --environment "$ENV_NAME" --agent codex --wait=false
 kubectl wait --for=jsonpath='{.status.state}'=Failed run/"$CODEX_FAILED_RUN_NAME" --timeout=3m
 CODEX_FAILED_RUN_UID=$(kubectl get run "$CODEX_FAILED_RUN_NAME" -o jsonpath='{.metadata.uid}')
+echo "==> verifying exact read-only CLI Run description"
+DESCRIBED_RUN=$(SWE_CONTROL_PLANE_URL=http://127.0.0.1:18080 SWE_CONTROL_PLANE_TOKEN="$CONSOLE_TOKEN" \
+	bin/swe describe-run "$CODEX_FAILED_RUN_NAME" --namespace "$PROJECT_NAMESPACE" --run-uid "$CODEX_FAILED_RUN_UID" --json)
+if ! jq -e --arg uid "$CODEX_FAILED_RUN_UID" --arg name "$CODEX_FAILED_RUN_NAME" \
+	'.uid == $uid and .name == $name and .state == "Failed" and .intent.agent == "codex" and
+	 .diagnostic.code == "AdapterFailed" and .diagnostic.message == "The agent reported a failure." and
+	 .diagnostic.nextAction == "Review the transcript for agent-reported details before starting another run."' <<<"$DESCRIBED_RUN" >/dev/null; then
+	echo "FAIL: exact CLI Run description did not return the safe failure diagnostic"
+	exit 1
+fi
+DESCRIBED_RUN_TEXT=$(SWE_CONTROL_PLANE_URL=http://127.0.0.1:18080 SWE_CONTROL_PLANE_TOKEN="$CONSOLE_TOKEN" \
+	bin/swe describe-run "$CODEX_FAILED_RUN_NAME" --namespace "$PROJECT_NAMESPACE" --run-uid "$CODEX_FAILED_RUN_UID")
+if ! grep -Fxq "UID: $CODEX_FAILED_RUN_UID" <<<"$DESCRIBED_RUN_TEXT" ||
+	! grep -Fxq 'Diagnostic: AdapterFailed' <<<"$DESCRIBED_RUN_TEXT" ||
+	grep -Fq 'fake Codex failure smoke test' <<<"$DESCRIBED_RUN_TEXT"; then
+	echo "FAIL: human CLI Run description omitted identity/diagnostic or exposed the prompt"
+	exit 1
+fi
+if SWE_CONTROL_PLANE_URL=http://127.0.0.1:18080 SWE_CONTROL_PLANE_TOKEN="$CONSOLE_TOKEN" \
+	bin/swe describe-run "$CODEX_FAILED_RUN_NAME" --namespace "$PROJECT_NAMESPACE" --run-uid stale-run-uid \
+	>/tmp/swe-platform-describe-stale.out 2>/dev/null || [[ -s /tmp/swe-platform-describe-stale.out ]]; then
+	echo "FAIL: stale CLI Run description succeeded or printed partial detail"
+	exit 1
+fi
+echo "PASS: exact CLI Run description preserves safe diagnostics and rejects stale identity"
 echo "==> verifying safe Run diagnostic and console transcript action"
 SWE_BROWSER_TOKEN="$CONSOLE_TOKEN" ./hack/console-run-diagnostic_test.sh \
 	"http://127.0.0.1:18080" "$PROJECT_NAMESPACE" "$CODEX_FAILED_RUN_NAME" "$CODEX_FAILED_RUN_UID" \
