@@ -33,6 +33,7 @@ const (
 // ResourceService is the Kubernetes-independent resource API used by HTTP
 // handlers. Its representations deliberately contain only the frozen API DTOs.
 type ResourceService interface {
+	ListProjects(ctx context.Context, namespace string, limit int64, continueToken string) (ProjectList, error)
 	ListRuns(ctx context.Context, namespace string, limit int64, continueToken string) (RunList, error)
 	ListRunSummaries(ctx context.Context, namespace string, limit int64, continueToken string) (RunSummaryList, error)
 	CreateRun(ctx context.Context, namespace string, request CreateRunRequest) (Run, error)
@@ -59,6 +60,18 @@ func (s *KubernetesResourceService) ListRunSummaries(ctx context.Context, namesp
 // KubernetesResourceService stores resource intent in swe.dev CRDs.
 type KubernetesResourceService struct {
 	Client client.WithWatch
+}
+
+func (s *KubernetesResourceService) ListProjects(ctx context.Context, namespace string, limit int64, continueToken string) (ProjectList, error) {
+	var projects platformv1alpha1.ProjectList
+	if err := s.Client.List(ctx, &projects, &client.ListOptions{Namespace: namespace, Limit: limit, Continue: continueToken}); err != nil {
+		return ProjectList{}, err
+	}
+	result := ProjectList{Items: make([]Project, 0, len(projects.Items)), Continue: projects.Continue}
+	for _, p := range projects.Items {
+		result.Items = append(result.Items, Project{Namespace: p.Namespace, Name: p.Name, UID: string(p.UID), Generation: p.Generation, DefaultTemplate: p.Spec.TemplateRef})
+	}
+	return result, nil
 }
 
 func (s *KubernetesResourceService) WatchRuns(ctx context.Context, namespace, resourceVersion string, timeout time.Duration) (watch.Interface, error) {

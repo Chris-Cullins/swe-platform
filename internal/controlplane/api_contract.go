@@ -2,6 +2,21 @@ package controlplane
 
 import "time"
 
+// Project is a read-only discovery observation, not a Run selection precondition.
+type Project struct {
+	Namespace       string `json:"namespace"`
+	Name            string `json:"name"`
+	UID             string `json:"uid"`
+	Generation      int64  `json:"generation"`
+	DefaultTemplate string `json:"defaultTemplate"`
+}
+
+// ProjectList is one bounded page; Continue is an opaque Kubernetes cursor.
+type ProjectList struct {
+	Items    []Project `json:"items"`
+	Continue string    `json:"continue,omitempty"`
+}
+
 // Problem is the error envelope returned by the resource and session APIs.
 type Problem struct {
 	Type   string `json:"type"`

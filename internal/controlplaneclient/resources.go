@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 
 	"github.com/Chris-Cullins/swe-platform/internal/controlplane"
@@ -27,6 +28,21 @@ const (
 	// than 6 MiB while remaining bounded.
 	maxExactResourceResponse = 8 << 20
 )
+
+// ListProjects reads one bounded discovery page, without resolving references.
+func (c *Client) ListProjects(ctx context.Context, namespace string, limit int64, continueToken string) (controlplane.ProjectList, error) {
+	if strings.TrimSpace(namespace) == "" || limit < 1 || limit > 200 || len(continueToken) > 4096 {
+		return controlplane.ProjectList{}, fmt.Errorf("explicit namespace, limit 1–200, and continuation of at most 4096 bytes are required")
+	}
+	endpoint := c.Endpoint("api", "v1", "namespaces", namespace, "projects")
+	query := url.Values{"limit": {strconv.FormatInt(limit, 10)}}
+	if continueToken != "" {
+		query.Set("continue", continueToken)
+	}
+	var page controlplane.ProjectList
+	err := c.getJSONLimit(ctx, endpoint+"?"+query.Encode(), &page, 1<<20)
+	return page, err
+}
 
 // PortalRoute is the stable authenticated route allocated for a declared service.
 type PortalRoute struct {
