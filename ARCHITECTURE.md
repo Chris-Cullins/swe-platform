@@ -17,7 +17,7 @@ CLI / TUI / local MCP / browser console
                     | HTTP, SSE, WebSocket
                     v
              control plane -------- shared PostgreSQL database
-                    |                 (transcripts + browser sessions,
+                    |                 (transcripts + Changes + browser sessions,
                     |                  or bounded dev memory stores)
                     | Kubernetes API
                     v
@@ -51,9 +51,10 @@ CLI / TUI / local MCP / browser console
   not exec into Environment pods.
 - **Clients.** `swe run`, `logs`, `attach`, `tui`, and the bounded local stdio MCP server use
   the control-plane or Kubernetes contracts appropriate to each command. The React console
-  uses the same control-plane resource, transcript, and terminal APIs; portal UI remains out of
-  scope. The CLI `swe portal ENV SERVICE` performs authenticated discovery and prints the exact
-  stable URL.
+  uses the same control-plane resource, transcript, terminal, Changes, and portal APIs. Its
+  per-Run Portals tab lists authorized services and opens them through a one-time browser
+  handoff. The CLI `swe portal ENV SERVICE` performs authenticated discovery and prints the
+  exact stable URL.
 - **`sandboxd`.** A small daemon in each Environment provides authenticated gRPC services for
   connection-bound exec, keyed managed processes, workspace-confined filesystem access, one
   shared terminal, health, bounded stateless TCP-connect observations, and a capability-gated
@@ -333,7 +334,8 @@ Each Environment pod receives a per-incarnation TLS identity and capability toke
 operator also creates an ingress NetworkPolicy allowing sandboxd traffic only from the
 release's control-plane- and operator-labeled pods in the configured control-plane namespace.
 NetworkPolicy enforcement is a cluster/CNI prerequisite; authenticated TLS and capabilities
-remain mandatory. Default-deny egress and an egress proxy do not exist today.
+remain mandatory. Default-deny egress and an active egress proxy are not implemented; the
+disabled foundations below confer no execution authority.
 
 ### Run, Environment, pause, and execution lifecycle
 
@@ -341,6 +343,9 @@ The Run UID is the idempotency key for allocation, adapter acceptance, and sandb
 process ownership. A durable acceptance-attempt condition is written before calling an
 adapter, so cancellation remains conservative after an uncertain response. Run status exposes
 adapter-neutral milestones from allocation through terminal success, failure, or cancellation.
+Same-name, same-intent API create recovery returns that existing Run; it does not retry a
+completed task, edit its prompt, or continue its agent session. Linked follow-ups and live
+input require separate contracts; a normalized `NeedsInput` state is not an input channel.
 Normalized adapter observation reasons and messages are fixed, bounded platform vocabulary;
 the Run controller derives the persisted message from the observation enum and never persists
 an adapter-returned detail string. Process errors, provider fields, result text, thread IDs, and
@@ -1070,6 +1075,11 @@ non-empty allowlist rejection behavior.
 
 ## Remaining decisions and open work
 
+The [product roadmap index (#197)](https://github.com/Chris-Cullins/swe-platform/issues/197)
+owns outcome sequencing and links the existing technical owners. Its approved product direction
+does not settle the open contracts below. Use shipped / implementing (with active-work evidence) /
+approved, not started / proposed/decision needed, without treating schema fields as capabilities.
+
 Repository service ingestion, process URL injection from authenticated discovery, and the
 authorization-filtered per-Run console Portal tab are implemented. Other unimplemented areas include inbox and child-run semantics, changes
 publication, whole-Project transcript purge, additional credential forms, ConPTY, Windows
@@ -1077,6 +1087,20 @@ setup/resume hook semantics and node-pool/provider requirements, non-Pod
 backends, and control-plane HA. Their detailed contracts remain issue work unless and until a
 maintainer decision is recorded. In particular, schema placeholders or portable interfaces do
 not by themselves make these features implemented.
+
+Technical ownership remains with #9 (remaining credential classes/selection authorization),
+#10/#68 (approved restricted isolation and egress, not runtime-active), #11 (destructive
+Project purge, not the shipped retained offboarding), #71 (inboxes/children), #72 (accounting),
+#74 (optional workload identity), and #76–#79 (SSO/audit/HA, backends, hibernation, hosted).
+The metering sampler/ledger/pricing and workload-identity recipient proposals are not approved
+implementation contracts. Kubernetes remains the token issuer; a platform JWKS issuer or CLI
+token export is not implied. Optional identity must not be mounted into the current shared main
+container. Ordinary pause retains PVC costs; CSI development snapshot tooling does not implement
+hibernation, portable object-storage archives, or zero-total-cost operation.
+
+The shipped #94 Changes contract is observation-only; #191 owns future exact-reviewed-result
+publication. The approved #101 Run-lifetime deletion contract supersedes the original TTL/global
+cap assumptions; whole-Project purge and backup/legal retention remain separate.
 
 ## Maintainer references
 
