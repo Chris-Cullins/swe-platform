@@ -403,6 +403,74 @@ func TestRunDiagnosticRejectsStaleUnknownAndInconsistentConditions(t *testing.T)
 	}
 }
 
+func TestRunDiagnosticUnsupportedCredentialProfiles(t *testing.T) {
+	run := diagnosticRun(platformv1alpha1.RunStateFailed, "CredentialProfilesUnsupported")
+	run.Spec.Agent = "pi"
+	run.Spec.CredentialProfileRef = "private-profile"
+	run.Status.Conditions[0].Status = metav1.ConditionFalse
+	run.Status.Conditions[0].Message += " private-profile private-secret secret-exists=true"
+	service := &KubernetesResourceService{Client: fake.NewClientBuilder().WithScheme(resourceScheme(t)).WithObjects(run).Build()}
+	got, err := service.GetRunExact(context.Background(), "ns", "run", "uid")
+	want := RunDiagnostic{
+		Code:       "CredentialProfilesUnsupported",
+		Message:    "The selected agent does not support credential profiles.",
+		NextAction: "Start a new run without a credential profile, or select an agent that supports credential profiles.",
+	}
+	if err != nil || got.Diagnostic == nil || *got.Diagnostic != want {
+		t.Fatalf("exact diagnostic = %#v, error = %v", got.Diagnostic, err)
+	}
+	assertJSONRedacted(t, got.Diagnostic, "private-profile", "private-secret", "secret-exists", "malicious", "secret-token")
+	assertJSONRedacted(t, got, "conditions", "private-secret", "secret-exists", "malicious", "secret-token")
+	assertJSONRedacted(t, runSummaryDTO(run), "diagnostic", "CredentialProfilesUnsupported", "private-profile", "private-secret", "secret-token")
+
+	for name, mutate := range map[string]func(*platformv1alpha1.Run){
+		"no generation": func(r *platformv1alpha1.Run) {
+			r.Generation, r.Status.ObservedGeneration, r.Status.Conditions[0].ObservedGeneration = 0, 0, 0
+		},
+		"stale run":        func(r *platformv1alpha1.Run) { r.Status.ObservedGeneration = 6 },
+		"future run":       func(r *platformv1alpha1.Run) { r.Status.ObservedGeneration = 8 },
+		"stale condition":  func(r *platformv1alpha1.Run) { r.Status.Conditions[0].ObservedGeneration = 6 },
+		"future condition": func(r *platformv1alpha1.Run) { r.Status.Conditions[0].ObservedGeneration = 8 },
+		"no condition":     func(r *platformv1alpha1.Run) { r.Status.Conditions = nil },
+		"wrong condition":  func(r *platformv1alpha1.Run) { r.Status.Conditions[0].Type = "CredentialProfileBound" },
+		"true condition":   func(r *platformv1alpha1.Run) { r.Status.Conditions[0].Status = metav1.ConditionTrue },
+		"unknown status":   func(r *platformv1alpha1.Run) { r.Status.Conditions[0].Status = metav1.ConditionUnknown },
+		"unknown reason":   func(r *platformv1alpha1.Run) { r.Status.Conditions[0].Reason = "malicious-secret-token" },
+	} {
+		t.Run(name, func(t *testing.T) {
+			changed := run.DeepCopy()
+			mutate(changed)
+			if got := runDTO(changed).Diagnostic; got != nil {
+				t.Fatalf("unexpected diagnostic: %#v", got)
+			}
+		})
+	}
+	for _, state := range []platformv1alpha1.RunState{
+		platformv1alpha1.RunStateAllocating, platformv1alpha1.RunStateEnvironmentReady, platformv1alpha1.RunStateAdapterAccepted,
+		platformv1alpha1.RunStateRunning, platformv1alpha1.RunStateNeedsInput, platformv1alpha1.RunStatePaused,
+		platformv1alpha1.RunStateSucceeded, platformv1alpha1.RunStateCancelled, "FutureState",
+	} {
+		t.Run(string(state), func(t *testing.T) {
+			changed := run.DeepCopy()
+			changed.Status.State = state
+			if got := runDTO(changed).Diagnostic; got != nil {
+				t.Fatalf("unexpected diagnostic: %#v", got)
+			}
+		})
+	}
+	for _, reason := range []string{"ProfileNotFound", "ProfileReplaced", "AdapterMismatch", "UnsupportedCredentialType", "SecretNotReady", "ForeignSecret", "MalformedSecret"} {
+		t.Run(reason, func(t *testing.T) {
+			for _, status := range []metav1.ConditionStatus{metav1.ConditionFalse, metav1.ConditionTrue} {
+				changed := run.DeepCopy()
+				changed.Status.Conditions[0].Reason, changed.Status.Conditions[0].Status = reason, status
+				if got := runDTO(changed).Diagnostic; got != nil {
+					t.Fatalf("unexpected credential diagnostic: %#v", got)
+				}
+			}
+		})
+	}
+}
+
 func TestRunDiagnosticTransitionsAndExactRead(t *testing.T) {
 	run := diagnosticRun(platformv1alpha1.RunStateFailed, "EnvironmentFailed")
 	run.Status.Conditions[0].Status = metav1.ConditionFalse

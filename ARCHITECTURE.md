@@ -354,7 +354,7 @@ adapter rejection and cancellation conditions likewise use fixed platform messag
 also normalizes legacy adapter observation/rejection messages before terminal or deletion cleanup.
 
 The typed Run HTTP representation adds optional `diagnostic: {code, message, nextAction}` for
-the CLI `swe tui` detail and browser Run detail. All three fields are fixed platform strings,
+the CLI `swe describe-run`, `swe tui` detail, and browser Run detail. All three fields are fixed platform strings,
 derived only from recognized `AdapterAccepted` reason/Run-state combinations, never condition
 messages. Both status and condition must observe the Run's current positive generation, and
 the condition must have a definite boolean status; adapter-observed failure/input-needed also
@@ -365,11 +365,15 @@ explicit unavailable explanation for attention states with no diagnostic. Summar
 include diagnostics, and Run/Environment identity fencing and authorization are unchanged.
 
 The bounded diagnostic codes are `EnvironmentUnavailable`, `EnvironmentLost`,
-`EnvironmentFailed`, `AdapterUnavailable`, `AdapterRejected`, and `AdapterFailed` for `Failed`;
+`EnvironmentFailed`, `AdapterUnavailable`, `AdapterRejected`, `AdapterFailed`, and
+`CredentialProfilesUnsupported` for `Failed`;
 `EnvironmentPreparing`, `EnvironmentStatusPending`, and `EnvironmentNotReachable` for
 `Allocating`; `EnvironmentPaused` for `Paused`; and `AgentNeedsInput` for `NeedsInput`.
-`EnvironmentPreparing` covers allocated, recovered, and not-ready reasons. Credential-specific
-failure diagnostics and raw operator errors are not projected by this contract. Next actions
+`EnvironmentPreparing` covers allocated, recovered, and not-ready reasons.
+`CredentialProfilesUnsupported` requires the exact same-named reason with `AdapterAccepted=False`;
+it explains the existing pre-allocation adapter-capability rejection (for example Pi), without
+profile/Secret reads or disclosure of their names, existence, or validity in the diagnostic.
+All other credential-specific failure diagnostics and raw operator errors remain excluded. Next actions
 are read-only guidance, not retry/resume/input capabilities; agent detail remains in transcripts.
 
 `Run.status.usage` is currently an unwritten compatibility placeholder. Lifecycle wall duration
