@@ -23,6 +23,42 @@ const (
 	maxAgentLength      = 128
 )
 
+func (s *Server) handleProjectCollection(w http.ResponseWriter, r *http.Request, namespace string) {
+	if r.Method != http.MethodGet {
+		writeResourceMethodError(w, "GET")
+		return
+	}
+	if !s.authorizeResource(w, r, ResourceAccess{Namespace: namespace, Verb: "list", Resource: "projects"}, true) {
+		return
+	}
+	query, err := url.ParseQuery(r.URL.RawQuery)
+	if err != nil {
+		writeProblem(w, http.StatusBadRequest, "invalid-query", "Invalid query", "malformed query")
+		return
+	}
+	for key, values := range query {
+		if (key != "limit" && key != "continue") || len(values) != 1 || (key == "limit" && values[0] == "") {
+			writeProblem(w, http.StatusBadRequest, "invalid-query", "Invalid query", "only single limit and continue parameters are supported")
+			return
+		}
+	}
+	limit, token, _, err := runListQuery(r)
+	if err != nil {
+		writeProblem(w, http.StatusBadRequest, "invalid-query", "Invalid query", err.Error())
+		return
+	}
+	if s.resources == nil {
+		writeProblem(w, http.StatusServiceUnavailable, "resource-service-unavailable", "Resource service unavailable", "Project resources are not configured")
+		return
+	}
+	page, err := s.resources.ListProjects(r.Context(), namespace, limit, token)
+	if err != nil {
+		s.writeRunListError(w, "list projects", namespace, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, page)
+}
+
 func (s *Server) handleRunCollection(w http.ResponseWriter, r *http.Request, namespace string) {
 	switch r.Method {
 	case http.MethodGet:

@@ -51,6 +51,12 @@ type fakeResources struct {
 	terminalErr                       error
 }
 
+func (f *fakeResources) ListProjects(_ context.Context, n string, l int64, c string) (ProjectList, error) {
+	f.calls = append(f.calls, "projects:"+n)
+	f.listLimit, f.listContinue = l, c
+	return ProjectList{Items: []Project{}, Continue: "next"}, f.listErr
+}
+
 func (f *fakeResources) ListRuns(_ context.Context, n string, l int64, c string) (RunList, error) {
 	f.calls = append(f.calls, "list")
 	f.listLimit, f.listContinue = l, c

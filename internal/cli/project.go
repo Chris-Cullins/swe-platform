@@ -2,11 +2,14 @@ package cli
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"reflect"
 	"strings"
+	"text/tabwriter"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -19,6 +22,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	platformv1alpha1 "github.com/Chris-Cullins/swe-platform/api/v1alpha1"
+	"github.com/Chris-Cullins/swe-platform/internal/controlplaneclient"
 	"github.com/Chris-Cullins/swe-platform/internal/tenancy"
 	"github.com/spf13/cobra"
 )
@@ -32,8 +36,49 @@ type onboardOptions struct {
 }
 
 func newProjectCommand() *cobra.Command {
-	cmd := &cobra.Command{Use: "project", Short: "Onboard and fence project namespaces"}
-	cmd.AddCommand(newProjectOnboardCommand(), newProjectOffboardCommand())
+	cmd := &cobra.Command{Use: "project", Short: "Discover Projects, onboard and fence project namespaces"}
+	cmd.AddCommand(newProjectListCommand(), newProjectOnboardCommand(), newProjectOffboardCommand())
+	return cmd
+}
+
+func newProjectListCommand() *cobra.Command {
+	var baseURL, token, continuation string
+	var limit int64
+	var asJSON bool
+	cmd := &cobra.Command{Use: "list", Short: "List one page of Project discovery observations", Args: cobra.NoArgs, RunE: func(cmd *cobra.Command, args []string) error {
+		namespace, _ := cmd.Flags().GetString("namespace")
+		c, err := controlplaneclient.New(baseURL, token, nil)
+		if err != nil {
+			return err
+		}
+		page, err := c.ListProjects(cmd.Context(), namespace, limit, continuation)
+		if err != nil {
+			return err
+		}
+		if asJSON {
+			return json.NewEncoder(cmd.OutOrStdout()).Encode(page)
+		}
+		w := tabwriter.NewWriter(cmd.OutOrStdout(), 0, 4, 2, ' ', 0)
+		fmt.Fprintln(w, "NAMESPACE\tNAME\tUID\tGENERATION\tDEFAULT TEMPLATE")
+		for _, p := range page.Items {
+			fmt.Fprintf(w, "%s\t%s\t%s\t%d\t%s\n", p.Namespace, p.Name, p.UID, p.Generation, p.DefaultTemplate)
+		}
+		if err := w.Flush(); err != nil {
+			return err
+		}
+		if len(page.Items) == 0 {
+			fmt.Fprintln(cmd.ErrOrStderr(), "No Projects found.")
+		}
+		if page.Continue != "" {
+			fmt.Fprintf(cmd.ErrOrStderr(), "More Projects: --continue %q\n", page.Continue)
+		}
+		return nil
+	}}
+	cmd.Flags().StringVar(&baseURL, "control-plane", os.Getenv("SWE_CONTROL_PLANE_URL"), "Control-plane base URL")
+	cmd.Flags().StringVar(&token, "token", os.Getenv("SWE_CONTROL_PLANE_TOKEN"), "Control-plane bearer token")
+	cmd.Flags().Int64Var(&limit, "limit", 50, "Maximum Projects per page (1–200)")
+	cmd.Flags().StringVar(&continuation, "continue", "", "Opaque continuation from a previous page")
+	cmd.Flags().BoolVar(&asJSON, "json", false, "Print the typed JSON page")
 	return cmd
 }
 

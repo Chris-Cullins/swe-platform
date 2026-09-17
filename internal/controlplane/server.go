@@ -232,6 +232,10 @@ func (s *Server) handleNamespacedAPI(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
+	if resource == "projects" && name == "" && subresource == "" {
+		s.handleProjectCollection(w, r, namespace)
+		return
+	}
 	if resource == "runs" && name == "" && subresource == "" {
 		s.handleRunCollection(w, r, namespace)
 		return
