@@ -3456,9 +3456,12 @@ fi
 if SWE_CONTROL_PLANE_URL=http://127.0.0.1:18080 SWE_CONTROL_PLANE_TOKEN="$CONSOLE_TOKEN" \
 	bin/swe describe-run "$CODEX_FAILED_RUN_NAME" --namespace "$PROJECT_NAMESPACE" --run-uid stale-run-uid \
 	>/tmp/swe-platform-describe-stale.out 2>/dev/null || [[ -s /tmp/swe-platform-describe-stale.out ]]; then
+	rm -f /tmp/swe-platform-describe-stale.out
 	echo "FAIL: stale CLI Run description succeeded or printed partial detail"
 	exit 1
 fi
+rm -f /tmp/swe-platform-describe-stale.out
+unset DESCRIBED_RUN DESCRIBED_RUN_TEXT
 echo "PASS: exact CLI Run description preserves safe diagnostics and rejects stale identity"
 echo "==> verifying safe Run diagnostic and console transcript action"
 SWE_BROWSER_TOKEN="$CONSOLE_TOKEN" ./hack/console-run-diagnostic_test.sh \
