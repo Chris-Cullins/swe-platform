@@ -51,7 +51,7 @@ export function RunChangesView({ namespace, run }: { namespace: string; run: Run
     {list.isPending && <p role="status">Loading changed files…</p>}
     {!!list.error && <p role="alert">{failure(list.error)}</p>}
     {snapshot && !list.error && <>
-      <div className="changes-summary"><strong>{snapshot.total} {snapshot.total === 1 ? 'file' : 'files'}</strong><span>{snapshot.final ? 'Final capture outcome' : 'Retained observation'}</span>{snapshot.capturedAt && !snapshot.capturedAt.startsWith('0001-') && <time dateTime={snapshot.capturedAt}>Captured {new Date(snapshot.capturedAt).toLocaleString()}</time>}</div>
+      <div className="changes-summary"><strong>{snapshot.total} {snapshot.total === 1 ? 'file' : 'files'}</strong><span>{snapshot.final ? 'Final capture outcome' : 'Retained observation'}</span><span aria-label="Observation revision">{snapshot.revision > 0 ? `Revision ${snapshot.revision}` : 'No captured revision'}</span>{snapshot.capturedAt && !snapshot.capturedAt.startsWith('0001-') && <time dateTime={snapshot.capturedAt}>Captured {new Date(snapshot.capturedAt).toLocaleString()}</time>}</div>
       {snapshot.unavailable && <p role="status" className="changes-warning">Latest capture unavailable. Any files shown are from the last verified observation, not a complete final result.</p>}
       {!snapshot.final && <p className="hint">The workspace may have changed after this capture. Pausing retains this review but may prevent a final capture. Refresh to load the latest retained observation.</p>}
       {snapshot.state === 'unavailable' && <p role="status">Comparison unavailable: no usable Run-start baseline or workspace capture. A missing baseline is never treated as an empty repository.</p>}
