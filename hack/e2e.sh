@@ -1965,6 +1965,45 @@ if ! grep -Fq "terminal console API ready for namespace $PROJECT_NAMESPACE" /tmp
 	exit 1
 fi
 
+echo "==> verifying filtered Run summary CLI"
+LIST_RUNS_JSON=$(SWE_CONTROL_PLANE_URL=http://127.0.0.1:18080 SWE_CONTROL_PLANE_TOKEN="$CONSOLE_TOKEN" \
+	bin/swe list-runs --namespace "$PROJECT_NAMESPACE" --state Succeeded --agent claude-code --json)
+printf '%s' "$LIST_RUNS_JSON" | python3 -c '
+import json, sys
+items = json.load(sys.stdin)
+assert any(r["name"] == sys.argv[1] and r["uid"] == sys.argv[2] for r in items), "exact Run missing from filtered list"
+assert all(r["state"] == "Succeeded" and r["agent"] == "claude-code" for r in items), "filters did not combine with AND"
+assert [(r["name"], r["uid"]) for r in items] == sorted((r["name"], r["uid"]) for r in items), "Run order is not deterministic"
+assert all("prompt" not in r and "transcript" not in r for r in items), "list returned full detail"
+' "$RUN_NAME" "$RUN_UID"
+LIST_RUNS_TABLE=$(SWE_CONTROL_PLANE_URL=http://127.0.0.1:18080 SWE_CONTROL_PLANE_TOKEN="$CONSOLE_TOKEN" \
+	bin/swe list-runs --namespace "$PROJECT_NAMESPACE" --state Succeeded --agent claude-code)
+if ! grep -Fq "$RUN_UID" <<<"$LIST_RUNS_TABLE" || \
+	grep -Fq 'end-to-end smoke test' <<<"$LIST_RUNS_TABLE" || grep -Fq "$CONSOLE_TOKEN" <<<"$LIST_RUNS_TABLE"; then
+	echo "FAIL: Run summary table lost identity or exposed prompt/credential"
+	exit 1
+fi
+LIST_RUNS_EMPTY=$(SWE_CONTROL_PLANE_URL=http://127.0.0.1:18080 SWE_CONTROL_PLANE_TOKEN="$CONSOLE_TOKEN" \
+	bin/swe list-runs --namespace "$PROJECT_NAMESPACE" --agent e2e-no-such-agent --json)
+if [[ "$LIST_RUNS_EMPTY" != '[]' ]]; then
+	echo "FAIL: unmatched Run filter did not return an empty JSON array"
+	exit 1
+fi
+if SWE_CONTROL_PLANE_URL=http://127.0.0.1:18080 SWE_CONTROL_PLANE_TOKEN="$CONSOLE_TOKEN" \
+	bin/swe list-runs --namespace e2e-console-other --json \
+	> /tmp/swe-platform-list-runs-denied.out 2> /tmp/swe-platform-list-runs-denied.err; then
+	echo "FAIL: Run summary CLI accepted an unauthorized namespace"
+	exit 1
+fi
+if [[ -s /tmp/swe-platform-list-runs-denied.out ]] || \
+	! grep -Fq '403' /tmp/swe-platform-list-runs-denied.err || \
+	grep -Fq "$CONSOLE_TOKEN" /tmp/swe-platform-list-runs-denied.err; then
+	echo "FAIL: Run summary denial did not fail safely with HTTP 403"
+	exit 1
+fi
+rm -f /tmp/swe-platform-list-runs-denied.out /tmp/swe-platform-list-runs-denied.err
+unset LIST_RUNS_JSON LIST_RUNS_TABLE LIST_RUNS_EMPTY
+
 echo "==> verifying embedded operations console through the control-plane Service"
 ROOT_STATUS=$(curl --silent --dump-header /tmp/swe-platform-console-root.headers \
 	--output /tmp/swe-platform-console-root.html --write-out '%{http_code}' \
