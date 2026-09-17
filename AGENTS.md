@@ -238,6 +238,7 @@ runs both via `make` targets:
   exchange/logout/revocation, capacity and CSRF,
   the embedded console entry point/SPA fallback/static assets, typed Run
   list/get/create/idempotent-create-recovery/cancel, Environment get, transcript SSE, terminal attach, and
+  read-only `swe list-runs` summary filtering (exact state/agent AND, no new API),
   the local stdio MCP tool list plus UID-fenced bounded transcript read,
   actual-listener service observation through healthy/unhealthy/restart/pause/resume/removal
   transitions with declaration and fresh-execution correlation and no URL,

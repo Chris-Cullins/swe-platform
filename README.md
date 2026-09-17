@@ -726,6 +726,33 @@ Name-only direct clients now fail with a terminal-identity error rather than sel
 same-name replacement. A stale UID is rejected before terminal activity, wake, readiness,
 backend resolution, or WebSocket upgrade.
 
+### Listing and filtering Runs
+
+`swe list-runs` reads one namespace through the authenticated control-plane summary API,
+without opening the TUI or falling back to Kubernetes. It requires existing namespaced Run-list
+permission and an explicit namespace, URL, and bearer credential:
+
+```sh
+export SWE_CONTROL_PLANE_URL=https://swe.example.com
+export SWE_CONTROL_PLANE_TOKEN="$TOKEN"
+swe list-runs --namespace my-project
+swe list-runs --namespace my-project --state Failed --agent codex --json
+```
+
+Filters are exact, case-sensitive matches combined with AND. Valid states are
+`Allocating`, `EnvironmentReady`, `AdapterAccepted`,
+`Running`, `NeedsInput`, `Paused`, `Succeeded`, `Failed`, and `Cancelled`; unknown future states
+remain visible without a state filter. Agent names are not restricted to the current adapters.
+
+The command collects the existing bounded, consistent snapshot before filtering, and fails
+without partial output if pagination fails or exceeds the client's bounds (100 pages, with up
+to three snapshot attempts). Both formats sort by name ascending, then exact UID. The table
+shows name, full UID, state, agent, and UTC creation time, never prompts or transcripts.
+`--json` emits the existing summary array, including bounded prompt previews; no matches is `[]`.
+The table explicitly reports an empty or unmatched result. This is a read-only observation,
+not a watch, wake, readiness probe, review queue, notification subscription, or input channel.
+`Succeeded` describes an agent outcome, not verified software.
+
 ### Terminal operations console
 
 `swe tui` is a keyboard-first, agent-neutral operations console for one namespace. It uses
