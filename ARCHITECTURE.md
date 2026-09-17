@@ -678,6 +678,26 @@ file/page reads, rejecting mixed observations with HTTP 409. Responses are no-st
 4 MiB encoded. Review metadata includes final/retained status, last successful capture time and
 latest-unavailable status. Observation grants no publication authority.
 
+### Project collection discovery
+
+`GET /api/v1/namespaces/{namespace}/projects` is a read-only collection using the existing
+bearer/browser authentication and namespace tenancy fences. The exact namespace-scoped
+`swe.dev` `projects/list` SAR precedes query validation and collection reads; named
+`projects/get` does not grant collection access. Only single `limit` and `continue` parameters
+are accepted. `limit` defaults to 50 and must be 1–200; `continue` is an opaque Kubernetes
+continuation of at most 4,096 bytes. Unknown, repeated, malformed, and invalid query values
+fail with sanitized problems; expired snapshots return HTTP 410 and require restarting.
+
+The response is `{items: [{namespace, name, uid, generation, defaultTemplate}], continue?}`,
+with `items: []` for an empty page. `defaultTemplate` is the configured Template name, not a
+resolved Template identity. Projection exposes no raw metadata/spec, repository URLs, Secret
+references/bytes, credential probes, or inferred readiness, and resolves no Template or
+credential references. `swe project list` uses this same control-plane contract, prints a table
+or `--json`, and reads only one page per invocation without Kubernetes fallback. This is
+limited observation, not an identity-fenced Run creation contract: exact Project selection,
+saved defaults, preflight, and corresponding UI remain deferred to
+[#189](https://github.com/Chris-Cullins/swe-platform/issues/189).
+
 ### Authentication and exact identity fences
 
 Normal control-plane bearer credentials are authenticated with Kubernetes TokenReview for the

@@ -360,6 +360,27 @@ allocatable so the Argo/system workload and two 1-CPU/2-GiB `tiny` Environments 
 warm member is claimed and replaced. Increase the container runtime's capacity before
 running `make argocd-up`; the script checks this before installing Argo.
 
+### Discovering Projects
+
+Use an explicit namespace and the existing control-plane URL and bearer credential:
+
+```sh
+SWE_CONTROL_PLANE_URL=https://swe.example.com SWE_CONTROL_PLANE_TOKEN="$TOKEN" \
+  swe --namespace my-project project list
+SWE_CONTROL_PLANE_URL=https://swe.example.com SWE_CONTROL_PLANE_TOKEN="$TOKEN" \
+  swe --namespace my-project project list --limit 20 --json
+```
+
+Each invocation returns one bounded page (default 50, maximum 200). Pass the returned opaque
+token unchanged with `--continue "$CONTINUE"` to read the next page in the same namespace;
+table mode prints the token to stderr, while JSON includes `continue`. An expired continuation
+requires restarting from the first page. Empty collections return `items: []` in JSON.
+This command requires `projects/list`, separately from named `projects/get`, and never falls
+back to kubeconfig. Output contains only namespace, name, immutable UID, generation, and
+`defaultTemplate`, which is a name, not a resolved Template identity. It does not inspect
+repository URLs, credentials, or readiness. Discovery is an observation: returned names/UIDs
+do not yet fence Project selection during Run creation against same-name replacement.
+
 Every executable CLI command requires an explicit namespace. Chart Templates are inert catalog
 sources in the system namespace, not runnable tenancy. Before the first Run, an administrator
 must onboard a dedicated namespace and choose all quota values; there are intentionally no

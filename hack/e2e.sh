@@ -1831,6 +1831,42 @@ CONSOLE_TOKEN=$(kubectl create token e2e-console --audience=swe-platform)
 
 echo "==> verifying live transcript stream through the control plane"
 start_control_plane_port_forward
+
+echo "==> verifying authenticated Project discovery without broadening console permissions"
+# This disposable identity has collection list only, separately from the console's
+# exact-name projects/get permission. Do not add list to the console Role.
+kubectl create serviceaccount e2e-project-discovery
+kubectl create role e2e-project-discovery --verb=list --resource=projects.swe.dev
+kubectl create rolebinding e2e-project-discovery --role=e2e-project-discovery \
+	--serviceaccount="${PROJECT_NAMESPACE}:e2e-project-discovery"
+DISCOVERY_TOKEN=$(kubectl create token e2e-project-discovery --audience=swe-platform)
+DISCOVERY_JSON=$(SWE_CONTROL_PLANE_URL=http://127.0.0.1:18080 SWE_CONTROL_PLANE_TOKEN="$DISCOVERY_TOKEN" \
+	./bin/swe --namespace "$PROJECT_NAMESPACE" project list --limit 1 --json)
+DISCOVERY_UID=$(kubectl get project "$PROJECT_NAME" -o jsonpath='{.metadata.uid}')
+if ! jq -e --arg ns "$PROJECT_NAMESPACE" --arg name "$PROJECT_NAME" --arg uid "$DISCOVERY_UID" \
+	'.items | length == 1 and (.[0] | .namespace == $ns and .name == $name and .uid == $uid and .generation >= 1 and (.defaultTemplate | length > 0) and (keys == ["defaultTemplate","generation","name","namespace","uid"]))' \
+	<<<"$DISCOVERY_JSON" >/dev/null; then
+	echo "FAIL: Project discovery did not return the bounded explicit DTO"
+	exit 1
+fi
+for discovery_case in named-get-only cross-namespace; do
+	DISCOVERY_DENIED_TOKEN="$CONSOLE_TOKEN"
+	DISCOVERY_DENIED_NAMESPACE="$PROJECT_NAMESPACE"
+	if [[ "$discovery_case" == cross-namespace ]]; then
+		DISCOVERY_DENIED_TOKEN="$DISCOVERY_TOKEN"
+		DISCOVERY_DENIED_NAMESPACE=e2e-console-other
+	fi
+	DISCOVERY_STATUS=$(curl --silent --output /dev/null --write-out '%{http_code}' \
+		-H "Authorization: Bearer $DISCOVERY_DENIED_TOKEN" \
+		"http://127.0.0.1:18080/api/v1/namespaces/${DISCOVERY_DENIED_NAMESPACE}/projects")
+	if [[ "$DISCOVERY_STATUS" != 403 ]]; then
+		echo "FAIL: Project discovery ${discovery_case} returned ${DISCOVERY_STATUS}, expected 403"
+		exit 1
+	fi
+done
+kubectl delete rolebinding,role,serviceaccount e2e-project-discovery
+unset DISCOVERY_TOKEN DISCOVERY_DENIED_TOKEN DISCOVERY_JSON
+
 UNLISTED_STATUS=$(curl --silent --output /dev/null --write-out '%{http_code}' \
 	-H "Authorization: Bearer ${E2E_BOOTSTRAP_TOKEN}" \
 	"http://127.0.0.1:18080/api/v1/namespaces/${ADOPT_NAMESPACE}/runs")
