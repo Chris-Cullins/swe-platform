@@ -154,12 +154,28 @@ function Shell() {
 function RunList() {
   const { namespace = '' } = useParams()
   const query = useActiveRunFeed()
+  const [filters, setFilters] = React.useState({ namespace, state: '', agent: '' })
+  if (filters.namespace !== namespace) setFilters({ namespace, state: '', agent: '' })
+  const { state, agent } = filters
+  const agents = [...new Set([...(query.data?.items.map(run => run.agent) || []), ...(agent ? [agent] : [])])].sort()
+  const matches = query.data?.items.filter(run => (!state || run.state === state) && (!agent || run.agent === agent)) || []
   return <main>
     <div className="title"><div><h1>Runs</h1><p>Agent tasks in {namespace}</p></div><Link className="button" to="new">New run</Link></div>
+    <div className="run-filters">
+      <label>State<select id="run-state-filter" value={state} onChange={event => setFilters({ ...filters, state: event.target.value })}>
+        <option value="">All states</option>
+        {['Allocating', 'EnvironmentReady', 'AdapterAccepted', 'Running', 'NeedsInput', 'Paused', 'Succeeded', 'Failed', 'Cancelled'].map(value => <option key={value}>{value}</option>)}
+      </select></label>
+      <label>Agent<select id="run-agent-filter" value={agent} onChange={event => setFilters({ ...filters, agent: event.target.value })}>
+        <option value="">All agents</option>{agents.map(value => <option key={value}>{value}</option>)}
+      </select></label>
+      <button disabled={!state && !agent} onClick={() => setFilters({ namespace, state: '', agent: '' })}>Clear filters</button>
+    </div>
     {query.fallback && <p className="hint" role="status">Live updates unavailable; refreshing every 4 seconds.</p>}
     {!query.fallback && query.watchError && <p className="hint" role="status">Live updates disconnected; reconnecting…</p>}
     {query.isPending ? <Busy label="Loading runs" /> : query.error ? <Failure error={query.error} /> : !query.data.items.length ? <p role="status">No runs found.</p> :
-      <div className="cards">{query.data.items.map(run => <Link className="card" key={run.uid} to={`${encodeURIComponent(run.name)}/overview`} state={{ runUID: run.uid }}>
+      !matches.length ? <p role="status">No runs match the filters.</p> :
+      <div className="cards">{matches.map(run => <Link className="card" key={run.uid} to={`${encodeURIComponent(run.name)}/overview`} state={{ runUID: run.uid }}>
         <div><strong>{run.name}</strong><span className="pill">{run.state}</span></div>
         <p>{run.promptPreview}</p><dl><dt>Agent</dt><dd>{run.agent}</dd><dt>Environment</dt><dd>{run.environment?.name || 'Allocating'}</dd><dt>Age</dt><dd title={run.createdAt}>{age(run.createdAt)}</dd></dl>
       </Link>)}</div>}
