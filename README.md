@@ -1010,6 +1010,23 @@ partial records. Process EOF can finish an unterminated JSON line; stopping the 
 any remaining partial line as raw. Fallback/truncation is not lossless: omit `--readable` for
 the unchanged opaque NDJSON and its cursors. Legacy Environment logs are unchanged.
 
+The console Transcript tab also presents these pinned Codex records on its existing
+authenticated exact-UID stream, with the same agent-reported/not-verified and usage-not-accounting
+labels. Expand **Raw transport event** to inspect the retained original envelope. Unknown or
+malformed records remain visible as bounded raw fallback; partial records are explicitly marked.
+Server transcript gaps, client history eviction, and Codex process gaps remain distinct.
+
+Browser limits are independent of the CLI: SSE frames are bounded at 8 MiB; the retained timeline
+holds at most 128 items and 2 MiB of raw payloads, plus its client-gap notice. Codex replays only
+this retained window after updates/eviction, with at most 64 execution IDs, two 256 KiB partial
+lines and two 256 KiB replay windows. Its envelope/chunk and per-record text limits match the
+CLI above. Each transport event additionally displays at most 16 parts and 32 KiB of content,
+plus fixed labels and explicit limit notices. Unsafe JavaScript integer metadata falls back to
+raw rather than presenting rounded values. Raw disclosure is lazy and bounded by timeline
+retention, not the shorter readable-output limits. Eviction and exact Run replacement retain no
+old parser state. This is a partial retained view, not a complete transcript or verified result;
+Claude presentation and other adapters' opaque views are unchanged.
+
 For compatibility, `swe logs <environment>` is not deprecated and still follows the
 current Environment pod's `environment` container using kubeconfig authentication. It
 does not read a Run transcript, and the CLI never infers a Run from a reusable

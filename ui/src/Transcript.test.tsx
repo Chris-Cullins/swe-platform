@@ -50,6 +50,34 @@ function processData(records: unknown[]) {
 
 afterEach(() => { Events.instances = []; vi.restoreAllMocks(); vi.unstubAllGlobals() })
 describe('Transcript', () => {
+  it('presents Codex on the sole exact-UID feed, keeps raw lazy, and resets same-name replacement assembly', async () => {
+    const fetch = mockStreams()
+    const view = render(<Transcript namespace="n" run="same" identity="old-uid" />)
+    await waitFor(() => expect(Events.instances).toHaveLength(1))
+    const old = Events.current
+    act(() => old.emit('transcript', JSON.stringify({ sequence: 1, source: 'codex', type: 'codex.process-output',
+      data: processData([{ type: 'item.completed', item: { id: 'a', type: 'agent_message', text: 'old message' } }]) }), 'one'))
+    expect(await screen.findByText('old message')).toBeInTheDocument()
+    expect(document.querySelector('.raw-event pre')).toBeNull()
+    await userEvent.click(screen.getByText('Raw transport event'))
+    await waitFor(() => expect(document.querySelector('.raw-event pre')).toHaveTextContent('codex.process-output'))
+    view.rerender(<Transcript namespace="n" run="same" identity="new-uid" />)
+    await waitFor(() => expect(Events.instances).toHaveLength(2))
+    expect((old.init.signal as AbortSignal).aborted).toBe(true)
+    const current = Events.current
+    expect(current.init.headers).toEqual(expect.objectContaining({ 'SWE-Run-UID': 'new-uid' }))
+    act(() => {
+      old.emit('transcript', JSON.stringify({ sequence: 9, source: 'codex', type: 'codex.process-output', data: processData([{ type: 'turn.started' }]) }), 'late')
+      current.emit('transcript', JSON.stringify({ sequence: 1, source: 'codex', type: 'codex.process-output',
+        data: processData([{ type: 'item.completed', item: { id: 'b', type: 'agent_message', text: 'new message' } }]) }), 'one')
+    })
+    expect(await screen.findByText('new message')).toBeInTheDocument()
+    expect(screen.queryByText('old message')).not.toBeInTheDocument()
+    expect(screen.queryByText('Codex agent-reported metadata')).not.toBeInTheDocument()
+    expect(fetch).toHaveBeenCalledTimes(2)
+    expect(document.querySelectorAll('.codex-output')).toHaveLength(1)
+  })
+
   it('sends the exact Run UID and SSE headers, orders events, and deduplicates IDs and sequences', async () => {
     mockStreams()
     const view = render(<Transcript namespace="a/b" run="run one" identity="uid/Exact Value" />)

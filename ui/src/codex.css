@@ -1,0 +1,6 @@
+.codex-output { overflow-wrap: anywhere; }
+.codex-output > .hint { font-size: .9rem; }
+.codex-part { margin: .75rem 0; padding: .75rem; border: 1px solid #33445c; border-radius: .4rem; background: #0f1825; }
+.codex-part h3 { margin: 0 0 .5rem; font-size: 1rem; }
+.codex-part pre { margin: .5rem 0 0; }
+.codex-raw { border-left: 3px solid #efbd54; }
