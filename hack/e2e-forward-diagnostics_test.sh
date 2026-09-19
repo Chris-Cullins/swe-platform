@@ -14,10 +14,23 @@ CONTROL_PLANE_FORWARD_LOG="$1"
 MARKER="$2"
 kubectl() { echo called >>"$MARKER"; echo SENSITIVE_KUBE_ERROR >&2; return 91; }
 case "$3" in
-	alive) sleep 60 & PORT_FORWARD_PID=$!; echo "$PORT_FORWARD_PID" >"$MARKER.pid" ;;
+	alive)
+		sleep 60 & PORT_FORWARD_PID=$!
+		echo "$PORT_FORWARD_PID" >"$MARKER.pid"
+		# Wait for exec, not the transient forked shell and its inherited traps.
+		while [[ "$(ps -o comm= -p "$PORT_FORWARD_PID")" != sleep ]]; do :; done
+		;;
 	dead) (exit 0) & PORT_FORWARD_PID=$!; wait "$PORT_FORWARD_PID" ;;
 	missing) PORT_FORWARD_PID="" ;;
 	command-failure) (exit "$4") ;;
+	recovered-failure)
+		set +e
+		(exit 29)
+		handled_status=$?
+		set -e
+		[[ "$handled_status" == 29 ]]
+		true
+		;;
 	diagnostic-failure) e2e_forward_diagnostics() { echo SENSITIVE_DIAGNOSTIC_ERROR >&2; exit 92; } ;;
 esac
 exit "$4"
@@ -69,6 +82,8 @@ run missing 20 "$TEMP/fifo"
 has 'log_readable=false'
 run command-failure 43 "$TEMP/log"
 has "exit=43 line=$(grep -n 'command-failure)' "$TEMP/acceptance.sh" | cut -d: -f1) "
+run recovered-failure 37 "$TEMP/log"
+has 'exit=37 line=0 '
 run alive 0 "$TEMP/log"
 [[ ! -s "$TEMP/err" ]] || fail 'success emitted diagnostics'
 run diagnostic-failure 41 "$TEMP/log"

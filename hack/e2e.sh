@@ -125,7 +125,8 @@ cleanup() {
 source "$(dirname "${BASH_SOURCE[0]}")/e2e-forward-diagnostics.sh"
 # EXIT's LINENO is not the failed command location. Explicit exits have no ERR
 # location and are reported as 0; never capture BASH_COMMAND or its arguments.
-trap 'E2E_FAILURE_LINE=$LINENO' ERR
+# Expected failures under set +e must not leave a misleading recovered location.
+trap 'if [[ $- == *e* ]]; then E2E_FAILURE_LINE=$LINENO; fi' ERR
 trap 'e2e_exit "$?" "${E2E_FAILURE_LINE:-0}"' EXIT
 
 contains_e2e_key() {
