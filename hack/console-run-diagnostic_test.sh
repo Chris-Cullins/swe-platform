@@ -32,16 +32,19 @@ browser eval "(async () => { const r = await fetch('/api/v1/namespaces/$NAMESPAC
 stage run-filters
 browser open "$BASE_URL/namespaces/$NAMESPACE/runs" >/dev/null
 browser wait --fn "!!document.querySelector('a.card[href$=\"/$RUN_NAME/overview\"]')" >/dev/null
+browser eval "(() => { const attention = document.querySelector('#run-attention-filter'); if (!attention || attention.checked) throw new Error('Attention must default off'); })()" >/dev/null
+browser check '#run-attention-filter' >/dev/null
 browser select '#run-state-filter' Failed >/dev/null
 browser select '#run-agent-filter' codex >/dev/null
-browser wait --fn "!!document.querySelector('a.card[href$=\"/$RUN_NAME/overview\"]') && [...document.querySelectorAll('a.card')].every(card => card.querySelector('.pill')?.textContent === 'Failed' && [...card.querySelectorAll('dt')].find(dt => dt.textContent === 'Agent')?.nextElementSibling?.textContent === 'codex')" >/dev/null
+browser wait --fn "document.querySelector('#run-attention-filter')?.checked && !!document.querySelector('a.card[href$=\"/$RUN_NAME/overview\"]') && [...document.querySelectorAll('a.card')].every(card => card.querySelector('.pill')?.textContent === 'Failed' && [...card.querySelectorAll('dt')].find(dt => dt.textContent === 'Agent')?.nextElementSibling?.textContent === 'codex')" >/dev/null
 stage run-filters-no-match
 browser select '#run-state-filter' NeedsInput >/dev/null
 browser wait --text 'No runs match the filters.' >/dev/null
 browser eval "(() => { if (document.querySelector('a.card')) throw new Error('Unexpected filtered card'); })()" >/dev/null
 stage run-filters-clear
 browser find role button click --name 'Clear filters' --exact >/dev/null
-browser wait --fn "!!document.querySelector('a.card[href$=\"/$RUN_NAME/overview\"]') && [...document.querySelectorAll('.run-filters select')].every(select => select.value === '')" >/dev/null
+browser wait --fn "!document.querySelector('#run-attention-filter')?.checked && !!document.querySelector('a.card[href$=\"/$RUN_NAME/overview\"]') && [...document.querySelectorAll('.run-filters select')].every(select => select.value === '')" >/dev/null
+browser check '#run-attention-filter' >/dev/null
 browser select '#run-state-filter' Failed >/dev/null
 browser select '#run-agent-filter' codex >/dev/null
 stage failure-detail
