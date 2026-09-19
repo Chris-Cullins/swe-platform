@@ -797,6 +797,9 @@ a common event schema. Both consoles show a fixed, safe status explanation and n
 recognized provisioning, adapter-failure, paused, and input-needed conditions. Unknown or stale
 conditions show no inferred cause; inspect the transcript or contact an administrator. These
 diagnostics do not expose raw controller/provider messages or add retry/resume capabilities.
+An observed unsupported credential-profile rejection (for example Pi) has a fixed explanation:
+start a new Run without a profile or select a supporting agent. This does not inspect credentials
+or reveal profile/Secret existence or validity; other credential failure reasons remain unprojected.
 Both native and browser consoles show terminal navigation only when the
 Run API returns `terminalAvailable` with an exact `environment.uid`; reconnects and component
 remounts retain that same Run and Environment identity and never follow same-name replacements.

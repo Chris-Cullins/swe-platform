@@ -3469,6 +3469,42 @@ SWE_BROWSER_TOKEN="$CONSOLE_TOKEN" ./hack/console-run-diagnostic_test.sh \
 	/tmp/swe-platform-run-diagnostic.png
 kubectl delete run "$CODEX_FAILED_RUN_NAME" --wait=true >/dev/null
 
+echo "==> verifying safe unsupported Pi credential-profile diagnostic without allocation"
+# Deliberately create no profile or Secret: unsupported capability is rejected first.
+PI_PROFILE_RUN=e2e-pi-unsupported-profile
+bin/swe --namespace "$PROJECT_NAMESPACE" run "unsupported Pi profile smoke test" --name "$PI_PROFILE_RUN" \
+	--project "$PROJECT_NAME" --agent pi --credential-profile e2e-pi-must-not-read --wait=false
+kubectl wait --for=jsonpath='{.status.state}'=Failed run/"$PI_PROFILE_RUN" --timeout=3m
+PI_PROFILE_UID=$(kubectl get run "$PI_PROFILE_RUN" -o jsonpath='{.metadata.uid}')
+if ! kubectl get run "$PI_PROFILE_RUN" -o json | jq -e '
+	.status.observedGeneration == .metadata.generation and .status.environmentRef == null and
+	.status.credentialProfileRef == null and .status.startedAt == null and
+	any(.status.conditions[]; .type == "AdapterAccepted" and .status == "False" and .reason == "CredentialProfilesUnsupported")' >/dev/null ||
+	! kubectl get environments -o json | jq -e --arg uid "$PI_PROFILE_UID" \
+	'all(.items[]; .status.claimedBy.uid != $uid and all(.metadata.ownerReferences[]?; .uid != $uid))' >/dev/null; then
+	echo "FAIL: unsupported Pi profile was bound, allocated, accepted, or reported the wrong rejection"
+	exit 1
+fi
+PI_PROFILE_DESCRIPTION=$(SWE_CONTROL_PLANE_URL=http://127.0.0.1:18080 SWE_CONTROL_PLANE_TOKEN="$CONSOLE_TOKEN" \
+	bin/swe describe-run "$PI_PROFILE_RUN" --namespace "$PROJECT_NAMESPACE" --run-uid "$PI_PROFILE_UID" --json)
+if ! jq -e --arg uid "$PI_PROFILE_UID" '.uid == $uid and .state == "Failed" and .environment == null and
+	.diagnostic == {code:"CredentialProfilesUnsupported", message:"The selected agent does not support credential profiles.",
+	nextAction:"Start a new run without a credential profile, or select an agent that supports credential profiles."}' \
+	<<<"$PI_PROFILE_DESCRIPTION" >/dev/null; then
+	echo "FAIL: unsupported Pi profile did not return the exact fixed diagnostic"
+	exit 1
+fi
+PI_PROFILE_TEXT=$(SWE_CONTROL_PLANE_URL=http://127.0.0.1:18080 SWE_CONTROL_PLANE_TOKEN="$CONSOLE_TOKEN" \
+	bin/swe describe-run "$PI_PROFILE_RUN" --namespace "$PROJECT_NAMESPACE" --run-uid "$PI_PROFILE_UID")
+if ! grep -Fxq 'Diagnostic: CredentialProfilesUnsupported' <<<"$PI_PROFILE_TEXT" || \
+	grep -Fq 'e2e-pi-must-not-read' <<<"$PI_PROFILE_TEXT"; then
+	echo "FAIL: human Pi diagnostic was missing or exposed the selected profile name"
+	exit 1
+fi
+unset PI_PROFILE_DESCRIPTION PI_PROFILE_TEXT
+kubectl delete run "$PI_PROFILE_RUN" --wait=true >/dev/null
+echo "PASS: unsupported Pi profile rejected without binding/allocation and explained by fixed diagnostic"
+
 echo "==> verifying fake Pi success, opaque output, and terminal error"
 PI_RUN_NAME=e2e-fake-pi-run
 bin/swe --namespace "$PROJECT_NAMESPACE" run "fake Pi lifecycle smoke test" --name "$PI_RUN_NAME" --environment "$ENV_NAME" --agent pi --wait=false

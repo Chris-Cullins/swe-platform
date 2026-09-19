@@ -355,6 +355,10 @@ func runDiagnostic(run *platformv1alpha1.Run) *RunDiagnostic {
 			return &RunDiagnostic{"AdapterUnavailable", "The selected agent adapter is not available.", "Check the agent name and ask an administrator which adapters are enabled."}
 		case "AdapterRejected":
 			return &RunDiagnostic{"AdapterRejected", "The agent adapter rejected the task.", "Review the task and adapter configuration before starting another run."}
+		case "CredentialProfilesUnsupported":
+			if condition.Status == metav1.ConditionFalse {
+				return &RunDiagnostic{"CredentialProfilesUnsupported", "The selected agent does not support credential profiles.", "Start a new run without a credential profile, or select an agent that supports credential profiles."}
+			}
 		case "Failed":
 			if condition.Status == metav1.ConditionTrue {
 				return &RunDiagnostic{"AdapterFailed", "The agent reported a failure.", "Review the transcript for agent-reported details before starting another run."}
