@@ -1,6 +1,7 @@
 import { memo, useEffect, useState, type ReactNode } from 'react'
 import { api } from './api'
 import { CLAUDE_PROCESS_OUTPUT_KEY, ClaudeProcessOutput, updateClaudeTranscript, type ClaudeTranscriptReduction } from './ClaudeTranscript'
+import { CodexProcessOutput, reduceCodexTranscript, type CodexPresentation } from './CodexTranscript'
 import { LazyJSONDetails } from './LazyDetails'
 import { appendTimelineItem, type TranscriptEntry, type TranscriptGap, type TranscriptRenderItem } from './TranscriptTimeline'
 
@@ -75,6 +76,7 @@ function RawTransportEvent({ entry }: { entry: TranscriptEntry }) {
 interface TranscriptState {
   timeline: TranscriptRenderItem[]
   claude: ClaudeTranscriptReduction
+  codex: ReadonlyMap<string, CodexPresentation>
 }
 
 const MAX_SSE_BUFFER = 8 << 20
@@ -199,7 +201,7 @@ function dataPayloadBytes(bytes: Uint8Array): number {
 
 function emptyTranscriptState(): TranscriptState {
   const timeline: TranscriptRenderItem[] = []
-  return { timeline, claude: updateClaudeTranscript(undefined, timeline) }
+  return { timeline, claude: updateClaudeTranscript(undefined, timeline), codex: reduceCodexTranscript(timeline) }
 }
 
 export function Transcript({ namespace, run, identity }: { namespace: string; run: string; identity: string }) {
@@ -234,7 +236,7 @@ export function Transcript({ namespace, run, identity }: { namespace: string; ru
       const timeline = queuedTimeline
       setTranscript(current => {
         if (timeline === current.timeline) return current
-        return { timeline, claude: updateClaudeTranscript(current.claude, timeline) }
+        return { timeline, claude: updateClaudeTranscript(current.claude, timeline), codex: reduceCodexTranscript(timeline) }
       })
     }
     const scheduleTimelineFlush = () => {
@@ -367,7 +369,7 @@ export function Transcript({ namespace, run, identity }: { namespace: string; ru
       controller.abort()
     }
   }, [namespace, run, identity])
-  const { timeline, claude } = transcript
+  const { timeline, claude, codex } = transcript
   return <section><p role="status" aria-live="polite">Transcript: {status}</p>
     {!timeline.length ? <p>No transcript events yet.</p> : <ol className="transcript">
       {timeline.map(item => {
@@ -376,9 +378,11 @@ export function Transcript({ namespace, run, identity }: { namespace: string; ru
         const { entry } = item
         const key = `${entry.source || ''}:${entry.type || ''}`
         const presentation = claude.presentations.get(entry.id)
+        const codexPresentation = codex.get(entry.id)
         return <li key={`event:${entry.id}`}><span>{[entry.source, entry.type].filter(Boolean).join(' / ') || 'Event'}</span>
           {key === CLAUDE_PROCESS_OUTPUT_KEY && presentation
             ? <ClaudeProcessOutput presentation={presentation} />
+            : codexPresentation ? <CodexProcessOutput presentation={codexPresentation} />
             : <OpaqueEvent data={entry.data} />}
           <RawTransportEvent entry={entry} />
         </li>

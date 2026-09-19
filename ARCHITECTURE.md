@@ -542,8 +542,14 @@ path. Default NDJSON and legacy Environment logs remain unchanged. Presentation 
 execution/stream/offset-aware, and reports gaps and raw fallbacks; it neither changes stored
 events nor infers platform verification/accounting from agent-reported commands or usage.
 Compatibility targets upstream `rust-v0.144.6`, not a version attestation on each event.
-The README documents line, replay-window, execution and output limits. No UI interpretation,
-controller behavior or shared transcript schema is added by this CLI mode.
+The console's `ui/src/CodexTranscript.tsx` owns corresponding pinned presentation over the
+existing exact-UID transcript feed; it adds no subscription or resource lookup. It replays only
+the bounded retained timeline, with bounded current-execution stdout/stderr assembly and retired
+identity tracking. Server/client/process loss, raw fallbacks, partial records and presentation
+limits are visible; original transport details remain lazy. Exact Run changes and timeline
+eviction cannot retain old parser state. The README documents browser-specific transport,
+timeline, line/replay, execution and output bounds separately from CLI limits. Neither
+presentation changes controller behavior, storage, or the adapter-owned transcript contract.
 
 The registered `claude-code` (default), `amp`, `codex`, and `pi` adapters each run a foreground
 CLI through sandboxd's keyed managed-process service. Starts are duplicate-safe within one

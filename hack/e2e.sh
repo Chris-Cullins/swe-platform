@@ -3455,6 +3455,8 @@ for marker in '[Codex agent-reported message]' codex-credential-present 'command
 done
 test "$(kubectl get run "$CODEX_RUN_NAME" -o jsonpath='{.status.state}')" = Succeeded
 echo 'PASS: readable Codex message, command, metadata and stderr; agent-reported command failure does not override terminal Run outcome'
+SWE_BROWSER_TOKEN="$CONSOLE_TOKEN" ./hack/console-codex-transcript_test.sh \
+	http://127.0.0.1:18080 "$PROJECT_NAMESPACE" "$CODEX_RUN_NAME" "$CODEX_RUN_UID"
 kubectl get run "$CODEX_RUN_NAME" -o yaml > /tmp/swe-platform-codex-run.yaml
 kubectl -n "$SYSTEM_NAMESPACE" logs -l app.kubernetes.io/component=control-plane --all-containers --prefix --tail=-1 > /tmp/swe-platform-codex-control-plane.log
 kubectl -n "$SYSTEM_NAMESPACE" logs -l app.kubernetes.io/component=operator --all-containers --prefix --tail=-1 > /tmp/swe-platform-codex-operator.log
