@@ -437,11 +437,12 @@ if [ "${12}" = 'fake Codex failure smoke test' ]; then
 fi
 test "${12}" = 'fake Codex lifecycle smoke test'
 test "${CODEX_API_KEY:-}" = '!!SWE-E2E-CODEX-API-KEY-DO-NOT-USE!!'
-printf '%s\n' '{"type":"item.completed","message":"codex-credential-present"}'
+printf '%s\n' '{"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"codex-credential-present"}}'
+printf '%s\n' '{"type":"item.completed","item":{"id":"item_1","type":"command_execution","command":"fake-check --fixture","aggregated_output":"fake-codex-check-output\n","exit_code":7,"status":"failed"}}'
 while [ ! -f /workspace/codex-credential-checks-complete ]; do
 	sleep 1
 done
-printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":1,"output_tokens":2}}'
+printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":1,"cached_input_tokens":0,"cache_write_input_tokens":0,"output_tokens":2,"reasoning_output_tokens":0}}'
 EOF
 chmod 0755 "$FAKE_ENV_CONTEXT/codex"
 cat > "$FAKE_ENV_CONTEXT/pi" <<'EOF'
@@ -3391,12 +3392,24 @@ if [[ "$CODEX_TRANSCRIPT_STATUS" != "0" && "$CODEX_TRANSCRIPT_STATUS" != "28" ]]
 grep -F '"source":"codex"' /tmp/swe-platform-codex-transcript.out | grep -F '"type":"codex.process-output"' | \
 	grep -oE '"data":"[A-Za-z0-9+/=]+"' | sed 's/^"data":"//; s/"$//' | while IFS= read -r encoded; do printf '%s' "$encoded" | base64 --decode || exit 1; done > /tmp/swe-platform-codex-process-output.out
 for marker in fake-codex-thread fake-codex-stderr-marker codex-credential-present turn.completed; do grep -Fq "$marker" /tmp/swe-platform-codex-process-output.out || { echo "FAIL: missing Codex marker $marker"; exit 1; }; done
+set +e
+SWE_CONTROL_PLANE_URL=http://127.0.0.1:18080 SWE_CONTROL_PLANE_TOKEN="$E2E_BOOTSTRAP_TOKEN" \
+	timeout --signal=INT 5 bin/swe --namespace "$PROJECT_NAMESPACE" logs --run "$CODEX_RUN_NAME" --run-uid "$CODEX_RUN_UID" --readable > /tmp/swe-platform-codex-readable.out
+CODEX_READABLE_STATUS=$?
+set -e
+if [[ "$CODEX_READABLE_STATUS" != "0" && "$CODEX_READABLE_STATUS" != "124" ]]; then echo "FAIL: readable Codex transcript read failed"; exit 1; fi
+for marker in '[Codex agent-reported message]' codex-credential-present 'command: fake-check --fixture' \
+	'status: failed; exit_code: 7' fake-codex-check-output 'not platform verification' 'usage is not accounting' fake-codex-stderr-marker; do
+	grep -Fq "$marker" /tmp/swe-platform-codex-readable.out || { echo "FAIL: missing readable Codex marker $marker"; exit 1; }
+done
+test "$(kubectl get run "$CODEX_RUN_NAME" -o jsonpath='{.status.state}')" = Succeeded
+echo 'PASS: readable Codex message, command, metadata and stderr; agent-reported command failure does not override terminal Run outcome'
 kubectl get run "$CODEX_RUN_NAME" -o yaml > /tmp/swe-platform-codex-run.yaml
 kubectl -n "$SYSTEM_NAMESPACE" logs -l app.kubernetes.io/component=control-plane --all-containers --prefix --tail=-1 > /tmp/swe-platform-codex-control-plane.log
 kubectl -n "$SYSTEM_NAMESPACE" logs -l app.kubernetes.io/component=operator --all-containers --prefix --tail=-1 > /tmp/swe-platform-codex-operator.log
 kubectl logs "$CODEX_POD_NAME" -c environment --tail=-1 > /tmp/swe-platform-codex-environment.log
 kubectl exec "$CODEX_POD_NAME" -- tar -C /workspace -cf - . > /tmp/swe-platform-codex-workspace.tar
-for artifact in /tmp/swe-platform-codex-transcript.out /tmp/swe-platform-codex-process-output.out \
+for artifact in /tmp/swe-platform-codex-transcript.out /tmp/swe-platform-codex-process-output.out /tmp/swe-platform-codex-readable.out \
 	/tmp/swe-platform-codex-run.yaml /tmp/swe-platform-codex-control-plane.log \
 	/tmp/swe-platform-codex-operator.log /tmp/swe-platform-codex-environment.log \
 	/tmp/swe-platform-codex-service.json /tmp/swe-platform-codex-terminal.out \
@@ -3406,6 +3419,8 @@ for artifact in /tmp/swe-platform-codex-transcript.out /tmp/swe-platform-codex-p
 		exit 1
 	fi
 done
+rm -f /tmp/swe-platform-codex-readable.out
+unset CODEX_READABLE_STATUS
 printf '%s' $'version: 1\nservices: {}\n' |
 	kubectl exec -i "$CODEX_POD_NAME" -- sh -c 'cat > /workspace/.swe/services.yaml'
 for _ in $(seq 1 90); do

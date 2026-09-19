@@ -248,6 +248,9 @@ runs both via `make` targets:
   declared-service portal allocation/proxy authorization and lifecycle fencing, process-scoped fake Claude, Amp, and Codex API-key delivery without ambient
   setup/resume/sandboxd exposure, and Secret-only sandboxd process/service-observation/portal
   capability tokens without Environment pod projection.
+  Fake Codex acceptance also checks opt-in `swe logs --readable` message/command/metadata/stderr
+  presentation without changing terminal Run outcome. Keep default NDJSON opaque; readable
+  interpretation and its bounded adversarial tests belong to `internal/adapters/codex`.
   Direct sandboxd acceptance RPCs always use the system-namespace policy-authorized relay
   to the Environment Pod IP, including on kindnet: direct Environment port-forward cannot
   reach gVisor's userspace listener. Relay cleanup is independent of runtime and CNI selection.

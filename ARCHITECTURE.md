@@ -532,6 +532,15 @@ type. Platform code supplies an immutable Run UID/task, an ephemeral credential,
 sandboxd process dialer, and an opaque event sink. Adapters own agent command/protocol details and
 event payload meaning; the platform does not impose a shared transcript schema.
 
+The opt-in CLI `swe logs --readable --run RUN --run-uid UID` delegates Codex JSONL
+presentation to `internal/adapters/codex`, using the existing exact-UID authenticated SSE
+path. Default NDJSON and legacy Environment logs remain unchanged. Presentation is bounded,
+execution/stream/offset-aware, and reports gaps and raw fallbacks; it neither changes stored
+events nor infers platform verification/accounting from agent-reported commands or usage.
+Compatibility targets upstream `rust-v0.144.6`, not a version attestation on each event.
+The README documents line, replay-window, execution and output limits. No UI interpretation,
+controller behavior or shared transcript schema is added by this CLI mode.
+
 The registered `claude-code` (default), `amp`, `codex`, and `pi` adapters each run a foreground
 CLI through sandboxd's keyed managed-process service. Starts are duplicate-safe within one
 sandboxd daemon epoch, and bounded output includes absolute offsets and observable gaps.
