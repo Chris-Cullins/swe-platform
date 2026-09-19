@@ -8,7 +8,7 @@ import {
   api, ApiProblem, fallbackPollInterval, isTerminal, onUnauthorized, queryKeys,
   retryTransientResourceError, transientResourceError,
 } from './api'
-import type { CreateRun, Environment, PortalServiceList, Run, Selector } from './contracts'
+import type { CreateRun, Environment, PortalServiceList, Run, RunSummary, Selector } from './contracts'
 import { useRunFeed } from './runFeed'
 import { Transcript } from './Transcript'
 import Changes from './Changes'
@@ -151,14 +151,24 @@ function Shell() {
   </header>{routeError ? <main><Failure error={new Error(routeError)} /></main> : <RunFeedOutlet namespace={namespace} />}</>
 }
 
+// Match swe attention's default reported-state membership, including its precedence.
+function isAttentionCandidate(run: RunSummary) {
+  switch (run.state) {
+    case 'Failed': case 'Succeeded': return true
+    case 'NeedsInput': case 'Paused': return !run.cancelRequested
+    case 'Cancelled': case 'Allocating': case 'EnvironmentReady': case 'AdapterAccepted': case 'Running': return false
+    default: return true
+  }
+}
+
 function RunList() {
   const { namespace = '' } = useParams()
   const query = useActiveRunFeed()
-  const [filters, setFilters] = React.useState({ namespace, state: '', agent: '' })
-  if (filters.namespace !== namespace) setFilters({ namespace, state: '', agent: '' })
-  const { state, agent } = filters
+  const [filters, setFilters] = React.useState({ namespace, state: '', agent: '', attention: false })
+  if (filters.namespace !== namespace) setFilters({ namespace, state: '', agent: '', attention: false })
+  const { state, agent, attention } = filters
   const agents = [...new Set([...(query.data?.items.map(run => run.agent) || []), ...(agent ? [agent] : [])])].sort()
-  const matches = query.data?.items.filter(run => (!state || run.state === state) && (!agent || run.agent === agent)) || []
+  const matches = query.data?.items.filter(run => (!state || run.state === state) && (!agent || run.agent === agent) && (!attention || isAttentionCandidate(run))) || []
   return <main>
     <div className="title"><div><h1>Runs</h1><p>Agent tasks in {namespace}</p></div><Link className="button" to="new">New run</Link></div>
     <div className="run-filters">
@@ -169,8 +179,10 @@ function RunList() {
       <label>Agent<select id="run-agent-filter" value={agent} onChange={event => setFilters({ ...filters, agent: event.target.value })}>
         <option value="">All agents</option>{agents.map(value => <option key={value}>{value}</option>)}
       </select></label>
-      <button disabled={!state && !agent} onClick={() => setFilters({ namespace, state: '', agent: '' })}>Clear filters</button>
+      <label className="attention-filter"><input id="run-attention-filter" type="checkbox" checked={attention} aria-describedby="attention-help" onChange={event => setFilters({ ...filters, attention: event.target.checked })} />Attention candidates</label>
+      <button disabled={!state && !agent && !attention} onClick={() => setFilters({ namespace, state: '', agent: '', attention: false })}>Clear filters</button>
     </div>
+    <p className="hint" id="attention-help">Based only on reported state; may include intentional pauses and retained successes. This is not a review acknowledgement or an input channel.</p>
     {query.fallback && <p className="hint" role="status">Live updates unavailable; refreshing every 4 seconds.</p>}
     {!query.fallback && query.watchError && <p className="hint" role="status">Live updates disconnected; reconnecting…</p>}
     {query.isPending ? <Busy label="Loading runs" /> : query.error ? <Failure error={query.error} /> : !query.data.items.length ? <p role="status">No runs found.</p> :

@@ -924,12 +924,21 @@ for terminal access until an explicit noninteractive, capability-safe session co
 
 ### Run resource watches
 
-The browser Runs list offers **State** and **Agent** filters over this same authorized feed.
-Exact, case-sensitive matches combine with AND; **Clear filters** restores all Runs, including
-unknown future states and agents. Live updates change the matching cards. A selected agent
-remains selected even if its last Run disappears; changing namespace resets both filters.
-An empty namespace and a feed with no filter matches have distinct messages. Filters are local,
-unsaved observations, not attention categories, readiness checks, or review-state changes.
+The browser Runs list offers **State**, **Agent**, and a default-off **Attention candidates**
+checkbox over this same authorized feed. All filters combine with AND; State and Agent use exact,
+case-sensitive matches. Attention matches the default `swe attention` membership: Failed and
+Succeeded even with cancellation requested; uncancelled NeedsInput and Paused; empty or future
+states even with cancellation requested. Cancelled, known active states, and cancelling
+known nonterminal Runs are excluded. These are reported-state candidates, not proof of freshness,
+readiness, verified or unreviewed results, or a supported input channel. Intentional pauses and
+retained successes may remain candidates.
+
+**Clear filters** restores all Runs, including unknown future states and agents. Live updates
+change the matching cards without resetting filters, including across reconnects. Agent options
+come from the full feed; a selected agent remains selected even if its last Run disappears.
+Changing namespace resets all filters. An empty namespace and a feed with no filter matches
+have distinct messages; disconnection remains a separate status. Filters are local, unsaved
+observations with no extra reads, subscriptions, review acknowledgements, or notifications.
 
 Authenticated consoles obtain a fully paginated Run summary snapshot from
 `GET /api/v1/namespaces/{namespace}/runs?view=summary`, then watch that same collection with

@@ -200,7 +200,10 @@ runs both via `make` targets:
   failure snapshot expression to check lifecycle, bounds, and sensitive-field exclusion.
   `hack/console-run-diagnostic_test.sh` exercises the existing fake Codex failure through the
   exact Run API and embedded console, checking fixed diagnostic text and transcript navigation.
-  It also checks Run-list State/Agent AND filters, clear/no-match, and exact UID card navigation.
+  It also checks Run-list State/Agent/Attention candidates AND filters, default-off attention,
+  clear/no-match, and exact UID card navigation. Attention must match the CLI's default
+  reported-state membership over the existing feed only, preserving terminal/unknown cancellation
+  precedence, full-feed agent options, namespace reset and live reconnect behavior.
   Safe Run diagnostics belong in the resource DTO mapper, not controller lifecycle changes:
   allowlist current state/reason pairs, never project raw condition messages.
 - **Windows portability:** CI runs focused sandboxd process, launch-material, Exec,
