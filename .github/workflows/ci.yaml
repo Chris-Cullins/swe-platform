@@ -113,6 +113,9 @@ jobs:
       - name: Disabled egress conformance guards
         run: ./hack/egress-conformance_test.sh
 
+      - name: Safe E2E forward failure evidence
+        run: ./hack/e2e-forward-diagnostics_test.sh
+
       - name: Generated code is current
         run: |
           make generate manifests

@@ -159,11 +159,16 @@ runs both via `make` targets:
   `RUN_SYSTEM_NAMESPACE`, and `RUN_INSTALLATION_NAME`; scoped mode also takes a
   space-separated `RUN_TENANCY_NAMESPACES` list.
 - **Unit tests:** `make test` (including rendered Helm RBAC, Argo port-forward, BYOC
-  production-preset checks, and the disabled egress-conformance guard) · **Vet:** `make vet`.
+  production-preset checks, the disabled egress-conformance guard, and safe E2E forward
+  failure diagnostics) · **Vet:** `make vet`.
   PostgreSQL transcript/session integration tests
   run when `SWE_TEST_POSTGRES_URL` points to a disposable database; CI supplies PostgreSQL 17.
   The required `build-test` CI job runs the root and sandboxd Go suites plus
-  the four shell checks above, mirroring `make test`. The egress-conformance live runner remains
+  the five shell checks above, mirroring `make test`. E2E EXIT diagnostics preserve the original
+  failure before cleanup, emitting only numeric location and fixed forward process/log indicators
+  from at most 64 KiB; never add raw logs, arguments, credentials or automatic retries. The
+  diagnostic test executes the actual EXIT/cleanup path with sensitive sentinels and bounded inputs.
+  The egress-conformance live runner remains
   default-off on its separate `hack/kind-calico-conformance.yaml` topology and must not be invoked
   by CI/e2e; only its guard test runs. Keep its temporary kind admin kubeconfig and Python bytecode
   inside cleanup-managed temporary paths so both early exits and `make test` leave no artifacts.

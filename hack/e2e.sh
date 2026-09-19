@@ -29,6 +29,7 @@ E2E_ROTATED_AGENT_API_KEY='!!SWE-E2E-ROTATED-AGENT-API-KEY-DO-NOT-USE!!'
 E2E_AMP_API_KEY='!!SWE-E2E-AMP-API-KEY-DO-NOT-USE!!'
 E2E_CODEX_API_KEY='!!SWE-E2E-CODEX-API-KEY-DO-NOT-USE!!'
 PORT_FORWARD_PID=""
+CONTROL_PLANE_FORWARD_LOG=/tmp/swe-platform-port-forward.log
 SANDBOXD_PORT_FORWARD_PID=""
 POSTGRES_PORT_FORWARD_PID=""
 STREAM_PID=""
@@ -121,7 +122,11 @@ cleanup() {
 		kind delete cluster --name "$CLUSTER" >/dev/null 2>&1 || true
 	fi
 }
-trap cleanup EXIT
+source "$(dirname "${BASH_SOURCE[0]}")/e2e-forward-diagnostics.sh"
+# EXIT's LINENO is not the failed command location. Explicit exits have no ERR
+# location and are reported as 0; never capture BASH_COMMAND or its arguments.
+trap 'E2E_FAILURE_LINE=$LINENO' ERR
+trap 'e2e_exit "$?" "${E2E_FAILURE_LINE:-0}"' EXIT
 
 contains_e2e_key() {
 	grep -aFq -- "$E2E_AGENT_API_KEY" "$1" || grep -aFq -- "$E2E_ROTATED_AGENT_API_KEY" "$1" || \
@@ -147,9 +152,9 @@ start_control_plane_port_forward() {
 		kill "$PORT_FORWARD_PID" >/dev/null 2>&1 || true
 		wait "$PORT_FORWARD_PID" >/dev/null 2>&1 || true
 	fi
-	: > /tmp/swe-platform-port-forward.log
+	: > "$CONTROL_PLANE_FORWARD_LOG"
 	kubectl -n "$SYSTEM_NAMESPACE" port-forward service/swe-platform-swe-platform-control-plane 18080:80 \
-		>/tmp/swe-platform-port-forward.log 2>&1 &
+		>"$CONTROL_PLANE_FORWARD_LOG" 2>&1 &
 	PORT_FORWARD_PID=$!
 	for _ in $(seq 1 30); do
 		if kill -0 "$PORT_FORWARD_PID" >/dev/null 2>&1 && \
@@ -159,7 +164,6 @@ start_control_plane_port_forward() {
 		sleep 1
 	done
 	echo "FAIL: control-plane port-forward did not become ready" >&2
-	cat /tmp/swe-platform-port-forward.log >&2
 	return 1
 }
 
