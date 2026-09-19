@@ -3455,8 +3455,42 @@ for marker in '[Codex agent-reported message]' codex-credential-present 'command
 done
 test "$(kubectl get run "$CODEX_RUN_NAME" -o jsonpath='{.status.state}')" = Succeeded
 echo 'PASS: readable Codex message, command, metadata and stderr; agent-reported command failure does not override terminal Run outcome'
-SWE_BROWSER_TOKEN="$CONSOLE_TOKEN" ./hack/console-codex-transcript_test.sh \
-	http://127.0.0.1:18080 "$PROJECT_NAMESPACE" "$CODEX_RUN_NAME" "$CODEX_RUN_UID"
+# Base Run reads do not authorize transcripts. Grant only this disposable fixture
+# name to the real browser principal, without widening the general console Role.
+CODEX_CONSOLE_DENIED=$(curl --silent --max-time 2 --output /dev/null --write-out '%{http_code}' \
+	-H "Authorization: Bearer $CONSOLE_TOKEN" -H "SWE-Run-UID: $CODEX_RUN_UID" \
+	"http://127.0.0.1:18080/api/v1/namespaces/$PROJECT_NAMESPACE/runs/$CODEX_RUN_NAME/transcript" || true)
+if [[ "$CODEX_CONSOLE_DENIED" != 403 ]]; then echo 'FAIL: console unexpectedly authorized for Codex transcript before fixture grant'; exit 1; fi
+unset CODEX_CONSOLE_DENIED
+(
+	trap 'kubectl -n "$PROJECT_NAMESPACE" delete rolebinding/e2e-codex-transcript role/e2e-codex-transcript --ignore-not-found >/dev/null 2>&1 || true' EXIT
+	cat <<EOF | kubectl -n "$PROJECT_NAMESPACE" apply -f -
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: e2e-codex-transcript
+rules:
+  - apiGroups: ["swe.dev"]
+    resources: ["runs/transcript"]
+    resourceNames: ["$CODEX_RUN_NAME"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: e2e-codex-transcript
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: e2e-codex-transcript
+subjects:
+  - kind: ServiceAccount
+    name: e2e-console
+    namespace: $PROJECT_NAMESPACE
+EOF
+	SWE_BROWSER_TOKEN="$CONSOLE_TOKEN" ./hack/console-codex-transcript_test.sh \
+		http://127.0.0.1:18080 "$PROJECT_NAMESPACE" "$CODEX_RUN_NAME" "$CODEX_RUN_UID"
+)
 kubectl get run "$CODEX_RUN_NAME" -o yaml > /tmp/swe-platform-codex-run.yaml
 kubectl -n "$SYSTEM_NAMESPACE" logs -l app.kubernetes.io/component=control-plane --all-containers --prefix --tail=-1 > /tmp/swe-platform-codex-control-plane.log
 kubectl -n "$SYSTEM_NAMESPACE" logs -l app.kubernetes.io/component=operator --all-containers --prefix --tail=-1 > /tmp/swe-platform-codex-operator.log

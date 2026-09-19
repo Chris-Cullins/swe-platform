@@ -23,6 +23,10 @@ token = json.dumps(os.environ['SWE_BROWSER_TOKEN'])
 print(f"(async () => {{ if (!(await fetch('/api/v1/session', {{method:'POST',headers:{{Authorization:'Bearer '+{token}}}}})).ok) throw new Error('Session exchange failed'); }})()")
 PY
 unset SWE_BROWSER_TOKEN
+stage transcript-authorization
+# Check only the numeric response status, then cancel this explicit test probe.
+# The renderer itself still uses its single existing exact-UID subscription.
+browser eval "(async () => { const response = await fetch('/api/v1/namespaces/$NAMESPACE/runs/$RUN_NAME/transcript', {headers:{'SWE-Run-UID':'$RUN_UID'}}); const status = response.status; if (response.body) await response.body.cancel(); if (status !== 200) throw new Error('Exact transcript HTTP '+status); return {transcriptReadStatus:status}; })()"
 stage exact-run-navigation
 browser open "$BASE_URL/namespaces/$NAMESPACE/runs" >/dev/null
 browser wait --fn "!!document.querySelector('a.card[href$=\"/$RUN_NAME/overview\"]')" >/dev/null

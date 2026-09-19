@@ -270,6 +270,10 @@ runs both via `make` targets:
   interpretation and its bounded adversarial tests belong to `internal/adapters/codex`.
   `hack/console-codex-transcript_test.sh` checks the same keyless fixture in the real console:
   exact-UID navigation, message/command/provenance/stderr and lazy raw transport disclosure.
+  Its disposable namespaced grant authorizes only the named Codex Run's transcript, asserts
+  HTTP 403 beforehand, and removes the Role/Binding on exit. The helper checks numeric
+  authenticated transcript status and cancels that test probe before UI navigation; never log
+  response bodies or use the static bootstrap token for browser session exchange.
   Browser interpretation and its bounds/tests belong to `ui/src/CodexTranscript.tsx`; keep
   the existing single transcript feed and Claude/opaque behavior unchanged. Browser evidence
   should include normal, gap/fallback, expanded raw and narrow-width states; no provider keys.
