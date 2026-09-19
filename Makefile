@@ -63,6 +63,7 @@ test: ## Run unit tests in both modules
 	./hack/helm-rbac_test.sh
 	./hack/validate-byoc_test.sh
 	./hack/egress-conformance_test.sh
+	./hack/e2e-forward-diagnostics_test.sh
 
 .PHONY: vet
 vet: ## Run go vet in both modules

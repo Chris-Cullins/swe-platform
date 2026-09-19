@@ -29,6 +29,7 @@ E2E_ROTATED_AGENT_API_KEY='!!SWE-E2E-ROTATED-AGENT-API-KEY-DO-NOT-USE!!'
 E2E_AMP_API_KEY='!!SWE-E2E-AMP-API-KEY-DO-NOT-USE!!'
 E2E_CODEX_API_KEY='!!SWE-E2E-CODEX-API-KEY-DO-NOT-USE!!'
 PORT_FORWARD_PID=""
+CONTROL_PLANE_FORWARD_LOG=/tmp/swe-platform-port-forward.log
 SANDBOXD_PORT_FORWARD_PID=""
 POSTGRES_PORT_FORWARD_PID=""
 STREAM_PID=""
@@ -121,7 +122,12 @@ cleanup() {
 		kind delete cluster --name "$CLUSTER" >/dev/null 2>&1 || true
 	fi
 }
-trap cleanup EXIT
+source "$(dirname "${BASH_SOURCE[0]}")/e2e-forward-diagnostics.sh"
+# EXIT's LINENO is not the failed command location. Explicit exits have no ERR
+# location and are reported as 0; never capture BASH_COMMAND or its arguments.
+# Expected failures under set +e must not leave a misleading recovered location.
+trap 'if [[ $- == *e* ]]; then E2E_FAILURE_LINE=$LINENO; fi' ERR
+trap 'e2e_exit "$?" "${E2E_FAILURE_LINE:-0}"' EXIT
 
 contains_e2e_key() {
 	grep -aFq -- "$E2E_AGENT_API_KEY" "$1" || grep -aFq -- "$E2E_ROTATED_AGENT_API_KEY" "$1" || \
@@ -147,9 +153,9 @@ start_control_plane_port_forward() {
 		kill "$PORT_FORWARD_PID" >/dev/null 2>&1 || true
 		wait "$PORT_FORWARD_PID" >/dev/null 2>&1 || true
 	fi
-	: > /tmp/swe-platform-port-forward.log
+	: > "$CONTROL_PLANE_FORWARD_LOG"
 	kubectl -n "$SYSTEM_NAMESPACE" port-forward service/swe-platform-swe-platform-control-plane 18080:80 \
-		>/tmp/swe-platform-port-forward.log 2>&1 &
+		>"$CONTROL_PLANE_FORWARD_LOG" 2>&1 &
 	PORT_FORWARD_PID=$!
 	for _ in $(seq 1 30); do
 		if kill -0 "$PORT_FORWARD_PID" >/dev/null 2>&1 && \
@@ -159,7 +165,6 @@ start_control_plane_port_forward() {
 		sleep 1
 	done
 	echo "FAIL: control-plane port-forward did not become ready" >&2
-	cat /tmp/swe-platform-port-forward.log >&2
 	return 1
 }
 
@@ -2004,6 +2009,52 @@ if [[ -s /tmp/swe-platform-list-runs-denied.out ]] || \
 fi
 rm -f /tmp/swe-platform-list-runs-denied.out /tmp/swe-platform-list-runs-denied.err
 unset LIST_RUNS_JSON LIST_RUNS_TABLE LIST_RUNS_EMPTY
+
+echo "==> verifying prompt-free reported-state attention candidates"
+ATTENTION_JSON=$(SWE_CONTROL_PLANE_URL=http://127.0.0.1:18080 SWE_CONTROL_PLANE_TOKEN="$CONSOLE_TOKEN" \
+	bin/swe attention --namespace "$PROJECT_NAMESPACE" --json)
+if ! jq -e --arg uid "$RUN_UID" --arg ns "$PROJECT_NAMESPACE" '
+	any(.[]; .uid == $uid and .reportedState == "Succeeded" and .bucket == "review-candidate") and
+	all(.[]; .namespace == $ns and
+		(keys == ["agent", "bucket", "cancelRequested", "createdAt", "name", "namespace", "reportedState", "uid"]) and
+		(.bucket == "failed" or .bucket == "input-reported" or .bucket == "review-candidate" or .bucket == "paused" or .bucket == "unknown")) and
+	(. == sort_by(.name, .uid))' <<<"$ATTENTION_JSON" >/dev/null; then
+	echo "FAIL: attention defaults, identity, ordering or prompt-free projection differed"
+	exit 1
+fi
+ATTENTION_FILTERED=$(SWE_CONTROL_PLANE_URL=http://127.0.0.1:18080 SWE_CONTROL_PLANE_TOKEN="$CONSOLE_TOKEN" \
+	bin/swe attention --namespace "$PROJECT_NAMESPACE" --bucket review-candidate --agent claude-code --json)
+if ! jq -e --arg uid "$RUN_UID" 'any(.[]; .uid == $uid) and
+	all(.[]; .bucket == "review-candidate" and .agent == "claude-code")' <<<"$ATTENTION_FILTERED" >/dev/null; then
+	echo "FAIL: attention bucket and agent did not combine with AND"
+	exit 1
+fi
+ATTENTION_TABLE=$(SWE_CONTROL_PLANE_URL=http://127.0.0.1:18080 SWE_CONTROL_PLANE_TOKEN="$CONSOLE_TOKEN" \
+	bin/swe attention --namespace "$PROJECT_NAMESPACE" --bucket review-candidate --agent claude-code)
+if ! grep -Fq "$RUN_UID" <<<"$ATTENTION_TABLE" || grep -Fq 'end-to-end smoke test' <<<"$ATTENTION_TABLE"; then
+	echo "FAIL: attention table lost identity or exposed prompt"
+	exit 1
+fi
+ATTENTION_EMPTY=$(SWE_CONTROL_PLANE_URL=http://127.0.0.1:18080 SWE_CONTROL_PLANE_TOKEN="$CONSOLE_TOKEN" \
+	bin/swe attention --namespace "$PROJECT_NAMESPACE" --agent e2e-no-such-agent --json)
+if [[ "$ATTENTION_EMPTY" != '[]' ]]; then
+	echo "FAIL: attention no-match result was not an empty JSON array"
+	exit 1
+fi
+if SWE_CONTROL_PLANE_URL=http://127.0.0.1:18080 SWE_CONTROL_PLANE_TOKEN="$CONSOLE_TOKEN" \
+	bin/swe attention --namespace e2e-console-other --json \
+	>/tmp/swe-platform-attention-denied.out 2>/tmp/swe-platform-attention-denied.err; then
+	echo "FAIL: attention accepted an unauthorized namespace"
+	exit 1
+fi
+if [[ -s /tmp/swe-platform-attention-denied.out ]] || ! grep -Fq '403' /tmp/swe-platform-attention-denied.err || \
+	grep -Fq "$CONSOLE_TOKEN" /tmp/swe-platform-attention-denied.err; then
+	echo "FAIL: attention denial did not fail safely with HTTP 403"
+	exit 1
+fi
+rm -f /tmp/swe-platform-attention-denied.out /tmp/swe-platform-attention-denied.err
+unset ATTENTION_JSON ATTENTION_FILTERED ATTENTION_TABLE ATTENTION_EMPTY
+echo "PASS: attention preserves exact identities, default candidates, AND filters and prompt-free output"
 
 echo "==> verifying embedded operations console through the control-plane Service"
 ROOT_STATUS=$(curl --silent --dump-header /tmp/swe-platform-console-root.headers \

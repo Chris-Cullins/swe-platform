@@ -753,6 +753,43 @@ The table explicitly reports an empty or unmatched result. This is a read-only o
 not a watch, wake, readiness probe, review queue, notification subscription, or input channel.
 `Succeeded` describes an agent outcome, not verified software.
 
+### Finding attention candidates
+
+`swe attention` classifies the same authorized summary snapshot without per-Run detail requests:
+
+```sh
+swe attention --namespace my-project
+swe attention --namespace my-project --bucket failed --agent codex --json
+swe attention --namespace my-project --bucket cancelling
+```
+
+Supply the existing `SWE_CONTROL_PLANE_URL` and `SWE_CONTROL_PLANE_TOKEN` (or `--control-plane`
+and `--token`). The command uses namespace `list runs` access with no Kubernetes fallback.
+It shares the bounded consistent pagination above and has a command-local **30-second deadline**,
+respecting earlier caller cancellation/deadlines. A failed snapshot prints no partial results.
+
+| Reported state | Bucket |
+| --- | --- |
+| Empty or unknown future state, regardless of cancellation request | `unknown` |
+| `Cancelled`, `Failed`, `Succeeded`, regardless of cancellation request | `cancelled`, `failed`, `review-candidate` respectively |
+| Known nonterminal state with cancellation requested | `cancelling` |
+| Otherwise `NeedsInput` or `Paused` | `input-reported` or `paused` |
+| Otherwise `Allocating`, `EnvironmentReady`, `AdapterAccepted`, `Running` | `in-progress` |
+
+Defaults include `failed`, `input-reported`, `review-candidate`, `paused`, and `unknown`.
+`--bucket` selects exactly one bucket instead; `--agent` is an exact, case-sensitive AND filter.
+Both formats sort by name then UID and expose only namespace, name, UID, reported state, agent,
+creation time, cancellation request and bucket. **Attention JSON excludes even prompt previews**,
+unlike `list-runs --json`; it uses `reportedState` for the source state. Empty JSON is `[]`;
+human output distinguishes no default candidates from no filter matches. Neither format fetches
+detail, transcripts, Changes, credentials or diagnostics.
+
+These are **reported-state candidates**, not proof of observed-generation freshness, verified
+success, available evidence, unreviewed work, failure cause, supported reply, or wake permission.
+Paused work may be intentional, and all retained successes remain review candidates. Transport
+errors are command failures, not failed Runs. This adds no review persistence or notifications.
+For an explicit explanation, use `swe describe-run RUN --namespace NS --run-uid UID` below.
+
 ### Describing an exact Run
 
 Use the UID returned by `swe list-runs` to inspect one Run without following a same-name replacement:
