@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/Chris-Cullins/swe-platform/internal/controlplaneclient"
@@ -80,6 +81,8 @@ func TestLogsCommandRequiresExactlyOneMode(t *testing.T) {
 		{"environment", "--control-plane", "https://control.example"},
 		{"environment", "--token", "token"},
 		{"environment", "--after="},
+		{"environment", "--readable"},
+		{"--run", "run", "--readable"},
 	} {
 		command := newLogsCommand()
 		command.SetArgs(args)
@@ -112,5 +115,58 @@ func TestLogsControlPlaneEnvironmentDefaultsDoNotSelectRunMode(t *testing.T) {
 		if command.Flags().Changed(flag) {
 			t.Fatalf("environment default marked --%s as explicitly changed", flag)
 		}
+	}
+}
+
+func TestReadableLogsUsesExactAuthenticatedStreamAndUnsupportedFallback(t *testing.T) {
+	requests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		if r.URL.Path != "/api/v1/namespaces/team/runs/task/transcript" || r.Header.Get("SWE-Run-UID") != "uid" || r.Header.Get("Authorization") != "Bearer reader" {
+			t.Errorf("unexpected transcript request %s", r.URL.Path)
+		}
+		if requests > 1 {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		line := []byte("{\"type\":\"item.completed\",\"item\":{\"id\":\"item_0\",\"type\":\"agent_message\",\"text\":\"hello from codex\"}}\n")
+		body, _ := json.Marshal(map[string]any{"source": "codex", "type": "codex.process-output", "data": map[string]any{"executionId": "execution", "stream": "stdout", "offset": 0, "nextOffset": len(line), "retainedFrom": 0, "producedEnd": len(line), "eof": true, "data": line}})
+		_, _ = io.WriteString(w, "event: transcript\nid: c1\ndata: "+string(body)+"\n\nevent: transcript\ndata: {\"source\":\"other\",\"data\":{\"opaque\":true}}\n\n")
+	}))
+	defer server.Close()
+	command := newLogsCommand()
+	command.Flags().String("namespace", "team", "")
+	command.SetArgs([]string{"--run", "task", "--run-uid", "uid", "--control-plane", server.URL, "--token", "reader", "--readable"})
+	var output bytes.Buffer
+	command.SetOut(&output)
+	if err := command.Execute(); err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"[Codex agent-reported message]\nhello from codex", "raw fallback", `"opaque":true`} {
+		if !strings.Contains(output.String(), want) {
+			t.Fatalf("missing %q: %s", want, output.String())
+		}
+	}
+	if requests != 2 {
+		t.Fatalf("requests=%d", requests)
+	}
+}
+
+func TestReadableLogsDeniedHasNoFallback(t *testing.T) {
+	requests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { requests++; w.WriteHeader(http.StatusForbidden) }))
+	defer server.Close()
+	command := newLogsCommand()
+	command.SilenceUsage = true
+	command.Flags().String("namespace", "team", "")
+	command.SetArgs([]string{"--run", "task", "--run-uid", "uid", "--control-plane", server.URL, "--token", "reader", "--readable"})
+	var output bytes.Buffer
+	command.SetOut(&output)
+	if err := command.Execute(); err == nil {
+		t.Fatal("denied stream succeeded")
+	}
+	if requests != 1 || output.Len() != 0 {
+		t.Fatalf("requests=%d output=%q", requests, output.String())
 	}
 }
