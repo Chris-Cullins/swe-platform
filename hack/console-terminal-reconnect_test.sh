@@ -16,6 +16,7 @@ cleanup() {
   if [[ "$result" != 0 ]]; then
     echo "FAIL: console-terminal stage=$STAGE exit=$result" >&2
     # Never dump page text, cookies, headers, API bodies, or URL queries.
+    browser eval 'window.terminalSocketSnapshot ? window.terminalSocketSnapshot() : {socketObserverAvailable:false}' >&2 || true
     browser eval '({path:location.pathname,login:!!document.querySelector("input[type=password]"),alert:!!document.querySelector("[role=alert]"),terminalRoots:document.querySelectorAll(".xterm").length,terminalStatus:[...document.querySelectorAll("[role=status]")].map(e=>e.textContent).filter(s=>/^Terminal: (Connecting|Connected|Disconnected|Connection error|Terminal data error)$/.test(s)),requests:performance.getEntriesByType("resource").slice(-12).map(e=>({path:new URL(e.name).pathname,status:e.responseStatus}))})' >&2 || true
   fi
   browser close >/dev/null 2>&1 || true
@@ -43,17 +44,50 @@ stage run-detail-render
 browser wait --text 'Task ·' >/dev/null
 # Observe native sockets without replacing transport, events, or xterm. Keep the
 # host reference so unmount checks detect leaked children even in detached DOM.
-browser eval --stdin >/dev/null <<'JS'
+browser eval --stdin >/dev/null <<'SOCKET_OBSERVER'
 window.terminalSockets = [];
 window.terminalInput = '';
+// Diagnostics only: first 8 sockets, first 16 events each, saturating counters.
+// Event kinds: 0 created, 1 open, 2 error, 3 close. Times are relative milliseconds.
+const socketRecords = [];
+const socketStarted = performance.now();
+let socketCount = 0, omittedSockets = 0, saturated = false;
+const increment = value => {
+  if (value === 65535) { saturated = true; return value; }
+  return value + 1;
+};
+const integer = (value, max) => Number.isInteger(value) && value >= 0 && value <= max ? value : null;
+const observeSocket = socket => {
+  socketCount = increment(socketCount);
+  if (socketRecords.length === 8) { omittedSockets = increment(omittedSockets); return; }
+  const record = {socket, events: [], eventCount: 0, omittedEvents: 0};
+  socketRecords.push(record);
+  const capture = (kind, event) => {
+    record.eventCount = increment(record.eventCount);
+    if (record.events.length === 16) { record.omittedEvents = increment(record.omittedEvents); return; }
+    record.events.push({kind, ms: Math.min(3600000, Math.max(0, Math.round(performance.now() - socketStarted))),
+      readyState: integer(socket.readyState, 3),
+      code: kind === 3 ? integer(event.code, 65535) : null,
+      clean: kind === 3 && typeof event.wasClean === 'boolean' ? event.wasClean : null});
+  };
+  capture(0);
+  socket.addEventListener('open', event => capture(1, event));
+  socket.addEventListener('error', event => capture(2, event));
+  socket.addEventListener('close', event => capture(3, event));
+};
+window.terminalSocketSnapshot = () => ({socketObserverAvailable: true, socketCount, omittedSockets, saturated,
+  sockets: socketRecords.map(record => ({readyState: integer(record.socket.readyState, 3),
+    eventCount: record.eventCount, omittedEvents: record.omittedEvents,
+    events: record.events.map(event => ({kind: event.kind, ms: event.ms, readyState: event.readyState,
+      code: event.code, clean: event.clean}))}))});
 window.WebSocket = class extends WebSocket {
-  constructor(...args) { super(...args); window.terminalSockets.push(this); }
+  constructor(...args) { super(...args); window.terminalSockets.push(this); observeSocket(this); }
   send(data) {
     if (ArrayBuffer.isView(data)) window.terminalInput += new TextDecoder().decode(data);
     super.send(data);
   }
 };
-JS
+SOCKET_OBSERVER
 stage terminal-open
 browser find role link click --name Terminal --exact >/dev/null
 browser wait --text 'Terminal: Connected' >/dev/null

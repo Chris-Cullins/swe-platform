@@ -191,7 +191,13 @@ runs both via `make` targets:
   Scroll the actual xterm screen into view and verify keyboard focus before typing; assert
   outbound fixture bytes, expanded shell output, and server disconnect as separate stages.
   Keep failure diagnostics stage-specific and credential-safe: paths, numeric HTTP statuses,
-  bounded terminal state, and DOM counts only, never cookies, response bodies, or page text.
+  bounded terminal state, DOM counts, and native socket lifecycle numbers only, never cookies,
+  response bodies, page text, socket payloads, close reasons, or full URLs/queries. The terminal
+  helper emits socket diagnostics only on failure: first eight sockets and sixteen events each,
+  relative milliseconds capped at one hour, counters saturated at 65535 with explicit overflow.
+  Event kinds are 0 created, 1 open, 2 error, 3 close; close code/cleanliness are not a root-cause
+  diagnosis. `ui/src/test/terminalDiagnostics.test.ts` executes the helper's exact observer and
+  failure snapshot expression to check lifecycle, bounds, and sensitive-field exclusion.
   `hack/console-run-diagnostic_test.sh` exercises the existing fake Codex failure through the
   exact Run API and embedded console, checking fixed diagnostic text and transcript navigation.
   It also checks Run-list State/Agent AND filters, clear/no-match, and exact UID card navigation.
@@ -256,6 +262,9 @@ runs both via `make` targets:
   declared-service portal allocation/proxy authorization and lifecycle fencing, process-scoped fake Claude, Amp, and Codex API-key delivery without ambient
   setup/resume/sandboxd exposure, and Secret-only sandboxd process/service-observation/portal
   capability tokens without Environment pod projection.
+  Fake Codex acceptance also checks opt-in `swe logs --readable` message/command/metadata/stderr
+  presentation without changing terminal Run outcome. Keep default NDJSON opaque; readable
+  interpretation and its bounded adversarial tests belong to `internal/adapters/codex`.
   Direct sandboxd acceptance RPCs always use the system-namespace policy-authorized relay
   to the Environment Pod IP, including on kindnet: direct Environment port-forward cannot
   reach gVisor's userspace listener. Relay cleanup is independent of runtime and CNI selection.

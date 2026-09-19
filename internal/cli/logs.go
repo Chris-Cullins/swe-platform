@@ -2,10 +2,12 @@ package cli
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 
+	"github.com/Chris-Cullins/swe-platform/internal/adapters/codex"
 	"github.com/Chris-Cullins/swe-platform/internal/controlplaneclient"
 	"github.com/spf13/cobra"
 	corev1 "k8s.io/api/core/v1"
@@ -45,7 +47,7 @@ Transcript and transcript-gap data remains adapter-owned JSON.`,
 			if len(args) == 0 {
 				return fmt.Errorf("an environment argument or --run is required")
 			}
-			for _, flag := range []string{"run-uid", "control-plane", "token", "after"} {
+			for _, flag := range []string{"run-uid", "control-plane", "token", "after", "readable"} {
 				if cmd.Flags().Changed(flag) {
 					return fmt.Errorf("--%s requires --run", flag)
 				}
@@ -58,6 +60,7 @@ Transcript and transcript-gap data remains adapter-owned JSON.`,
 	cmd.Flags().StringVar(&controlPlaneURL, "control-plane", os.Getenv("SWE_CONTROL_PLANE_URL"), "Control-plane base URL (or SWE_CONTROL_PLANE_URL; requires --run)")
 	cmd.Flags().StringVar(&token, "token", os.Getenv("SWE_CONTROL_PLANE_TOKEN"), "Control-plane bearer token (or SWE_CONTROL_PLANE_TOKEN; requires --run)")
 	cmd.Flags().StringVar(&cursor, "after", "", "Opaque transcript cursor to resume after (requires --run)")
+	cmd.Flags().Bool("readable", false, "Bounded readable Codex output; agent-reported, not platform verification (requires --run and --run-uid)")
 	return cmd
 }
 
@@ -101,6 +104,14 @@ func streamRunTranscript(cmd *cobra.Command, controlPlaneURL, token, namespace, 
 	client, err := controlplaneclient.New(controlPlaneURL, token, nil)
 	if err != nil {
 		return err
+	}
+	readable, _ := cmd.Flags().GetBool("readable")
+	if readable {
+		formatter := codex.NewTranscriptFormatter(cmd.OutOrStdout())
+		err := client.StreamRunTranscript(cmd.Context(), namespace, run, runUID, cursor, func(event controlplaneclient.SSEEvent) error {
+			return formatter.Write(event.Event, event.Data)
+		})
+		return errors.Join(err, formatter.Close())
 	}
 	return client.StreamRunTranscript(cmd.Context(), namespace, run, runUID, cursor, func(event controlplaneclient.SSEEvent) error {
 		return writeTranscriptOutput(cmd.OutOrStdout(), event)

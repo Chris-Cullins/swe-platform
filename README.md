@@ -972,6 +972,35 @@ complete block successfully emitted and the same expected Run UID. The UID is re
 explicitly so transcript-only RBAC does not gain a hidden base-Run read dependency.
 Invalid and expired cursors are reported rather than silently skipped.
 
+Add `--readable` to this exact-UID command for bounded Codex presentation:
+
+```sh
+swe --namespace my-project logs --run fix-flaky-42 --run-uid "$RUN_UID" --readable
+```
+
+Use the same explicit control-plane URL and bearer token as above; there is no Kubernetes
+fallback or base-Run lookup. The Codex-owned formatter recognizes completed agent messages,
+completed command items (command, aggregated output, status and nullable exit code), and
+thread/turn metadata from the pinned
+[`rust-v0.144.6` exec JSONL contract](https://github.com/openai/codex/blob/rust-v0.144.6/codex-rs/exec/src/exec_events.rs)
+and [producer examples](https://github.com/openai/codex/blob/rust-v0.144.6/codex-rs/exec/tests/event_processor_with_json_output.rs).
+This is pin-based compatibility, not a per-event version guarantee. Commands and outcomes
+are **agent-reported, not platform verification**; usage metadata is **not accounting**.
+
+The formatter reconstructs stdout/stderr by execution and absolute byte offsets, including
+split UTF-8 and verified overlaps. It retains up to 256 KiB each of partial line and replay
+window per stream, accepts envelopes up to 128 KiB and decoded chunks up to 64 KiB, and tracks
+at most 64 execution IDs (256 bytes each). After that execution budget it uses raw fallback.
+Each interpreted record/stderr line displays at most 16 KiB of sanitized content; each raw
+fallback displays at most 4 KiB, plus fixed labels/truncation notices. Total streamed output
+is not capped. Terminal controls (except newline/tab) and Unicode format controls are escaped.
+Unknown/malformed/oversized records, unsupported adapters, retired executions, and overlaps
+outside the verification window get explicit raw fallback. Store/client/process gaps flush
+incomplete lines and resume interpretation only after a newline; execution changes never join
+partial records. Process EOF can finish an unterminated JSON line; stopping the reader exposes
+any remaining partial line as raw. Fallback/truncation is not lossless: omit `--readable` for
+the unchanged opaque NDJSON and its cursors. Legacy Environment logs are unchanged.
+
 For compatibility, `swe logs <environment>` is not deprecated and still follows the
 current Environment pod's `environment` container using kubeconfig authentication. It
 does not read a Run transcript, and the CLI never infers a Run from a reusable
