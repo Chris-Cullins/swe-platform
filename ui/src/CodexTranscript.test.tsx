@@ -65,6 +65,14 @@ describe('bounded pinned Codex presentation', () => {
     }
   })
 
+  it('keeps a deeply nested invalid envelope from crashing raw fallback rendering', () => {
+    const nested = chunk(1, '')
+    if (nested.kind === 'event') nested.entry.data = JSON.parse('['.repeat(20000) + '0' + ']'.repeat(20000))
+    expect(parts([nested])[0]).toMatchObject({ raw: true, text: '[Envelope preview unavailable: cannot serialize retained data]' })
+    render(<CodexProcessOutput presentation={reduceCodexTranscript([nested]).get('1')!} />)
+    expect(screen.getByText('[Envelope preview unavailable: cannot serialize retained data]')).toBeInTheDocument()
+  })
+
   it.each(['server', 'client', 'process', 'execution', 'invalid', 'unsupported'])('never joins across %s boundaries', boundary => {
     const text = message('wrong join')
     const split = text.length - 5

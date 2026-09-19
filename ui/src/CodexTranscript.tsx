@@ -172,7 +172,10 @@ export function reduceCodexTranscript(timeline: readonly TranscriptRenderItem[])
     const c = entry.type === 'codex.process-output' && item.rawBytes <= ENVELOPE_LIMIT ? parseChunk(entry.data) : undefined
     if (!c) {
       boundary('invalid or unsupported Codex envelope', p)
-      raw(p, 'invalid, oversized or unsupported Codex envelope', JSON.stringify(entry.data))
+      let preview: string
+      try { preview = JSON.stringify(entry.data) ?? '[Missing envelope data]' }
+      catch { preview = '[Envelope preview unavailable: cannot serialize retained data]' }
+      raw(p, 'invalid, oversized or unsupported Codex envelope', preview)
       previous = p; continue
     }
     p.location = `Execution ${safeText(c.executionId, 256)} · ${c.stream} · bytes ${c.offset}-${c.nextOffset}`
