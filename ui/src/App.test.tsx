@@ -43,6 +43,74 @@ describe('App frozen API integration', () => {
     expect(await screen.findByRole('heading', { name: 'SWE Operations' })).toBeInTheDocument()
   })
 
+  it('defaults attention off and matches CLI membership for every state with both cancellation values', async () => {
+    const cases: [string, boolean, boolean][] = [
+      ['Failed', true, true], ['Succeeded', true, true], ['NeedsInput', true, false], ['Paused', true, false],
+      ['Cancelled', false, false], ['Allocating', false, false], ['EnvironmentReady', false, false],
+      ['AdapterAccepted', false, false], ['Running', false, false], ['', true, true], ['FutureState', true, true],
+    ]
+    const items = cases.flatMap(([state, uncancelled, cancelling], index) => [false, true].map(cancelRequested => ({
+      ...run, name: `case-${index}-${cancelRequested}`, uid: `${index}-${cancelRequested}`, state, cancelRequested,
+      agent: 'amp', promptPreview: 'Membership fixture', expected: cancelRequested ? cancelling : uncancelled,
+    })))
+    const fetch = vi.spyOn(globalThis, 'fetch').mockImplementation(async path => {
+      if (path === '/api/v1/session') return response({ authenticated: true, username: 'alex' })
+      if (String(path).includes('watch=true')) return new Response(new ReadableStream())
+      if (path === '/api/v1/namespaces/default/runs?limit=200&view=summary') return response({ items, resourceVersion: '1' })
+      throw new Error(`Unexpected request: ${path}`)
+    })
+    show('/namespaces/default/runs')
+    await screen.findByText(items[0].name)
+    const checkbox = screen.getByRole('checkbox', { name: 'Attention candidates' })
+    expect(checkbox).not.toBeChecked()
+    expect(checkbox).toHaveAccessibleDescription(/reported state.*intentional pauses and retained successes.*not a review acknowledgement or an input channel/)
+    expect(screen.getByRole('button', { name: 'Clear filters' })).toBeDisabled()
+    for (const item of items) expect(screen.getByText(item.name)).toBeInTheDocument()
+    await userEvent.click(checkbox)
+    for (const item of items) expect(!!screen.queryByText(item.name)).toBe(item.expected)
+    await userEvent.selectOptions(screen.getByLabelText('State'), 'Running')
+    expect(screen.getByText('No runs match the filters.')).toBeInTheDocument()
+    await userEvent.selectOptions(screen.getByLabelText('State'), 'Succeeded')
+    for (const item of items) expect(!!screen.queryByText(item.name)).toBe(item.state === 'Succeeded')
+    await userEvent.click(screen.getByRole('button', { name: 'Clear filters' }))
+    expect(checkbox).not.toBeChecked()
+    for (const item of items) expect(screen.getByText(item.name)).toBeInTheDocument()
+    expect(fetch).toHaveBeenCalledTimes(3) // Session, one summary snapshot, one watch; no detail reads.
+  })
+
+  it('retains attention through live cancellation updates and reconnect without narrowing agent options', async () => {
+    const paused: RunSummary = { ...run, name: 'paused-task', uid: 'paused', state: 'Paused', agent: 'amp', promptPreview: 'Paused task' }
+    const active: RunSummary = { ...run, name: 'active-task', uid: 'active', agent: 'active-only', promptPreview: 'Active task' }
+    let stream!: ReadableStreamDefaultController<Uint8Array>
+    const fetch = vi.spyOn(globalThis, 'fetch').mockImplementation(async path => {
+      if (path === '/api/v1/session') return response({ authenticated: true, username: 'alex' })
+      if (String(path).includes('watch=true')) return new Response(new ReadableStream({ start(controller) { stream = controller } }))
+      if (path === '/api/v1/namespaces/default/runs?limit=200&view=summary') return response({ items: [paused, active], resourceVersion: '1' })
+      throw new Error(`Unexpected request: ${path}`)
+    })
+    show('/namespaces/default/runs')
+    await screen.findByText('paused-task')
+    const checkbox = screen.getByRole('checkbox', { name: 'Attention candidates' })
+    await userEvent.click(checkbox)
+    expect(screen.queryByText('active-task')).not.toBeInTheDocument()
+    expect(screen.getByRole('option', { name: 'active-only' })).toBeInTheDocument()
+    await act(async () => stream.enqueue(new TextEncoder().encode(`event: run\nid: 2\ndata: ${JSON.stringify({ type: 'MODIFIED', resourceVersion: '2', run: { ...paused, cancelRequested: true } })}\n\n`)))
+    expect(await screen.findByText('No runs match the filters.')).toBeInTheDocument()
+    vi.useFakeTimers()
+    await act(async () => stream.error(new Error('Disconnected')))
+    expect(screen.getByText('Live updates disconnected; reconnecting…')).toBeInTheDocument()
+    expect(screen.getByText('No runs match the filters.')).toBeInTheDocument()
+    expect(checkbox).toBeChecked()
+    await act(async () => { await vi.advanceTimersByTimeAsync(1001) })
+    expect(screen.queryByText('Live updates disconnected; reconnecting…')).not.toBeInTheDocument()
+    expect(checkbox).toBeChecked()
+    await act(async () => stream.enqueue(new TextEncoder().encode(`event: run\nid: 3\ndata: ${JSON.stringify({ type: 'MODIFIED', resourceVersion: '3', run: { ...paused, state: 'Succeeded', cancelRequested: true } })}\n\n`)))
+    await act(async () => { await vi.advanceTimersByTimeAsync(0) })
+    expect(screen.getByText('paused-task')).toBeInTheDocument()
+    expect(fetch).toHaveBeenCalledTimes(4) // Only the existing watch reconnects; no relist or detail reads.
+    expect(new Headers(fetch.mock.calls[3][1]?.headers).get('Last-Event-ID')).toBe('2')
+  })
+
   it('filters the complete live feed with exact AND matches and preserves replacement UID navigation', async () => {
     const items: RunSummary[] = [
       { ...run, name: 'running-amp', uid: 'a', agent: 'amp', promptPreview: 'Running task' },
@@ -66,6 +134,8 @@ describe('App frozen API integration', () => {
     show('/namespaces/default/runs')
     await screen.findByText('future')
     expect(screen.getByText('FutureState')).toBeInTheDocument()
+    await userEvent.click(screen.getByRole('checkbox', { name: 'Attention candidates' }))
+    expect(screen.queryByText('running-amp')).not.toBeInTheDocument()
     await userEvent.selectOptions(screen.getByLabelText('State'), 'Failed')
     expect(screen.getByText('failed-codex')).toBeInTheDocument()
     expect(screen.queryByText('running-amp')).not.toBeInTheDocument()
@@ -90,13 +160,19 @@ describe('App frozen API integration', () => {
     expect(screen.getByLabelText('Agent')).toHaveValue('amp')
     for (const item of [items[1], items[3]]) await publish('ADDED', item)
     expect(await screen.findByText('No runs match the filters.')).toBeInTheDocument()
+    expect(screen.getByRole('checkbox', { name: 'Attention candidates' })).toBeChecked()
     await userEvent.click(screen.getByRole('button', { name: 'Clear filters' }))
+    expect(screen.getByRole('checkbox', { name: 'Attention candidates' })).not.toBeChecked()
+    expect(screen.getByLabelText('State')).toHaveValue('')
+    expect(screen.getByLabelText('Agent')).toHaveValue('')
     expect(screen.getByText('failed-codex')).toBeInTheDocument()
     expect(screen.getByText('future')).toBeInTheDocument()
     expect(screen.queryByRole('option', { name: 'amp' })).not.toBeInTheDocument()
     await publish('ADDED', { ...items[2], uid: 'replacement-uid' })
     await userEvent.selectOptions(screen.getByLabelText('State'), 'Failed')
     await userEvent.selectOptions(screen.getByLabelText('Agent'), 'amp')
+    await userEvent.click(screen.getByRole('checkbox', { name: 'Attention candidates' }))
+    expect(fetch).toHaveBeenCalledTimes(4) // Session, two pages, one watch; filters never fetch details.
     await userEvent.click(screen.getByRole('link', { name: /failed-amp/ }))
     expect(await screen.findByText('replacement-uid')).toBeInTheDocument()
     expect(fetch.mock.calls.filter(([path]) => String(path).includes('watch=true'))).toHaveLength(1)
@@ -122,6 +198,7 @@ describe('App frozen API integration', () => {
     expect(await screen.findByText('repair-ui')).toBeInTheDocument()
     await userEvent.selectOptions(screen.getByLabelText('State'), 'Failed')
     await userEvent.selectOptions(screen.getByLabelText('Agent'), 'amp')
+    await userEvent.click(screen.getByRole('checkbox', { name: 'Attention candidates' }))
     expect(screen.getByText('No runs match the filters.')).toBeInTheDocument()
     act(() => { void client.invalidateQueries({ queryKey: queryKeys.runs('default') }) })
     await waitFor(() => expect(defaultRequests).toBe(2))
@@ -131,6 +208,7 @@ describe('App frozen API integration', () => {
     expect(await screen.findByText('Loading runs…')).toBeInTheDocument()
     expect(screen.getByLabelText('State')).toHaveValue('')
     expect(screen.getByLabelText('Agent')).toHaveValue('')
+    expect(screen.getByRole('checkbox', { name: 'Attention candidates' })).not.toBeChecked()
     expect(screen.queryByRole('option', { name: 'amp' })).not.toBeInTheDocument()
     expect(screen.queryByText('repair-ui')).not.toBeInTheDocument()
     resolveOther(response({ items: [otherRun] }))
