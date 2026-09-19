@@ -241,6 +241,8 @@ runs both via `make` targets:
   the embedded console entry point/SPA fallback/static assets, typed Run
   list/get/create/idempotent-create-recovery/cancel, Environment get, transcript SSE, terminal attach, and
   read-only `swe list-runs` summary filtering (exact state/agent AND, no new API),
+  `swe attention` prompt-free reported-state candidates (summary-only, exact bucket/agent AND,
+  command-local 30-second deadline; not diagnostic causes, review state or notifications),
   exact `swe describe-run` diagnostics, prompt-free human output, and stale-UID rejection,
   Pi/profile capability rejection without binding/allocation and its fixed safe diagnostic,
   the local stdio MCP tool list plus UID-fenced bounded transcript read,
