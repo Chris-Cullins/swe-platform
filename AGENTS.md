@@ -199,7 +199,9 @@ runs both via `make` targets:
   diagnosis. `ui/src/test/terminalDiagnostics.test.ts` executes the helper's exact observer and
   failure snapshot expression to check lifecycle, bounds, and sensitive-field exclusion.
   `hack/console-run-diagnostic_test.sh` exercises the existing fake Codex failure through the
-  exact Run API and embedded console, checking fixed diagnostic text and transcript navigation.
+  exact Run API and embedded console, checking fixed diagnostic text, unavailable/not-collected
+  platform usage, and transcript navigation. Human usage must not present zero or nonzero raw
+  compatibility fields as measured totals; preserve lifecycle timestamps and raw DTO values.
   It also checks Run-list State/Agent/Attention candidates AND filters, default-off attention,
   clear/no-match, and exact UID card navigation. Attention must match the CLI's default
   reported-state membership over the existing feed only, preserving terminal/unknown cancellation
