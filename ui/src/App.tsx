@@ -327,7 +327,7 @@ function Overview() {
     <h2>Operational conditions</h2><table><thead><tr><th>Exposed fact</th><th>Status</th></tr></thead><tbody>
       <tr><td>Cancellation requested</td><td>{run.cancelRequested ? 'Yes' : 'No'}</td></tr>
       <tr><td>Environment allocated</td><td>{run.environment ? 'Yes' : 'No'}</td></tr>
-      {environmentUID && <><tr><td>Environment ready</td><td>{environment.isPending ? 'Loading…' : env?.ready ? 'Yes' : 'No'}</td></tr><tr><td>Environment paused</td><td>{environment.isPending ? 'Loading…' : env?.paused ? 'Yes' : 'No'}</td></tr></>}
+      {environmentUID && <><tr><td>Environment ready</td><td>{environment.isPending ? 'Loading…' : environment.error || !env ? 'Unavailable' : env.ready ? 'Yes' : 'No'}</td></tr><tr><td>Environment paused</td><td>{environment.isPending ? 'Loading…' : environment.error || !env ? 'Unavailable' : env.paused ? 'Yes' : 'No'}</td></tr></>}
     </tbody></table>
     <h2>Environment</h2>{!run.environment ? <p>Not allocated.</p> : !environmentUID ? <p role="status">Exact Environment identity unavailable.</p> : environment.error ? <Failure error={environment.error} /> : <dl className="facts"><dt>Name</dt><dd>{run.environment.name}</dd><dt>Ownership</dt><dd>{run.environment.ownership}</dd><dt>Phase</dt><dd>{env?.phase || 'Loading…'}</dd><dt>Backend</dt><dd>{env?.backend || 'Loading…'}</dd><dt>Template</dt><dd>{env?.template || 'Loading…'}</dd><dt>Status</dt><dd>{env ? `${env.ready ? 'Ready' : 'Not ready'}, ${env.paused ? 'paused' : 'active'}` : 'Loading…'}</dd></dl>}
     {!isTerminal(run.state) && !run.cancelRequested && (confirmCancel ? <section className="card" aria-label="Confirm cancellation">
