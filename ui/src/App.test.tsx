@@ -619,10 +619,79 @@ describe('App frozen API integration', () => {
     act(() => { void client.invalidateQueries({ queryKey: queryKeys.environment('default', 'repair-env', 'env-uid') }) })
     await act(async () => { await vi.advanceTimersByTimeAsync(1); await Promise.resolve() })
     expect(screen.getByRole('alert')).toHaveTextContent('different Environment identity')
+    expect(screen.getByRole('row', { name: 'Environment ready Unavailable' })).toBeInTheDocument()
+    expect(screen.getByRole('row', { name: 'Environment paused Unavailable' })).toBeInTheDocument()
+    expect(screen.getByRole('row', { name: 'Environment allocated Yes' })).toBeInTheDocument()
     const settled = environments
     act(() => { focusManager.setFocused(false); focusManager.setFocused(true); onlineManager.setOnline(false); onlineManager.setOnline(true) })
     await act(async () => { await vi.advanceTimersByTimeAsync(8001); await Promise.resolve() })
     expect(environments).toBe(settled)
+  })
+
+  it.each([[false, false], [true, true], [true, false]])('keeps Environment conditions loading until exact ready=%s paused=%s facts arrive', async (ready, paused) => {
+    let resolveEnvironment!: (value: Response) => void
+    const pending = new Promise<Response>(resolve => { resolveEnvironment = resolve })
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async path => {
+      if (path === '/api/v1/session') return response({ authenticated: true, username: 'alex' })
+      if (String(path).includes('/environments/')) {
+        expect(String(path)).toBe('/api/v1/namespaces/default/environments/repair-env')
+        return pending
+      }
+      return response({ ...run, state: 'Succeeded' })
+    })
+    show('/namespaces/default/runs/repair-ui/overview', { runUID: run.uid })
+    expect(await screen.findByRole('row', { name: 'Environment ready Loading…' })).toBeInTheDocument()
+    expect(screen.getByRole('row', { name: 'Environment paused Loading…' })).toBeInTheDocument()
+    expect(screen.getByRole('row', { name: 'Environment allocated Yes' })).toBeInTheDocument()
+    await act(async () => { resolveEnvironment(response({ ...environment, ready, paused })) })
+    expect(await screen.findByRole('row', { name: `Environment ready ${ready ? 'Yes' : 'No'}` })).toBeInTheDocument()
+    expect(screen.getByRole('row', { name: `Environment paused ${paused ? 'Yes' : 'No'}` })).toBeInTheDocument()
+  })
+
+  it.each([403, 404, 409, 503])('keeps Environment facts unavailable after exact HTTP %s, without name fallback', async status => {
+    vi.useFakeTimers()
+    let reads = 0
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async path => {
+      if (path === '/api/v1/session') return response({ authenticated: true, username: 'alex' })
+      if (String(path).includes('/environments/')) {
+        reads++
+        expect(String(path)).toBe('/api/v1/namespaces/default/environments/repair-env')
+        return response({ title: `Environment read failed ${status}`, status }, status)
+      }
+      return response({ ...run, state: 'Succeeded' })
+    })
+    show('/namespaces/default/runs/repair-ui/overview', { runUID: run.uid })
+    await act(async () => { await vi.advanceTimersByTimeAsync(3100) })
+    expect(reads).toBe(status === 503 ? 3 : 1)
+    expect(screen.getByRole('alert')).toHaveTextContent(`Environment read failed ${status}`)
+    expect(screen.getByRole('row', { name: 'Environment ready Unavailable' })).toBeInTheDocument()
+    expect(screen.getByRole('row', { name: 'Environment paused Unavailable' })).toBeInTheDocument()
+    expect(screen.getByRole('row', { name: 'Environment allocated Yes' })).toBeInTheDocument()
+    await act(async () => { await vi.advanceTimersByTimeAsync(8000) })
+    expect(reads).toBe(status === 503 ? 3 : 1)
+  })
+
+  it('does not present retained Environment data as current facts after a failed refresh', async () => {
+    let reads = 0
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async path => {
+      if (path === '/api/v1/session') return response({ authenticated: true, username: 'alex' })
+      if (String(path).includes('/environments/')) {
+        expect(String(path)).toBe('/api/v1/namespaces/default/environments/repair-env')
+        return ++reads === 1 ? response({ ...environment, ready: true, paused: true }) : response({ title: 'Forbidden', status: 403 }, 403)
+      }
+      return response({ ...run, state: 'Succeeded' })
+    })
+    const { client } = show('/namespaces/default/runs/repair-ui/overview', { runUID: run.uid })
+    expect(await screen.findByRole('row', { name: 'Environment ready Yes' })).toBeInTheDocument()
+    expect(screen.getByRole('row', { name: 'Environment paused Yes' })).toBeInTheDocument()
+    const key = queryKeys.environment('default', 'repair-env', 'env-uid')
+    await act(async () => { await client.invalidateQueries({ queryKey: key, exact: true }) })
+    expect(await screen.findByRole('alert')).toHaveTextContent('Forbidden')
+    expect(client.getQueryData<Environment>(key)).toMatchObject({ ready: true, paused: true })
+    expect(screen.getByRole('row', { name: 'Environment ready Unavailable' })).toBeInTheDocument()
+    expect(screen.getByRole('row', { name: 'Environment paused Unavailable' })).toBeInTheDocument()
+    expect(screen.getByRole('row', { name: 'Environment allocated Yes' })).toBeInTheDocument()
+    expect(reads).toBe(2)
   })
 
   it('hides and revokes terminal navigation when the exact association is unavailable', async () => {
