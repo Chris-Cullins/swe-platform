@@ -54,6 +54,27 @@ func TestTUIModelListDetailCancelAndFreeFormCreate(t *testing.T) {
 	}
 }
 
+func TestTUIDetailUsageUnavailable(t *testing.T) {
+	for _, usage := range []controlplane.RunUsage{{}, {CPUSeconds: 42, TokensIn: 1234, TokensOut: 567}} {
+		client, _ := controlplaneclient.New("http://control.test", "token", &http.Client{})
+		model := newTUIModel(context.Background(), client, "team-a")
+		model.mode, model.width, model.height = tuiDetail, 80, 30
+		started := time.Date(2026, 7, 19, 12, 1, 0, 0, time.UTC)
+		finished := started.Add(time.Hour)
+		model.run = &controlplane.Run{Name: "usage-fixture", State: "Succeeded", Usage: usage, StartedAt: &started, FinishedAt: &finished}
+		view := model.View()
+		if !strings.Contains(view, "Usage: unavailable (not collected)") || strings.Contains(view, "Usage: CPU") || strings.Contains(view, "tokens") {
+			t.Fatalf("placeholder usage displayed as measured: %s", view)
+		}
+		if !strings.Contains(view, "Started: 2026-07-19T12:01:00Z") || !strings.Contains(view, "Finished: 2026-07-19T13:01:00Z") {
+			t.Fatalf("lifecycle timestamps missing: %s", view)
+		}
+		if model.run.Usage != usage {
+			t.Fatal("rendering changed raw usage")
+		}
+	}
+}
+
 func TestTUIDetailDiagnosticAndRefresh(t *testing.T) {
 	client, _ := controlplaneclient.New("http://control.test", "token", &http.Client{})
 	model := newTUIModel(context.Background(), client, "team-a")

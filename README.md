@@ -827,10 +827,13 @@ confirmed cancellation, `t` to attach to the selected Run's allocated Environmen
 refresh, and `q` to quit. The create form accepts a free-form agent adapter name and uses Tab
 to move between fields and Ctrl-S to submit. Esc returns or closes a form; Ctrl-] detaches an
 attached terminal and restores the dashboard. Run details show normalized status, lifecycle
-wall-time timestamps (started/finished), and usage, Environment readiness/pause state, and a
+wall-time timestamps (started/finished), Environment readiness/pause state, and a
 bounded raw transcript view. Transcript source, type,
 payload, and retention gaps are displayed generically; adapter-owned payloads are not parsed as
-a common event schema. Both consoles show a fixed, safe status explanation and next action for
+a common event schema. Both consoles label platform usage unavailable/not collected, regardless
+of zero or nonzero compatibility values in the raw API. Lifecycle timestamps are not active
+compute duration; Codex transcript usage remains agent-reported, not accounting.
+Both consoles show a fixed, safe status explanation and next action for
 recognized provisioning, adapter-failure, paused, and input-needed conditions. Unknown or stale
 conditions show no inferred cause; inspect the transcript or contact an administrator. These
 diagnostics do not expose raw controller/provider messages or add retry/resume capabilities.

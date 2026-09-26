@@ -503,19 +503,27 @@ describe('App frozen API integration', () => {
     await waitFor(() => expect(screen.getAllByTestId('location').at(-1)).toHaveTextContent('/namespaces/default/runs'))
   })
 
-  it('renders exact Run usage, operational facts, environment status and ownership', async () => {
+  it.each([
+    { cpuSeconds: 0, tokensIn: 0, tokensOut: 0 },
+    { cpuSeconds: 12.5, tokensIn: 101, tokensOut: 202 },
+  ])('marks placeholder usage $cpuSeconds/$tokensIn/$tokensOut unavailable while preserving lifecycle facts', async usage => {
+    const current = { ...run, usage, finishedAt: '2026-07-19T13:02:00Z' }
     vi.spyOn(globalThis, 'fetch').mockImplementation(async path => {
       if (path === '/api/v1/session') return response({ authenticated: true, username: 'alex' })
       if (String(path).includes('/environments/')) return response(environment)
-      return response(run)
+      return response(current)
     })
-    show('/namespaces/default/runs/repair-ui/overview')
+    const { client } = show('/namespaces/default/runs/repair-ui/overview')
     expect(await screen.findByRole('heading', { name: 'Operational conditions' })).toBeInTheDocument()
     await waitFor(() => expect(screen.getByText('Ready, active')).toBeInTheDocument())
-    expect(screen.getByText('12.5')).toBeInTheDocument()
-    expect(screen.getByText('101')).toBeInTheDocument()
-    expect(screen.getByText('202')).toBeInTheDocument()
+    expect(screen.getByRole('region', { name: 'Usage' }).textContent).toBe('UsageUnavailable — platform usage is not collected.')
+    expect(screen.queryByText('CPU seconds')).not.toBeInTheDocument()
+    expect(screen.queryByText('Tokens in')).not.toBeInTheDocument()
+    expect(screen.queryByText('Tokens out')).not.toBeInTheDocument()
+    expect(client.getQueryData<Run>(queryKeys.run('default', run.name, run.uid))?.usage).toEqual(usage)
+    expect(screen.getByText('2026-07-19T12:00:00Z')).toBeInTheDocument()
     expect(screen.getByText('2026-07-19T12:01:00Z')).toBeInTheDocument()
+    expect(screen.getByText('2026-07-19T13:02:00Z')).toBeInTheDocument()
     expect(screen.getByText('Owned')).toBeInTheDocument()
     expect(screen.getByRole('link', { name: 'Changes' })).toHaveAttribute('href', '/namespaces/default/runs/repair-ui/changes')
   })

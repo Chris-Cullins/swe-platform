@@ -376,7 +376,9 @@ profile/Secret reads or disclosure of their names, existence, or validity in the
 All other credential-specific failure diagnostics and raw operator errors remain excluded. Next actions
 are read-only guidance, not retry/resume/input capabilities; agent detail remains in transcripts.
 
-`Run.status.usage` is currently an unwritten compatibility placeholder. Lifecycle wall duration
+`Run.status.usage` is currently an unwritten compatibility placeholder. Human TUI and console
+Overview label usage unavailable/not collected for both zero and nonzero values; raw API/CRD/JSON
+compatibility values remain unchanged and have no accounting provenance. Lifecycle wall duration
 is derivable as `FinishedAt - StartedAt`; it includes `Paused` and `NeedsInput` intervals and is
 unavailable for Runs that were never accepted because `StartedAt` remains absent. Usage-, token-,
 or cost-looking provider data in transcript events remains adapter-owned opaque bytes. The

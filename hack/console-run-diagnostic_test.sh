@@ -53,9 +53,12 @@ browser wait --fn "location.pathname.endsWith('/runs/$RUN_NAME/overview') && his
 browser set viewport 1280 900 2 >/dev/null
 browser wait --text 'The agent reported a failure.' >/dev/null
 browser wait --text 'Review the transcript for agent-reported details before starting another run.' >/dev/null
+stage usage-unavailable
+browser wait --text 'Unavailable — platform usage is not collected.' >/dev/null
+browser eval "(() => { const usage = document.querySelector('[aria-label=\"Usage\"]'); if (usage?.textContent !== 'UsageUnavailable — platform usage is not collected.' || usage.querySelector('dl')) throw new Error('Placeholder usage rendered as measured'); })()" >/dev/null
 if [[ -n "$SCREENSHOT" ]]; then browser screenshot "$SCREENSHOT" >/dev/null; fi
 stage review-transcript
 browser find role link click --name 'Review transcript' --exact >/dev/null
 browser wait --fn "location.pathname.endsWith('/runs/$RUN_NAME/transcript') && !!document.querySelector('[aria-label=\"Run status\"]')" >/dev/null
 browser wait --text 'Task ·' >/dev/null
-echo 'PASS: Run filters, clear/no-match, exact UID navigation, safe failure diagnostic, next action, transcript navigation, and task context'
+echo 'PASS: Run filters, clear/no-match, exact UID navigation, safe failure diagnostic, unavailable usage, next action, transcript navigation, and task context'

@@ -691,7 +691,7 @@ func (m *tuiModel) renderDetail(body *strings.Builder, width int) {
 	} else {
 		body.WriteString("Finished: —\n")
 	}
-	fmt.Fprintf(body, "Usage: CPU %ds • tokens %d in / %d out\n", run.Usage.CPUSeconds, run.Usage.TokensIn, run.Usage.TokensOut)
+	body.WriteString("Usage: unavailable (not collected)\n")
 	if run.Environment == nil {
 		body.WriteString("Environment: not allocated\n")
 	} else if m.env == nil {
