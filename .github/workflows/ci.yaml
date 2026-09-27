@@ -89,6 +89,9 @@ jobs:
       - name: Test root module
         run: go test ./...
 
+      - name: Inert egress publication API-server semantics
+        run: SWE_TEST_EGRESS_APISERVER=1 go test ./internal/egresspod -run '^TestPublicationAPIServer$' -count=1 -v
+
       - name: Build sandboxd
         working-directory: sandboxd
         run: go build ./...

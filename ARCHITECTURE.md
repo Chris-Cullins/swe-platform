@@ -1086,11 +1086,18 @@ certificate fingerprint, and canonical claims. Future wiring may issue and creat
 UID-bound credential only after validation, then remove the gate; no unbound credential is ever
 placed in a runnable Pod. The foundation's issuer returns one immutable exact-Pod-owned Secret
 containing the mutually verified client certificate, matching private key, client trust copy,
-and canonical claims plus a private issuance binding. Future wiring must successfully create
-(never adopt, including on `AlreadyExists`) that Secret, seal the private binding exactly once
-with the UID/resourceVersion from that successful CREATE response, uncached-reread the Secret,
-revalidate the exact sealed identity and still-gated Pod, and only then UID/resourceVersion-fence
-gate removal. A GET, adoption, empty create identity, mismatched response, or reseal fails closed.
+and canonical claims plus a private issuance binding. The inert `PublishCredential` transaction
+now implements successful CREATE (never adoption, including on `AlreadyExists`), one-time sealing
+with the returned UID/resourceVersion, uncached Secret/Pod re-reads and exact binding validation.
+One UID/resourceVersion-guarded Pod JSON patch publishes matching execution/policy/forwarder/
+fingerprint annotations, preserves unrelated annotations, and removes only the identity gate.
+Deleting, replaced, changed, or identity-less observations fail closed. It performs no write retry
+or cleanup, and a lost binding cannot be recovered by adopting a GET. Fixed, credential-free
+errors distinguish uncertain CREATE/release responses: a lost release response does not establish
+either success or a still-gated Pod. This is not cross-object atomicity; Secret or authority changes
+after validation still require future live checks and ordered fencing. No controller or command
+calls the transaction. Disposable Kubernetes API-server tests verify real UID/resourceVersion
+guards and scheduling-gate semantics, not scheduling, sidecar execution or network enforcement.
 The helper mounts per-execution client cert/key and the separate
 administrator-owned proxy server CA only in the forwarder, uses a fixed non-root, read-only,
 drop-all security context and bounded resources, and injects loopback proxy variables while
