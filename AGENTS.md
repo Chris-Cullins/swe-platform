@@ -106,7 +106,11 @@ offboarding ship; destructive Project purge remains open. Preserve these boundar
   the final tunnel lease closes.
   `internal/egressidentity/` and `internal/egresspod/` are likewise inert contract foundations;
   do not wire them into reconciliation or relax the non-empty allowlist fence before the complete
-  restricted runtime is atomically enabled. The exact adapter contract boundary is
+  restricted runtime is atomically enabled. The unused `egresspod.PublishCredential` transaction
+  creates and seals an exact-Pod Secret, uncached-revalidates it, and UID/resourceVersion-guards
+  annotation publication and gate removal. Preserve its no-adoption/no-retry behavior and explicit
+  uncertain write outcomes; it provides neither cross-object atomicity nor live runtime authority.
+  The exact adapter contract boundary is
   `internal/agent/`. Shared fenced Environment intent
   publication and validation belongs in `internal/lifecycle/`; controllers remain
   the sole owners of observed lifecycle transitions. Environment reconciliation is split
@@ -163,6 +167,12 @@ runs both via `make` targets:
   failure diagnostics) · **Vet:** `make vet`.
   PostgreSQL transcript/session integration tests
   run when `SWE_TEST_POSTGRES_URL` points to a disposable database; CI supplies PostgreSQL 17.
+  Run `SWE_TEST_EGRESS_APISERVER=1 go test ./internal/egresspod -run '^TestPublicationAPIServer$' -count=1 -v`
+  for the inert publication transaction's real API checks. This downloads pinned Kubernetes v1.35.0
+  envtest binaries into a temporary directory and starts disposable loopback API-server/etcd
+  processes, explicitly refusing existing-cluster mode. No scheduler, kubelet, provider, or live
+  conformance runner is involved. Ordinary tests skip it unless opted in; `build-test` CI runs it
+  in a separate required step. Fake-client tests are not scheduling-gate/UID/resourceVersion proof.
   The required `build-test` CI job runs the root and sandboxd Go suites plus
   the five shell checks above, mirroring `make test`. E2E EXIT diagnostics preserve the original
   failure before cleanup, emitting only numeric location and fixed forward process/log indicators
