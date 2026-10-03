@@ -265,6 +265,9 @@ manage_observation_listener() {
 		--labels='app.kubernetes.io/name=swe-platform,app.kubernetes.io/instance=swe-platform,app.kubernetes.io/component=control-plane' \
 		-- sh -c "exec nc -ll -p 50051 -e nc '$pod_ip' 50051"
 	kubectl -n "$SYSTEM_NAMESPACE" wait --for=condition=Ready pod/swe-sandboxd-relay --timeout=30s
+	# Clear prior readiness in the parent before the background shell can race
+	# the first grep; its own redirection may not have executed yet.
+	: >/tmp/swe-platform-observation-port-forward.log
 	kubectl -n "$SYSTEM_NAMESPACE" port-forward pod/swe-sandboxd-relay 15052:50051 >/tmp/swe-platform-observation-port-forward.log 2>&1 &
 	SANDBOXD_PORT_FORWARD_PID=$!
 	for _ in $(seq 1 30); do
@@ -274,7 +277,6 @@ manage_observation_listener() {
 		sleep 1
 	done
 	if ! grep -q 'Forwarding from' /tmp/swe-platform-observation-port-forward.log; then
-		cat /tmp/swe-platform-observation-port-forward.log >&2
 		echo "FAIL: sandboxd observation port-forward did not become ready" >&2
 		return 1
 	fi

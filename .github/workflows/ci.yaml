@@ -119,6 +119,9 @@ jobs:
       - name: Safe E2E forward failure evidence
         run: ./hack/e2e-forward-diagnostics_test.sh
 
+      - name: Observation forward launch ordering
+        run: ./hack/e2e-observation-forward_test.sh
+
       - name: Generated code is current
         run: |
           make generate manifests
