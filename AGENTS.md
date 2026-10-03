@@ -163,8 +163,8 @@ runs both via `make` targets:
   `RUN_SYSTEM_NAMESPACE`, and `RUN_INSTALLATION_NAME`; scoped mode also takes a
   space-separated `RUN_TENANCY_NAMESPACES` list.
 - **Unit tests:** `make test` (including rendered Helm RBAC, Argo port-forward, BYOC
-  production-preset checks, the disabled egress-conformance guard, and safe E2E forward
-  failure diagnostics) · **Vet:** `make vet`.
+  production-preset checks, the disabled egress-conformance guard, safe E2E forward
+  failure diagnostics, and observation-forward launch ordering) · **Vet:** `make vet`.
   PostgreSQL transcript/session integration tests
   run when `SWE_TEST_POSTGRES_URL` points to a disposable database; CI supplies PostgreSQL 17.
   Run `SWE_TEST_EGRESS_APISERVER=1 go test ./internal/egresspod -run '^TestPublicationAPIServer$' -count=1 -v`
@@ -174,10 +174,13 @@ runs both via `make` targets:
   conformance runner is involved. Ordinary tests skip it unless opted in; `build-test` CI runs it
   in a separate required step. Fake-client tests are not scheduling-gate/UID/resourceVersion proof.
   The required `build-test` CI job runs the root and sandboxd Go suites plus
-  the five shell checks above, mirroring `make test`. E2E EXIT diagnostics preserve the original
+  the six shell checks above, mirroring `make test`. E2E EXIT diagnostics preserve the original
   failure before cleanup, emitting only numeric location and fixed forward process/log indicators
   from at most 64 KiB; never add raw logs, arguments, credentials or automatic retries. The
   diagnostic test executes the actual EXIT/cleanup path with sensitive sentinels and bounded inputs.
+  `hack/e2e-observation-forward_test.sh` executes the actual observation helper with a pre-redirection
+  scheduling barrier. Keep log initialization synchronous before launch so stale readiness cannot
+  satisfy a new forward; preserve its 30 polls and fixed failure text without dumping raw logs.
   The egress-conformance live runner remains
   default-off on its separate `hack/kind-calico-conformance.yaml` topology and must not be invoked
   by CI/e2e; only its guard test runs. Keep its temporary kind admin kubeconfig and Python bytecode
