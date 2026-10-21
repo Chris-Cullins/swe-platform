@@ -368,6 +368,9 @@ func decodeCreateRun(w http.ResponseWriter, r *http.Request) (CreateRunRequest, 
 		}
 	}
 	selector := request.Selector
+	if selector.ProjectUID != "" && (selector.Project == "" || selector.Environment != "" || len(selector.ProjectUID) > 128 || strings.TrimSpace(selector.ProjectUID) != selector.ProjectUID) {
+		return CreateRunRequest{}, fmt.Errorf("selector.projectUID requires project, excludes environment, and must be at most 128 bytes without surrounding whitespace")
+	}
 	if selector.Environment == "" && selector.Project == "" && selector.Template == "" {
 		return CreateRunRequest{}, fmt.Errorf("selector must set environment, project, or template")
 	}

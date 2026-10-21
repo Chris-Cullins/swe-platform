@@ -3,6 +3,7 @@ package controlplane
 import (
 	"context"
 	"errors"
+	"fmt"
 	"reflect"
 	"strings"
 	"time"
@@ -110,10 +111,13 @@ func (s *KubernetesResourceService) CreateRun(ctx context.Context, namespace str
 		},
 		Spec: desiredRunSpec(request),
 	}
-	if err := s.Client.Create(ctx, run); err != nil {
+	if err := s.Client.Create(ctx, run, &client.CreateOptions{FieldValidation: metav1.FieldValidationStrict}); err != nil {
 		// In particular, do not resolve AlreadyExists here: doing so would read an
 		// object before the handler has separately authorized that operation.
 		return Run{}, err
+	}
+	if request.Selector.ProjectUID != "" && run.Spec.ProjectUID != request.Selector.ProjectUID {
+		return Run{}, fmt.Errorf("server did not preserve exact Project selection")
 	}
 	return runDTO(run), nil
 }
@@ -173,6 +177,7 @@ func desiredRunSpec(request CreateRunRequest) platformv1alpha1.RunSpec {
 	return platformv1alpha1.RunSpec{
 		EnvironmentRef:       request.Selector.Environment,
 		ProjectRef:           request.Selector.Project,
+		ProjectUID:           request.Selector.ProjectUID,
 		TemplateRef:          request.Selector.Template,
 		Agent:                request.Agent,
 		Prompt:               request.Prompt,
@@ -267,6 +272,9 @@ func validateRunEnvironmentAssociation(ctx context.Context, reader client.Reader
 }
 
 func runOwnsOrClaimsEnvironment(run *platformv1alpha1.Run, environment *platformv1alpha1.Environment) bool {
+	if !platformv1alpha1.RunProjectBindingMatches(run, environment) {
+		return false
+	}
 	if run.Status.EnvironmentRef == nil || run.Status.EnvironmentRef.Name != environment.Name || run.Status.EnvironmentRef.UID != environment.UID {
 		return false
 	}
@@ -296,7 +304,7 @@ func runDTO(run *platformv1alpha1.Run) Run {
 		Generation: run.Generation,
 		CreatedAt:  run.CreationTimestamp.Time,
 		Intent: RunIntent{
-			Selector:             RunSelector{Environment: run.Spec.EnvironmentRef, Project: run.Spec.ProjectRef, Template: run.Spec.TemplateRef},
+			Selector:             RunSelector{Environment: run.Spec.EnvironmentRef, Project: run.Spec.ProjectRef, ProjectUID: run.Spec.ProjectUID, Template: run.Spec.TemplateRef},
 			Agent:                run.Spec.Agent,
 			Prompt:               run.Spec.Prompt,
 			CredentialProfile:    run.Spec.CredentialProfileRef,
@@ -345,6 +353,8 @@ func runDiagnostic(run *platformv1alpha1.Run) *RunDiagnostic {
 	switch run.Status.State {
 	case platformv1alpha1.RunStateFailed:
 		switch condition.Reason {
+		case "ProjectSelectionUnavailable":
+			return &RunDiagnostic{"ProjectSelectionUnavailable", "The selected Project incarnation is unavailable.", "Rediscover and reselect the Project before starting a new run."}
 		case "EnvironmentUnavailable":
 			return &RunDiagnostic{"EnvironmentUnavailable", "The environment could not be allocated.", "Ask an administrator to check environment availability before starting another run."}
 		case "EnvironmentLost":

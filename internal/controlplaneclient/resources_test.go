@@ -16,6 +16,34 @@ import (
 	"github.com/Chris-Cullins/swe-platform/internal/controlplane"
 )
 
+func TestCreateRunPreservesExactProjectSelection(t *testing.T) {
+	for _, returned := range []string{"selected-A", "", "replacement-B"} {
+		t.Run("returned-"+returned, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				var request controlplane.CreateRunRequest
+				if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+					t.Error(err)
+				}
+				if request.Selector.ProjectUID != "selected-A" || request.Selector.Project != "repo" {
+					t.Errorf("lost selection: %#v", request.Selector)
+				}
+				request.Selector.ProjectUID = returned
+				w.Header().Set("Content-Type", "application/json")
+				_ = json.NewEncoder(w).Encode(controlplane.Run{Name: request.Name, UID: "run-A", Intent: controlplane.RunIntent{Selector: request.Selector}})
+			}))
+			defer server.Close()
+			c, err := New(server.URL, "token", server.Client())
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, err = c.CreateRun(context.Background(), "ns", controlplane.CreateRunRequest{Name: "task", Agent: "test", Prompt: "test", Selector: controlplane.RunSelector{Project: "repo", ProjectUID: "selected-A"}})
+			if (err == nil) != (returned == "selected-A") {
+				t.Fatalf("returned selection %q: %v", returned, err)
+			}
+		})
+	}
+}
+
 func TestResourceClientUsesAuthenticatedTypedEndpoints(t *testing.T) {
 	token := "api-token"
 	requests := make([]string, 0, 6)

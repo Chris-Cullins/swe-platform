@@ -13,6 +13,7 @@ export interface Problem {
 export interface Selector {
   environment?: string
   project?: string
+  projectUID?: string
   template?: string
 }
 

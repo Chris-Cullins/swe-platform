@@ -324,6 +324,8 @@ type EnvironmentServiceDeclaration struct {
 }
 
 // EnvironmentSpec defines the desired state of Environment.
+// +kubebuilder:validation:XValidation:rule="!has(self.projectUID) || (has(self.projectRef) && self.projectRef.size() > 0)",message="projectUID requires projectRef"
+// +kubebuilder:validation:XValidation:rule="!(has(oldSelf.projectRef) && oldSelf.projectRef.size() > 0) || (has(self.projectUID) == has(oldSelf.projectUID) && (!has(self.projectUID) || self.projectUID == oldSelf.projectUID))",message="projectUID may only be set with the initial Project binding"
 // +kubebuilder:validation:XValidation:rule="self.templateRef == oldSelf.templateRef",message="templateRef is immutable"
 // +kubebuilder:validation:XValidation:rule="has(self.backend) == has(oldSelf.backend) && (!has(self.backend) || self.backend == oldSelf.backend)",message="backend is immutable"
 // +kubebuilder:validation:XValidation:rule="!has(oldSelf.projectRef) ? (!has(self.projectRef) || self.projectRef.size() > 0) : (oldSelf.projectRef.size() == 0 ? (!has(self.projectRef) || self.projectRef.size() >= 0) : (has(self.projectRef) && self.projectRef == oldSelf.projectRef))",message="projectRef may only transition once from empty to non-empty"
@@ -333,6 +335,14 @@ type EnvironmentSpec struct {
 	// +kubebuilder:validation:MinLength=1
 	// +optional
 	ProjectRef string `json:"projectRef,omitempty"`
+
+	// ProjectUID fences provisioning to the expected Project incarnation. Warm
+	// promotion sets it atomically with ProjectRef; legacy bindings stay legacy.
+	// +optional
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=128
+	// +kubebuilder:validation:Pattern=`^\S(.*\S)?$`
+	ProjectUID string `json:"projectUID,omitempty"`
 
 	// TemplateRef is the name of the EnvironmentTemplate to build from.
 	// +kubebuilder:validation:MinLength=1

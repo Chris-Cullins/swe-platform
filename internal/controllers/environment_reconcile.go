@@ -512,7 +512,7 @@ func (r *EnvironmentReconciler) provisioningSourcesCurrent(ctx context.Context, 
 		}
 		return false, err
 	}
-	if confirmedEnv.UID != env.UID || confirmedEnv.Generation != env.Generation || confirmedEnv.Spec.TemplateRef != env.Spec.TemplateRef || confirmedEnv.Spec.ProjectRef != env.Spec.ProjectRef || confirmedEnv.Spec.Backend != env.Spec.Backend {
+	if confirmedEnv.UID != env.UID || confirmedEnv.Generation != env.Generation || confirmedEnv.Spec.TemplateRef != env.Spec.TemplateRef || confirmedEnv.Spec.ProjectRef != env.Spec.ProjectRef || confirmedEnv.Spec.ProjectUID != env.Spec.ProjectUID || confirmedEnv.Spec.Backend != env.Spec.Backend {
 		return false, nil
 	}
 	var confirmedTemplate platformv1alpha1.EnvironmentTemplate
@@ -541,7 +541,7 @@ func (r *EnvironmentReconciler) provisioningSourcesCurrent(ctx context.Context, 
 		}
 		return false, err
 	}
-	if confirmedProject.UID != project.UID || confirmedProject.Generation != project.Generation || !confirmedProject.DeletionTimestamp.IsZero() || len(confirmedProject.Spec.Repositories) != 1 || confirmedProject.Spec.Repositories[0] != project.Spec.Repositories[0] {
+	if confirmedEnv.Spec.ProjectUID != "" && confirmedEnv.Spec.ProjectUID != string(confirmedProject.UID) || confirmedProject.UID != project.UID || confirmedProject.Generation != project.Generation || !confirmedProject.DeletionTimestamp.IsZero() || len(confirmedProject.Spec.Repositories) != 1 || confirmedProject.Spec.Repositories[0] != project.Spec.Repositories[0] {
 		return false, nil
 	}
 	return true, nil

@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"strings"
 	"time"
 
 	"github.com/google/jsonschema-go/jsonschema"
@@ -39,6 +40,7 @@ type CreateRunInput struct {
 	Agent                string `json:"agent,omitempty" jsonschema:"Agent adapter; defaults to claude-code."`
 	Environment          string `json:"environment,omitempty" jsonschema:"Existing Environment; exclusive with project and template."`
 	Project              string `json:"project,omitempty" jsonschema:"Project supplying repository and default template configuration."`
+	ProjectUID           string `json:"projectUID,omitempty" jsonschema:"Expected Project UID from discovery; requires project. Preserve on retries."`
 	Template             string `json:"template,omitempty" jsonschema:"EnvironmentTemplate; may override a Project default."`
 	CredentialProfile    string `json:"credentialProfile,omitempty" jsonschema:"Same-namespace AgentCredentialProfile name."`
 	RepositoryCredential string `json:"repositoryCredential,omitempty" jsonschema:"Repository credential provider; GitHubApp when selected."`
@@ -131,6 +133,7 @@ func createRun(ctx context.Context, client controlPlaneClient, namespace string,
 		Selector: controlplane.RunSelector{
 			Environment: input.Environment,
 			Project:     input.Project,
+			ProjectUID:  input.ProjectUID,
 			Template:    input.Template,
 		},
 		Agent:                agent,
@@ -164,6 +167,9 @@ func validateCreateRun(input CreateRunInput) error {
 	}
 	if input.Environment == "" && input.Project == "" && input.Template == "" {
 		return fmt.Errorf("environment, project, or template is required")
+	}
+	if input.ProjectUID != "" && (input.Project == "" || input.Environment != "" || len(input.ProjectUID) > 128 || strings.TrimSpace(input.ProjectUID) != input.ProjectUID) {
+		return fmt.Errorf("projectUID requires project, excludes environment, and must be at most 128 bytes without surrounding whitespace")
 	}
 	if input.Environment != "" && (input.Project != "" || input.Template != "") {
 		return fmt.Errorf("environment cannot be combined with project or template")
@@ -294,6 +300,7 @@ func createRunSchema() *jsonschema.Schema {
 	setStringBounds(schema, "name", 1, 253)
 	setStringBounds(schema, "prompt", 1, maxPromptBytes)
 	setStringBounds(schema, "agent", 0, 128)
+	setStringBounds(schema, "projectUID", 1, 128)
 	for _, field := range []string{"environment", "project", "template", "credentialProfile"} {
 		setStringBounds(schema, field, 0, 253)
 	}

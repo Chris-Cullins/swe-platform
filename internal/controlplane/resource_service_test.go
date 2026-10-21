@@ -59,7 +59,7 @@ func TestResourceServiceCreateRunIntentOnlyAndAlreadyExistsDoesNotGet(t *testing
 	scheme := resourceScheme(t)
 	base := fake.NewClientBuilder().WithScheme(scheme).Build()
 	service := &KubernetesResourceService{Client: base}
-	req := CreateRunRequest{Name: "new", Selector: RunSelector{Project: "p", Template: "t"}, Agent: "a", Prompt: "do it", RepositoryCredential: "GitHubApp"}
+	req := CreateRunRequest{Name: "new", Selector: RunSelector{Project: "p", ProjectUID: "selected-uid", Template: "t"}, Agent: "a", Prompt: "do it", RepositoryCredential: "GitHubApp"}
 	created, err := service.CreateRun(context.Background(), "ns", req)
 	if err != nil {
 		t.Fatal(err)
@@ -87,13 +87,15 @@ func TestResourceServiceCreateRunIntentOnlyAndAlreadyExistsDoesNotGet(t *testing
 }
 
 func TestResourceServiceCreateCollisionComparesFullRunSpec(t *testing.T) {
-	request := CreateRunRequest{Name: "same", Selector: RunSelector{Template: "small"}, Agent: "agent", Prompt: "prompt", CredentialProfile: "profile", RepositoryCredential: "GitHubApp"}
+	request := CreateRunRequest{Name: "same", Selector: RunSelector{Project: "p", ProjectUID: "selected-uid", Template: "small"}, Agent: "agent", Prompt: "prompt", CredentialProfile: "profile", RepositoryCredential: "GitHubApp"}
 	for _, test := range []struct {
 		name   string
 		mutate func(*platformv1alpha1.RunSpec)
 		want   error
 	}{
 		{name: "same intent", mutate: func(*platformv1alpha1.RunSpec) {}},
+		{name: "dropped Project UID conflicts", mutate: func(spec *platformv1alpha1.RunSpec) { spec.ProjectUID = "" }, want: errRunIntentConflict},
+		{name: "changed Project UID conflicts", mutate: func(spec *platformv1alpha1.RunSpec) { spec.ProjectUID = "replacement" }, want: errRunIntentConflict},
 		{name: "cancel ignored", mutate: func(spec *platformv1alpha1.RunSpec) { spec.Cancel = true }},
 		{name: "empty notify normalized", mutate: func(spec *platformv1alpha1.RunSpec) { spec.Notify = []string{} }},
 		{name: "parent conflicts", mutate: func(spec *platformv1alpha1.RunSpec) { spec.ParentRef = "parent" }, want: errRunIntentConflict},
@@ -327,6 +329,7 @@ func TestRunDiagnosticKnownConditions(t *testing.T) {
 		reason string
 		code   string
 	}{
+		{platformv1alpha1.RunStateFailed, "ProjectSelectionUnavailable", "ProjectSelectionUnavailable"},
 		{platformv1alpha1.RunStateFailed, "EnvironmentUnavailable", "EnvironmentUnavailable"},
 		{platformv1alpha1.RunStateFailed, "EnvironmentLost", "EnvironmentLost"},
 		{platformv1alpha1.RunStateFailed, "EnvironmentFailed", "EnvironmentFailed"},

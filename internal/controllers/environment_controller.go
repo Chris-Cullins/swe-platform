@@ -758,6 +758,9 @@ func (r *EnvironmentReconciler) resolveEnvironmentProject(ctx context.Context, e
 		}
 		return nil, wrapped
 	}
+	if env.Spec.ProjectUID != "" && (string(project.UID) != env.Spec.ProjectUID || !project.DeletionTimestamp.IsZero()) {
+		return nil, terminalEnvironment(fmt.Errorf("expected Project selection is unavailable; rediscover and reselect the Project"))
+	}
 	return &project, nil
 }
 
@@ -800,6 +803,9 @@ func (r *EnvironmentReconciler) repositoryCloneCredential(ctx context.Context, e
 	}
 	if run.Status.EnvironmentRef.Name != env.Name || run.Status.EnvironmentRef.UID != env.UID || run.Status.EnvironmentRef.Ownership != ownership {
 		return nil, terminalEnvironment(stderrors.New("associated Run environment reference is invalid"))
+	}
+	if !platformv1alpha1.RunProjectBindingMatches(&run, env) {
+		return nil, terminalEnvironment(errProjectSelectionUnavailable)
 	}
 	if run.Spec.RepositoryCredential == "" {
 		return nil, nil
@@ -908,7 +914,7 @@ func (r *EnvironmentReconciler) backendCreationSourcesCurrent(ctx context.Contex
 			return false, nil
 		}
 	} else {
-		if currentEnv.Spec.ProjectRef != snapshot.Project.Name {
+		if currentEnv.Spec.ProjectRef != snapshot.Project.Name || currentEnv.Spec.ProjectUID != "" && currentEnv.Spec.ProjectUID != string(snapshot.Project.UID) {
 			return false, nil
 		}
 		var project platformv1alpha1.Project

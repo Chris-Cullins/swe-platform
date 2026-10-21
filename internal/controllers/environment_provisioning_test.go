@@ -145,6 +145,7 @@ func TestProvisioningSnapshotAtomicPublicationAndFailClosedInputs(t *testing.T) 
 	t.Run("initial atomic snapshot before any child", func(t *testing.T) {
 		scheme, env, tmpl := fixture(t)
 		env.Spec.ProjectRef = "project"
+		env.Spec.ProjectUID = "project-uid"
 		project := &platformv1alpha1.Project{ObjectMeta: metav1.ObjectMeta{Name: "project", Namespace: env.Namespace, UID: "project-uid", Generation: 3}, Spec: platformv1alpha1.ProjectSpec{Repositories: []string{"https://example.test/repository"}}}
 		c := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(env).WithObjects(env, tmpl, project).Build()
 		r := &EnvironmentReconciler{Client: c, Scheme: scheme}
@@ -165,6 +166,11 @@ func TestProvisioningSnapshotAtomicPublicationAndFailClosedInputs(t *testing.T) 
 		want.TemplateVerified, want.ProjectVerified = true, true
 		if !platformv1alpha1.ProvisioningSnapshotsEqual(got.Status.Provisioning, want) {
 			t.Fatalf("snapshot = %#v, want %#v", got.Status.Provisioning, want)
+		}
+		mismatch := got.DeepCopy()
+		mismatch.Spec.ProjectUID = "different-selection"
+		if platformv1alpha1.ValidateEnvironmentProvisioningSnapshot(mismatch, mismatch.Status.Provisioning) == nil || platformv1alpha1.ValidateEnvironmentProvisioningTemplateSnapshot(mismatch, mismatch.Status.Provisioning) == nil {
+			t.Fatal("full or partial snapshot validation ignored expected Project UID")
 		}
 		for _, child := range []struct {
 			name   string

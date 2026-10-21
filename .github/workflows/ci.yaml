@@ -92,6 +92,9 @@ jobs:
       - name: Inert egress publication API-server semantics
         run: SWE_TEST_EGRESS_APISERVER=1 go test ./internal/egresspod -run '^TestPublicationAPIServer$' -count=1 -v
 
+      - name: Exact Project selection API-server admission
+        run: SWE_TEST_PROJECT_APISERVER=1 go test ./api/v1alpha1 -run '^TestProjectSelectionAPIServer$' -count=1 -v
+
       - name: Build sandboxd
         working-directory: sandboxd
         run: go build ./...

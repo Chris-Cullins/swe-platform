@@ -66,7 +66,7 @@ func TestMCPCreateRunUsesFixedNamespaceAndReturnsUID(t *testing.T) {
 	result, err := clientSession.CallTool(context.Background(), &mcp.CallToolParams{
 		Name: "create_run",
 		Arguments: map[string]any{
-			"name": "task-1", "prompt": "do the work", "project": "repo", "repositoryCredential": "GitHubApp",
+			"name": "task-1", "prompt": "do the work", "project": "repo", "projectUID": "selected-uid", "repositoryCredential": "GitHubApp",
 		},
 	})
 	if err != nil || result.IsError {
@@ -76,7 +76,7 @@ func TestMCPCreateRunUsesFixedNamespaceAndReturnsUID(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if fake.createdNamespace != "team-a" || fake.createdRequest.Agent != "claude-code" || fake.createdRequest.Selector.Project != "repo" || fake.createdRequest.RepositoryCredential != "GitHubApp" {
+	if fake.createdNamespace != "team-a" || fake.createdRequest.Agent != "claude-code" || fake.createdRequest.Selector.Project != "repo" || fake.createdRequest.Selector.ProjectUID != "selected-uid" || fake.createdRequest.RepositoryCredential != "GitHubApp" {
 		t.Fatalf("create = %q/%#v", fake.createdNamespace, fake.createdRequest)
 	}
 	if !strings.Contains(string(encoded), `"namespace":"team-a"`) || !strings.Contains(string(encoded), `"uid":"run-uid"`) || strings.Contains(string(encoded), "do the work") {
@@ -202,6 +202,9 @@ func TestReadTranscriptDoesNotAdvancePastOmittedGap(t *testing.T) {
 func TestValidateCreateRunRejectsUnboundedOrAmbiguousIntent(t *testing.T) {
 	for _, input := range []CreateRunInput{
 		{Name: "task", Prompt: "work"},
+		{Name: "task", Prompt: "work", Template: "small", ProjectUID: "A"},
+		{Name: "task", Prompt: "work", Project: "repo", ProjectUID: " A"},
+		{Name: "task", Prompt: "work", Project: "repo", ProjectUID: strings.Repeat("a", 129)},
 		{Name: "task", Prompt: "work", Environment: "env", Project: "repo"},
 		{Name: "task", Prompt: strings.Repeat("x", maxPromptBytes+1), Project: "repo"},
 	} {

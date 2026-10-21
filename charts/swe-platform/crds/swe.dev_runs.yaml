@@ -91,6 +91,14 @@ spec:
                   default template when templateRef is empty.
                 minLength: 1
                 type: string
+              projectUID:
+                description: |-
+                  ProjectUID is the caller's expected Project incarnation, not a discovered default.
+                  Omission retains legacy name-based selection.
+                maxLength: 128
+                minLength: 1
+                pattern: ^\S(.*\S)?$
+                type: string
               prompt:
                 description: Prompt is the task handed to the agent.
                 type: string
@@ -109,6 +117,11 @@ spec:
             - prompt
             type: object
             x-kubernetes-validations:
+            - message: projectUID requires projectRef and excludes environmentRef
+              rule: '!has(self.projectUID) || (has(self.projectRef) && !has(self.environmentRef))'
+            - message: projectUID is immutable
+              rule: has(self.projectUID) == has(oldSelf.projectUID) && (!has(self.projectUID)
+                || self.projectUID == oldSelf.projectUID)
             - message: set environmentRef or templateRef/projectRef, not both
               rule: 'has(self.environmentRef) ? (!has(self.templateRef) && !has(self.projectRef))
                 : (has(self.templateRef) || has(self.projectRef))'

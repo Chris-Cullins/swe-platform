@@ -1562,9 +1562,38 @@ kubectl wait --for=condition=Ready pod/e2e-git-server --timeout=1m
 rm -rf "$PROJECT_REPO" "$PROJECT_WORKTREE"
 PROJECT_REPO=""
 PROJECT_WORKTREE=""
+echo "==> rejecting stale exact Project selections before credentials or allocation"
+for selection_mode in default explicit; do
+	selection_args=()
+	if [[ "$selection_mode" == explicit ]]; then selection_args+=(--template small); fi
+	selection_name="e2e-project-selection-${selection_mode}"
+	bin/swe --namespace "$PROJECT_NAMESPACE" run "keyless exact selection denial" --name "$selection_name" \
+		--project "$PROJECT_NAME" --project-uid obsolete-selection --credential-profile must-not-resolve \
+		"${selection_args[@]}" --wait=false
+	kubectl wait --for=jsonpath='{.status.state}'=Failed "run/$selection_name" --timeout=1m
+	selection_uid=$(kubectl get run "$selection_name" -o jsonpath='{.metadata.uid}')
+	kubectl get run "$selection_name" -o json | jq -e \
+		'.spec.projectUID == "obsolete-selection" and .status.environmentRef == null and .status.credentialProfileRef == null and any(.status.conditions[]; .reason == "ProjectSelectionUnavailable")' >/dev/null
+	kubectl get environments -o json | jq -e --arg uid "$selection_uid" \
+		'all(.items[]; (.status.claimedBy.uid != $uid) and all(.metadata.ownerReferences[]?; .uid != $uid))' >/dev/null
+	# Same immutable intent recovers even after authoritative rejection.
+	bin/swe --namespace "$PROJECT_NAMESPACE" run "keyless exact selection denial" --name "$selection_name" \
+		--project "$PROJECT_NAME" --project-uid obsolete-selection --credential-profile must-not-resolve \
+		"${selection_args[@]}" --wait=false
+	if bin/swe --namespace "$PROJECT_NAMESPACE" run "keyless exact selection denial" --name "$selection_name" \
+		--project "$PROJECT_NAME" --project-uid "$PROJECT_UID" --credential-profile must-not-resolve \
+		"${selection_args[@]}" --wait=false >/dev/null 2>&1; then
+		echo "FAIL: exact Project retry retargeted a replacement" >&2; exit 1
+	fi
+	if kubectl patch run "$selection_name" --type=json -p '[{"op":"remove","path":"/spec/projectUID"}]' >/dev/null 2>&1; then
+		echo "FAIL: Run Project UID was mutable" >&2; exit 1
+	fi
+	kubectl delete run "$selection_name" --wait=true >/dev/null
+done
+unset selection_mode selection_args selection_name selection_uid
 echo "==> creating project environment + run intent via swe"
 printf '%s' "$E2E_AGENT_API_KEY" | bin/swe --namespace "$PROJECT_NAMESPACE" credentials create e2e-claude --agent claude-code --api-key-stdin
-bin/swe --namespace "$PROJECT_NAMESPACE" run "end-to-end smoke test" --project "$PROJECT_NAME" --credential-profile e2e-claude --wait=false
+bin/swe --namespace "$PROJECT_NAMESPACE" run "end-to-end smoke test" --project "$PROJECT_NAME" --project-uid "$PROJECT_UID" --credential-profile e2e-claude --wait=false
 RUN_NAME=$(kubectl get runs -o jsonpath='{.items[0].metadata.name}')
 if ! kubectl wait --for=jsonpath='{.status.state}'=Running run/"$RUN_NAME" --timeout=3m; then
 	echo "FAIL: Run did not reach Running" >&2
@@ -1585,6 +1614,8 @@ if [[ "$BOUND_PROFILE_NAME" != "e2e-claude" || -z "$PROFILE_UID" || "$BOUND_PROF
 fi
 RUN_ENV_NAME=$(kubectl get run "$RUN_NAME" -o jsonpath='{.status.environmentRef.name}')
 RUN_ENV_OWNERSHIP=$(kubectl get run "$RUN_NAME" -o jsonpath='{.status.environmentRef.ownership}')
+kubectl get environment "$RUN_ENV_NAME" -o json | jq -e --arg uid "$PROJECT_UID" \
+	'.spec.projectUID == $uid and .status.provisioning.project.uid == $uid and .status.provisioning.projectVerified == true' >/dev/null
 RUN_STARTED_AT=$(kubectl get run "$RUN_NAME" -o jsonpath='{.status.startedAt}')
 RUN_FINISHED_AT=$(kubectl get run "$RUN_NAME" -o jsonpath='{.status.finishedAt}')
 if [[ -z "$RUN_STARTED_AT" || -z "$RUN_FINISHED_AT" ]]; then
