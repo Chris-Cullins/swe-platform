@@ -30,6 +30,8 @@ spec:
       message: the control plane may publish only a current Idle wake intent
     - expression: object.?spec.?projectRef == oldObject.?spec.?projectRef
       message: the control plane may not change spec.projectRef
+    - expression: object.?spec.?projectUID == oldObject.?spec.?projectUID
+      message: the control plane may not change spec.projectUID
     - expression: object.?spec.?templateRef == oldObject.?spec.?templateRef
       message: the control plane may not change spec.templateRef
     - expression: object.?spec.?backend == oldObject.?spec.?backend

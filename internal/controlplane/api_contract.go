@@ -2,7 +2,8 @@ package controlplane
 
 import "time"
 
-// Project is a read-only discovery observation, not a Run selection precondition.
+// Project is a read-only observation. Callers opt into exact selection by copying
+// its UID into RunSelector.ProjectUID; merely listing does not bind a Run.
 type Project struct {
 	Namespace       string `json:"namespace"`
 	Name            string `json:"name"`
@@ -37,6 +38,7 @@ type Session struct {
 type RunSelector struct {
 	Environment string `json:"environment,omitempty"`
 	Project     string `json:"project,omitempty"`
+	ProjectUID  string `json:"projectUID,omitempty"`
 	Template    string `json:"template,omitempty"`
 }
 

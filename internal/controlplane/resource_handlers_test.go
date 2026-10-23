@@ -170,8 +170,13 @@ func TestRunListQueryValidation(t *testing.T) {
 }
 
 func TestCreateRunValidation(t *testing.T) {
-	valid := `{"name":"r","selector":{"template":"small"},"agent":"amp","prompt":"go","credentialProfile":"amp-production","repositoryCredential":"GitHubApp"}`
+	valid := `{"name":"r","selector":{"project":"repo","projectUID":"selected-A","template":"small"},"agent":"amp","prompt":"go","credentialProfile":"amp-production","repositoryCredential":"GitHubApp"}`
 	cases := []string{"{", valid + " {}", `{"name":"r","selector":{"template":"small"},"agent":"amp","prompt":"go","x":1}`, `{"name":"r","selector":{"template":"small","x":1},"agent":"amp","prompt":"go"}`, `{"name":"r","selector":{},"agent":"amp","prompt":"go"}`, `{"name":"r","selector":{"environment":"e","project":"p"},"agent":"amp","prompt":"go"}`, `{"name":"BAD NAME","selector":{"template":"small"},"agent":"amp","prompt":"go"}`, `{"name":"r","selector":{"template":"BAD NAME"},"agent":"amp","prompt":"go"}`, `{"name":"r","selector":{"template":"small"},"agent":"amp","prompt":"go","credentialProfile":"BAD PROFILE"}`, `{"name":"r","selector":{"template":"small"},"agent":"","prompt":"go"}`, `{"name":"r","selector":{"template":"small"},"agent":"` + strings.Repeat("a", 129) + `","prompt":"go"}`, `{"name":"r","selector":{"template":"small"},"agent":"amp","prompt":""}`}
+	cases = append(cases,
+		`{"name":"r","selector":{"template":"small","projectUID":"A"},"agent":"amp","prompt":"go"}`,
+		`{"name":"r","selector":{"project":"repo","projectUID":" A"},"agent":"amp","prompt":"go"}`,
+		`{"name":"r","selector":{"project":"repo","projectUID":"`+strings.Repeat("a", 129)+`"},"agent":"amp","prompt":"go"}`,
+	)
 	for i, body := range cases {
 		f := &fakeResources{}
 		w := resourceRequest(NewServer(nil, ServerOptions{Access: &recordingAccess{}, Resources: f}), "POST", "/api/v1/namespaces/ns/runs", body, "")
@@ -189,7 +194,7 @@ func TestCreateRunValidation(t *testing.T) {
 	if w.Code != 201 || !strings.Contains(w.Body.String(), `"name":"r"`) {
 		t.Errorf("success=%d %s", w.Code, w.Body.String())
 	}
-	if f.createdRequest.CredentialProfile != "amp-production" || f.createdRequest.RepositoryCredential != "GitHubApp" {
+	if f.createdRequest.CredentialProfile != "amp-production" || f.createdRequest.RepositoryCredential != "GitHubApp" || f.createdRequest.Selector.ProjectUID != "selected-A" {
 		t.Fatalf("profile create request = %#v", f.createdRequest)
 	}
 }

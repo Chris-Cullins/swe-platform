@@ -379,7 +379,8 @@ This command requires `projects/list`, separately from named `projects/get`, and
 back to kubeconfig. Output contains only namespace, name, immutable UID, generation, and
 `defaultTemplate`, which is a name, not a resolved Template identity. It does not inspect
 repository URLs, credentials, or readiness. Discovery is an observation: returned names/UIDs
-do not yet fence Project selection during Run creation against same-name replacement.
+fence selection only when the caller carries the UID into `swe run --project-uid` or the
+equivalent API/MCP field. Name-only creation remains compatible and does not provide that fence.
 
 Every executable CLI command requires an explicit namespace. Chart Templates are inert catalog
 sources in the system namespace, not runnable tenancy. Before the first Run, an administrator
@@ -450,6 +451,16 @@ swe --namespace my-project run --project private-org-repo \
   --git-credential github-app "Fix and push the flaky test"
 swe --namespace my-project cancel fix-flaky-42
 ```
+
+For a Project chosen from `swe project list --json`, carry its observed UID with
+`swe --namespace my-project run --name fix-flaky-42 --project org-repo --project-uid "$SELECTED_PROJECT_UID" "Fix the flaky test"`.
+Keep the same name, UID and task intent on uncertain retries. Creation persists intent; a missing
+or replaced Project fails asynchronously before Project-specific provisioning, even with an
+explicit `--template`. Without an override, the default Template name is resolved at allocation
+and retained on recovery. Omitting the UID keeps legacy name-based behavior. This does not pin
+a selected Template or existing Environment UID, and cannot be combined with `--environment`.
+HTTP callers use `selector.projectUID`; MCP `create_run` accepts `projectUID`. Upgrade the CRDs
+and controller together before relying on this contract; there is no old-controller guarantee.
 
 `--git-credential github-app` requires an administrator-configured GitHub App and an exact
 `https://github.com/<owner>/<repo>[.git]` Project repository. It mints a short-lived installation

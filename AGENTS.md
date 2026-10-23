@@ -173,6 +173,12 @@ runs both via `make` targets:
   processes, explicitly refusing existing-cluster mode. No scheduler, kubelet, provider, or live
   conformance runner is involved. Ordinary tests skip it unless opted in; `build-test` CI runs it
   in a separate required step. Fake-client tests are not scheduling-gate/UID/resourceVersion proof.
+  `SWE_TEST_PROJECT_APISERVER=1 go test ./api/v1alpha1 -run '^TestProjectSelectionAPIServer$' -count=1 -v`
+  likewise installs generated CRDs in disposable Kubernetes v1.35.0 and checks actual Project UID
+  admission/persistence, immutable Run intent and atomic Environment binding. CI runs it separately.
+  Exact Project selection is optional for legacy compatibility; discovery-driven producers must
+  preserve it through CLI/API/MCP, retries, allocation and provisioning. Never retrofit bound
+  legacy Environments or re-resolve default Template names after durable allocation.
   The required `build-test` CI job runs the root and sandboxd Go suites plus
   the six shell checks above, mirroring `make test`. E2E EXIT diagnostics preserve the original
   failure before cleanup, emitting only numeric location and fixed forward process/log indicators
@@ -269,6 +275,8 @@ runs both via `make` targets:
   exchange/logout/revocation, capacity and CSRF,
   the embedded console entry point/SPA fallback/static assets, typed Run
   list/get/create/idempotent-create-recovery/cancel, Environment get, transcript SSE, terminal attach, and
+  keyless exact Project selection denial before profile/allocation (including explicit Template),
+  immutable same-name retry and schema rejection, plus exact warm intent/snapshot propagation,
   read-only `swe list-runs` summary filtering (exact state/agent AND, no new API),
   `swe attention` prompt-free reported-state candidates (summary-only, exact bucket/agent AND,
   command-local 30-second deadline; not diagnostic causes, review state or notifications),

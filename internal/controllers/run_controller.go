@@ -238,6 +238,14 @@ func (r *RunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.R
 		run.Status.EnvironmentRef = ref
 		return ctrl.Result{Requeue: true}, r.setRunState(ctx, &run, platformv1alpha1.RunStateAllocating, "EnvironmentRecovered", fmt.Sprintf("recovered environment %s before cancellation", ref.Name), false)
 	}
+	if !run.Spec.Cancel {
+		if _, err := r.resolveSelectedProject(ctx, &run); err != nil {
+			if errors.Is(err, errProjectSelectionUnavailable) {
+				return ctrl.Result{}, r.rejectProjectSelection(ctx, &run)
+			}
+			return ctrl.Result{}, err
+		}
+	}
 	if run.Status.EnvironmentRef == nil {
 		if run.Spec.CredentialProfileRef != "" {
 			if policy, ok := r.Adapters[run.Spec.Agent].(agent.AdapterCredentialPolicy); ok && !policy.SupportsCredentialProfiles() {
@@ -253,6 +261,9 @@ func (r *RunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.R
 		allocatedNow := false
 		ref, err := r.recoverEnvironmentReference(ctx, &run)
 		if err != nil {
+			if errors.Is(err, errProjectSelectionUnavailable) {
+				return ctrl.Result{}, r.rejectProjectSelection(ctx, &run)
+			}
 			return ctrl.Result{}, err
 		}
 		if ref == nil {
@@ -283,6 +294,9 @@ func (r *RunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.R
 			allocatedNow = ref != nil && err == nil
 		}
 		if err != nil {
+			if errors.Is(err, errProjectSelectionUnavailable) {
+				return ctrl.Result{}, r.rejectProjectSelection(ctx, &run)
+			}
 			if errors.Is(err, errExplicitEnvironmentClaimed) || errors.Is(err, errExplicitEnvironmentHeld) || errors.Is(err, errExplicitEnvironmentSuspensionNotWakeable) {
 				return ctrl.Result{}, r.setRunState(ctx, &run, platformv1alpha1.RunStateFailed, "EnvironmentUnavailable", err.Error(), false)
 			}
@@ -1331,12 +1345,12 @@ func (r *RunReconciler) allocateEnvironment(ctx context.Context, run *platformv1
 	if apierrors.IsNotFound(err) {
 		env = platformv1alpha1.Environment{
 			ObjectMeta: metav1.ObjectMeta{Namespace: run.Namespace, Name: name},
-			Spec:       platformv1alpha1.EnvironmentSpec{ProjectRef: run.Spec.ProjectRef, TemplateRef: template},
+			Spec:       platformv1alpha1.EnvironmentSpec{ProjectRef: run.Spec.ProjectRef, ProjectUID: run.Spec.ProjectUID, TemplateRef: template},
 		}
 		if err := controllerutil.SetControllerReference(run, &env, r.Scheme); err != nil {
 			return nil, err
 		}
-		if err := r.Create(ctx, &env); err != nil {
+		if err := r.Create(ctx, &env, &client.CreateOptions{FieldValidation: metav1.FieldValidationStrict}); err != nil {
 			if !apierrors.IsAlreadyExists(err) {
 				return nil, err
 			}
@@ -1349,6 +1363,9 @@ func (r *RunReconciler) allocateEnvironment(ctx context.Context, run *platformv1
 	}
 	if !exactControllerOwner(&env, platformv1alpha1.GroupVersion.String(), "Run", run.Name, run.UID) {
 		return nil, fmt.Errorf("deterministic environment %q is not owned by run UID %s", env.Name, run.UID)
+	}
+	if !platformv1alpha1.RunProjectBindingMatches(run, &env) {
+		return nil, errProjectSelectionUnavailable
 	}
 	return &platformv1alpha1.RunEnvironmentReference{Name: env.Name, UID: env.UID, Ownership: platformv1alpha1.EnvironmentOwnershipOwned}, nil
 }
@@ -1380,6 +1397,10 @@ func getAllocatedEnvironment(ctx context.Context, reader client.Reader, run *pla
 		}
 	default:
 		return nil, fmt.Errorf("%w: environment %q has unknown ownership", errAllocatedEnvironmentGone, env.Name)
+	}
+	// Cleanup uses exact ownership/claim authority even when selection is stale.
+	if !run.Spec.Cancel && run.DeletionTimestamp.IsZero() && !terminalRunState(run.Status.State) && !platformv1alpha1.RunProjectBindingMatches(run, &env) {
+		return nil, fmt.Errorf("%w: expected Project binding does not match", errAllocatedEnvironmentGone)
 	}
 	return &env, nil
 }
@@ -1421,6 +1442,9 @@ func (r *RunReconciler) recoverEnvironmentReference(ctx context.Context, run *pl
 			} else if metav1.GetControllerOf(env) != nil {
 				continue
 			}
+			if env.Labels[warmPoolLabel] == "" && !run.Spec.Cancel && run.DeletionTimestamp.IsZero() && !terminalRunState(run.Status.State) && !platformv1alpha1.RunProjectBindingMatches(run, env) {
+				return nil, errProjectSelectionUnavailable
+			}
 			return &platformv1alpha1.RunEnvironmentReference{Name: env.Name, UID: env.UID, Ownership: platformv1alpha1.EnvironmentOwnershipClaimed}, nil
 		}
 	}
@@ -1434,13 +1458,70 @@ func (r *RunReconciler) recoverEnvironmentReference(ctx context.Context, run *pl
 	if !exactControllerOwner(&env, platformv1alpha1.GroupVersion.String(), "Run", run.Name, run.UID) {
 		return nil, nil
 	}
+	if !run.Spec.Cancel && run.DeletionTimestamp.IsZero() && !terminalRunState(run.Status.State) && !platformv1alpha1.RunProjectBindingMatches(run, &env) {
+		return nil, errProjectSelectionUnavailable
+	}
 	return &platformv1alpha1.RunEnvironmentReference{Name: env.Name, UID: env.UID, Ownership: platformv1alpha1.EnvironmentOwnershipOwned}, nil
 }
 
+var errProjectSelectionUnavailable = errors.New("expected Project selection is unavailable; rediscover and reselect the Project")
+
+func (r *RunReconciler) rejectProjectSelection(ctx context.Context, run *platformv1alpha1.Run) error {
+	if run.Status.EnvironmentRef == nil {
+		// Recover only cleanup authority after a lost allocation status write. Do
+		// not demand the now-invalid selection or re-resolve a default to clean up.
+		cleanup := run.DeepCopy()
+		cleanup.Spec.Cancel = true
+		ref, err := r.recoverEnvironmentReference(ctx, cleanup)
+		if err != nil {
+			return err
+		}
+		if ref != nil && ref.Ownership == platformv1alpha1.EnvironmentOwnershipClaimed {
+			var env platformv1alpha1.Environment
+			if err := r.Get(ctx, types.NamespacedName{Namespace: run.Namespace, Name: ref.Name}, &env); err != nil {
+				return err
+			}
+			if env.Labels[warmPoolLabel] != "" {
+				if err := r.releaseClaim(ctx, run, &env); err != nil {
+					return err
+				}
+				ref = nil
+			}
+		}
+		run.Status.EnvironmentRef = ref
+	}
+	return r.setRunState(ctx, run, platformv1alpha1.RunStateFailed, "ProjectSelectionUnavailable", errProjectSelectionUnavailable.Error(), false)
+}
+
+// Exact selection is authoritative and uncached, including explicit Template
+// overrides. It does not run on cleanup paths or add a create-time Project SAR.
+func (r *RunReconciler) resolveSelectedProject(ctx context.Context, run *platformv1alpha1.Run) (*platformv1alpha1.Project, error) {
+	if run.Spec.ProjectUID == "" {
+		return nil, nil
+	}
+	var project platformv1alpha1.Project
+	if err := r.apiReader().Get(ctx, types.NamespacedName{Namespace: run.Namespace, Name: run.Spec.ProjectRef}, &project); err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil, errProjectSelectionUnavailable
+		}
+		return nil, err
+	}
+	if run.Spec.ProjectRef == "" || run.Spec.EnvironmentRef != "" || string(project.UID) != run.Spec.ProjectUID || !project.DeletionTimestamp.IsZero() {
+		return nil, errProjectSelectionUnavailable
+	}
+	return &project, nil
+}
+
 func (r *RunReconciler) resolveTemplate(ctx context.Context, run *platformv1alpha1.Run) (string, error) {
+	selected, err := r.resolveSelectedProject(ctx, run)
+	if err != nil {
+		return "", err
+	}
 	templateName := run.Spec.TemplateRef
 	if run.Spec.TemplateRef != "" {
 		templateName = run.Spec.TemplateRef
+	} else if selected != nil {
+		templateName = selected.Spec.TemplateRef
 	} else if run.Spec.ProjectRef != "" {
 		var project platformv1alpha1.Project
 		if err := r.Get(ctx, types.NamespacedName{Namespace: run.Namespace, Name: run.Spec.ProjectRef}, &project); err != nil {
@@ -1524,6 +1605,17 @@ func (r *RunReconciler) claimWarmEnvironment(ctx context.Context, run *platformv
 }
 
 func (r *RunReconciler) promoteWarmEnvironment(ctx context.Context, run *platformv1alpha1.Run, env *platformv1alpha1.Environment) error {
+	if env.Spec.ProjectRef != "" && !platformv1alpha1.RunProjectBindingMatches(run, env) {
+		return errProjectSelectionUnavailable
+	}
+	if _, err := r.resolveSelectedProject(ctx, run); err != nil {
+		if env.Spec.ProjectRef == "" {
+			if releaseErr := r.releaseClaim(ctx, run, env); releaseErr != nil {
+				return releaseErr
+			}
+		}
+		return err
+	}
 	before := env.DeepCopy()
 	delete(env.Labels, warmPoolLabel)
 	owners := env.OwnerReferences[:0]
@@ -1535,10 +1627,14 @@ func (r *RunReconciler) promoteWarmEnvironment(ctx context.Context, run *platfor
 	}
 	env.OwnerReferences = owners
 	env.Spec.ProjectRef = run.Spec.ProjectRef
+	env.Spec.ProjectUID = run.Spec.ProjectUID
 	if !reflect.DeepEqual(before.ObjectMeta, env.ObjectMeta) || !reflect.DeepEqual(before.Spec, env.Spec) {
-		if err := r.Patch(ctx, env, client.MergeFromWithOptions(before, client.MergeFromWithOptimisticLock{})); err != nil {
+		if err := r.Patch(ctx, env, client.MergeFromWithOptions(before, client.MergeFromWithOptimisticLock{}), &client.PatchOptions{FieldValidation: metav1.FieldValidationStrict}); err != nil {
 			return fmt.Errorf("promote warm environment %q: %w", env.Name, err)
 		}
+	}
+	if !platformv1alpha1.RunProjectBindingMatches(run, env) {
+		return errProjectSelectionUnavailable
 	}
 	// A warm pod may still represent the generic, project-less environment.
 	// Withdraw readiness before recording the allocation on the Run so the

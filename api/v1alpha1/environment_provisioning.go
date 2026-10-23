@@ -16,6 +16,12 @@ var environmentSizeResources = map[string]corev1.ResourceList{
 	"large":  {corev1.ResourceCPU: resource.MustParse("16"), corev1.ResourceMemory: resource.MustParse("32Gi")},
 }
 
+// RunProjectBindingMatches bridges caller intent into durable Environment intent.
+// It deliberately does not require a snapshot yet: allocation precedes capture.
+func RunProjectBindingMatches(run *Run, env *Environment) bool {
+	return run.Spec.ProjectUID == "" || (env.Spec.ProjectRef == run.Spec.ProjectRef && env.Spec.ProjectUID == run.Spec.ProjectUID)
+}
+
 func ResolveEnvironmentProvisioning(env *Environment, tmpl *EnvironmentTemplate, project *Project) *EnvironmentProvisioningSnapshot {
 	backend := EffectiveEnvironmentBackend(env, tmpl)
 	size := tmpl.Spec.Size
@@ -76,6 +82,9 @@ func ValidateEnvironmentProvisioningTemplateSnapshot(env *Environment, s *Enviro
 	}
 	if s.Project != nil && (s.Project.Name == "" || s.Project.UID == "" || s.Project.Generation < 1 || strings.TrimSpace(s.Project.Repository) == "") {
 		return fmt.Errorf("provisioning snapshot has an invalid project source")
+	}
+	if s.Project != nil && env.Spec.ProjectUID != "" && (s.Project.Name != env.Spec.ProjectRef || string(s.Project.UID) != env.Spec.ProjectUID) {
+		return fmt.Errorf("provisioning snapshot does not match expected Project identity")
 	}
 	if s.Project == nil && s.ProjectVerified {
 		return fmt.Errorf("provisioning project verification has no project source")

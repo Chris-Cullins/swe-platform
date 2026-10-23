@@ -30,6 +30,8 @@ const (
 // RunSpec defines one agent task executing in an environment.
 // A Run either claims environmentRef or asks the controller to allocate an
 // Environment from templateRef/projectRef.
+// +kubebuilder:validation:XValidation:rule="!has(self.projectUID) || (has(self.projectRef) && !has(self.environmentRef))",message="projectUID requires projectRef and excludes environmentRef"
+// +kubebuilder:validation:XValidation:rule="has(self.projectUID) == has(oldSelf.projectUID) && (!has(self.projectUID) || self.projectUID == oldSelf.projectUID)",message="projectUID is immutable"
 // +kubebuilder:validation:XValidation:rule="has(self.environmentRef) ? (!has(self.templateRef) && !has(self.projectRef)) : (has(self.templateRef) || has(self.projectRef))",message="set environmentRef or templateRef/projectRef, not both"
 // +kubebuilder:validation:XValidation:rule="self.agent == oldSelf.agent && self.prompt == oldSelf.prompt && ((!has(self.environmentRef) && !has(oldSelf.environmentRef)) || (has(self.environmentRef) && has(oldSelf.environmentRef) && self.environmentRef == oldSelf.environmentRef)) && ((!has(self.projectRef) && !has(oldSelf.projectRef)) || (has(self.projectRef) && has(oldSelf.projectRef) && self.projectRef == oldSelf.projectRef)) && ((!has(self.templateRef) && !has(oldSelf.templateRef)) || (has(self.templateRef) && has(oldSelf.templateRef) && self.templateRef == oldSelf.templateRef)) && ((!has(self.credentialProfileRef) && !has(oldSelf.credentialProfileRef)) || (has(self.credentialProfileRef) && has(oldSelf.credentialProfileRef) && self.credentialProfileRef == oldSelf.credentialProfileRef)) && ((!has(self.repositoryCredential) && !has(oldSelf.repositoryCredential)) || (has(self.repositoryCredential) && has(oldSelf.repositoryCredential) && self.repositoryCredential == oldSelf.repositoryCredential))",message="agent, prompt, environment selection, credential profile, and repository credential are immutable"
 // +kubebuilder:validation:XValidation:rule="!has(oldSelf.cancel) || !oldSelf.cancel || (has(self.cancel) && self.cancel)",message="cancel cannot be unset"
@@ -45,6 +47,14 @@ type RunSpec struct {
 	// +optional
 	// +kubebuilder:validation:MinLength=1
 	ProjectRef string `json:"projectRef,omitempty"`
+
+	// ProjectUID is the caller's expected Project incarnation, not a discovered default.
+	// Omission retains legacy name-based selection.
+	// +optional
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=128
+	// +kubebuilder:validation:Pattern=`^\S(.*\S)?$`
+	ProjectUID string `json:"projectUID,omitempty"`
 
 	// TemplateRef selects the template for a controller-allocated Environment.
 	// +optional

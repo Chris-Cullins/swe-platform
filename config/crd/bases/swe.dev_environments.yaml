@@ -223,6 +223,14 @@ spec:
                   belongs to.
                 minLength: 1
                 type: string
+              projectUID:
+                description: |-
+                  ProjectUID fences provisioning to the expected Project incarnation. Warm
+                  promotion sets it atomically with ProjectRef; legacy bindings stay legacy.
+                maxLength: 128
+                minLength: 1
+                pattern: ^\S(.*\S)?$
+                type: string
               services:
                 description: |-
                   Services contains bounded durable desired service declarations. This
@@ -358,6 +366,13 @@ spec:
             - templateRef
             type: object
             x-kubernetes-validations:
+            - message: projectUID requires projectRef
+              rule: '!has(self.projectUID) || (has(self.projectRef) && self.projectRef.size()
+                > 0)'
+            - message: projectUID may only be set with the initial Project binding
+              rule: '!(has(oldSelf.projectRef) && oldSelf.projectRef.size() > 0) ||
+                (has(self.projectUID) == has(oldSelf.projectUID) && (!has(self.projectUID)
+                || self.projectUID == oldSelf.projectUID))'
             - message: templateRef is immutable
               rule: self.templateRef == oldSelf.templateRef
             - message: backend is immutable

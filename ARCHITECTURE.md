@@ -80,8 +80,8 @@ All current CRDs are namespaced:
 | `Installation` | System-namespace identity whose immutable Kubernetes UID remains the stable identity used by namespace claims, catalog sources, managed Template copies, and baseline resources. An optional, non-defaulted installation-wide `isolation` selection admits only explicit unrestricted development or the future Calico v3.32.1 restricted contract; omission exists only for staged legacy migration. The isolation controller publishes bounded `LegacyUnclassified`, `Fencing`, `Blocked`, or `Active` status, fixed conditions, exact non-secret observed object identities, and a canonical revision. Unrestricted development can be active but is explicitly non-production. Restricted selection fences every Environment and warm pool, then remains blocked because runtime activation is not implemented. |
 | `Project` | One repository URL (represented as a one-item list), a same-namespace default Template reference, changes-workflow metadata, and up to 64 exact lowercase-ASCII FQDN egress selections. The selection contract is admitted, but a non-empty selection remains rejected when an Environment uses the Project because runtime egress enforcement is not enabled. |
 | `EnvironmentTemplate` | Pod image, size/resources, disk, runtime class, idle timeout, warm-pool minimum, and backend. Admission currently permits only the `pod` backend. Chart-owned system-namespace objects are inert catalog sources; execution accepts only installation-managed same-namespace copies bound to exact Installation, source, and Project identities. |
-| `Environment` | Immutable Template selection, an immutable optional backend override, one-way empty-to-nonempty Project binding, explicit hold policy, bounded wake/suspend/activity intents, and up to 32 API- or Repository-owned service declarations. New declarations have an immutable-per-incarnation random `instanceID`; upgrade-retained legacy declarations may omit it, receive no portal route, and can add it only with a higher revision. Omitted legacy service ownership defaults only to `API` and is immutable thereafter. Controller-owned status includes the immutable resolved `provisioning` snapshot, readiness, lifecycle/execution, claim, observations, activity, and nested backend-neutral recovery state; recovery records attempts, exhaustion, the exact failed execution generation being accounted, and the next allowed attempt time, while generation zero means no recovery identity. The gateway owns bounded `portalRoutes` and monotonic `nextPortalRouteGeneration`; inactive routes are denial tombstones preserved by other status writers. |
-| `Run` | Immutable agent task and Environment/Project/Template/agent-credential/repository-credential selection plus monotonic cancellation; status records normalized lifecycle, exact Environment name/UID and ownership, exact credential profile identity, repository credential readiness, accepted lifecycle epoch, and accepted execution generation. Controller-owned `ChangesBaselineCaptured` and `ChangesFinalCaptured` conditions record durable capture outcomes, never diff bytes. The cleanup finalizer retains deletion authority until work/credentials/claims are fenced and exact live-primary transcript and Changes cleanup commits. `notify` and `parentRef` are schema placeholders without an implemented inbox. |
+| `Environment` | Immutable Template selection, an immutable optional backend override, one-way empty-to-nonempty Project binding with optional expected `projectUID` set only at initial binding, explicit hold policy, bounded wake/suspend/activity intents, and up to 32 API- or Repository-owned service declarations. New declarations have an immutable-per-incarnation random `instanceID`; upgrade-retained legacy declarations may omit it, receive no portal route, and can add it only with a higher revision. Omitted legacy service ownership defaults only to `API` and is immutable thereafter. Controller-owned status includes the immutable resolved `provisioning` snapshot, readiness, lifecycle/execution, claim, observations, activity, and nested backend-neutral recovery state; recovery records attempts, exhaustion, the exact failed execution generation being accounted, and the next allowed attempt time, while generation zero means no recovery identity. The gateway owns bounded `portalRoutes` and monotonic `nextPortalRouteGeneration`; inactive routes are denial tombstones preserved by other status writers. |
+| `Run` | Immutable agent task and Environment/Project/Template/agent-credential/repository-credential selection, including optional immutable expected `projectUID`, plus monotonic cancellation; status records normalized lifecycle, exact Environment name/UID and ownership, exact credential profile identity, repository credential readiness, accepted lifecycle epoch, and accepted execution generation. Controller-owned `ChangesBaselineCaptured` and `ChangesFinalCaptured` conditions record durable capture outcomes, never diff bytes. The cleanup finalizer retains deletion authority until work/credentials/claims are fenced and exact live-primary transcript and Changes cleanup commits. `notify` and `parentRef` are schema placeholders without an implemented inbox. |
 | `AgentCredentialProfile` | Immutable adapter and `APIKey` type metadata. Key bytes live in an owner-linked Secret whose name is derived from the profile UID. |
 
 The current ownership/reference shape is:
@@ -126,7 +126,7 @@ Ordinary Environment mutation ownership is currently:
 | `spec.lifecycle.hold` | Environment hold/release CLI, Project offboarding CLI, and Environment controller offboarding/legacy-pause migration |
 | `spec.paused` | Deprecated input accepted from legacy clients; only the Environment controller clears it while migrating to `hold` |
 | `spec.services` | Environment services CLI for API-owned declarations and declared-service controller for Repository-owned declarations |
-| `spec.projectRef`, warm-pool label, and Template owner reference | Run controller's atomic warm-Environment promotion |
+| `spec.projectRef`, optional `spec.projectUID`, warm-pool label, and Template owner reference | Run controller's atomic warm-Environment promotion; UID presence/value is immutable once Project-bound, including legacy bindings without a UID |
 | Environment finalizer | Environment controller |
 | Repository-provisioning and warm-pool-cleanup annotations | Environment controller and warm-pool controller respectively |
 
@@ -172,6 +172,37 @@ The Run controller creates an owned Environment or exclusively claims a reusable
 Owned allocations have a Run controller owner reference; claimed allocations carry Run name
 and UID in `Environment.status.claimedBy`. Exact UIDs prevent same-name replacements from
 inheriting allocation, cancellation, transcript, terminal, or credential authority.
+
+`Run.spec.projectUID` is an optional caller-owned Project-incarnation precondition (1–128
+characters, no surrounding whitespace; CLI/API/MCP also bound it to 128 bytes). It requires
+`projectRef`, excludes `environmentRef`, and cannot be added, removed or changed after creation.
+Name-only callers retain legacy selection semantics. Discovery-driven callers must submit the
+observed UID; no producer fills it from a newer lookup. `swe run --project-uid`, API
+`selector.projectUID`, RunIntent DTO and MCP `projectUID` preserve this expectation, including
+same-name lost-response recovery. Changed or dropped UID is different immutable intent.
+Create keeps its existing `runs/create` and separately authorized collision `runs/get` SARs,
+without a Project read or new Project SAR: success acknowledges persisted intent, not readiness.
+Strict field validation and returned intent checks prevent upgraded producers from silently
+accepting schema pruning; old controllers that ignore the field are not supported for exact mode.
+Deploy schemas and enforcement together before advertising it; this is not mixed-version proof.
+
+After cleanup/cancellation routing, the Run controller uncached-validates the expected Project,
+even with an explicit Template. Missing, deleting or replaced selections fail with fixed
+`ProjectSelectionUnavailable` diagnostics; read failures retry without authorizing progress.
+Owned allocation stores Project name and UID together; warm promotion binds them in one
+resourceVersion-guarded patch. No legacy Project-bound Environment is retrofitted to satisfy an
+exact Run. Recovery and uncached execution/credential association checks require matching intent;
+Environment snapshot validation and source currentness checks reject replacement identities before
+Project provisioning. Invalid selection retains exact allocation/claim cleanup authority, including
+lost status writes. Tenancy revocation can still block mutations; selection never overrides it.
+
+Without an explicit Template, the default name comes from the exact Project at allocation.
+Edits before durable allocation can affect it; after Environment creation or warm claim it stays
+fixed on recovery. This is neither an atomic latest-default guarantee nor a selection-time Project
+generation or Template UID fence. Template UID is captured by the existing provisioning snapshot;
+caller-selected Template/Environment UID contracts and discovery UI remain separate work.
+The contract prevents retargeting to a replacement, not cross-object atomicity against deletion
+immediately after a final authority read. Existing execution currentness and teardown still apply.
 
 Environment selector admission is deliberately narrow: `templateRef` cannot change;
 `backend` cannot change value or presence (including omitted to explicit `pod`); and
@@ -714,9 +745,9 @@ with `items: []` for an empty page. `defaultTemplate` is the configured Template
 resolved Template identity. Projection exposes no raw metadata/spec, repository URLs, Secret
 references/bytes, credential probes, or inferred readiness, and resolves no Template or
 credential references. `swe project list` uses this same control-plane contract, prints a table
-or `--json`, and reads only one page per invocation without Kubernetes fallback. This is
-limited observation, not an identity-fenced Run creation contract: exact Project selection,
-saved defaults, preflight, and corresponding UI remain deferred to
+or `--json`, and reads only one page per invocation without Kubernetes fallback. This remains
+an observation: callers opt into exact Project selection by carrying its UID into the Run
+contract above. Saved preferences, preflight, exact Template/Environment selection and UI remain in
 [#189](https://github.com/Chris-Cullins/swe-platform/issues/189).
 
 ### Authentication and exact identity fences

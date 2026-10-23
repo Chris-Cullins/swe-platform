@@ -272,6 +272,9 @@ func (c *Client) GetRunExact(ctx context.Context, namespace, name, expectedUID s
 func (c *Client) CreateRun(ctx context.Context, namespace string, value controlplane.CreateRunRequest) (controlplane.Run, error) {
 	var run controlplane.Run
 	err := c.sendJSON(ctx, http.MethodPost, c.Endpoint("api", "v1", "namespaces", namespace, "runs"), value, &run)
+	if err == nil && value.Selector.ProjectUID != "" && run.Intent.Selector != value.Selector {
+		return controlplane.Run{}, fmt.Errorf("server did not preserve exact Project selection; create outcome uncertain, retain the same name and intent")
+	}
 	return run, err
 }
 

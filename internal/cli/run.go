@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"fmt"
 	"reflect"
+	"strings"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -21,6 +22,7 @@ func newRunCommand() *cobra.Command {
 	var (
 		template          string
 		project           string
+		projectUID        string
 		environment       string
 		agent             string
 		name              string
@@ -39,13 +41,14 @@ func newRunCommand() *cobra.Command {
 			if gitCredential != "" && gitCredential != "github-app" {
 				return fmt.Errorf("--git-credential must be github-app")
 			}
-			return runEnvironmentWithCredentials(cmd.Context(), namespace, name, template, project, environment, agent, args[0], credentialProfile, gitCredential, wait, timeout)
+			return runEnvironmentWithCredentials(cmd.Context(), namespace, name, template, project, environment, agent, args[0], credentialProfile, gitCredential, projectUID, wait, timeout)
 		},
 	}
 
 	cmd.Flags().StringVar(&name, "name", "", "Stable Run name/idempotency key (reuse to retry an uncertain create)")
 	cmd.Flags().StringVarP(&template, "template", "t", "", "EnvironmentTemplate to use (defaults to the project's template)")
 	cmd.Flags().StringVarP(&project, "project", "p", "", "Project providing the default template and environment configuration")
+	cmd.Flags().StringVar(&projectUID, "project-uid", "", "Expected Project UID from discovery (requires --project; preserve on uncertain retries)")
 	cmd.Flags().StringVarP(&environment, "environment", "e", "", "Existing unclaimed Environment to reuse (exclusive with --template/--project)")
 	cmd.Flags().StringVar(&agent, "agent", "claude-code", "Agent adapter to run")
 	cmd.Flags().StringVar(&credentialProfile, "credential-profile", "", "AgentCredentialProfile to use")
@@ -60,15 +63,15 @@ func runEnvironment(ctx context.Context, namespace, name, template, project, env
 }
 
 func runEnvironmentWithCredential(ctx context.Context, namespace, name, template, project, environment, agent, prompt, credentialProfile string, wait bool, timeout time.Duration) error {
-	return runEnvironmentWithCredentials(ctx, namespace, name, template, project, environment, agent, prompt, credentialProfile, "", wait, timeout)
+	return runEnvironmentWithCredentials(ctx, namespace, name, template, project, environment, agent, prompt, credentialProfile, "", "", wait, timeout)
 }
 
-func runEnvironmentWithCredentials(ctx context.Context, namespace, name, template, project, environment, agent, prompt, credentialProfile, gitCredential string, wait bool, timeout time.Duration) error {
+func runEnvironmentWithCredentials(ctx context.Context, namespace, name, template, project, environment, agent, prompt, credentialProfile, gitCredential, projectUID string, wait bool, timeout time.Duration) error {
 	clients, err := newKubeClients()
 	if err != nil {
 		return err
 	}
-	return createRunWithCredentials(ctx, clients, namespace, name, template, project, environment, agent, prompt, credentialProfile, gitCredential, wait, timeout)
+	return createRunWithCredentials(ctx, clients, namespace, name, template, project, environment, agent, prompt, credentialProfile, gitCredential, projectUID, wait, timeout)
 }
 
 func createRun(ctx context.Context, clients *kubeClients, namespace, name, template, project, environment, agent, prompt string, wait bool, timeout time.Duration) error {
@@ -76,10 +79,13 @@ func createRun(ctx context.Context, clients *kubeClients, namespace, name, templ
 }
 
 func createRunWithCredential(ctx context.Context, clients *kubeClients, namespace, name, template, project, environment, agent, prompt, credentialProfile string, wait bool, timeout time.Duration) error {
-	return createRunWithCredentials(ctx, clients, namespace, name, template, project, environment, agent, prompt, credentialProfile, "", wait, timeout)
+	return createRunWithCredentials(ctx, clients, namespace, name, template, project, environment, agent, prompt, credentialProfile, "", "", wait, timeout)
 }
 
-func createRunWithCredentials(ctx context.Context, clients *kubeClients, namespace, name, template, project, environment, agent, prompt, credentialProfile, gitCredential string, wait bool, timeout time.Duration) error {
+func createRunWithCredentials(ctx context.Context, clients *kubeClients, namespace, name, template, project, environment, agent, prompt, credentialProfile, gitCredential, projectUID string, wait bool, timeout time.Duration) error {
+	if projectUID != "" && (project == "" || environment != "" || len(projectUID) > 128 || strings.TrimSpace(projectUID) != projectUID) {
+		return fmt.Errorf("--project-uid requires --project, excludes --environment, and must be at most 128 bytes without surrounding whitespace")
+	}
 	if credentialProfile != "" && len(validation.IsDNS1123Subdomain(credentialProfile)) != 0 {
 		return fmt.Errorf("--credential-profile must be a Kubernetes DNS subdomain")
 	}
@@ -98,6 +104,7 @@ func createRunWithCredentials(ctx context.Context, clients *kubeClients, namespa
 		Spec: platformv1alpha1.RunSpec{
 			EnvironmentRef:       environment,
 			ProjectRef:           project,
+			ProjectUID:           projectUID,
 			TemplateRef:          template,
 			Agent:                agent,
 			Prompt:               prompt,
@@ -107,7 +114,7 @@ func createRunWithCredentials(ctx context.Context, clients *kubeClients, namespa
 	if gitCredential == "github-app" {
 		run.Spec.RepositoryCredential = platformv1alpha1.RepositoryCredentialGitHubApp
 	}
-	if err := clients.Create(ctx, run); err != nil {
+	if err := clients.Create(ctx, run, &client.CreateOptions{FieldValidation: metav1.FieldValidationStrict}); err != nil {
 		// A timeout may mean the API server persisted the object but its response
 		// was lost. Read the same name and accept only the same immutable intent.
 		var existing platformv1alpha1.Run
@@ -121,6 +128,9 @@ func createRunWithCredentials(ctx context.Context, clients *kubeClients, namespa
 		run = &existing
 		fmt.Printf("run %s already exists with the same intent; reusing it\n", run.Name)
 	} else {
+		if projectUID != "" && run.Spec.ProjectUID != projectUID {
+			return fmt.Errorf("server did not preserve --project-uid; create outcome uncertain, retain --name %s and the same intent", name)
+		}
 		fmt.Printf("run %s created (agent %s)\n", run.Name, agent)
 	}
 

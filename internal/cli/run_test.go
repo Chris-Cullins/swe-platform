@@ -275,7 +275,7 @@ func TestCreateRunIsDeclarativeAndIdempotent(t *testing.T) {
 	c := fake.NewClientBuilder().WithScheme(s).Build()
 	clients := &kubeClients{Client: c}
 	call := func(prompt string) error {
-		return createRunWithCredentials(context.Background(), clients, "ns", "stable", "small", "", "", "test", prompt, "", "github-app", false, 0)
+		return createRunWithCredentials(context.Background(), clients, "ns", "stable", "small", "", "", "test", prompt, "", "github-app", "", false, 0)
 	}
 	if err := call("do it"); err != nil {
 		t.Fatal(err)
@@ -306,14 +306,26 @@ func TestCreateRunRecoversUncertainCreateResponse(t *testing.T) {
 	}
 	base := fake.NewClientBuilder().WithScheme(s).Build()
 	clients := &kubeClients{Client: &uncertainCreateClient{Client: base}}
-	if err := createRun(context.Background(), clients, "ns", "stable-timeout", "small", "", "", "test", "do it", false, 0); err != nil {
+	call := func(uid string) error {
+		return createRunWithCredentials(context.Background(), clients, "ns", "stable-timeout", "small", "project", "", "test", "do it", "", "", uid, false, 0)
+	}
+	if err := call("selected-A"); err != nil {
 		t.Fatalf("uncertain create was not recovered: %v", err)
+	}
+	// No Project exists: retry must compare immutable intent, not resolve defaults.
+	if err := call("selected-A"); err != nil {
+		t.Fatal(err)
+	}
+	for _, uid := range []string{"", "replacement-B"} {
+		if err := call(uid); err == nil {
+			t.Fatal("changed/dropped expectation reused exact Run")
+		}
 	}
 	var runs platformv1alpha1.RunList
 	if err := base.List(context.Background(), &runs); err != nil {
 		t.Fatal(err)
 	}
-	if len(runs.Items) != 1 || runs.Items[0].Name != "stable-timeout" {
+	if len(runs.Items) != 1 || runs.Items[0].Name != "stable-timeout" || runs.Items[0].Spec.ProjectUID != "selected-A" {
 		t.Fatalf("runs = %#v", runs.Items)
 	}
 }
