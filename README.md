@@ -868,8 +868,17 @@ The browser **New run** form starts with an editable, randomly generated technic
 That name is the stable create key: after an uncertain response, retry with the same name
 and all the same fields to recover the same task. Validation and request errors retain the
 form; leaving it or switching namespace starts a fresh form and name. The form is not saved
-across reloads. Project references remain name-based; this does not implement exact Project
-selection or resolve the identity contract proposed in #207.
+across reloads. **Discover a Project** reads authorized pages of up to 50 Projects and lets you
+select an exact name/UID. Refresh, expired pages, and discovery failures retain that selection;
+selecting another Project or clearing it is an explicit intent change. The default Template
+shown is an observation, not a pinned configuration: allocation resolves its name. An existing
+Environment remains exclusive with Project/Template selection. Manual Project reference is
+labeled legacy name-only selection and does not fence replacement.
+
+Exact create responses must confirm the selected UID and full intent before navigation. If a
+response is lost or does not confirm intent, **Retry previous exact request** resends the original
+name and all original fields, even after form edits. **Create run** submits the current form;
+an existing name with different intent conflicts rather than overwriting the earlier task.
 
 ### Reviewing Run Changes
 

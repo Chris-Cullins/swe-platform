@@ -8,10 +8,11 @@ import {
   api, ApiProblem, fallbackPollInterval, isTerminal, onUnauthorized, queryKeys,
   retryTransientResourceError, transientResourceError,
 } from './api'
-import type { CreateRun, Environment, PortalServiceList, Run, RunSummary, Selector } from './contracts'
+import type { CreateRun, Environment, PortalServiceList, Project, Run, RunSummary, Selector } from './contracts'
 import { useRunFeed } from './runFeed'
 import { Transcript } from './Transcript'
 import Changes from './Changes'
+import { ProjectPicker } from './ProjectPicker'
 
 const Terminal = lazy(() => import('./Terminal'))
 const DNS_SUBDOMAIN = /^[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?$/
@@ -38,7 +39,8 @@ export function validateCreateRun(value: CreateRun): string | undefined {
   if (!value.agent) return 'Agent is required.'
   if (value.agent.length > 128) return 'Agent must be at most 128 characters.'
   if (!value.prompt.trim()) return 'Prompt is required.'
-  const refs = Object.entries(value.selector).filter((entry): entry is [string, string] => !!entry[1])
+  if (value.selector.projectUID !== undefined && (!value.selector.project || value.selector.environment || !value.selector.projectUID || value.selector.projectUID.trim() !== value.selector.projectUID || hasASCIIControl(value.selector.projectUID) || new TextEncoder().encode(value.selector.projectUID).length > 128)) return 'Exact Project selection requires a Project and a valid UID, without an existing Environment.'
+  const refs = Object.entries(value.selector).filter((entry): entry is [string, string] => entry[0] !== 'projectUID' && !!entry[1])
   if (!refs.length) return 'Choose an environment, project, or template.'
   if (value.selector.environment && (value.selector.project || value.selector.template)) return 'Environment cannot be combined with project or template.'
   if (refs.some(([, ref]) => ref.length > 253 || !DNS_SUBDOMAIN.test(ref) || ref.split('.').some(part => part.length > 63 || !DNS_LABEL.test(part)))) {
@@ -204,31 +206,36 @@ function NewRun() {
 function NewRunForm({ namespace }: { namespace: string }) {
   const navigate = useNavigate()
   const [form, setForm] = React.useState<RunForm>(() => ({ name: `run-${Array.from(crypto.getRandomValues(new Uint8Array(16)), byte => byte.toString(16).padStart(2, '0')).join('')}`, agent: 'claude-code', prompt: '', credentialProfile: '', repositoryCredential: '', environment: '', project: '', template: '' }))
+  const [project, setProject] = React.useState<Project>()
   const [validation, setValidation] = React.useState('')
   const mutation = useMutation({
     mutationFn: (value: CreateRun) => api.createRun(namespace, value),
   })
+  const submit = (value: CreateRun) => mutation.mutate(value, { onSuccess: run => navigate(`/namespaces/${encodeURIComponent(namespace)}/runs/${encodeURIComponent(run.name)}/overview`, { state: { runUID: run.uid } }) })
   const field = (key: keyof RunForm, label: string, area = false) => <label>{label}{area
-    ? <textarea value={form[key]} onChange={event => setForm({ ...form, [key]: event.target.value })} />
-    : <input value={form[key]} onChange={event => setForm({ ...form, [key]: event.target.value })} />}</label>
+    ? <textarea disabled={mutation.isPending} value={form[key]} onChange={event => setForm({ ...form, [key]: event.target.value })} />
+    : <input disabled={mutation.isPending || key === 'project' && !!project} value={form[key]} onChange={event => setForm({ ...form, [key]: event.target.value })} />}</label>
   return <main><h1>New run</h1><form className="runform" onSubmit={event => {
     event.preventDefault()
     const selector: Selector = {}
     for (const key of ['environment', 'project', 'template'] as const) if (form[key].trim()) selector[key] = form[key].trim()
+    if (project) { selector.project = project.name; selector.projectUID = project.uid }
     const credentialProfile = form.credentialProfile.trim()
     const repositoryCredential = form.repositoryCredential.trim()
     const value: CreateRun = { name: form.name.trim(), agent: form.agent.trim(), prompt: form.prompt, selector, ...(credentialProfile ? { credentialProfile } : {}), ...(repositoryCredential ? { repositoryCredential: repositoryCredential as 'GitHubApp' } : {}) }
     const error = validateCreateRun(value)
     setValidation(error || '')
-    if (!error) mutation.mutate(value, { onSuccess: run => navigate(`/namespaces/${encodeURIComponent(namespace)}/runs/${encodeURIComponent(run.name)}/overview`, { state: { runUID: run.uid } }) })
+    if (!error) submit(value)
   }}>
     {field('name', 'Name')}
     <p className="hint">This editable technical name is the stable create key. If a response is lost, retry with the same name and all the same fields to recover the same task.</p>
     {field('agent', 'Agent')}{field('credentialProfile', 'Credential profile')}
-    <label>Git credential<select value={form.repositoryCredential} onChange={event => setForm({ ...form, repositoryCredential: event.target.value })}><option value="">None</option><option value="GitHubApp">GitHub App</option></select></label>{field('prompt', 'Prompt / task', true)}
+    <label>Git credential<select disabled={mutation.isPending} value={form.repositoryCredential} onChange={event => setForm({ ...form, repositoryCredential: event.target.value })}><option value="">None</option><option value="GitHubApp">GitHub App</option></select></label>{field('prompt', 'Prompt / task', true)}
+    <ProjectPicker namespace={namespace} selected={project} disabled={mutation.isPending} onSelect={selected => { setProject(selected); setForm({ ...form, project: '' }) }} />
     {field('project', 'Project reference')}{field('template', 'Template reference')}{field('environment', 'Existing environment reference')}
-    <p className="hint">Use an existing environment alone, or provide a project and/or template.</p>
+    <p className="hint">Manual Project reference is legacy name-only selection: replacement is not fenced. Clear exact selection explicitly to use it. Use an existing environment alone, or provide a project and/or template.</p>
     {validation && <p role="alert">{validation}</p>}{mutation.isError && <Failure error={mutation.error} />}
+    {mutation.isError && mutation.variables?.selector.projectUID && <><p className="hint">A response failure can leave a Run created. Retry the previous exact request unchanged, even if you have edited this form. Create run submits the current revised intent; the same name cannot overwrite earlier intent.</p><button type="button" onClick={() => submit(mutation.variables!)}>Retry previous exact request</button></>}
     <button disabled={mutation.isPending}>Create run</button>
   </form></main>
 }

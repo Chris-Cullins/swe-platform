@@ -3229,6 +3229,86 @@ RUN_TERMINAL_PATH="/api/v1/namespaces/${PROJECT_NAMESPACE}/runs/${RESUME_RUN_NAM
 echo "==> verifying real console terminal disconnect/reconnect and xterm DOM lifecycle"
 SWE_BROWSER_TOKEN="$CONSOLE_TOKEN" ./hack/console-terminal-reconnect_test.sh \
 	http://127.0.0.1:18080 "$PROJECT_NAMESPACE" "$RESUME_RUN_NAME" "$RESUME_RUN_UID" "$RESUME_ENV_UID"
+echo "==> verifying console exact Project selection with isolated discovery authority"
+(
+	fixture=e2e-console-project-selection
+	# Existing named Project GET must not be mistaken for collection-list authority.
+	denied=$(curl --silent --output /dev/null --write-out '%{http_code}' \
+		-H "Authorization: Bearer $CONSOLE_TOKEN" "http://127.0.0.1:18080/api/v1/namespaces/$PROJECT_NAMESPACE/projects?limit=50")
+	[[ "$denied" == 403 ]] || { echo 'FAIL: expected console discovery denial before fixture'; exit 1; }
+	for resource in run agentcredentialprofile serviceaccount role rolebinding; do
+		existing=$(kubectl -n "$PROJECT_NAMESPACE" get "$resource" "$fixture" --ignore-not-found -o name)
+		[[ -z "$existing" ]] || { echo 'FAIL: Project console fixture name already exists'; exit 1; }
+	done
+	project_uid=$(kubectl -n "$PROJECT_NAMESPACE" get project "$PROJECT_NAME" -o jsonpath='{.metadata.uid}')
+	[[ -n "$project_uid" ]] || { echo 'FAIL: missing Project fixture UID'; exit 1; }
+	fixture_dir=$(mktemp -d)
+	cleanup_project_console() {
+		local result=$? cleanup_ok=true returned_uid remaining
+		trap - EXIT
+		set +e
+		if [[ -s "$fixture_dir/run-uid" ]]; then
+			returned_uid=$(cat "$fixture_dir/run-uid")
+			if [[ "$returned_uid" =~ ^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$ ]]; then
+				# Delete only the UID returned by our create, never GET/adopt a replacement.
+				jq -n --arg uid "$returned_uid" '{apiVersion:"v1",kind:"DeleteOptions",preconditions:{uid:$uid}}' |
+					kubectl delete --raw "/apis/swe.dev/v1alpha1/namespaces/$PROJECT_NAMESPACE/runs/$fixture" -f - >/dev/null 2>&1 || cleanup_ok=false
+			else cleanup_ok=false; fi
+		else
+			# Unknown create outcome: observe absence only; never adopt an observed UID.
+			remaining=$(kubectl -n "$PROJECT_NAMESPACE" get run "$fixture" --ignore-not-found -o name 2>/dev/null) || cleanup_ok=false
+			[[ -z "$remaining" ]] || cleanup_ok=false
+		fi
+		kubectl -n "$PROJECT_NAMESPACE" delete rolebinding/"$fixture" role/"$fixture" serviceaccount/"$fixture" --ignore-not-found >/dev/null 2>&1 || cleanup_ok=false
+		if [[ "$cleanup_ok" == true ]]; then rm -rf "$fixture_dir"; else
+			echo 'FAIL: Project console cleanup uncertain; no adoption or deletion retry attempted' >&2
+			[[ "$result" != 0 ]] || result=1
+		fi
+		exit "$result"
+	}
+	trap cleanup_project_console EXIT
+	# Collection list cannot be resourceNames-scoped. Keep it namespaced, temporary,
+	# and separate from the normal console principal; unrelated reads remain denied.
+	cat <<EOF | kubectl -n "$PROJECT_NAMESPACE" create -f - >/dev/null
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: $fixture
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: $fixture
+rules:
+  - apiGroups: ["swe.dev"]
+    resources: ["projects"]
+    verbs: ["list"]
+  - apiGroups: ["swe.dev"]
+    resources: ["runs"]
+    verbs: ["create"]
+  - apiGroups: ["swe.dev"]
+    resources: ["runs"]
+    resourceNames: ["$fixture"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: $fixture
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: $fixture
+subjects:
+  - kind: ServiceAccount
+    name: $fixture
+    namespace: $PROJECT_NAMESPACE
+EOF
+	fixture_token=$(kubectl -n "$PROJECT_NAMESPACE" create token "$fixture" --audience=swe-platform --duration=10m)
+	SWE_BROWSER_TOKEN="$fixture_token" ./hack/console-project-selection_test.sh \
+		http://127.0.0.1:18080 "$PROJECT_NAMESPACE" "$PROJECT_NAME" "$project_uid" "$fixture" "$fixture_dir/run-uid"
+	unset fixture_token
+)
 echo "==> verifying exact browser Run terminal through a same-origin session"
 "$WEB_TERMINAL_CLIENT" http://127.0.0.1:18080 "$CONSOLE_TOKEN" "$RUN_TERMINAL_PATH" \
 	$'touch /workspace/browser-terminal-opened; printf browser-run-terminal-e2e-ok; exit\n' browser-run-terminal-e2e-ok
