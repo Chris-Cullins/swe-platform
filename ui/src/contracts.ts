@@ -26,6 +26,19 @@ export interface CreateRun {
   repositoryCredential?: 'GitHubApp'
 }
 
+export interface Project {
+  namespace: string
+  name: string
+  uid: string
+  generation: number
+  defaultTemplate: string
+}
+
+export interface ProjectList {
+  items: Project[]
+  continue?: string
+}
+
 export interface Run {
   name: string
   uid: string

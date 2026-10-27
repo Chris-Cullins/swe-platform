@@ -215,6 +215,15 @@ runs both via `make` targets:
   baseline attribution, plus a valid generated New run name retained through validation without
   creating an extra task. The helper closes its isolated browser session on exit; no provider keys or
   browser fixtures are needed in the live acceptance path.
+  `hack/console-project-selection_test.sh` exercises real Project discovery and exact create
+  response/navigation with a missing-profile keyless Run. Its isolated namespaced principal has
+  only projects/list, runs/create and exact fixture-name runs/get; unrelated Run-list reads remain
+  denied. Preserve the existing console principal's discovery 403, pre-creation absence checks,
+  session/grant cleanup and returned-UID-only DeleteOptions cleanup. Never GET/adopt a replacement
+  for cleanup or retry an uncertain deletion. Console selection retains UID/full intent through
+  refresh and uncertain retries; discovery uses one 50-item page at a time, at most 100 pages
+  before explicit restart. Browser coverage includes loading/empty/denied/expired/retry and narrow
+  states, explicit selection changes and keyboard/pointer input.
   Scroll the actual xterm screen into view and verify keyboard focus before typing; assert
   outbound fixture bytes, expanded shell output, and server disconnect as separate stages.
   Keep failure diagnostics stage-specific and credential-safe: paths, numeric HTTP statuses,

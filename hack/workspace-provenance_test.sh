@@ -5,6 +5,10 @@ set -euo pipefail
 BASE_URL=$1 NAMESPACE=$2 SOURCE=$3 SOURCE_UID=$4 ENVIRONMENT=$5 ENVIRONMENT_UID=$6
 : "${SWE_BROWSER_TOKEN:?existing console principal required}"
 FIXTURE=e2e-workspace-proof
+for resource in environment role rolebinding; do
+	EXISTING=$(kubectl -n "$NAMESPACE" get "$resource" "$FIXTURE" --ignore-not-found -o name)
+	[[ -z "$EXISTING" ]] || { echo 'FAIL: workspace fixture name already exists'; exit 1; }
+done
 TMP=$(mktemp -d)
 cleanup() {
 	kubectl -n "$NAMESPACE" delete rolebinding,role "$FIXTURE" --ignore-not-found >/dev/null 2>&1 || true

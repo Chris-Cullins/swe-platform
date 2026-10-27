@@ -1,4 +1,4 @@
-import type { CreateRun, Environment, PortalServiceList, Problem, Run, RunChanges, RunList, RunSummaryList, Session } from './contracts'
+import type { CreateRun, Environment, PortalServiceList, Problem, ProjectList, Run, RunChanges, RunList, RunSummaryList, Session } from './contracts'
 
 export class ApiProblem extends Error {
   constructor(public readonly problem: Problem, public readonly status: number) {
@@ -107,6 +107,18 @@ export const api = {
   session: () => request<Session>('/api/v1/session'),
   login: (token: string) => request<Session>('/api/v1/session', { method: 'POST' }, { token, notifyUnauthorized: false }),
   logout: () => request<void>('/api/v1/session', { method: 'DELETE' }),
+  projects: async (namespace: string, cursor = '', signal?: AbortSignal) => {
+    if (new TextEncoder().encode(cursor).length > 4096) throw new RangeError('Project continuation is too long')
+    const query = new URLSearchParams({ limit: '50' })
+    if (cursor) query.set('continue', cursor)
+    const page = await request<ProjectList>(`${base(namespace)}/projects?${query}`, { signal })
+    if (!page || !Array.isArray(page.items) || page.items.length > 50 ||
+      page.items.some(project => !project || project.namespace !== namespace || typeof project.name !== 'string' || !project.name || typeof project.uid !== 'string' || !project.uid || project.uid.length > 128 || typeof project.defaultTemplate !== 'string') ||
+      (page.continue !== undefined && (typeof page.continue !== 'string' || new TextEncoder().encode(page.continue).length > 4096))) {
+      throw new Error('Invalid Project discovery response. No selection was changed.')
+    }
+    return page
+  },
   runs: (namespace: string, options: RunListOptions = {}) => {
     const query = new URLSearchParams()
     if (options.limit !== undefined) {
@@ -136,7 +148,18 @@ export const api = {
     if (run.uid !== runUID) throw new ResourceIdentityMismatch('Run')
     return run
   },
-  createRun: (namespace: string, value: CreateRun) => request<Run>(`${base(namespace)}/runs`, { method: 'POST', body: JSON.stringify(value) }),
+  createRun: async (namespace: string, value: CreateRun) => {
+    const run = await request<Run>(`${base(namespace)}/runs`, { method: 'POST', body: JSON.stringify(value) })
+    if (value.selector.projectUID && (!run || run.name !== value.name || typeof run.uid !== 'string' || !run.uid ||
+      run.intent?.selector?.project !== value.selector.project || run.intent.selector.projectUID !== value.selector.projectUID ||
+      (run.intent.selector.template || '') !== (value.selector.template || '') || !!run.intent.selector.environment ||
+      run.intent.agent !== value.agent || run.intent.prompt !== value.prompt ||
+      (run.intent.credentialProfile || '') !== (value.credentialProfile || '') ||
+      (run.intent.repositoryCredential || '') !== (value.repositoryCredential || ''))) {
+      throw new Error('Create outcome uncertain: response did not confirm the exact Project and full intent. Retry the same request; do not downgrade to name-only selection.')
+    }
+    return run
+  },
   cancelRun: (namespace: string, name: string, runUID: string) => request<Run>(`${base(namespace)}/runs/${encodeURIComponent(name)}/cancel`, { method: 'POST', body: JSON.stringify({ runUID }) }),
   environment: (namespace: string, name: string) => request<Environment>(`${base(namespace)}/environments/${encodeURIComponent(name)}`),
   environmentExact: async (namespace: string, name: string, environmentUID: string, signal?: AbortSignal) => {
