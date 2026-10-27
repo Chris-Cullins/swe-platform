@@ -54,4 +54,38 @@ describe('API boundary', () => {
     ])
   })
   it('keeps compatibility polling bounded at four seconds', () => { expect(fallbackPollInterval).toBe(4000) })
+  it('bounds and scopes Project pages, encodes cursors and preserves cancellation/auth failures', async () => {
+    const project = { namespace: 'team/a', name: 'p', uid: 'uid-a', defaultTemplate: 'small', generation: 1 }
+    const fetch = vi.spyOn(globalThis, 'fetch').mockImplementation(async () => new Response(JSON.stringify({ items: [project], continue: 'next' })))
+    const signal = new AbortController().signal
+    await expect(api.projects('team/a', 'a+b', signal)).resolves.toEqual({ items: [project], continue: 'next' })
+    expect(fetch.mock.calls[0]).toEqual(['/api/v1/namespaces/team%2Fa/projects?limit=50&continue=a%2Bb', expect.objectContaining({ signal, credentials: 'same-origin' })])
+    await expect(api.projects('team/a', 'é'.repeat(2049))).rejects.toThrow(RangeError)
+    for (const page of [{ items: Array(51).fill(project) }, { items: [{ ...project, namespace: 'other' }] }, { items: [{ ...project, uid: '' }] }, { items: [], continue: 'a'.repeat(4097) }]) {
+      fetch.mockResolvedValueOnce(new Response(JSON.stringify(page)))
+      await expect(api.projects('team/a')).rejects.toThrow('Invalid Project discovery')
+    }
+    const listener = vi.fn()
+    const unsubscribe = onUnauthorized(listener)
+    fetch.mockResolvedValueOnce(new Response('{}', { status: 401 }))
+    await expect(api.projects('team/a')).rejects.toMatchObject({ status: 401 })
+    expect(listener).toHaveBeenCalledOnce()
+    unsubscribe()
+  })
+  it('requires exact create success to confirm full intent, including omitted or replaced Project UID', async () => {
+    const value = { name: 'task', agent: 'amp', prompt: ' prompt ', selector: { project: 'p', projectUID: 'original', template: 'explicit' }, credentialProfile: 'profile' }
+    const { name, ...intent } = value
+    const valid = { name, uid: 'run-uid', intent }
+    const fetch = vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(JSON.stringify(valid)))
+    await expect(api.createRun('n', value)).resolves.toEqual(valid)
+    expect(JSON.parse(String(fetch.mock.calls[0][1]?.body))).toEqual(value)
+    for (const wrong of [
+      { ...valid, name: 'other' }, { ...valid, uid: '' },
+      ...[{ ...intent.selector, projectUID: undefined }, { ...intent.selector, projectUID: 'replacement' }, { ...intent.selector, project: 'other' }, { ...intent.selector, template: '' }, { ...intent.selector, environment: 'env' }].map(selector => ({ ...valid, intent: { ...intent, selector } })),
+      ...[{ prompt: 'prompt' }, { agent: 'pi' }, { credentialProfile: '' }, { repositoryCredential: 'GitHubApp' }].map(change => ({ ...valid, intent: { ...intent, ...change } })),
+    ]) {
+      fetch.mockResolvedValueOnce(new Response(JSON.stringify(wrong)))
+      await expect(api.createRun('n', value)).rejects.toThrow('Create outcome uncertain')
+    }
+  })
 })
