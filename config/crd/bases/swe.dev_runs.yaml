@@ -321,8 +321,46 @@ spec:
                     format: int64
                     type: integer
                 type: object
+              workspaceRef:
+                description: WorkspaceRef is operator-owned pre-first-acceptance storage
+                  provenance.
+                properties:
+                  environmentUID:
+                    description: |-
+                      UID is a type that holds unique ID values, including UUIDs.  Because we
+                      don't ONLY use UUIDs, this is an alias to string.  Being a type captures
+                      intent and helps make sure that UIDs and names do not get conflated.
+                    maxLength: 128
+                    minLength: 1
+                    type: string
+                  incarnation:
+                    format: uuid
+                    type: string
+                required:
+                - environmentUID
+                - incarnation
+                type: object
             type: object
+            x-kubernetes-validations:
+            - message: Run workspace association is immutable
+              rule: '!has(oldSelf.workspaceRef) || (has(self.workspaceRef) && self.workspaceRef
+                == oldSelf.workspaceRef)'
         type: object
+        x-kubernetes-validations:
+        - message: Run workspace association cannot be removed with status
+          rule: '!(has(oldSelf.status) && has(oldSelf.status.workspaceRef)) || (has(self.status)
+            && has(self.status.workspaceRef))'
+        - message: workspace association must match the allocated Environment
+          rule: '!has(self.status) || !has(self.status.workspaceRef) || (has(self.status.environmentRef)
+            && self.status.workspaceRef.environmentUID == self.status.environmentRef.uid)'
+        - message: workspace association cannot be added after acceptance or terminal
+            outcome
+          rule: '!has(self.status) || !has(self.status.workspaceRef) || (has(oldSelf.status)
+            && has(oldSelf.status.workspaceRef)) || (!has(oldSelf.status) || ((!has(oldSelf.status.startedAt))
+            && (!has(oldSelf.status.state) || oldSelf.status.state in ['''', ''Allocating'',
+            ''EnvironmentReady'', ''Paused'']) && (!has(oldSelf.status.conditions)
+            || !oldSelf.status.conditions.exists(c, c.type in [''AdapterAcceptanceAttempted'',
+            ''AdapterAccepted''] && c.status == ''True''))))'
     served: true
     storage: true
     subresources:

@@ -662,6 +662,19 @@ func (r *EnvironmentReconciler) ensureWorkspacePVC(ctx context.Context, env *pla
 		if legacyPVCUID != "" && pvc.UID != legacyPVCUID {
 			return false, terminalEnvironment(fmt.Errorf("legacy workspace PVC %q UID %q does not match frozen UID %q", pvcName, pvc.UID, legacyPVCUID))
 		}
+		if workspace := env.Status.Workspace; workspace != nil {
+			if workspace.PVCRef == nil {
+				if pvc.UID == "" || pvc.Annotations[platformv1alpha1.WorkspaceIncarnationAnnotation] != workspace.Incarnation {
+					return false, terminalEnvironment(fmt.Errorf("workspace PVC is not the pending incarnation"))
+				}
+				before := env.DeepCopy()
+				workspace.PVCRef = &platformv1alpha1.WorkspacePVCReference{Name: pvc.Name, UID: pvc.UID}
+				return false, r.Status().Patch(ctx, env, client.MergeFromWithOptions(before, client.MergeFromWithOptimisticLock{}))
+			}
+			if !platformv1alpha1.WorkspacePVCMatches(env, &pvc) {
+				return false, terminalEnvironment(fmt.Errorf("bound workspace PVC identity changed"))
+			}
+		}
 		return true, nil
 	}
 	if !errors.IsNotFound(err) {
@@ -669,6 +682,9 @@ func (r *EnvironmentReconciler) ensureWorkspacePVC(ctx context.Context, env *pla
 	}
 	if legacyPVCUID != "" {
 		return false, terminalEnvironment(fmt.Errorf("legacy workspace PVC %q with frozen UID %q is missing", pvcName, legacyPVCUID))
+	}
+	if env.Status.Workspace != nil && env.Status.Workspace.PVCRef != nil {
+		return false, terminalEnvironment(fmt.Errorf("bound workspace PVC is missing"))
 	}
 
 	size := resource.MustParse(defaultDiskSize)
@@ -694,10 +710,13 @@ func (r *EnvironmentReconciler) ensureWorkspacePVC(ctx context.Context, env *pla
 	if err := controllerutil.SetControllerReference(env, &pvc, r.Scheme); err != nil {
 		return false, err
 	}
+	if env.Status.Workspace != nil {
+		pvc.Annotations = map[string]string{platformv1alpha1.WorkspaceIncarnationAnnotation: env.Status.Workspace.Incarnation}
+	}
 	if err := r.Create(ctx, &pvc); err != nil {
 		return false, collisionOnAlreadyExists(err, "PersistentVolumeClaim", pvcName)
 	}
-	return true, nil
+	return env.Status.Workspace == nil, nil
 }
 
 // envImagePullPolicy applies the Kubernetes default pull-policy convention to
@@ -888,6 +907,18 @@ func (r *EnvironmentReconciler) backendCreationSourcesCurrent(ctx context.Contex
 	if allowed, err := installationExecutionCurrent(ctx, r.apiReader(), r.Scope); err != nil || !allowed {
 		return false, err
 	}
+	if currentEnv.Status.Workspace != nil {
+		if !apiequality.Semantic.DeepEqual(currentEnv.Status.Workspace, env.Status.Workspace) {
+			return false, nil
+		}
+		var pvc corev1.PersistentVolumeClaim
+		if err := r.apiReader().Get(ctx, types.NamespacedName{Namespace: env.Namespace, Name: envPVCName(env)}, &pvc); err != nil {
+			return false, client.IgnoreNotFound(err)
+		}
+		if !platformv1alpha1.WorkspacePVCMatches(&currentEnv, &pvc) {
+			return false, nil
+		}
+	}
 	// Direct unit-level callers may exercise the lower-level Pod constructor
 	// without the reconcile pipeline's required provisioning snapshot.
 	if env.Status.Provisioning == nil {
@@ -978,6 +1009,15 @@ func projectSetupPending(env *platformv1alpha1.Environment) bool {
 }
 
 func (r *EnvironmentReconciler) ensurePodForProject(ctx context.Context, env *platformv1alpha1.Environment, tmpl *platformv1alpha1.EnvironmentTemplate, project *platformv1alpha1.Project, runtimeClassUID types.UID, claim tenancy.Claim) (*corev1.Pod, error) {
+	if env.Status.Workspace != nil {
+		current, err := r.backendCreationSourcesCurrent(ctx, env, claim)
+		if err != nil {
+			return nil, err
+		}
+		if !current {
+			return nil, terminalEnvironment(fmt.Errorf("workspace provisioning authority changed"))
+		}
+	}
 	podName := envPodName(env)
 	resuming := env.Status.Phase == platformv1alpha1.EnvironmentPhaseResuming
 	resumeReplacement := isResumeReplacement(env)

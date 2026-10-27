@@ -176,6 +176,14 @@ runs both via `make` targets:
   `SWE_TEST_PROJECT_APISERVER=1 go test ./api/v1alpha1 -run '^TestProjectSelectionAPIServer$' -count=1 -v`
   likewise installs generated CRDs in disposable Kubernetes v1.35.0 and checks actual Project UID
   admission/persistence, immutable Run intent and atomic Environment binding. CI runs it separately.
+  That same disposable API test installs the rendered workspace admission policy and verifies
+  exact operator versus gateway/foreign-principal proof writes, immutable pending/bound storage,
+  PVC marker protection and rejection of retrospective Run/Environment provenance. New-storage
+  proof must never change legacy operation or cleanup authority. The keyless
+  `hack/workspace-provenance_test.sh` helper runs from E2E after fake-agent claim release,
+  checks named execution-use authorization/revocation and exact advisory inspection, and destroys
+  only its own disposable held workspace to test missing/replaced PVC denial. It must not change
+  the shared agent workspace or the console-project-selection hook region.
   Exact Project selection is optional for legacy compatibility; discovery-driven producers must
   preserve it through CLI/API/MCP, retries, allocation and provisioning. Never retrofit bound
   legacy Environments or re-resolve default Template names after durable allocation.

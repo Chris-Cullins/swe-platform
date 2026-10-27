@@ -84,6 +84,14 @@ All current CRDs are namespaced:
 | `Run` | Immutable agent task and Environment/Project/Template/agent-credential/repository-credential selection, including optional immutable expected `projectUID`, plus monotonic cancellation; status records normalized lifecycle, exact Environment name/UID and ownership, exact credential profile identity, repository credential readiness, accepted lifecycle epoch, and accepted execution generation. Controller-owned `ChangesBaselineCaptured` and `ChangesFinalCaptured` conditions record durable capture outcomes, never diff bytes. The cleanup finalizer retains deletion authority until work/credentials/claims are fenced and exact live-primary transcript and Changes cleanup commits. `notify` and `parentRef` are schema placeholders without an implemented inbox. |
 | `AgentCredentialProfile` | Immutable adapter and `APIKey` type metadata. Key bytes live in an owner-linked Secret whose name is derived from the profile UID. |
 
+The current storage-provenance fields supplement those resource contracts:
+
+| Field | Current contract |
+|---|---|
+| `Environment.status.workspace` | Operator-only `{incarnation: UUID, backend: pod, pvcRef?: {name, uid}}`. Initially pending, published with the first new-storage provisioning snapshot; exact PVC binding is monotonic and immutable. Absence means unverifiable legacy provenance, not an invitation to backfill. |
+| `Run.status.workspaceRef` | Operator-only immutable `{environmentUID, incarnation}`, matching the allocated Environment, recorded before the first adapter acceptance attempt. Previously accepted or terminal Runs cannot acquire retrospective provenance. |
+| PVC annotation `swe.dev/workspace-incarnation` | Operator-created marker linking new storage to pending Environment provenance; immutable, including absence. A marker alone cannot substitute for the bound PVC UID, exact owner and nondeleting storage. |
+
 The current ownership/reference shape is:
 
 `Installation.spec.isolation` is installation-administrator authority; tenant resources cannot
@@ -238,6 +246,20 @@ validates the complete snapshot and exact live source UIDs before consuming it. 
 recreation of a selected Template or bound Project under the same
 name therefore fences and removes execution rather than granting the replacement authority;
 the old snapshot is retained and the Environment does not silently recover.
+New-storage provisioning additionally publishes a random workspace incarnation while pending,
+creates the exact-owned PVC with that marker, then uncached-reads and durably binds its UID
+before any execution credential or Pod creation. Lost create/binding responses recover from
+those durable identities without minting another incarnation or adopting an unmarked PVC.
+Bound PVC absence, deletion, replacement or foreign ownership fences execution and never
+recreates storage. The Run controller persists the matching association before first acceptance
+and checks storage around execution calls; observed drift prevents result publication. These
+are sequential cross-object proofs, not an atomic transaction or proof of immutable disk bytes.
+Legacy Environments remain operational under their existing provisioning contract but acquire
+no workspace incarnation; legacy or previously accepted Runs acquire no retrospective association.
+New owned workspaces have provenance, but ownership and deletion authority are unchanged.
+The chart's fail-closed workspace policy protects the two status fields for the exact operator
+ServiceAccount in its claimed namespaces and makes PVC markers operator-created and immutable.
+CRD transition rules also prevent proof removal/mutation and late retrofits by that operator.
 Immediately before and after every replacement Pod creation, the controller uncached-revalidates
 the exact Environment generation and nonsuspended policy plus the captured Template and optional
 Project incarnations and managed Template authority. Drift prevents creation or UID-precondition
@@ -279,6 +301,34 @@ provide equivalent ACL or workspace preparation semantics rather than reproducin
 Security revision 6 also requires the purpose-scoped Changes token and replaces older Environment
 Pods to apply the workspace and Changes contracts while retaining the
 exact workspace PVC and frozen provisioning inputs.
+
+### Advisory retained-workspace inspection
+
+`swe follow-up inspect SOURCE --run-uid UID` uses only
+`GET /api/v1/namespaces/{namespace}/runs/{name}/follow-up` with `SWE-Run-UID`.
+It requires named Run `get`, then named Environment `get` **and** `use` before target
+disclosure. Execution-use is a custom SAR verb on `environments`, not terminal access;
+ordinary reader grants do not imply it and the chart grants it to no user automatically.
+The control plane needs read-only PVC access for exact identity checks, never disk access.
+The response contains exact Namespace/Run and authorized Environment/incarnation identities,
+a fixed reason, and bounded hold revision/suspension reason/sequence. It contains no prompt,
+raw condition message, credential, PVC identity or review bytes. CLI/server deadlines are
+30 seconds; there are at most twelve object reads (six objects read twice), no lists, retries,
+claim, wake, credential issuance, filesystem or adapter calls. Positive results re-read exact
+UID/resourceVersions and reauthorize; observed drift conflicts rather than selecting replacements.
+
+Reasons follow this precedence: absent proof is `WorkspaceUnverifiable`; absent/replaced/deleting
+Environment is `WorkspaceUnavailable`; nonterminal/unknown source is `SourceNotTerminal`;
+Run-owned target is `OwnedEnvironmentUnsupported`; stale or incomplete release is
+`SourceCleanupPending`; any current claim is `EnvironmentBusy`; missing/replaced/deleting/foreign
+bound PVC is `WorkspaceUnavailable`; stale namespace/provisioning/readiness authority is
+`AuthorityUnavailable`. Otherwise explicit holds are `EnvironmentHeld`, Idle/Requested
+suspension is `WakeConsentRequired`, and a current ready target is `EligibleActive`.
+The source must be terminal with current-generation `EnvironmentReleased` evidence; the
+Environment must be ownerless, released, and have current frozen-source identities.
+Inspection is advisory, not a reservation, source-validation milestone or promise of execution.
+No follow-up create schema, lineage writer, wake consent writer, owned transfer or cumulative
+Changes exists yet (#216/#190). Existing unavailable-review semantics are unchanged.
 
 ### Tenancy and Project namespace lifecycle
 
