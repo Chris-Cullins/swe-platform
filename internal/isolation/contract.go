@@ -1,5 +1,6 @@
-// Package isolation validates the inert Installation isolation selection and
-// derives its canonical identity. It is intentionally not wired to a controller.
+// Package isolation validates Installation isolation selection, derives its
+// canonical identity and shares the development-only execution predicate.
+// Restricted runtime activation remains unavailable.
 package isolation
 
 import (
@@ -11,6 +12,9 @@ import (
 
 	platformv1alpha1 "github.com/Chris-Cullins/swe-platform/api/v1alpha1"
 	"github.com/Chris-Cullins/swe-platform/internal/egresspolicy"
+	apiequality "k8s.io/apimachinery/pkg/api/equality"
+	apimeta "k8s.io/apimachinery/pkg/api/meta"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/validation"
 )
@@ -221,4 +225,55 @@ func (in RevisionInputs) DeriveRevision() (Revision, error) {
 		return Revision{}, err
 	}
 	return sha256.Sum256(canonical), nil
+}
+
+// LegacyCompatibleStatus preserves the pre-selection development lifecycle.
+func LegacyCompatibleStatus(status platformv1alpha1.InstallationStatus) bool {
+	if status.ObservedIsolation != nil || status.IsolationRevision != "" || status.PolicyConfigMap != nil || status.RuntimeClass != nil || status.StorageClass != nil || status.CSIDriver != nil {
+		return false
+	}
+	switch status.IsolationState {
+	case "":
+		return len(status.Conditions) == 0
+	case platformv1alpha1.InstallationIsolationStateLegacyUnclassified:
+		return true
+	default:
+		return false
+	}
+}
+
+// UnrestrictedAuthorityMatches compares the durable, fenced development authority.
+func UnrestrictedAuthorityMatches(status platformv1alpha1.InstallationStatus, selection *platformv1alpha1.InstallationIsolationSpec, revision Revision) bool {
+	return status.IsolationState == platformv1alpha1.InstallationIsolationStateActive &&
+		apiequality.Semantic.DeepEqual(status.ObservedIsolation, selection) &&
+		status.IsolationRevision == revision.String() &&
+		status.PolicyConfigMap == nil && status.RuntimeClass == nil && status.StorageClass == nil && status.CSIDriver == nil
+}
+
+// ExecutionAllowed checks selection/status only. Callers must independently prove
+// the exact live Installation and namespace authority; restricted runtime is inert.
+func ExecutionAllowed(installation *platformv1alpha1.Installation) (bool, error) {
+	if installation.Spec.Isolation == nil {
+		return LegacyCompatibleStatus(installation.Status), nil
+	}
+	if err := ValidateSelection(installation.Spec.Isolation); err != nil {
+		return false, fmt.Errorf("validate Installation isolation selection: %w", err)
+	}
+	switch installation.Spec.Isolation.Mode {
+	case platformv1alpha1.InstallationIsolationModeUnrestrictedDevelopment:
+		revision, err := (RevisionInputs{InstallationUID: installation.UID, Selection: *installation.Spec.Isolation}).DeriveRevision()
+		if err != nil {
+			return false, fmt.Errorf("derive Installation isolation revision: %w", err)
+		}
+		if LegacyCompatibleStatus(installation.Status) {
+			return true, nil
+		}
+		ready := apimeta.FindStatusCondition(installation.Status.Conditions, platformv1alpha1.InstallationConditionIsolationReady)
+		return UnrestrictedAuthorityMatches(installation.Status, installation.Spec.Isolation, revision) &&
+			ready != nil && ready.Status == metav1.ConditionTrue && ready.Reason == "UnrestrictedDevelopment" && ready.ObservedGeneration == installation.Generation, nil
+	case platformv1alpha1.InstallationIsolationModeRestrictedProductionCalicoV3_32_1:
+		return false, nil
+	default:
+		return false, errors.New("unsupported Installation isolation selection")
+	}
 }
