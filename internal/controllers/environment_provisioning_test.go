@@ -184,7 +184,7 @@ func TestProvisioningSnapshotAtomicPublicationAndFailClosedInputs(t *testing.T) 
 
 	t.Run("warm snapshot promotion only extends project", func(t *testing.T) {
 		scheme, env, tmpl := fixture(t)
-		c := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(env).WithObjects(env, tmpl).Build()
+		c := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(env).WithObjects(env, tmpl).WithInterceptorFuncs(workspaceTestUIDs()).Build()
 		r := &EnvironmentReconciler{Client: c, Scheme: scheme}
 		var warmPod corev1.Pod
 		for i := 0; i < 20; i++ {

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/google/uuid"
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
 	nodev1 "k8s.io/api/node/v1"
@@ -465,6 +466,9 @@ func (r *EnvironmentReconciler) publishProvisioningSnapshot(ctx context.Context,
 		return true, failErr
 	}
 	env.Status.Provisioning = candidate
+	if !legacyMigration && candidate.Backend == platformv1alpha1.EnvironmentBackendPod {
+		env.Status.Workspace = &platformv1alpha1.EnvironmentWorkspace{Incarnation: uuid.NewString(), Backend: platformv1alpha1.EnvironmentBackendPod}
+	}
 	if err := r.Status().Patch(ctx, env, client.MergeFromWithOptions(before, client.MergeFromWithOptimisticLock{})); err != nil {
 		if errors.IsConflict(err) {
 			return true, nil
@@ -593,6 +597,12 @@ func reconcileEnvironmentProvisioningGate(r *EnvironmentReconciler, ctx context.
 	env, tmpl := &state.env, &state.template
 	pvcReady, err := r.ensureWorkspacePVC(ctx, env, tmpl)
 	if err != nil {
+		var terminal *terminalEnvironmentError
+		var collision *childOwnershipCollisionError
+		if env.Status.Workspace != nil && (stderrors.As(err, &terminal) || stderrors.As(err, &collision)) {
+			result, fenceErr := r.reconcileInvalidProvisioningConfiguration(ctx, env, "workspace storage identity is unavailable")
+			return phaseHandled(result, fenceErr)
+		}
 		return phaseHandled(ctrl.Result{}, r.fail(ctx, env, fmt.Errorf("ensure workspace PVC: %w", err)))
 	}
 	if !pvcReady {

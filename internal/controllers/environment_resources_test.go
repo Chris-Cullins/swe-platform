@@ -2651,7 +2651,7 @@ func TestNamedRuntimeClassMustExistBeforeProvisioningAndRecovers(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{Name: "isolated", Namespace: env.Namespace, UID: "template-uid", Generation: 1},
 		Spec:       platformv1alpha1.EnvironmentTemplateSpec{Image: "example/environment:dev", Size: "small", RuntimeClass: "gvisor"},
 	}
-	baseClient := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(env).WithObjects(env, template).Build()
+	baseClient := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(env).WithObjects(env, template).WithInterceptorFuncs(workspaceTestUIDs()).Build()
 	reconciler := &EnvironmentReconciler{Client: baseClient, Scheme: scheme}
 	request := ctrl.Request{NamespacedName: client.ObjectKeyFromObject(env)}
 
@@ -2974,7 +2974,7 @@ func TestBlankTemplateRefIsTerminalAndCorrectedSpecRecovers(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default", UID: "environment-uid", Generation: 1, Finalizers: []string{environmentFinalizer}},
 		Spec:       platformv1alpha1.EnvironmentSpec{TemplateRef: "   "},
 	}
-	baseClient := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(env).WithObjects(env).Build()
+	baseClient := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(env).WithObjects(env).WithInterceptorFuncs(workspaceTestUIDs()).Build()
 	reconciler := &EnvironmentReconciler{Client: baseClient, Scheme: scheme}
 	request := ctrl.Request{NamespacedName: client.ObjectKeyFromObject(env)}
 	if result, err := reconciler.Reconcile(context.Background(), request); err != nil || result != (ctrl.Result{}) {
@@ -3005,6 +3005,11 @@ func TestBlankTemplateRefIsTerminalAndCorrectedSpecRecovers(t *testing.T) {
 	}
 	if _, err := reconciler.Reconcile(context.Background(), request); err != nil {
 		t.Fatalf("corrected spec did not provision after verification: %v", err)
+	}
+	for range 3 {
+		if _, err := reconciler.Reconcile(context.Background(), request); err != nil {
+			t.Fatal(err)
+		}
 	}
 	var recovering platformv1alpha1.Environment
 	if err := baseClient.Get(context.Background(), client.ObjectKeyFromObject(env), &recovering); err != nil {
@@ -3416,7 +3421,7 @@ func TestUnsupportedEgressAllowlistRecoversAfterProjectIsCleared(t *testing.T) {
 	}
 	template := &platformv1alpha1.EnvironmentTemplate{ObjectMeta: metav1.ObjectMeta{Name: "small", Namespace: "default", UID: "template-uid", Generation: 1}, Spec: platformv1alpha1.EnvironmentTemplateSpec{Image: "example/environment:dev", Size: "small"}}
 	reconciler := &EnvironmentReconciler{
-		Client: fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(env).WithObjects(env, project, template).Build(), Scheme: scheme,
+		Client: fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(env).WithObjects(env, project, template).WithInterceptorFuncs(workspaceTestUIDs()).Build(), Scheme: scheme,
 	}
 	request := ctrl.Request{NamespacedName: client.ObjectKeyFromObject(env)}
 	if _, err := reconciler.Reconcile(context.Background(), request); err != nil {

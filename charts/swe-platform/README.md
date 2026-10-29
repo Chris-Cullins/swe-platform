@@ -363,6 +363,15 @@ delete a raced Pod before readiness publication. This cannot reconstruct histori
 old API never stored. Held or suspended Environments remain podless and paused during capture;
 foreign fixed-name children are neither adopted nor deleted.
 
+New-storage Environments also capture pending `status.workspace` and bind its exact marked
+PVC UID before execution. The workspace admission policy admits proof changes only from this
+installation's operator ServiceAccount in its claimed namespaces; PVC incarnation markers
+are operator-created and immutable. Apply CRDs and chart policies together. Previously
+provisioned storage and accepted Runs are not backfilled. The control plane has read-only
+PVC access for `swe follow-up inspect`; callers need named Run `get` and Environment `get`
+plus custom `use` authorization. No user receives `use` from the chart automatically.
+This is advisory inspection only, with no follow-up execution or ownership transfer.
+
 The production presets create a `medium` catalog source using the published `env-base` image;
 onboarding creates each runnable Project-local Template copy. Operator, control-plane, and
 env-base tags default to the chart

@@ -96,7 +96,7 @@ func (r *InstallationIsolationReconciler) Reconcile(ctx context.Context, req ctr
 
 func (r *InstallationIsolationReconciler) reconcileLegacySelection(ctx context.Context, installation *platformv1alpha1.Installation) (ctrl.Result, error) {
 	desiredLegacy := r.legacyStatus(installation, platformv1alpha1.InstallationIsolationStateLegacyUnclassified)
-	if legacyCompatibleIsolationStatus(installation.Status) {
+	if isolation.LegacyCompatibleStatus(installation.Status) {
 		_, err := r.updateStatus(ctx, installation, desiredLegacy)
 		return ctrl.Result{}, err
 	}
@@ -136,7 +136,7 @@ func (r *InstallationIsolationReconciler) legacyStatus(installation *platformv1a
 
 func (r *InstallationIsolationReconciler) reconcileUnrestrictedSelection(ctx context.Context, installation *platformv1alpha1.Installation, selection *platformv1alpha1.InstallationIsolationSpec, revision isolation.Revision) (ctrl.Result, error) {
 	desiredActive := r.unrestrictedStatus(installation, platformv1alpha1.InstallationIsolationStateActive, selection, revision)
-	if legacyCompatibleIsolationStatus(installation.Status) || unrestrictedAuthorityMatches(installation.Status, selection, revision) {
+	if isolation.LegacyCompatibleStatus(installation.Status) || isolation.UnrestrictedAuthorityMatches(installation.Status, selection, revision) {
 		_, err := r.updateStatus(ctx, installation, desiredActive)
 		return ctrl.Result{}, err
 	}
@@ -292,27 +292,6 @@ func sameIsolationDependencyAuthority(current, desired platformv1alpha1.Installa
 		apiequality.Semantic.DeepEqual(current.RuntimeClass, desired.RuntimeClass) &&
 		apiequality.Semantic.DeepEqual(current.StorageClass, desired.StorageClass) &&
 		apiequality.Semantic.DeepEqual(current.CSIDriver, desired.CSIDriver)
-}
-
-func legacyCompatibleIsolationStatus(status platformv1alpha1.InstallationStatus) bool {
-	if status.ObservedIsolation != nil || status.IsolationRevision != "" || status.PolicyConfigMap != nil || status.RuntimeClass != nil || status.StorageClass != nil || status.CSIDriver != nil {
-		return false
-	}
-	switch status.IsolationState {
-	case "":
-		return len(status.Conditions) == 0
-	case platformv1alpha1.InstallationIsolationStateLegacyUnclassified:
-		return true
-	default:
-		return false
-	}
-}
-
-func unrestrictedAuthorityMatches(status platformv1alpha1.InstallationStatus, selection *platformv1alpha1.InstallationIsolationSpec, revision isolation.Revision) bool {
-	return status.IsolationState == platformv1alpha1.InstallationIsolationStateActive &&
-		apiequality.Semantic.DeepEqual(status.ObservedIsolation, selection) &&
-		status.IsolationRevision == revision.String() &&
-		status.PolicyConfigMap == nil && status.RuntimeClass == nil && status.StorageClass == nil && status.CSIDriver == nil
 }
 
 func (r *InstallationIsolationReconciler) blockedStatus(installation *platformv1alpha1.Installation, state platformv1alpha1.InstallationIsolationState, observed *platformv1alpha1.InstallationIsolationSpec, identities *restrictedIsolationIdentities, revision *isolation.Revision, resolveErr error) platformv1alpha1.InstallationStatus {
@@ -484,29 +463,7 @@ func installationExecutionAllowed(ctx context.Context, reader client.Reader, ide
 	if installation.UID != identity.UID || !installation.DeletionTimestamp.IsZero() {
 		return false, stderrors.New("Installation isolation identity changed")
 	}
-	if installation.Spec.Isolation == nil {
-		return legacyCompatibleIsolationStatus(installation.Status), nil
-	}
-	if err := isolation.ValidateSelection(installation.Spec.Isolation); err != nil {
-		return false, fmt.Errorf("validate Installation isolation selection: %w", err)
-	}
-	switch installation.Spec.Isolation.Mode {
-	case platformv1alpha1.InstallationIsolationModeUnrestrictedDevelopment:
-		revision, err := (isolation.RevisionInputs{InstallationUID: installation.UID, Selection: *installation.Spec.Isolation}).DeriveRevision()
-		if err != nil {
-			return false, fmt.Errorf("derive Installation isolation revision: %w", err)
-		}
-		if legacyCompatibleIsolationStatus(installation.Status) {
-			return true, nil
-		}
-		ready := apimeta.FindStatusCondition(installation.Status.Conditions, platformv1alpha1.InstallationConditionIsolationReady)
-		return unrestrictedAuthorityMatches(installation.Status, installation.Spec.Isolation, revision) &&
-			ready != nil && ready.Status == metav1.ConditionTrue && ready.Reason == "UnrestrictedDevelopment" && ready.ObservedGeneration == installation.Generation, nil
-	case platformv1alpha1.InstallationIsolationModeRestrictedProductionCalicoV3_32_1:
-		return false, nil
-	default:
-		return false, stderrors.New("unsupported Installation isolation selection")
-	}
+	return isolation.ExecutionAllowed(&installation)
 }
 
 func installationIdentity(scope *tenancy.ReconcileScope) (tenancy.InstallationIdentity, bool) {

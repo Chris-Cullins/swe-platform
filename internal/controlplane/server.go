@@ -256,6 +256,14 @@ func (s *Server) handleNamespacedAPI(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
+	if resource == "runs" && name != "" && subresource == "follow-up" {
+		if r.Method == http.MethodGet {
+			s.handleInspectFollowUp(w, r, namespace, name)
+		} else {
+			writeResourceMethodError(w, "GET")
+		}
+		return
+	}
 	if resource == "runs" && name != "" && subresource == "terminal" && r.Method == http.MethodGet {
 		s.handleRunTerminal(w, r, namespace, name)
 		return

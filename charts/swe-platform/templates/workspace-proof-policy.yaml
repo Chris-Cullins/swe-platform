@@ -1,0 +1,61 @@
+{{- $name := printf "%s-workspace" (include "swe-platform.clusterFullname" . | trunc 53 | trimSuffix "-") -}}
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "swe-platform.labels" . | nindent 4 }}
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: ["swe.dev"]
+        apiVersions: ["v1alpha1"]
+        operations: ["UPDATE"]
+        resources: ["environments/status", "runs/status"]
+        scope: Namespaced
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["persistentvolumeclaims"]
+        scope: Namespaced
+  variables:
+    - name: claimedNamespace
+      expression: >-
+        'swe.dev/installation-namespace' in namespaceObject.metadata.?annotations.orValue({}) &&
+        'swe.dev/installation-name' in namespaceObject.metadata.?annotations.orValue({}) &&
+        namespaceObject.metadata.?annotations.orValue({})['swe.dev/installation-namespace'] == {{ .Release.Namespace | quote }} &&
+        namespaceObject.metadata.?annotations.orValue({})['swe.dev/installation-name'] == {{ include "swe-platform.fullname" . | quote }}
+    - name: operator
+      expression: request.userInfo.username == {{ printf "system:serviceaccount:%s:%s" .Release.Namespace (include "swe-platform.serviceAccountName" .) | quote }}
+  validations:
+    - expression: >-
+        !variables.claimedNamespace || request.resource.resource != 'environments' || variables.operator ||
+        object.?status.?workspace == oldObject.?status.?workspace
+      message: only the installation operator may publish workspace proof
+      reason: Forbidden
+    - expression: >-
+        !variables.claimedNamespace || request.resource.resource != 'runs' || variables.operator ||
+        object.?status.?workspaceRef == oldObject.?status.?workspaceRef
+      message: only the installation operator may publish Run workspace association
+      reason: Forbidden
+    - expression: >-
+        !variables.claimedNamespace || request.resource.resource != 'persistentvolumeclaims' ||
+        (request.operation == 'CREATE' ?
+          (variables.operator || !('swe.dev/workspace-incarnation' in object.metadata.?annotations.orValue({}))) :
+          (('swe.dev/workspace-incarnation' in object.metadata.?annotations.orValue({})) ==
+           ('swe.dev/workspace-incarnation' in oldObject.metadata.?annotations.orValue({})) &&
+           (!('swe.dev/workspace-incarnation' in object.metadata.?annotations.orValue({})) ||
+            object.metadata.annotations['swe.dev/workspace-incarnation'] == oldObject.metadata.annotations['swe.dev/workspace-incarnation'])))
+      message: workspace marker is operator-created and immutable
+      reason: Forbidden
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "swe-platform.labels" . | nindent 4 }}
+spec:
+  policyName: {{ $name }}
+  validationActions: [Deny]

@@ -130,4 +130,7 @@ func TestProjectSelectionAPIServer(t *testing.T) {
 	if err := c.Create(ctx, unknown, &client.CreateOptions{FieldValidation: metav1.FieldValidationStrict}); !apierrors.IsBadRequest(err) {
 		t.Fatalf("strict unknown selection accepted: %v", err)
 	}
+	t.Run("workspace-principal-and-immutability", func(t *testing.T) {
+		testWorkspaceAdmission(t, config, c, scheme)
+	})
 }
