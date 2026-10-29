@@ -10,8 +10,11 @@ import (
 	"testing"
 
 	platformv1alpha1 "github.com/Chris-Cullins/swe-platform/api/v1alpha1"
+	"github.com/Chris-Cullins/swe-platform/internal/isolation"
+	"github.com/Chris-Cullins/swe-platform/internal/tenancy"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
@@ -20,6 +23,10 @@ import (
 func followUpFixture() (*platformv1alpha1.Run, *platformv1alpha1.Environment, *corev1.PersistentVolumeClaim, *platformv1alpha1.EnvironmentTemplate) {
 	incarnation := "15bd9bf1-eef4-4e49-a6ae-02cd99ca9695"
 	tmpl := &platformv1alpha1.EnvironmentTemplate{ObjectMeta: metav1.ObjectMeta{Name: "small", Namespace: "team", UID: "template-a", Generation: 1}, Spec: platformv1alpha1.EnvironmentTemplateSpec{Image: "image"}}
+	tmpl.Annotations = map[string]string{
+		tenancy.InstallationNamespaceAnnotation: "system", tenancy.InstallationNameAnnotation: "main", tenancy.InstallationUIDAnnotation: "installation-a",
+		tenancy.ProjectNameAnnotation: "project", tenancy.ProjectUIDAnnotation: "project-a", tenancy.CatalogNameAnnotation: "small", tenancy.CatalogRevisionAnnotation: "revision", tenancy.CatalogSourceUIDAnnotation: "catalog-a",
+	}
 	env := &platformv1alpha1.Environment{ObjectMeta: metav1.ObjectMeta{Name: "retained", Namespace: "team", UID: "environment-a", Generation: 3}, Spec: platformv1alpha1.EnvironmentSpec{TemplateRef: tmpl.Name}, Status: platformv1alpha1.EnvironmentStatus{ObservedGeneration: 3, ExecutionGeneration: 2, Workspace: &platformv1alpha1.EnvironmentWorkspace{Incarnation: incarnation, Backend: platformv1alpha1.EnvironmentBackendPod, PVCRef: &platformv1alpha1.WorkspacePVCReference{Name: "disk", UID: "disk-a"}}, Conditions: []metav1.Condition{{Type: "Ready", Status: metav1.ConditionTrue, ObservedGeneration: 3}}}}
 	env.Status.Provisioning = platformv1alpha1.ResolveEnvironmentProvisioning(env, tmpl, nil)
 	env.Status.Provisioning.TemplateVerified = true
@@ -27,6 +34,21 @@ func followUpFixture() (*platformv1alpha1.Run, *platformv1alpha1.Environment, *c
 	controller := true
 	pvc := &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: "disk", Namespace: "team", UID: "disk-a", Annotations: map[string]string{platformv1alpha1.WorkspaceIncarnationAnnotation: incarnation}, OwnerReferences: []metav1.OwnerReference{{APIVersion: platformv1alpha1.GroupVersion.String(), Kind: "Environment", Name: env.Name, UID: env.UID, Controller: &controller}}}}
 	return run, env, pvc, tmpl
+}
+
+func followUpAuthority() []client.Object {
+	return []client.Object{
+		&platformv1alpha1.Installation{ObjectMeta: metav1.ObjectMeta{Name: "main", Namespace: "system", UID: "installation-a", Generation: 1}},
+		&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "team", UID: "namespace-a", Annotations: map[string]string{
+			tenancy.InstallationNamespaceAnnotation: "system", tenancy.InstallationNameAnnotation: "main", tenancy.InstallationUIDAnnotation: "installation-a",
+			tenancy.ProjectNameAnnotation: "project", tenancy.ProjectUIDAnnotation: "project-a", tenancy.LifecycleAnnotation: string(tenancy.LifecycleActive),
+		}}},
+		&platformv1alpha1.Project{ObjectMeta: metav1.ObjectMeta{Name: "project", Namespace: "team", UID: "project-a"}},
+	}
+}
+
+func followUpService(c client.WithWatch) *KubernetesResourceService {
+	return &KubernetesResourceService{Client: c, Installation: tenancy.InstallationIdentity{Key: types.NamespacedName{Namespace: "system", Name: "main"}, UID: "installation-a"}}
 }
 
 func TestFollowUpInspectionClassifications(t *testing.T) {
@@ -106,7 +128,7 @@ func TestFollowUpInspectionClassifications(t *testing.T) {
 			if err := corev1.AddToScheme(scheme); err != nil {
 				t.Fatal(err)
 			}
-			base := fake.NewClientBuilder().WithScheme(scheme).WithObjects(run, env, pvc, tmpl, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "team", UID: "namespace-a"}}).Build()
+			base := fake.NewClientBuilder().WithScheme(scheme).WithObjects(run, env, pvc, tmpl).WithObjects(followUpAuthority()...).Build()
 			gets := 0
 			c := interceptor.NewClient(base, interceptor.Funcs{Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
 				gets++
@@ -121,13 +143,13 @@ func TestFollowUpInspectionClassifications(t *testing.T) {
 				t.Fatal("inspection wrote resource")
 				return nil
 			}})
-			got, err := (&KubernetesResourceService{Client: c}).InspectFollowUp(context.Background(), "team", "source", "run-a", func(name string) error {
+			got, err := followUpService(c).InspectFollowUp(context.Background(), "team", "source", "run-a", func(name string) error {
 				if name != "retained" {
 					t.Fatal("wrong authorization target")
 				}
 				return nil
 			})
-			if err != nil || got.Reason != tc.want || gets > 12 {
+			if err != nil || got.Reason != tc.want || gets > 14 {
 				t.Fatalf("reason=%s reads=%d err=%v", got.Reason, gets, err)
 			}
 			data, _ := json.Marshal(got)
@@ -162,7 +184,7 @@ func TestFollowUpInspectionAuthorizationAndIdentity(t *testing.T) {
 			run, env, pvc, tmpl := followUpFixture()
 			scheme := resourceScheme(t)
 			_ = corev1.AddToScheme(scheme)
-			base := fake.NewClientBuilder().WithScheme(scheme).WithObjects(run, env, pvc, tmpl, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "team", UID: "namespace-a"}}).Build()
+			base := fake.NewClientBuilder().WithScheme(scheme).WithObjects(run, env, pvc, tmpl).WithObjects(followUpAuthority()...).Build()
 			gets := 0
 			c := interceptor.NewClient(base, interceptor.Funcs{Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
 				gets++
@@ -174,7 +196,7 @@ func TestFollowUpInspectionAuthorizationAndIdentity(t *testing.T) {
 				return c.Get(ctx, key, obj, opts...)
 			}})
 			a := &followUpAccess{deny: deny}
-			s := NewServer(nil, ServerOptions{Access: a, Resources: &KubernetesResourceService{Client: c}})
+			s := NewServer(nil, ServerOptions{Access: a, Resources: followUpService(c)})
 			r := httptest.NewRequest("GET", "/api/v1/namespaces/team/runs/source/follow-up", nil)
 			r.Header.Set(RunUIDHeader, "run-a")
 			w := httptest.NewRecorder()
@@ -207,12 +229,12 @@ func TestFollowUpInspectionAuthorizationAndIdentity(t *testing.T) {
 }
 
 func TestFollowUpInspectionDetectsDrift(t *testing.T) {
-	for _, kind := range []string{"namespace", "run", "environment", "pvc"} {
+	for _, kind := range []string{"namespace", "run", "environment", "pvc", "installation"} {
 		t.Run(kind, func(t *testing.T) {
 			run, env, pvc, tmpl := followUpFixture()
 			scheme := resourceScheme(t)
 			_ = corev1.AddToScheme(scheme)
-			base := fake.NewClientBuilder().WithScheme(scheme).WithObjects(run, env, pvc, tmpl, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "team", UID: "namespace-a"}}).Build()
+			base := fake.NewClientBuilder().WithScheme(scheme).WithObjects(run, env, pvc, tmpl).WithObjects(followUpAuthority()...).Build()
 			seen := map[string]int{}
 			c := interceptor.NewClient(base, interceptor.Funcs{Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
 				if err := c.Get(ctx, key, obj, opts...); err != nil {
@@ -228,6 +250,8 @@ func TestFollowUpInspectionDetectsDrift(t *testing.T) {
 					k = "environment"
 				case *corev1.PersistentVolumeClaim:
 					k = "pvc"
+				case *platformv1alpha1.Installation:
+					k = "installation"
 				}
 				seen[k]++
 				if k == kind && seen[k] == 2 {
@@ -235,9 +259,81 @@ func TestFollowUpInspectionDetectsDrift(t *testing.T) {
 				}
 				return nil
 			}})
-			got, err := (&KubernetesResourceService{Client: c}).InspectFollowUp(context.Background(), "team", "source", "run-a", func(string) error { return nil })
+			got, err := followUpService(c).InspectFollowUp(context.Background(), "team", "source", "run-a", func(string) error { return nil })
 			if err == nil || got.Reason != "" {
 				t.Fatal(fmt.Sprintf("%s drift returned eligibility", kind))
+			}
+		})
+	}
+}
+
+func TestFollowUpInspectionInstallationAuthority(t *testing.T) {
+	for _, scenario := range []string{"active", "fencing", "restricted", "stale-condition", "wrong-revision", "replacement", "revoked-claim", "fencing-claim", "reclaimed-project"} {
+		t.Run(scenario, func(t *testing.T) {
+			run, env, pvc, tmpl := followUpFixture()
+			authority := followUpAuthority()
+			installation := authority[0].(*platformv1alpha1.Installation)
+			ns := authority[1].(*corev1.Namespace)
+			project := authority[2].(*platformv1alpha1.Project)
+			installation.Spec.Isolation = &platformv1alpha1.InstallationIsolationSpec{Mode: platformv1alpha1.InstallationIsolationModeUnrestrictedDevelopment}
+			if scenario == "replacement" {
+				installation.UID = "valid-replacement"
+				ns.Annotations[tenancy.InstallationUIDAnnotation] = string(installation.UID)
+				tmpl.Annotations[tenancy.InstallationUIDAnnotation] = string(installation.UID)
+			}
+			revision, err := (isolation.RevisionInputs{InstallationUID: installation.UID, Selection: *installation.Spec.Isolation}).DeriveRevision()
+			if err != nil {
+				t.Fatal(err)
+			}
+			installation.Status = platformv1alpha1.InstallationStatus{IsolationState: platformv1alpha1.InstallationIsolationStateActive, ObservedIsolation: installation.Spec.Isolation.DeepCopy(), IsolationRevision: revision.String(), Conditions: []metav1.Condition{{Type: platformv1alpha1.InstallationConditionIsolationReady, Status: metav1.ConditionTrue, Reason: "UnrestrictedDevelopment", ObservedGeneration: installation.Generation}}}
+			switch scenario {
+			case "fencing":
+				installation.Status.IsolationState = platformv1alpha1.InstallationIsolationStateFencing
+			case "restricted":
+				installation.Spec.Isolation = &platformv1alpha1.InstallationIsolationSpec{Mode: platformv1alpha1.InstallationIsolationModeRestrictedProductionCalicoV3_32_1, PolicyConfigMapName: "policy", RuntimeClass: &platformv1alpha1.InstallationRuntimeClassExpectation{Name: "gvisor", Handler: "runsc"}, StorageClass: &platformv1alpha1.InstallationStorageClassExpectation{Name: "disk", CSIDriver: "csi.example.com"}}
+				if err := isolation.ValidateSelection(installation.Spec.Isolation); err != nil {
+					t.Fatalf("invalid restricted fixture: %v", err)
+				}
+				installation.Status.IsolationState = platformv1alpha1.InstallationIsolationStateBlocked
+			case "stale-condition":
+				installation.Status.Conditions[0].ObservedGeneration--
+			case "wrong-revision":
+				installation.Status.IsolationRevision = "sha256:" + strings.Repeat("0", 64)
+			case "revoked-claim":
+				delete(ns.Annotations, tenancy.InstallationUIDAnnotation)
+			case "fencing-claim":
+				ns.Annotations[tenancy.LifecycleAnnotation] = string(tenancy.LifecycleFencing)
+				ns.Annotations[tenancy.LifecycleOperationAnnotation] = tenancy.OperationOffboarding
+			case "reclaimed-project":
+				project.UID = "new-project"
+				ns.Annotations[tenancy.ProjectUIDAnnotation] = string(project.UID)
+			}
+			scheme := resourceScheme(t)
+			_ = corev1.AddToScheme(scheme)
+			c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(run, env, pvc, tmpl).WithObjects(authority...).Build()
+			service := followUpService(c)
+			result, err := service.InspectFollowUp(context.Background(), "team", "source", "run-a", func(string) error { return nil })
+			want := "AuthorityUnavailable"
+			if scenario == "active" {
+				want = "EligibleActive"
+			}
+			if err != nil || result.Reason != want {
+				t.Fatalf("inspection=%#v err=%v", result, err)
+			}
+			// Exercise the production middleware as well: revoked/replaced/fencing
+			// namespace authority stays an authorization denial, never a disclosure.
+			access := TenancyAccessController{Access: &followUpAccess{}, Verifier: &tenancy.Verifier{Reader: c, Installation: service.Installation, Mode: tenancy.ModeScoped}, Namespaces: map[string]struct{}{"team": {}}}
+			server := NewServer(nil, ServerOptions{Access: access, Resources: service})
+			req := httptest.NewRequest("GET", "/api/v1/namespaces/team/runs/source/follow-up", nil)
+			req.Header.Set(RunUIDHeader, "run-a")
+			response := httptest.NewRecorder()
+			server.Handler().ServeHTTP(response, req)
+			if scenario == "replacement" || scenario == "revoked-claim" || scenario == "fencing-claim" {
+				if response.Code != 403 || strings.Contains(response.Body.String(), "environment-a") {
+					t.Fatalf("revoked tenancy disclosed inspection: %d", response.Code)
+				}
+			} else if response.Code != 200 || !strings.Contains(response.Body.String(), want) {
+				t.Fatalf("middleware result=%d want=%s", response.Code, want)
 			}
 		})
 	}

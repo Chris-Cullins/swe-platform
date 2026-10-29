@@ -9,6 +9,7 @@ import (
 	"time"
 
 	platformv1alpha1 "github.com/Chris-Cullins/swe-platform/api/v1alpha1"
+	"github.com/Chris-Cullins/swe-platform/internal/tenancy"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	apiMeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -60,7 +61,8 @@ func (s *KubernetesResourceService) ListRunSummaries(ctx context.Context, namesp
 
 // KubernetesResourceService stores resource intent in swe.dev CRDs.
 type KubernetesResourceService struct {
-	Client client.WithWatch
+	Client       client.WithWatch
+	Installation tenancy.InstallationIdentity
 }
 
 func (s *KubernetesResourceService) ListProjects(ctx context.Context, namespace string, limit int64, continueToken string) (ProjectList, error) {

@@ -8,10 +8,13 @@ import (
 	"time"
 
 	platformv1alpha1 "github.com/Chris-Cullins/swe-platform/api/v1alpha1"
+	"github.com/Chris-Cullins/swe-platform/internal/isolation"
+	"github.com/Chris-Cullins/swe-platform/internal/tenancy"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	apiMeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
@@ -155,7 +158,35 @@ func (s *KubernetesResourceService) InspectFollowUp(ctx context.Context, namespa
 	if platformv1alpha1.ValidateEnvironmentProvisioningSnapshot(&env, env.Status.Provisioning) != nil {
 		return result, nil
 	}
-	observed := []client.Object{&run, &env, &ns, &pvc}
+	// Authorization proves the current active namespace claim, not isolation
+	// selection. Pin the startup Installation identity and include it in the final
+	// drift proof; never derive authority from a same-name replacement.
+	identity := s.Installation
+	if identity.UID == "" || identity.Key.Namespace == "" || identity.Key.Name == "" ||
+		ns.Annotations[tenancy.InstallationNamespaceAnnotation] != identity.Key.Namespace ||
+		ns.Annotations[tenancy.InstallationNameAnnotation] != identity.Key.Name ||
+		ns.Annotations[tenancy.InstallationUIDAnnotation] != string(identity.UID) ||
+		ns.Annotations[tenancy.LifecycleAnnotation] != string(tenancy.LifecycleActive) {
+		return result, nil
+	}
+	var installation platformv1alpha1.Installation
+	if err := s.Client.Get(ctx, identity.Key, &installation); err != nil {
+		if apierrors.IsNotFound(err) {
+			return result, nil
+		}
+		return FollowUpInspection{}, err
+	}
+	if installation.UID != identity.UID || !installation.DeletionTimestamp.IsZero() {
+		return result, nil
+	}
+	if allowed, err := isolation.ExecutionAllowed(&installation); err != nil || !allowed {
+		return result, nil
+	}
+	claim := tenancy.Claim{NamespaceUID: ns.UID, ProjectName: ns.Annotations[tenancy.ProjectNameAnnotation], ProjectUID: types.UID(ns.Annotations[tenancy.ProjectUIDAnnotation])}
+	if claim.ProjectName == "" || claim.ProjectUID == "" {
+		return result, nil
+	}
+	observed := []client.Object{&run, &env, &ns, &pvc, &installation}
 	var template platformv1alpha1.EnvironmentTemplate
 	if err := s.Client.Get(ctx, client.ObjectKey{Namespace: namespace, Name: env.Status.Provisioning.Template.Name}, &template); err != nil {
 		if apierrors.IsNotFound(err) {
@@ -163,7 +194,7 @@ func (s *KubernetesResourceService) InspectFollowUp(ctx context.Context, namespa
 		}
 		return FollowUpInspection{}, err
 	}
-	if template.UID != env.Status.Provisioning.Template.UID || !template.DeletionTimestamp.IsZero() {
+	if template.UID != env.Status.Provisioning.Template.UID || !template.DeletionTimestamp.IsZero() || tenancy.ValidateManagedTemplate(&template, identity, claim) != nil {
 		return result, nil
 	}
 	observed = append(observed, &template)
@@ -175,7 +206,7 @@ func (s *KubernetesResourceService) InspectFollowUp(ctx context.Context, namespa
 			}
 			return FollowUpInspection{}, err
 		}
-		if project.UID != selected.UID || !project.DeletionTimestamp.IsZero() || len(project.Spec.EgressAllowlist) != 0 {
+		if project.UID != selected.UID || project.Name != claim.ProjectName || project.UID != claim.ProjectUID || !project.DeletionTimestamp.IsZero() || len(project.Spec.EgressAllowlist) != 0 {
 			return result, nil
 		}
 		observed = append(observed, &project)

@@ -313,9 +313,16 @@ The control plane needs read-only PVC access for exact identity checks, never di
 The response contains exact Namespace/Run and authorized Environment/incarnation identities,
 a fixed reason, and bounded hold revision/suspension reason/sequence. It contains no prompt,
 raw condition message, credential, PVC identity or review bytes. CLI/server deadlines are
-30 seconds; there are at most twelve object reads (six objects read twice), no lists, retries,
-claim, wake, credential issuance, filesystem or adapter calls. Positive results re-read exact
+30 seconds; the inspection service performs at most fourteen object reads (seven objects read
+twice), no lists or retries. Standard tenancy authorization also revalidates the Installation,
+namespace claim and sole Project through its existing reads/list. There are no claim, wake,
+credential issuance, filesystem or adapter calls. Positive results re-read exact
 UID/resourceVersions and reauthorize; observed drift conflicts rather than selecting replacements.
+Revoked/replaced/fencing tenancy remains an authorization denial before disclosure. Independently,
+the inspection service pins the startup Installation UID, validates managed Template/Project
+claim identities and uses the same isolation selection/status predicate as the controllers.
+Restricted, fencing, stale-revision or stale-readiness authority reports `AuthorityUnavailable`;
+the legacy development compatibility boundary is unchanged. This does not attest execution readiness.
 
 Reasons follow this precedence: absent proof is `WorkspaceUnverifiable`; absent/replaced/deleting
 Environment is `WorkspaceUnavailable`; nonterminal/unknown source is `SourceNotTerminal`;
