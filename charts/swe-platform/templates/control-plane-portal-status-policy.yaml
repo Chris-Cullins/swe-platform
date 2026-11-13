@@ -103,6 +103,8 @@ spec:
       message: the portal gateway may not change status.executionGeneration
     - expression: object.?status.?provisioning == oldObject.?status.?provisioning
       message: the portal gateway may not change status.provisioning
+    - expression: object.?status.?workspace == oldObject.?status.?workspace
+      message: the portal gateway may not change status.workspace
     - expression: object.?status.?provisioningMigrationPVCUID == oldObject.?status.?provisioningMigrationPVCUID
       message: the portal gateway may not change status.provisioningMigrationPVCUID
     - expression: object.?status.?phase == oldObject.?status.?phase

@@ -152,7 +152,7 @@ metadata:
     app.kubernetes.io/component: control-plane
 rules:
   - apiGroups: [""]
-    resources: ["pods"]
+    resources: ["pods", "persistentvolumeclaims"]
     verbs: ["get"]
   {{- if .Values.controlPlane.portal.enabled }}
   # The enabled gateway resolves only the exact credential Secret named by the

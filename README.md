@@ -172,6 +172,22 @@ Environment ownership and cleanup are explicit:
 | Controller-created (`Owned`) | Environment has a Run controller owner reference | Stop Run-scoped work and pause the Environment; retain workspace and transcript for review | Finalizer stops work, then Kubernetes garbage-collects the Environment, pod, and PVC |
 | Existing (`Claimed`) | `Environment.status.claimedBy` stores Run name + UID; optimistic concurrency permits one claimant | Stop Run-scoped work, clear only the matching UID claim, and leave the Environment active and reusable | Finalizer stops work and releases only the matching claim; it never deletes the Environment |
 
+### Inspect retained-workspace eligibility
+
+`swe follow-up inspect SOURCE --run-uid UID` (optionally `--json`) reads an exact source
+through `SWE_CONTROL_PLANE_URL` and `SWE_CONTROL_PLANE_TOKEN`, with a 30-second deadline.
+It requires named Run `get` and named Environment `get` plus custom `use` permission;
+ordinary read or terminal access alone is insufficient. A retained, released ownerless
+Environment can report `EligibleActive` or `WakeConsentRequired`. Neither result reserves,
+wakes or executes anything. Follow-up creation is not implemented.
+
+New Pod workspaces record immutable incarnation/PVC identity before execution, and new Runs
+record their association before first adapter acceptance. Legacy storage or historical Runs
+without that proof report `WorkspaceUnverifiable`; missing or replaced storage cannot inherit
+the old proof. Owned Environments remain `OwnedEnvironmentUnsupported` for reuse. Inspection
+returns bounded identities and fixed reasons, never task/credential/review content, and does
+not change existing cleanup, deletion or retained Changes behavior.
+
 An explicit `--environment` request fails terminally if another Run already holds the claim or
 the Environment has an enabled explicit hold. It does not wait for claim release or hold-policy
 changes and unexpectedly start later. Automatic Idle suspension is ordinarily wakeable. A Run

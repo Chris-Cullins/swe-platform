@@ -18,6 +18,8 @@ RUN go mod download
 COPY api/ api/
 COPY cmd/control-plane/ cmd/control-plane/
 COPY internal/controlplane/ internal/controlplane/
+COPY internal/egresspolicy/ internal/egresspolicy/
+COPY internal/isolation/ internal/isolation/
 COPY internal/lifecycle/ internal/lifecycle/
 COPY internal/sandboxclient/ internal/sandboxclient/
 COPY internal/tenancy/ internal/tenancy/

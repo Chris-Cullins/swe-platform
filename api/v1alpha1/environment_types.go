@@ -542,7 +542,32 @@ type EnvironmentProvisioningSnapshot struct {
 	ProjectVerified bool `json:"projectVerified"`
 }
 
+// WorkspacePVCReference is the exact storage object, never a name-only selector.
+type WorkspacePVCReference struct {
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=253
+	Name string `json:"name"`
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=128
+	// +kubebuilder:validation:Type=string
+	UID types.UID `json:"uid"`
+}
+
+// EnvironmentWorkspace is pending until PVCRef is durably bound. It describes
+// storage identity, not content, and is never inferred from an existing workspace.
+// +kubebuilder:validation:XValidation:rule="self.incarnation == oldSelf.incarnation && self.backend == oldSelf.backend",message="workspace incarnation and backend are immutable"
+// +kubebuilder:validation:XValidation:rule="!has(oldSelf.pvcRef) || (has(self.pvcRef) && self.pvcRef == oldSelf.pvcRef)",message="workspace PVC binding is immutable"
+type EnvironmentWorkspace struct {
+	// +kubebuilder:validation:Format=uuid
+	Incarnation string `json:"incarnation"`
+	// +kubebuilder:validation:Enum=pod
+	Backend EnvironmentBackend `json:"backend"`
+	// +optional
+	PVCRef *WorkspacePVCReference `json:"pvcRef,omitempty"`
+}
+
 // EnvironmentStatus defines the observed state of Environment.
+// +kubebuilder:validation:XValidation:rule="!has(oldSelf.workspace) || has(self.workspace)",message="workspace proof cannot be removed"
 // +kubebuilder:validation:XValidation:rule="!has(oldSelf.executionGeneration) || (has(self.executionGeneration) && self.executionGeneration >= oldSelf.executionGeneration)",message="executionGeneration cannot decrease or be removed"
 // +kubebuilder:validation:XValidation:rule="!has(oldSelf.nextPortalRouteGeneration) || (has(self.nextPortalRouteGeneration) && self.nextPortalRouteGeneration >= oldSelf.nextPortalRouteGeneration)",message="nextPortalRouteGeneration cannot decrease or be removed"
 // +kubebuilder:validation:XValidation:rule="!has(oldSelf.provisioning) || has(self.provisioning)",message="provisioning snapshot cannot be removed"
@@ -566,6 +591,11 @@ type EnvironmentStatus struct {
 	// child is created and may only gain its one-time Project binding.
 	// +optional
 	Provisioning *EnvironmentProvisioningSnapshot `json:"provisioning,omitempty"`
+
+	// Workspace is operator-owned new-storage provenance. Absence is legacy,
+	// not permission to adopt an existing PVC or reconstruct historical identity.
+	// +optional
+	Workspace *EnvironmentWorkspace `json:"workspace,omitempty"`
 
 	// ProvisioningMigrationPVCUID durably fences the exact retained legacy
 	// workspace before migration tears down any execution child.
@@ -673,6 +703,8 @@ func EffectiveEnvironmentBackend(environment *Environment, template *Environment
 // +kubebuilder:printcolumn:name="Phase",type=string,JSONPath=`.status.phase`
 // +kubebuilder:printcolumn:name="Template",type=string,JSONPath=`.spec.templateRef`
 // +kubebuilder:printcolumn:name="Age",type=date,JSONPath=`.metadata.creationTimestamp`
+// +kubebuilder:validation:XValidation:rule="!(has(oldSelf.status) && has(oldSelf.status.workspace)) || (has(self.status) && has(self.status.workspace))",message="workspace proof cannot be removed with status"
+// +kubebuilder:validation:XValidation:rule="!has(self.status) || !has(self.status.workspace) || (has(oldSelf.status) && has(oldSelf.status.workspace)) || (!(has(oldSelf.status) && has(oldSelf.status.provisioning)) && has(self.status.provisioning) && !has(self.status.workspace.pvcRef) && !has(self.status.provisioning.legacyWorkspacePVCUID))",message="workspace proof starts pending with first new-storage provisioning snapshot"
 // The first-publication transition guard is rooted here because oldSelf is not
 // available inside the optional status subtree when that entire subtree first appears.
 // +kubebuilder:validation:XValidation:rule="!has(self.status) || !has(self.status.provisioning) || (has(oldSelf.status) && has(oldSelf.status.provisioning)) || (!self.status.provisioning.templateVerified && !self.status.provisioning.projectVerified)",message="initial provisioning snapshot must be unverified"

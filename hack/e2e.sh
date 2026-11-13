@@ -3331,6 +3331,9 @@ if [[ "${RELEASED_CLAIM_UID:-}" == "$RESUME_RUN_UID" ]]; then
 	echo "FAIL: completed Run retained its Environment claim"
 	exit 1
 fi
+echo "==> verifying retained workspace provenance and exact advisory inspection"
+SWE_BROWSER_TOKEN="$CONSOLE_TOKEN" bash ./hack/workspace-provenance_test.sh \
+	http://127.0.0.1:18080 "$PROJECT_NAMESPACE" "$RESUME_RUN_NAME" "$RESUME_RUN_UID" "$ENV_NAME" "$RESUME_ENV_UID"
 echo "==> verifying retained read-only Run Changes after claim release"
 CHANGES_JSON=$(SWE_CONTROL_PLANE_URL=http://127.0.0.1:18080 SWE_CONTROL_PLANE_TOKEN="$CONSOLE_TOKEN" \
 	bin/swe --namespace "$PROJECT_NAMESPACE" changes "$RESUME_RUN_NAME" --run-uid "$RESUME_RUN_UID" --json)

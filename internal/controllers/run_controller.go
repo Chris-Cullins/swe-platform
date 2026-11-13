@@ -317,6 +317,17 @@ func (r *RunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.R
 	}
 	repositoryRefreshAfter := time.Duration(0)
 	if !run.Spec.Cancel {
+		ready, err := r.ensureRunWorkspace(ctx, &run)
+		if err != nil && !apierrors.IsNotFound(err) {
+			var terminal *terminalEnvironmentError
+			if errors.As(err, &terminal) {
+				return ctrl.Result{}, r.setRunState(ctx, &run, platformv1alpha1.RunStateFailed, "EnvironmentLost", "workspace storage identity is unavailable", false)
+			}
+			return ctrl.Result{}, err
+		}
+		if err == nil && !ready {
+			return ctrl.Result{RequeueAfter: adapterPollInterval}, nil
+		}
 		result, done, err := r.ensureRepositoryCredential(ctx, &run)
 		if done || err != nil {
 			return result, err
@@ -2240,6 +2251,11 @@ func (r *RunReconciler) resolveAllocatedExecution(ctx context.Context, run *plat
 	if !environmentReachable(current) {
 		return sandboxclient.Execution{}, false, nil
 	}
+	if !run.Spec.Cancel && !terminalRunState(run.Status.State) && run.DeletionTimestamp.IsZero() {
+		if ready, err := r.runWorkspaceCurrent(ctx, run, current); err != nil || !ready {
+			return sandboxclient.Execution{}, false, err
+		}
+	}
 	allowed, err := installationExecutionCurrent(ctx, r.apiReader(), r.Scope)
 	if err != nil || !allowed {
 		return sandboxclient.Execution{}, false, err
@@ -2273,6 +2289,11 @@ func (r *RunReconciler) allocatedExecutionCurrent(ctx context.Context, run *plat
 	}
 	if !environmentReachable(current) {
 		return false, nil
+	}
+	if !run.Spec.Cancel && !terminalRunState(run.Status.State) && run.DeletionTimestamp.IsZero() {
+		if ready, err := r.runWorkspaceCurrent(ctx, run, current); err != nil || !ready {
+			return false, err
+		}
 	}
 	allowed, err := installationExecutionCurrent(ctx, r.apiReader(), r.Scope)
 	if err != nil || !allowed {

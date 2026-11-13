@@ -113,7 +113,7 @@ func main() {
 		os.Exit(1)
 	}
 	resourceAccess := controlplane.TenancyAccessController{Access: access, Verifier: verifier, Namespaces: configuredNamespaces}
-	resources := &controlplane.KubernetesResourceService{Client: kubeClient}
+	resources := &controlplane.KubernetesResourceService{Client: kubeClient, Installation: identity}
 	portalSuffix, portalScheme := os.Getenv("SWE_PORTAL_SUFFIX"), portalSchemeFromEnvironment()
 	if err := controlplane.ValidatePortalConfiguration(portalSuffix, portalScheme); err != nil {
 		log.Error("invalid portal configuration", "error", err)

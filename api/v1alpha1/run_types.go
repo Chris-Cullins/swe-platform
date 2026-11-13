@@ -132,7 +132,18 @@ type RunUsage struct {
 	TokensOut int64 `json:"tokensOut,omitempty"`
 }
 
+// RunWorkspaceReference is recorded before first acceptance, never backfilled.
+type RunWorkspaceReference struct {
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=128
+	// +kubebuilder:validation:Type=string
+	EnvironmentUID types.UID `json:"environmentUID"`
+	// +kubebuilder:validation:Format=uuid
+	Incarnation string `json:"incarnation"`
+}
+
 // RunStatus defines the observed state of Run.
+// +kubebuilder:validation:XValidation:rule="!has(oldSelf.workspaceRef) || (has(self.workspaceRef) && self.workspaceRef == oldSelf.workspaceRef)",message="Run workspace association is immutable"
 type RunStatus struct {
 	// +optional
 	State RunState `json:"state,omitempty"`
@@ -158,6 +169,10 @@ type RunStatus struct {
 	// remains as historical identity after terminal cleanup.
 	// +optional
 	EnvironmentRef *RunEnvironmentReference `json:"environmentRef,omitempty"`
+
+	// WorkspaceRef is operator-owned pre-first-acceptance storage provenance.
+	// +optional
+	WorkspaceRef *RunWorkspaceReference `json:"workspaceRef,omitempty"`
 
 	// CredentialProfileRef is the exact profile incarnation selected for this Run.
 	// It remains as historical identity after the Run terminates.
@@ -204,6 +219,9 @@ type RunStatus struct {
 // +kubebuilder:printcolumn:name="State",type=string,JSONPath=`.status.state`
 // +kubebuilder:printcolumn:name="Agent",type=string,JSONPath=`.spec.agent`
 // +kubebuilder:printcolumn:name="Age",type=date,JSONPath=`.metadata.creationTimestamp`
+// +kubebuilder:validation:XValidation:rule="!(has(oldSelf.status) && has(oldSelf.status.workspaceRef)) || (has(self.status) && has(self.status.workspaceRef))",message="Run workspace association cannot be removed with status"
+// +kubebuilder:validation:XValidation:rule="!has(self.status) || !has(self.status.workspaceRef) || (has(self.status.environmentRef) && self.status.workspaceRef.environmentUID == self.status.environmentRef.uid)",message="workspace association must match the allocated Environment"
+// +kubebuilder:validation:XValidation:rule="!has(self.status) || !has(self.status.workspaceRef) || (has(oldSelf.status) && has(oldSelf.status.workspaceRef)) || (!has(oldSelf.status) || ((!has(oldSelf.status.startedAt)) && (!has(oldSelf.status.state) || oldSelf.status.state in ['', 'Allocating', 'EnvironmentReady', 'Paused']) && (!has(oldSelf.status.conditions) || !oldSelf.status.conditions.exists(c, c.type in ['AdapterAcceptanceAttempted', 'AdapterAccepted'] && c.status == 'True'))))",message="workspace association cannot be added after acceptance or terminal outcome"
 
 // Run is one agent task executing in an environment.
 type Run struct {

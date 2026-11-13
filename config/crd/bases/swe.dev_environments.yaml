@@ -943,8 +943,57 @@ spec:
                   rule: 'has(self.executionGeneration) ? self.records.all(r, r.state
                     in [''Healthy'', ''Unhealthy'', ''Unknown'']) : (self.records.all(r,
                     r.state == ''Pending'') || self.records.all(r, r.state == ''Unavailable''))'
+              workspace:
+                description: |-
+                  Workspace is operator-owned new-storage provenance. Absence is legacy,
+                  not permission to adopt an existing PVC or reconstruct historical identity.
+                properties:
+                  backend:
+                    description: |-
+                      EnvironmentBackend selects where the environment executes. The v1alpha1 Go
+                      API retains planned backend names for compatibility, but CRD admission only
+                      accepts pod until another backend is implemented.
+                    enum:
+                    - pod
+                    type: string
+                  incarnation:
+                    format: uuid
+                    type: string
+                  pvcRef:
+                    description: WorkspacePVCReference is the exact storage object,
+                      never a name-only selector.
+                    properties:
+                      name:
+                        maxLength: 253
+                        minLength: 1
+                        type: string
+                      uid:
+                        description: |-
+                          UID is a type that holds unique ID values, including UUIDs.  Because we
+                          don't ONLY use UUIDs, this is an alias to string.  Being a type captures
+                          intent and helps make sure that UIDs and names do not get conflated.
+                        maxLength: 128
+                        minLength: 1
+                        type: string
+                    required:
+                    - name
+                    - uid
+                    type: object
+                required:
+                - backend
+                - incarnation
+                type: object
+                x-kubernetes-validations:
+                - message: workspace incarnation and backend are immutable
+                  rule: self.incarnation == oldSelf.incarnation && self.backend ==
+                    oldSelf.backend
+                - message: workspace PVC binding is immutable
+                  rule: '!has(oldSelf.pvcRef) || (has(self.pvcRef) && self.pvcRef
+                    == oldSelf.pvcRef)'
             type: object
             x-kubernetes-validations:
+            - message: workspace proof cannot be removed
+              rule: '!has(oldSelf.workspace) || has(self.workspace)'
             - message: executionGeneration cannot decrease or be removed
               rule: '!has(oldSelf.executionGeneration) || (has(self.executionGeneration)
                 && self.executionGeneration >= oldSelf.executionGeneration)'
@@ -961,6 +1010,15 @@ spec:
                 > 0'
         type: object
         x-kubernetes-validations:
+        - message: workspace proof cannot be removed with status
+          rule: '!(has(oldSelf.status) && has(oldSelf.status.workspace)) || (has(self.status)
+            && has(self.status.workspace))'
+        - message: workspace proof starts pending with first new-storage provisioning
+            snapshot
+          rule: '!has(self.status) || !has(self.status.workspace) || (has(oldSelf.status)
+            && has(oldSelf.status.workspace)) || (!(has(oldSelf.status) && has(oldSelf.status.provisioning))
+            && has(self.status.provisioning) && !has(self.status.workspace.pvcRef)
+            && !has(self.status.provisioning.legacyWorkspacePVCUID))'
         - message: initial provisioning snapshot must be unverified
           rule: '!has(self.status) || !has(self.status.provisioning) || (has(oldSelf.status)
             && has(oldSelf.status.provisioning)) || (!self.status.provisioning.templateVerified
