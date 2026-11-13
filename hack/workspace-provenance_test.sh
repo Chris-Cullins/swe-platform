@@ -12,10 +12,41 @@ done
 TMP=$(mktemp -d)
 CREATED_UID=""
 CREATE_ATTEMPTED=false
+STAGE=0
+workspace_diagnostics() {
+	# Bounded, failure-only allowlisted facts, before cleanup. Never emit messages,
+	# object names/UIDs, logs, arguments, annotations or credential material.
+	local pod_uid
+	printf 'workspace_fixture stage=%s\n' "$STAGE" >&2
+	kubectl --request-timeout=5s -n "$NAMESPACE" get environment "$FIXTURE" -o json 2>/dev/null | head -c 65536 > "$TMP/diagnostic-env.json" || : > "$TMP/diagnostic-env.json"
+	jq -sce --arg uid "$CREATED_UID" 'select(length == 1) | .[0] | select(.metadata.uid == $uid) |
+	 {environment:true,current:(.metadata.generation == .status.observedGeneration),
+	  ready:any(.status.conditions[]?; .type == "Ready" and .status == "True"),
+	  invalid:any(.status.conditions[]?; .reason == "InvalidConfiguration"),
+	  workspacePending:(.status.workspace != null and .status.workspace.pvcRef == null),
+	  workspaceBound:(.status.workspace.pvcRef.uid != null)}' "$TMP/diagnostic-env.json" >&2 2>/dev/null || echo 'workspace_fixture environment_evidence=false' >&2
+	kubectl --request-timeout=5s -n "$NAMESPACE" get pvc "env-$FIXTURE" -o json 2>/dev/null | head -c 65536 > "$TMP/diagnostic-pvc.json" || : > "$TMP/diagnostic-pvc.json"
+	jq -sce --arg uid "$CREATED_UID" 'select(length == 1) | .[0] | select(any(.metadata.ownerReferences[]?; .controller == true and .kind == "Environment" and .uid == $uid)) |
+	 {pvc:true,bound:(.status.phase == "Bound"),pending:(.status.phase == "Pending"),deleting:(.metadata.deletionTimestamp != null)}' "$TMP/diagnostic-pvc.json" >&2 2>/dev/null || echo 'workspace_fixture pvc_evidence=false' >&2
+	kubectl --request-timeout=5s -n "$NAMESPACE" get pod "env-$FIXTURE" -o json 2>/dev/null | head -c 65536 > "$TMP/diagnostic-pod.json" || : > "$TMP/diagnostic-pod.json"
+	jq -sce --arg uid "$CREATED_UID" 'select(length == 1) | .[0] | select(any(.metadata.ownerReferences[]?; .controller == true and .kind == "Environment" and .uid == $uid)) |
+	 {pod:true,scheduled:any(.status.conditions[]?; .type == "PodScheduled" and .status == "True"),
+	  unschedulable:any(.status.conditions[]?; .type == "PodScheduled" and .reason == "Unschedulable"),
+	  imagePull:any((.status.initContainerStatuses[]?,.status.containerStatuses[]?); .state.waiting.reason == "ImagePullBackOff" or .state.waiting.reason == "ErrImagePull"),
+	  initFailed:any(.status.initContainerStatuses[]?; (.state.terminated.exitCode // 0) != 0)}' "$TMP/diagnostic-pod.json" >&2 2>/dev/null || echo 'workspace_fixture pod_evidence=false' >&2
+	pod_uid=$(jq -ser --arg uid "$CREATED_UID" 'select(length == 1) | .[0] | select(any(.metadata.ownerReferences[]?; .controller == true and .kind == "Environment" and .uid == $uid)) | .metadata.uid' "$TMP/diagnostic-pod.json" 2>/dev/null) || return 0
+	[[ "$pod_uid" =~ ^[a-f0-9-]{36}$ ]] || return 0
+	kubectl --request-timeout=5s get --raw "/api/v1/namespaces/$NAMESPACE/events?fieldSelector=involvedObject.uid%3D$pod_uid&limit=20" 2>/dev/null | head -c 65536 > "$TMP/diagnostic-events.json" || : > "$TMP/diagnostic-events.json"
+	jq -sce 'select(length == 1) | .[0] | select(.items | type == "array") | {events:true,insufficientCPU:any(.items[]?; .reason == "FailedScheduling" and ((.message // "") | contains("Insufficient cpu"))),
+	 insufficientMemory:any(.items[]?; .reason == "FailedScheduling" and ((.message // "") | contains("Insufficient memory"))),
+	 unboundPVC:any(.items[]?; .reason == "FailedScheduling" and ((.message // "") | contains("unbound immediate PersistentVolumeClaims"))),
+	 volumeFailure:any(.items[]?; .reason == "FailedMount" or .reason == "FailedAttachVolume")}' "$TMP/diagnostic-events.json" >&2 2>/dev/null || echo 'workspace_fixture event_evidence=false' >&2
+}
 cleanup() {
 	local result=$? cleanup_ok=true remaining
 	trap - EXIT
 	set +e
+	if [[ "$result" != 0 && -n "$CREATED_UID" ]]; then workspace_diagnostics; fi
 	if [[ "$CREATE_ATTEMPTED" == true ]]; then
 		if [[ "$CREATED_UID" =~ ^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$ ]]; then
 			jq -n --arg uid "$CREATED_UID" '{apiVersion:"v1",kind:"DeleteOptions",preconditions:{uid:$uid}}' |
@@ -79,6 +110,7 @@ CREATED_UID=$(jq --arg name "$FIXTURE" --arg ns "$NAMESPACE" \
 	'{apiVersion:"swe.dev/v1alpha1",kind:"Environment",metadata:{name:$name,namespace:$ns},spec:{templateRef:.spec.templateRef,projectRef:.spec.projectRef}}' \
 	"$TMP/environment.json" | kubectl create -f - -o jsonpath='{.metadata.uid}')
 [[ "$CREATED_UID" =~ ^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$ ]] || { echo 'FAIL: workspace create returned no exact UID'; exit 1; }
+STAGE=1
 kubectl -n "$NAMESPACE" wait --for=condition=Ready environment/"$FIXTURE" --timeout=3m >/dev/null
 kubectl -n "$NAMESPACE" get environment "$FIXTURE" -o json > "$TMP/new.json"
 jq -e --arg uid "$CREATED_UID" '.metadata.uid == $uid' "$TMP/new.json" >/dev/null
@@ -86,7 +118,9 @@ PVC=$(jq -r '.status.workspace.pvcRef.name' "$TMP/new.json")
 PVC_UID=$(jq -r '.status.workspace.pvcRef.uid' "$TMP/new.json")
 [[ "$PVC" != null && "$PVC_UID" != null ]] || { echo 'FAIL: new workspace has no storage proof'; exit 1; }
 bin/swe --namespace "$NAMESPACE" environment hold "$FIXTURE" >/dev/null
+STAGE=2
 kubectl -n "$NAMESPACE" wait --for=jsonpath='{.status.phase}'=Paused environment/"$FIXTURE" --timeout=3m >/dev/null
+STAGE=3
 kubectl -n "$NAMESPACE" wait --for=delete pod/"env-$FIXTURE" --timeout=60s >/dev/null
 kubectl -n "$NAMESPACE" get pvc "$PVC" -o json | jq \
 	'{apiVersion:"v1",kind:"PersistentVolumeClaim",metadata:{name:.metadata.name,namespace:.metadata.namespace,ownerReferences:.metadata.ownerReferences},spec:{accessModes:.spec.accessModes,resources:.spec.resources,storageClassName:.spec.storageClassName}}' > "$TMP/replacement.json"
@@ -94,6 +128,7 @@ jq -n --arg uid "$PVC_UID" '{apiVersion:"v1",kind:"DeleteOptions",preconditions:
 	kubectl delete --raw "/api/v1/namespaces/$NAMESPACE/persistentvolumeclaims/$PVC" -f - >/dev/null
 kubectl -n "$NAMESPACE" wait --for=delete pvc/"$PVC" --timeout=60s >/dev/null
 bin/swe --namespace "$NAMESPACE" environment release "$FIXTURE" >/dev/null
+STAGE=4
 kubectl -n "$NAMESPACE" wait --for=jsonpath='{.status.phase}'=Failed environment/"$FIXTURE" --timeout=60s >/dev/null
 if kubectl -n "$NAMESPACE" get pvc "$PVC" >/dev/null 2>&1 || kubectl -n "$NAMESPACE" get pod "env-$FIXTURE" >/dev/null 2>&1; then
 	echo 'FAIL: missing bound workspace was recreated or executed'; exit 1
@@ -103,8 +138,10 @@ REPLACEMENT_UID=$(kubectl -n "$NAMESPACE" get pvc "$PVC" -o jsonpath='{.metadata
 [[ "$REPLACEMENT_UID" != "$PVC_UID" ]] || { echo 'FAIL: replacement fixture retained old UID'; exit 1; }
 # A new hold revision forces a fresh reconciliation rather than observing stale failure.
 bin/swe --namespace "$NAMESPACE" environment hold "$FIXTURE" >/dev/null
+STAGE=5
 kubectl -n "$NAMESPACE" wait --for=jsonpath='{.status.phase}'=Paused environment/"$FIXTURE" --timeout=60s >/dev/null
 bin/swe --namespace "$NAMESPACE" environment release "$FIXTURE" >/dev/null
+STAGE=6
 kubectl -n "$NAMESPACE" wait --for=jsonpath='{.status.phase}'=Failed environment/"$FIXTURE" --timeout=60s >/dev/null
 kubectl -n "$NAMESPACE" get environment "$FIXTURE" -o json | jq -e --arg uid "$PVC_UID" '.status.workspace.pvcRef.uid == $uid' >/dev/null
 if kubectl -n "$NAMESPACE" get pod "env-$FIXTURE" >/dev/null 2>&1; then

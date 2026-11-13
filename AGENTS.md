@@ -187,6 +187,11 @@ runs both via `make` targets:
   `hack/workspace-fixture_test.sh` executes that actual helper with isolated boundaries to verify
   the custom-verb Role YAML, returned-UID-only cleanup, unknown outcomes, no retries, and safe
   failure diagnostics. Use explicit Role YAML for custom `use`; kubectl's role generator rejects it.
+  Workspace failures report numeric stages (1 Ready, 2 initial hold, 3 Pod deletion,
+  4 missing-storage fence, 5 replacement hold, 6 replacement fence) before cleanup, plus
+  identity-filtered Environment/Pod/PVC booleans and allowlisted event indicators. Each diagnostic
+  read has a five-second deadline and 64 KiB cap; events use one page of at most 20. Never emit
+  raw objects, event/condition messages, credentials or logs, or replace the original exit status.
   The shared `internal/isolation.ExecutionAllowed` predicate preserves controller selection/status
   semantics and gates advisory inspection; it does not replace exact live identity/tenancy checks.
   Exact Project selection is optional for legacy compatibility; discovery-driven producers must
